@@ -103,16 +103,23 @@ struct RepetitionProcessor: LogitProcessor, Sendable {
         guard !recentTokens.isEmpty, penalty != 1.0 else {
             return logits
         }
-        var logitsArray: [Float] = logits.flattened().asArray(Float.self)
-        for tokenID in recentTokens {
-            guard tokenID >= 0, tokenID < logitsArray.count else { continue }
-            if logitsArray[tokenID] > 0 {
-                logitsArray[tokenID] /= penalty
-            } else {
-                logitsArray[tokenID] *= penalty
-            }
+        let indices = MLXArray(recentTokens.map { Int32($0) })
+        let selected = logits.take(indices, axis: -1)
+
+        // Divide positive logits by penalty, multiply negative logits by penalty
+        let penalized = MLX.where(
+            selected .> 0,
+            selected / MLXArray(penalty),
+            selected * MLXArray(penalty)
+        )
+
+        // Scatter penalized values back into logits
+        let result = logits
+        for (i, tokenID) in recentTokens.enumerated() {
+            guard tokenID >= 0 else { continue }
+            result[tokenID] = penalized[i]
         }
-        return MLXArray(logitsArray).reshaped(logits.shape)
+        return result
     }
 
     mutating func didSample(token: MLXArray) {

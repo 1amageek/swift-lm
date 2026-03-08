@@ -14,6 +14,7 @@ struct TokenIterator: Sequence, IteratorProtocol {
     private let maxTokens: Int?
     private let eosTokenIds: Set<Int>
 
+    private var fullInput: LMInput
     private var inputText: LMInput.Text
     private var prefillComplete: Bool = false
     private var tokenCount: Int = 0
@@ -40,6 +41,7 @@ struct TokenIterator: Sequence, IteratorProtocol {
         self.prefillStepSize = parameters.prefillStepSize
         self.maxTokens = parameters.maxTokens
         self.eosTokenIds = eosTokenIds
+        self.fullInput = input
         self.inputText = input.text
 
         // Initialize repetition processor with prompt tokens
@@ -55,19 +57,24 @@ struct TokenIterator: Sequence, IteratorProtocol {
             let output: LMOutput
 
             if !prefillComplete {
-                let result = try model.prepare(
-                    LMInput(text: inputText),
-                    cache: cache,
-                    windowSize: prefillStepSize
-                )
-                switch result {
-                case .tokens(let remaining):
-                    inputText = remaining
-                    // Prefill chunk processed, recurse for next chunk
-                    return next()
-                case .logits(let logits):
-                    output = logits
-                    prefillComplete = true
+                // Iterative prefill: process chunks until we get logits
+                while true {
+                    let result = try model.prepare(
+                        fullInput,
+                        cache: cache,
+                        windowSize: prefillStepSize
+                    )
+                    switch result {
+                    case .tokens(let remaining):
+                        inputText = remaining
+                        fullInput = LMInput(text: inputText)
+                        continue
+                    case .logits(let logits):
+                        output = logits
+                        prefillComplete = true
+                        break
+                    }
+                    break
                 }
             } else {
                 output = model.callAsFunction(inputText, cache: cache, state: nil)
