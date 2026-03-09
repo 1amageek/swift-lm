@@ -13,16 +13,35 @@ public struct ModelInputs: Sendable {
     /// Optional KV cache from a previous execution step.
     public let cache: KVCacheState?
 
+    /// Optional image pixel data for vision-language models.
+    ///
+    /// Shape depends on the vision encoder:
+    /// - 2D (Conv2d): `[N, H, W, C]` where N = number of images
+    /// - 3D (Conv3d): `[N, T, H, W, C]` where T = temporal frames
+    public let imagePixels: TensorData?
+
+    /// Grid dimensions for each image/video in the batch.
+    ///
+    /// Each entry is a `[T, H, W]` triple describing the grid of patches:
+    /// - T: number of temporal frames (1 for images)
+    /// - H: number of patch rows after smart resize
+    /// - W: number of patch columns after smart resize
+    public let imageGridSizes: TensorData?
+
     public init(
         tokenIDs: TensorData,
         positionIDs: TensorData? = nil,
         attentionMask: TensorData? = nil,
-        cache: KVCacheState? = nil
+        cache: KVCacheState? = nil,
+        imagePixels: TensorData? = nil,
+        imageGridSizes: TensorData? = nil
     ) {
         self.tokenIDs = tokenIDs
         self.positionIDs = positionIDs
         self.attentionMask = attentionMask
         self.cache = cache
+        self.imagePixels = imagePixels
+        self.imageGridSizes = imageGridSizes
     }
 }
 

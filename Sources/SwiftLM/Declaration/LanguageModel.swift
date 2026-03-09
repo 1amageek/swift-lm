@@ -1,77 +1,26 @@
-/// A declarative language model architecture definition.
-///
-/// `LanguageModel` declares ONLY the structural topology of a model.
-/// Weights are a separate concern, attached later via the `.weights(_:)` modifier.
-///
-/// `LanguageModel` is NOT:
-/// - a file loader
-/// - a checkpoint artifact
-/// - a stateful runtime module
-/// - a forward-pass executor
-/// - a weight declaration
-///
-/// `LanguageModel` IS:
-/// - a pure architecture declaration
-///
-/// ```swift
-/// struct Qwen3_5: LanguageModel {
-///     var body: some ModelComponent {
-///         TokenEmbedding(vocabSize: 151936, embeddingSize: 4096)
-///         Repeat(count: 32) {
-///             Residual {
-///                 RMSNorm(dimension: 4096)
-///                 Attention(hiddenSize: 4096, headCount: 32, kvHeadCount: 8)
-///             }
-///             Residual {
-///                 RMSNorm(dimension: 4096)
-///                 MLP(inputSize: 4096, intermediateSize: 11008)
-///             }
-///         }
-///         RMSNorm(dimension: 4096, epsilon: 1e-6)
-///         OutputHead(inputSize: 4096, vocabSize: 151936)
-///     }
-/// }
-///
-/// // Weights are attached externally:
-/// let weighted = Qwen3_5().weights(.gguf(location: "qwen3.5.gguf"))
-/// ```
-public protocol LanguageModel: Sendable {
-
-    /// The type of structural body for this model.
-    associatedtype Body: ModelComponent
-
-    /// Declarative structural body.
-    @ModelComponentBuilder var body: Body { get }
-}
-
 // MARK: - Structure-only Operations
 
-extension LanguageModel {
+extension ModelComponent {
 
-    /// Produce the open declaration tree for this model's body.
-    public func makeModelDeclaration() -> ModelDeclaration {
-        body.makeDeclaration()
-    }
-
-    /// Produce the normalized (structurally closed) semantic IR for this model.
+    /// Produce the normalized (structurally closed) semantic IR for this component.
     ///
     /// Returns the `NormalizedModel` containing both the semantic graph
     /// and diagnostic metadata. The graph is well-formed but NOT
     /// canonicalized. For equivalence comparison, pass `result.graph`
     /// through `canonicalize(_:)`.
     public func makeNormalizedModel() throws -> NormalizedModel {
-        try normalize(body.makeDeclaration())
+        try normalize(self)
     }
 
     /// Convenience: produce just the semantic graph (discarding metadata).
     public func makeModelGraph() throws -> ModelGraph {
-        try normalize(body.makeDeclaration()).graph
+        try normalize(self).graph
     }
 }
 
 // MARK: - Weight Modifier
 
-extension LanguageModel {
+extension ModelComponent {
 
     /// Attach a weight declaration to this model.
     ///
@@ -103,11 +52,11 @@ extension LanguageModel {
 
 /// A model bundled with a weight declaration.
 ///
-/// `WeightedModel` is produced by the `.weights(_:)` modifier on `LanguageModel`.
+/// `WeightedModel` is produced by the `.weights(_:)` modifier on `ModelComponent`.
 /// It carries both the structural graph and the weight source, ready for
 /// resolution and compilation.
 ///
-/// `WeightedModel` is NOT a `LanguageModel`. This is intentional — it represents
+/// `WeightedModel` is NOT a `ModelComponent`. This is intentional — it represents
 /// a different concept: a structure-plus-weights bundle, not a pure structure.
 ///
 /// ```swift
@@ -117,7 +66,7 @@ extension LanguageModel {
 /// let graph = try weighted.makeModelGraph()
 /// let weightsDecl = weighted.weightsDeclaration
 /// ```
-public struct WeightedModel<M: LanguageModel>: Sendable {
+public struct WeightedModel<M: ModelComponent>: Sendable {
 
     /// The underlying model (structure only).
     public let model: M
@@ -128,11 +77,6 @@ public struct WeightedModel<M: LanguageModel>: Sendable {
     public init(model: M, weightsDeclaration: WeightsDeclaration) {
         self.model = model
         self.weightsDeclaration = weightsDeclaration
-    }
-
-    /// Produce the open declaration tree for the model's body.
-    public func makeModelDeclaration() -> ModelDeclaration {
-        model.makeModelDeclaration()
     }
 
     /// Produce the normalized semantic IR for the model.

@@ -131,7 +131,7 @@ private func checkUniqueness(_ region: Region, seen: inout Set<ValueID>) -> Bool
 // MARK: - Architecture Declarations
 
 /// Mixtral-style MoE model.
-struct TinyMixtral: LanguageModel {
+struct TinyMixtral: ModelComponent {
     let vocabSize: Int
     let hiddenSize: Int
     let headCount: Int
@@ -170,7 +170,7 @@ struct TinyMixtral: LanguageModel {
 }
 
 /// Jamba-style hybrid model (Mamba + Attention interleaved).
-struct TinyJamba: LanguageModel {
+struct TinyJamba: ModelComponent {
     let vocabSize: Int
     let hiddenSize: Int
     let headCount: Int
@@ -219,96 +219,96 @@ struct IRInvariantTests {
 
     @Test("Invariant: normalize → GraphValidator.validate always succeeds")
     func normalizeAlwaysValid() throws {
-        // Every well-formed ModelDeclaration, when normalized,
+        // Every well-formed ModelComponent, when normalized,
         // must produce a graph that passes structural validation.
-        let declarations: [ModelDeclaration] = [
+        let components: [any ModelComponent] = [
             // Single primitive
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
+            RMSNorm(dimension: 64),
 
             // Sequence of primitives
-            .sequence([
-                .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-            ]),
+            Group {
+                TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+                RMSNorm(dimension: 64)
+                OutputHead(inputSize: 64, vocabSize: 100)
+            },
 
             // Residual
-            .sequence([
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .residual(strategy: .add, body:
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64)))
-                ),
-            ]),
+            Group {
+                RMSNorm(dimension: 64)
+                Residual {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            },
 
             // Parallel
-            .sequence([
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .parallel(merge: .add, branches: [
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                ]),
-            ]),
+            Group {
+                RMSNorm(dimension: 64)
+                Parallel(merge: .add) {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            },
 
             // Repeating
-            .sequence([
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .repeating(count: 3, label: nil, body:
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64)))
-                ),
-            ]),
+            Group {
+                RMSNorm(dimension: 64)
+                Repeat(count: 3) {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            },
 
             // Deeply nested
-            .sequence([
-                .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-                .repeating(count: 2, label: nil, body:
-                    .residual(strategy: .add, body: .sequence([
-                        .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                        .parallel(merge: .add, branches: [
-                            .primitive(.attention(AttentionAttributes(
-                                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16
-                            ))),
-                            .primitive(.mlp(MLPAttributes(inputSize: 64, outputSize: 64, intermediateSize: 256))),
-                        ]),
-                    ]))
-                ),
-                .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-            ]),
+            Group {
+                TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+                Repeat(count: 2) {
+                    Residual {
+                        RMSNorm(dimension: 64)
+                        Parallel(merge: .add) {
+                            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)
+                            MLP(inputSize: 64, intermediateSize: 256)
+                        }
+                    }
+                }
+                OutputHead(inputSize: 64, vocabSize: 100)
+            },
 
             // Empty sequence (identity)
-            .sequence([
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .sequence([]),
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-            ]),
+            Group {
+                RMSNorm(dimension: 64)
+                Group { }
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            },
 
             // Single-branch parallel
-            .sequence([
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-                .parallel(merge: .concat, branches: [
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                ]),
-            ]),
+            Group {
+                RMSNorm(dimension: 64)
+                Parallel(merge: .concat) {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            },
 
             // Labeled wrapping
-            .labeled("model", .sequence([
-                .labeled("embed", .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64)))),
-                .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-            ])),
+            Group(label: "model") {
+                Group(label: "embed") {
+                    TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+                }
+                OutputHead(inputSize: 64, vocabSize: 100)
+            },
         ]
 
-        for (i, decl) in declarations.enumerated() {
-            let graph = try normalize(decl).graph
+        for (i, component) in components.enumerated() {
+            let graph = try normalize(component).graph
             do {
                 try GraphValidator.validate(graph)
             } catch {
-                Issue.record("Declaration \(i) failed validation: \(error)")
+                Issue.record("Component \(i) failed validation: \(error)")
             }
         }
     }
 
     @Test("Invariant: normalize → canonicalize → GraphValidator.validate always succeeds")
     func normalizeCanonicalizeAlwaysValid() throws {
-        let models: [any LanguageModel] = [
+        let models: [any ModelComponent] = [
             TinyLlama(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyCohere(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyMixtral(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 1),
@@ -328,7 +328,7 @@ struct IRInvariantTests {
 
     @Test("Invariant: normalized graph has globally unique ValueIDs")
     func normalizedGraphUniqueIDs() throws {
-        let models: [any LanguageModel] = [
+        let models: [any ModelComponent] = [
             TinyLlama(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyCohere(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyMixtral(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 1),
@@ -342,7 +342,7 @@ struct IRInvariantTests {
 
     @Test("Invariant: normalized graph satisfies SSA def-use in all regions")
     func normalizedGraphSSA() throws {
-        let models: [any LanguageModel] = [
+        let models: [any ModelComponent] = [
             TinyLlama(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 3),
             TinyCohere(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyMixtral(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, expertCount: 8, expertsPerToken: 2, layerCount: 2),
@@ -372,14 +372,14 @@ struct IRInvariantTests {
 
     @Test("Value flow: linear chain threads each output to next input")
     func linearChainValueFlow() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let component = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            RMSNorm(dimension: 64)
+            SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(component).graph
         let ops = graph.rootRegion.operations
 
         // tokenEmbedding is source: no operands
@@ -397,15 +397,15 @@ struct IRInvariantTests {
 
     @Test("Value flow: residual operation's operand becomes body parameter")
     func residualValueFlow() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .residual(strategy: .add, body: .sequence([
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-            ])),
-        ])
+        let component = Group {
+            RMSNorm(dimension: 64)
+            Residual {
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(component).graph
         let normOp = graph.rootRegion.operations[0]
         let residualOp = graph.rootRegion.operations[1]
 
@@ -436,17 +436,15 @@ struct IRInvariantTests {
 
     @Test("Value flow: parallel forks input to each branch via separate parameters")
     func parallelValueFlow() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .parallel(merge: .add, branches: [
-                .primitive(.attention(AttentionAttributes(
-                    hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16
-                ))),
-                .primitive(.mlp(MLPAttributes(inputSize: 64, outputSize: 64, intermediateSize: 256))),
-            ]),
-        ])
+        let component = Group {
+            RMSNorm(dimension: 64)
+            Parallel(merge: .add) {
+                Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)
+                MLP(inputSize: 64, intermediateSize: 256)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(component).graph
         let normOp = graph.rootRegion.operations[0]
         let parallelOp = graph.rootRegion.operations[1]
 
@@ -483,15 +481,15 @@ struct IRInvariantTests {
 
     @Test("Value flow: repeating body results feed back as next iteration parameters")
     func repeatingValueFlow() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .repeating(count: 4, label: nil, body: .sequence([
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-            ])),
-        ])
+        let component = Group {
+            RMSNorm(dimension: 64)
+            Repeat(count: 4) {
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(component).graph
         let repeatOp = graph.rootRegion.operations[1]
 
         guard case .repeating(let count, let body) = repeatOp.kind else {
@@ -562,9 +560,8 @@ struct IRInvariantTests {
             intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 2
         )
 
-        let decl = model.body.makeDeclaration()
-        let graph1 = try normalize(decl).graph
-        let graph2 = try normalize(decl).graph
+        let graph1 = try normalize(model).graph
+        let graph2 = try normalize(model).graph
 
         #expect(graph1 == graph2)
     }
@@ -605,16 +602,16 @@ struct IRInvariantTests {
 
     @Test("Canonicalization preserves value flow topology")
     func canonicalizationPreservesTopology() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .residual(strategy: .add, body:
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64)))
-            ),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let component = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            RMSNorm(dimension: 64)
+            Residual {
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            }
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(component).graph
         let canon = canonicalize(graph)
 
         // Both have same operation count
@@ -839,7 +836,7 @@ struct IRInvariantTests {
 
     @Test("Invariant: Codable roundtrip preserves graph equality for all architectures")
     func codableRoundtripAllArchitectures() throws {
-        let models: [any LanguageModel] = [
+        let models: [any ModelComponent] = [
             TinyLlama(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyCohere(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 1),
             TinyMixtral(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 1),
@@ -862,7 +859,7 @@ struct IRInvariantTests {
 
     @Test("LLMProfileValidator accepts all real architecture patterns")
     func profileValidatorAllArchitectures() throws {
-        let models: [any LanguageModel] = [
+        let models: [any ModelComponent] = [
             TinyLlama(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 2),
             TinyCohere(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, layerCount: 1),
             TinyMixtral(vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2, intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 1),

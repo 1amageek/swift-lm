@@ -5,7 +5,9 @@
 /// ```swift
 /// TokenEmbedding(vocabSize: 32000, embeddingSize: 4096)
 /// ```
-public struct TokenEmbedding: PrimitiveModelComponent {
+public struct TokenEmbedding: ModelComponent {
+
+    public typealias Body = Never
 
     public let vocabSize: Int
     public let embeddingSize: Int
@@ -22,12 +24,19 @@ public struct TokenEmbedding: PrimitiveModelComponent {
         self.embeddingSize = embeddingSize
         self.dtypeHint = dtypeHint
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.tokenEmbedding(TokenEmbeddingAttributes(
+extension TokenEmbedding: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .tokenEmbedding(TokenEmbeddingAttributes(
             vocabSize: vocabSize,
             embeddingSize: embeddingSize,
             dtypeHint: dtypeHint
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
     }
 }

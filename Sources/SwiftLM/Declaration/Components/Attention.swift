@@ -10,7 +10,9 @@
 ///     headDimension: 128
 /// )
 /// ```
-public struct Attention: PrimitiveModelComponent {
+public struct Attention: ModelComponent {
+
+    public typealias Body = Never
 
     public let hiddenSize: Int
     public let headCount: Int
@@ -56,9 +58,12 @@ public struct Attention: PrimitiveModelComponent {
         self.window = window
         self.implementationHint = implementationHint
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.attention(AttentionAttributes(
+extension Attention: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .attention(AttentionAttributes(
             hiddenSize: hiddenSize,
             headCount: headCount,
             kvHeadCount: kvHeadCount,
@@ -69,6 +74,10 @@ public struct Attention: PrimitiveModelComponent {
             qkNorm: qkNorm,
             window: window,
             implementationHint: implementationHint
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

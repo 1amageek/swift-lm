@@ -6,7 +6,9 @@
 /// ```swift
 /// Linear(inputSize: 4096, outputSize: 32000)
 /// ```
-public struct Linear: PrimitiveModelComponent {
+public struct Linear: ModelComponent {
+
+    public typealias Body = Never
 
     public let inputSize: Int
     public let outputSize: Int
@@ -19,12 +21,15 @@ public struct Linear: PrimitiveModelComponent {
         self.outputSize = outputSize
         self.bias = bias
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.linear(LinearAttributes(
-            inputSize: inputSize,
-            outputSize: outputSize,
-            bias: bias
-        )))
+extension Linear: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .linear(LinearAttributes(inputSize: inputSize, outputSize: outputSize, bias: bias))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

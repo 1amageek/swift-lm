@@ -8,29 +8,42 @@
 /// ```swift
 /// RoPE(dimension: 128, base: 500_000.0)
 /// ```
-public struct RoPE: PrimitiveModelComponent {
+public struct RoPE: ModelComponent {
+
+    public typealias Body = Never
 
     public let dimension: Int
     public let base: Float
     public let scaling: RoPEScaling?
+    public let mropeAxes: MRoPEAxes?
 
     public init(
         dimension: Int,
         base: Float = 10_000.0,
-        scaling: RoPEScaling? = nil
+        scaling: RoPEScaling? = nil,
+        mropeAxes: MRoPEAxes? = nil
     ) {
         precondition(dimension > 0, "dimension must be positive")
         precondition(base > 0, "base must be positive")
         self.dimension = dimension
         self.base = base
         self.scaling = scaling
+        self.mropeAxes = mropeAxes
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.rope(RoPEAttributes(
+extension RoPE: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .rope(RoPEAttributes(
             dimension: dimension,
             base: base,
-            scaling: scaling
-        )))
+            scaling: scaling,
+            mropeAxes: mropeAxes
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

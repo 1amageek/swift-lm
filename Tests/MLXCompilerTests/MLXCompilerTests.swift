@@ -78,7 +78,7 @@ struct CompilerTests {
 
     @Test("Model with no attention has no caches")
     func noCachesForNonAttentionModel() throws {
-        struct NormOnly: LanguageModel {
+        struct NormOnly: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 4)
                 RMSNorm(dimension: 4)
@@ -144,7 +144,7 @@ struct ExecutorOperationTests {
 
     @Test("TokenEmbedding looks up embeddings by token ID")
     func tokenEmbedding() throws {
-        struct EmbedOnly: LanguageModel {
+        struct EmbedOnly: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 3)
             }
@@ -181,7 +181,7 @@ struct ExecutorOperationTests {
 
     @Test("RMSNorm applies 1+w convention")
     func rmsNormConvention() throws {
-        struct NormModel: LanguageModel {
+        struct NormModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 RMSNorm(dimension: 4)
@@ -216,7 +216,7 @@ struct ExecutorOperationTests {
 
     @Test("Linear projection: output = input @ weight.T")
     func linearProjection() throws {
-        struct LinearModel: LanguageModel {
+        struct LinearModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Linear(inputSize: 2, outputSize: 3)
@@ -257,7 +257,7 @@ struct ExecutorOperationTests {
 
     @Test("OutputHead with tied embedding reuses embedding table")
     func tiedOutputHead() throws {
-        struct TiedModel: LanguageModel {
+        struct TiedModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 3, embeddingSize: 2)
                 OutputHead(inputSize: 2, vocabSize: 3, tiedToEmbedding: true)
@@ -290,7 +290,7 @@ struct ExecutorOperationTests {
 
     @Test("MLP SwiGLU: gate activation * up projection, then down")
     func mlpSwiGLU() throws {
-        struct MLPModel: LanguageModel {
+        struct MLPModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 MLP(inputSize: 2, intermediateSize: 4, activation: .silu, gating: .swiglu)
@@ -351,7 +351,7 @@ struct ExecutorStructuralTests {
 
     @Test("Residual adds body output to input")
     func residualAdd() throws {
-        struct ResidualModel: LanguageModel {
+        struct ResidualModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Residual {
@@ -385,7 +385,7 @@ struct ExecutorStructuralTests {
 
     @Test("Repeating block executes body N times with per-iteration weight paths")
     func repeatingWithDistinctWeights() throws {
-        struct RepeatModel: LanguageModel {
+        struct RepeatModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Repeat(count: 2) {
@@ -424,7 +424,7 @@ struct ExecutorStructuralTests {
 
     @Test("Parallel with add merge sums branch outputs")
     func parallelAdd() throws {
-        struct ParallelModel: LanguageModel {
+        struct ParallelModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Parallel(merge: .add) {
@@ -470,7 +470,7 @@ struct ExecutorAttentionTests {
 
     @Test("Attention produces correct output shape and caches keys/values")
     func attentionShapeAndCache() throws {
-        struct AttnModel: LanguageModel {
+        struct AttnModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 4)
                 Attention(
@@ -512,7 +512,7 @@ struct ExecutorAttentionTests {
     @Test("Attention with RoPE produces correct output")
     func attentionWithRoPE() throws {
         let rope = RoPEAttributes(dimension: 2, base: 10_000.0)
-        struct RoPEAttnModel: LanguageModel {
+        struct RoPEAttnModel: ModelComponent {
             let rope: RoPEAttributes
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 4)
@@ -672,7 +672,7 @@ struct ExecutorLayerNormTests {
 
     @Test("LayerNorm normalizes input with affine transform")
     func layerNormAffine() throws {
-        struct LNModel: LanguageModel {
+        struct LNModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 LayerNorm(dimension: 4, affine: true)
@@ -712,7 +712,7 @@ struct ExecutorLayerNormTests {
 
     @Test("LayerNorm with non-trivial scale and bias shifts output")
     func layerNormScaleBias() throws {
-        struct LNModel: LanguageModel {
+        struct LNModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 LayerNorm(dimension: 2, affine: true)
@@ -753,7 +753,7 @@ struct ExecutorGQATests {
     @Test("GQA with kvHeadCount < headCount produces correct shape")
     func gqaShape() throws {
         // 4 query heads, 2 kv heads → GQA ratio = 2
-        struct GQAModel: LanguageModel {
+        struct GQAModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 8)
                 Attention(
@@ -794,7 +794,7 @@ struct ExecutorGQATests {
 
     @Test("GQA autoregressive: KV cache stores correct head count")
     func gqaAutoregressive() throws {
-        struct GQAModel: LanguageModel {
+        struct GQAModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 8)
                 Attention(
@@ -838,7 +838,7 @@ struct ExecutorAttentionVariantTests {
 
     @Test("Attention with bias adds bias to projections")
     func attentionWithBias() throws {
-        struct BiasAttnModel: LanguageModel {
+        struct BiasAttnModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Attention(
@@ -875,7 +875,7 @@ struct ExecutorAttentionVariantTests {
 
     @Test("Attention with RMSNorm QK normalization")
     func attentionQKNorm() throws {
-        struct QKNormModel: LanguageModel {
+        struct QKNormModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Attention(
@@ -912,7 +912,7 @@ struct ExecutorAttentionVariantTests {
     func attentionPartialRoPE() throws {
         // headDim=4, ropeDim=2 → only first 2 dims get RoPE, last 2 pass through
         let rope = RoPEAttributes(dimension: 2, base: 10_000.0)
-        struct PartialRoPEModel: LanguageModel {
+        struct PartialRoPEModel: ModelComponent {
             let rope: RoPEAttributes
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 8)
@@ -955,7 +955,7 @@ struct ExecutorLinearVariantTests {
 
     @Test("Linear with bias adds bias vector")
     func linearWithBias() throws {
-        struct BiasLinearModel: LanguageModel {
+        struct BiasLinearModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Linear(inputSize: 2, outputSize: 3, bias: true)
@@ -988,7 +988,7 @@ struct ExecutorLinearVariantTests {
 
     @Test("OutputHead with separate projection (not tied to embedding)")
     func outputHeadSeparateProjection() throws {
-        struct UntiedModel: LanguageModel {
+        struct UntiedModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 3, embeddingSize: 2)
                 OutputHead(inputSize: 2, vocabSize: 3, tiedToEmbedding: false)
@@ -1026,7 +1026,7 @@ struct ExecutorMLPVariantTests {
 
     @Test("MLP without gating (no up_proj): gate → activate → down")
     func mlpNoGating() throws {
-        struct NoGateModel: LanguageModel {
+        struct NoGateModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 MLP(inputSize: 2, intermediateSize: 4, activation: .silu, gating: .none)
@@ -1071,7 +1071,7 @@ struct ExecutorMLPVariantTests {
 
     @Test("MLP with GELU activation")
     func mlpGELU() throws {
-        struct GELUModel: LanguageModel {
+        struct GELUModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 MLP(inputSize: 2, intermediateSize: 4, activation: .gelu, gating: .none)
@@ -1113,7 +1113,7 @@ struct ExecutorMLPVariantTests {
 
     @Test("MLP with bias on all projections")
     func mlpWithBias() throws {
-        struct BiasMLP: LanguageModel {
+        struct BiasMLP: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 MLP(inputSize: 2, intermediateSize: 2, activation: .silu, gating: .swiglu, bias: true)
@@ -1164,7 +1164,7 @@ struct ExecutorParallelMergeTests {
 
     @Test("Parallel with concat merge concatenates branch outputs")
     func parallelConcat() throws {
-        struct ConcatModel: LanguageModel {
+        struct ConcatModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Parallel(merge: .concat) {
@@ -1211,7 +1211,7 @@ struct ExecutorBatchTests {
 
     @Test("2D tokenIDs [B, L] preserves batch dimension in output")
     func batchDimensionPreserved() throws {
-        struct SimpleModel: LanguageModel {
+        struct SimpleModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Linear(inputSize: 2, outputSize: 3)
@@ -1240,7 +1240,7 @@ struct ExecutorBatchTests {
 
     @Test("1D tokenIDs [L] squeezes batch dimension from output")
     func singleSequenceSqueezed() throws {
-        struct SimpleModel: LanguageModel {
+        struct SimpleModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Linear(inputSize: 2, outputSize: 3)
@@ -1275,7 +1275,7 @@ struct ExecutorAttentionNumericsTests {
     @Test("Single-head attention with identity projections computes correct output")
     func singleHeadIdentityAttention() throws {
         // 1 head, headDim=2, hiddenSize=2 → projections are identity-like
-        struct SingleHeadModel: LanguageModel {
+        struct SingleHeadModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Attention(
@@ -1342,7 +1342,7 @@ struct ExecutorCacheTests {
 
     @Test("Cache offset increments correctly across multiple forward passes")
     func cacheOffsetTracking() throws {
-        struct AttnModel: LanguageModel {
+        struct AttnModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 8, embeddingSize: 4)
                 Attention(
@@ -1418,7 +1418,7 @@ struct CompilerEdgeCaseTests {
     @Test("Deeply nested structure produces correct weight paths")
     func deeplyNestedPaths() throws {
         // Residual { Residual { Linear } }
-        struct DeepModel: LanguageModel {
+        struct DeepModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Residual {
@@ -1456,7 +1456,7 @@ struct CompilerEdgeCaseTests {
 
     @Test("Missing weight during execution throws descriptive error")
     func missingWeightError() throws {
-        struct LinearModel: LanguageModel {
+        struct LinearModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Linear(inputSize: 2, outputSize: 2)
@@ -1479,7 +1479,7 @@ struct CompilerEdgeCaseTests {
 
     @Test("Repeat(count=1) applies body exactly once")
     func singleRepeat() throws {
-        struct OneRepeatModel: LanguageModel {
+        struct OneRepeatModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Repeat(count: 1) {
@@ -1516,7 +1516,7 @@ struct CompilerErrorPathTests {
 
     @Test("Multiple embeddings with tied head throws invalidGraphStructure")
     func multipleEmbeddingsWithTiedHeadThrows() throws {
-        struct DoubleEmbed: LanguageModel {
+        struct DoubleEmbed: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
@@ -1537,7 +1537,7 @@ struct CompilerErrorPathTests {
 
     @Test("Tied head without embedding throws invalidGraphStructure")
     func tiedHeadWithoutEmbeddingThrows() throws {
-        struct HeadOnly: LanguageModel {
+        struct HeadOnly: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 RMSNorm(dimension: 4)
                 OutputHead(inputSize: 4, vocabSize: 4, tiedToEmbedding: true)
@@ -1556,7 +1556,7 @@ struct CompilerErrorPathTests {
 
     @Test("StateSpace operation produces recurrent cache descriptor")
     func stateSpaceRecurrentCache() throws {
-        struct SSModel: LanguageModel {
+        struct SSModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
@@ -1582,7 +1582,7 @@ struct ExecutorErrorPathTests {
 
     @Test("Custom operation throws unsupportedOperation")
     func customOpThrowsUnsupported() throws {
-        struct CustomModel: LanguageModel {
+        struct CustomModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Custom(domain: "test", name: "no_impl")
@@ -1652,7 +1652,7 @@ struct ExecutorStandaloneRoPETests {
 
     @Test("Standalone RoPE applies rotation and preserves shape")
     func standaloneRoPEAppliesRotation() throws {
-        struct RoPEModel: LanguageModel {
+        struct RoPEModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 RoPE(dimension: 4, base: 10_000.0)
@@ -1690,7 +1690,7 @@ struct ExecutorStandaloneRoPETests {
 
     @Test("Standalone RoPE with linear scaling applies scale factor")
     func ropeWithLinearScaling() throws {
-        struct ScaledRoPEModel: LanguageModel {
+        struct ScaledRoPEModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 RoPE(dimension: 4, base: 10_000.0,
@@ -1698,7 +1698,7 @@ struct ExecutorStandaloneRoPETests {
             }
         }
 
-        struct UnscaledRoPEModel: LanguageModel {
+        struct UnscaledRoPEModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 RoPE(dimension: 4, base: 10_000.0)
@@ -1745,7 +1745,7 @@ struct ExecutorPositionalEmbeddingTests {
 
     @Test("Positional embedding adds learned positions to input")
     func positionalEmbeddingAddsPositions() throws {
-        struct PosEmbedModel: LanguageModel {
+        struct PosEmbedModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 PositionalEmbedding(maxPositions: 8, embeddingSize: 2, kind: .learnedAbsolute)
@@ -1796,7 +1796,7 @@ struct ExecutorMoETests {
 
     @Test("MoE routes tokens to experts and produces correct shape")
     func moeRoutesToExperts() throws {
-        struct MoEModel: LanguageModel {
+        struct MoEModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MoE(
@@ -1846,7 +1846,7 @@ struct ExecutorParallelStackTests {
 
     @Test("Parallel with stack merge adds new axis")
     func parallelStackMerge() throws {
-        struct StackModel: LanguageModel {
+        struct StackModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 Parallel(merge: .stack) {
@@ -2071,7 +2071,7 @@ struct ExecutorDeltaNetTests {
         //   norm:        [linearValueHeadDim=2]
         //   dt_bias:     [linearKeyHeads=1]
         //   A_log:       [linearKeyHeads=1]
-        struct DeltaNetModel: LanguageModel {
+        struct DeltaNetModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
@@ -2110,7 +2110,7 @@ struct ExecutorDeltaNetTests {
 
     @Test("DeltaNet autoregressive: recurrent state persists across calls")
     func deltaNetAutoregressive() throws {
-        struct DeltaNetModel: LanguageModel {
+        struct DeltaNetModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
@@ -2162,7 +2162,7 @@ struct ExecutorMLPActivationTests {
 
     @Test("MLP with ReLU activation")
     func mlpReLU() throws {
-        struct ReLUModel: LanguageModel {
+        struct ReLUModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MLP(inputSize: 4, intermediateSize: 8, activation: .relu, gating: .none)
@@ -2193,7 +2193,7 @@ struct ExecutorMLPActivationTests {
 
     @Test("MLP with GEGLU gating uses gelu activation with up projection")
     func mlpGEGLU() throws {
-        struct GEGLUModel: LanguageModel {
+        struct GEGLUModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MLP(inputSize: 4, intermediateSize: 8, activation: .gelu, gating: .geglu)
@@ -2225,7 +2225,7 @@ struct ExecutorMLPActivationTests {
 
     @Test("MLP with custom gating falls through to up_proj multiplication")
     func mlpCustomGating() throws {
-        struct CustomGateModel: LanguageModel {
+        struct CustomGateModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MLP(inputSize: 4, intermediateSize: 8, activation: .silu, gating: .custom("test"))
@@ -2263,7 +2263,7 @@ struct ExecutorAttentionLayerNormQKTests {
 
     @Test("Attention with LayerNorm QK normalization applies per-head normalization")
     func attentionLayerNormQK() throws {
-        struct LNQKModel: LanguageModel {
+        struct LNQKModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Attention(
@@ -2314,7 +2314,7 @@ struct ExecutorOutputHeadVariantTests {
 
     @Test("OutputHead with bias adds bias vector to logits")
     func outputHeadWithBias() throws {
-        struct BiasHeadModel: LanguageModel {
+        struct BiasHeadModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 2)
                 OutputHead(inputSize: 2, vocabSize: 4, tiedToEmbedding: false, bias: true)
@@ -2407,7 +2407,7 @@ struct CompilerMixedCacheTests {
 
     @Test("Model with both attention and stateSpace produces mixed cache descriptors")
     func mixedCacheTypes() throws {
-        struct HybridModel: LanguageModel {
+        struct HybridModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Attention(hiddenSize: 4, headCount: 2, kvHeadCount: 2, headDimension: 2)
@@ -2541,7 +2541,7 @@ struct ExecutorMoEVariantTests {
 
     @Test("MoE with top-2 routing activates multiple experts per token")
     func moeTopK2() throws {
-        struct MoETop2Model: LanguageModel {
+        struct MoETop2Model: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MoE(
@@ -2579,7 +2579,7 @@ struct ExecutorMoEVariantTests {
 
     @Test("MoE with GELU expert activation")
     func moeGELUExpert() throws {
-        struct MoEGELUModel: LanguageModel {
+        struct MoEGELUModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 MoE(
@@ -2624,7 +2624,7 @@ struct ExecutorBatchVariantTests {
 
     @Test("Batch size > 1 with 2D tokens processes all sequences")
     func largeBatch() throws {
-        struct SimpleModel: LanguageModel {
+        struct SimpleModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 RMSNorm(dimension: 4)
@@ -2679,7 +2679,7 @@ struct CompilerErrorDescriptionTests {
 // MARK: - Test Model Definitions
 
 /// Tiny Llama-style: TokenEmbed → Repeat(Residual(Norm+Attn), Residual(Norm+MLP)) → Norm → OutputHead
-private struct MiniLlama: LanguageModel {
+private struct MiniLlama: ModelComponent {
     let layerCount: Int
     let vocabSize = 8
     let hiddenSize = 4
@@ -2713,7 +2713,7 @@ private struct MiniLlama: LanguageModel {
 }
 
 /// Tiny Cohere-style: TokenEmbed → Repeat(Residual(LayerNorm, Parallel(Attn, MLP))) → LayerNorm → OutputHead
-private struct MiniCohere: LanguageModel {
+private struct MiniCohere: ModelComponent {
     let layerCount: Int
     let vocabSize = 8
     let hiddenSize = 4

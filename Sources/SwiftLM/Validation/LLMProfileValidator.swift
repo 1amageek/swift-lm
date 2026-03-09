@@ -64,9 +64,8 @@ public enum LLMProfileError: Error, Sendable {
 /// Walk a region and validate primitive operand arity against signatures.
 private func validateRegionPrimitiveArity(_ region: Region) throws {
     for op in region.operations {
-        // Check primitive operand arity.
-        if let primitiveDecl = primitiveDeclaration(from: op.kind) {
-            let (_, signature) = primitiveInfo(from: primitiveDecl)
+        // Check primitive operand arity using OperationKind directly.
+        if let signature = primitiveSignature(from: op.kind) {
             switch signature.operandArity {
             case .exact(let expected):
                 if op.operands.count != expected {
@@ -94,24 +93,5 @@ private func validateRegionPrimitiveArity(_ region: Region) throws {
         default:
             break
         }
-    }
-}
-
-/// Extract a `PrimitiveDeclaration` from an `OperationKind`, if primitive.
-private func primitiveDeclaration(from kind: OperationKind) -> PrimitiveDeclaration? {
-    switch kind {
-    case .tokenEmbedding(let a): return .tokenEmbedding(a)
-    case .positionalEmbedding(let a): return .positionalEmbedding(a)
-    case .rope(let a): return .rope(a)
-    case .attention(let a): return .attention(a)
-    case .mlp(let a): return .mlp(a)
-    case .moe(let a): return .moe(a)
-    case .rmsNorm(let a): return .rmsNorm(a)
-    case .layerNorm(let a): return .layerNorm(a)
-    case .linear(let a): return .linear(a)
-    case .outputHead(let a): return .outputHead(a)
-    case .stateSpace(let a): return .stateSpace(a)
-    case .custom(let a): return .custom(a)
-    case .residual, .parallel, .repeating: return nil
     }
 }

@@ -3,7 +3,9 @@
 /// ```swift
 /// MLP(inputSize: 4096, intermediateSize: 11008)
 /// ```
-public struct MLP: PrimitiveModelComponent {
+public struct MLP: ModelComponent {
+
+    public typealias Body = Never
 
     public let inputSize: Int
     public let outputSize: Int
@@ -31,15 +33,22 @@ public struct MLP: PrimitiveModelComponent {
         self.gating = gating
         self.bias = bias
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.mlp(MLPAttributes(
+extension MLP: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .mlp(MLPAttributes(
             inputSize: inputSize,
             outputSize: outputSize,
             intermediateSize: intermediateSize,
             activation: activation,
             gating: gating,
             bias: bias
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

@@ -1,9 +1,8 @@
 /// Declares the operand and result arity of an operation kind.
 ///
 /// `OperationSignature` separates the arity contract from the normalizer
-/// implementation. Each `PrimitiveDeclaration` / `OperationKind` has a
-/// well-defined signature that the normalizer consults when generating
-/// `ValueID`s.
+/// implementation. Each `OperationKind` has a well-defined signature that
+/// validators consult when checking contracts.
 ///
 /// Current DSL primitives are all unary (1 operand, 1 result), but the
 /// IR supports arbitrary arity. Future semantic nodes (e.g., router with
@@ -35,73 +34,46 @@ public enum Arity: Sendable, Equatable {
 
 // MARK: - Primitive Signatures
 
-/// Returns the operation kind and arity signature for a primitive declaration.
+/// Returns the arity signature for a primitive operation kind.
+///
+/// Structural operations (residual, parallel, repeating) return `nil`.
 ///
 /// This is the single source of truth for primitive semantic contracts.
 /// The normalizer uses `resultArity` to generate the correct number
 /// of result `ValueID`s. `operandArity` is the semantic truth about
 /// what each primitive expects; enforcement is deferred to profile
 /// validation (not the normalizer, which remains tolerant).
-public func primitiveInfo(
-    from primitive: PrimitiveDeclaration
-) -> (kind: OperationKind, signature: OperationSignature) {
-    let kind: OperationKind
-    let signature: OperationSignature
-
-    switch primitive {
-    case .tokenEmbedding(let a):
-        // Source operation: produces embeddings from weight parameters,
-        // does not consume upstream hidden state.
-        kind = .tokenEmbedding(a)
-        signature = OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
-
-    case .positionalEmbedding(let a):
-        kind = .positionalEmbedding(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .rope(let a):
-        kind = .rope(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .attention(let a):
-        kind = .attention(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .mlp(let a):
-        kind = .mlp(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .moe(let a):
-        kind = .moe(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .rmsNorm(let a):
-        kind = .rmsNorm(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .layerNorm(let a):
-        kind = .layerNorm(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .linear(let a):
-        kind = .linear(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .outputHead(let a):
-        kind = .outputHead(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .stateSpace(let a):
-        kind = .stateSpace(a)
-        signature = OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
-
-    case .custom(let a):
-        // Escape hatch: no arity constraint.
-        kind = .custom(a)
-        signature = OperationSignature(operandArity: .variadic, resultArity: .variadic)
+public func primitiveSignature(from kind: OperationKind) -> OperationSignature? {
+    switch kind {
+    case .tokenEmbedding:
+        return OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
+    case .positionalEmbedding:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .rope:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .attention:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .mlp:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .moe:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .rmsNorm:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .layerNorm:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .linear:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .outputHead:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .stateSpace:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .visionEncoder:
+        return OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
+    case .custom:
+        return OperationSignature(operandArity: .variadic, resultArity: .variadic)
+    case .residual, .parallel, .repeating:
+        return nil
     }
-
-    return (kind, signature)
 }
 
 /// Resolves an `Arity` to a concrete count given an upstream tuple size.

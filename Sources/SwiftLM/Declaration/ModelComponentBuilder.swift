@@ -1,8 +1,8 @@
-/// Result builder for composing `ModelComponent` values into a declaration tree.
+/// Result builder for composing `ModelComponent` values with type safety.
 ///
-/// The builder converts each component expression into a `ModelDeclaration`
-/// via `makeDeclaration()`, then combines them into a `.sequence(...)`.
-/// No graph is built — only a pure declaration value is produced.
+/// Follows the SwiftUI `@ViewBuilder` pattern: the builder returns
+/// concrete generic types (`TupleComponent`, `OptionalComponent`,
+/// `ConditionalComponent`) instead of type-erased arrays.
 ///
 /// ```swift
 /// @ModelComponentBuilder
@@ -18,28 +18,39 @@
 @resultBuilder
 public enum ModelComponentBuilder {
 
-    public static func buildExpression(_ component: any ModelComponent) -> ModelDeclaration {
-        component.makeDeclaration()
+    // MARK: - Single Component (identity)
+
+    public static func buildBlock<C: ModelComponent>(_ component: C) -> C {
+        component
     }
 
-    public static func buildBlock(_ declarations: ModelDeclaration...) -> ModelDeclaration {
-        if declarations.count == 1 { return declarations[0] }
-        return .sequence(declarations)
+    // MARK: - Multiple Components (tuple)
+
+    public static func buildBlock<each C: ModelComponent>(
+        _ components: repeat each C
+    ) -> TupleComponent<repeat each C> {
+        TupleComponent(repeat each components)
     }
 
-    public static func buildOptional(_ declaration: ModelDeclaration?) -> ModelDeclaration {
-        declaration ?? .sequence([])
+    // MARK: - Optional (if without else)
+
+    public static func buildOptional<C: ModelComponent>(
+        _ component: C?
+    ) -> OptionalComponent<C> {
+        OptionalComponent(content: component)
     }
 
-    public static func buildEither(first declaration: ModelDeclaration) -> ModelDeclaration {
-        declaration
+    // MARK: - Conditional (if/else)
+
+    public static func buildEither<First: ModelComponent, Second: ModelComponent>(
+        first component: First
+    ) -> ConditionalComponent<First, Second> {
+        ConditionalComponent(storage: .first(component))
     }
 
-    public static func buildEither(second declaration: ModelDeclaration) -> ModelDeclaration {
-        declaration
-    }
-
-    public static func buildArray(_ declarations: [ModelDeclaration]) -> ModelDeclaration {
-        .sequence(declarations)
+    public static func buildEither<First: ModelComponent, Second: ModelComponent>(
+        second component: Second
+    ) -> ConditionalComponent<First, Second> {
+        ConditionalComponent(storage: .second(component))
     }
 }

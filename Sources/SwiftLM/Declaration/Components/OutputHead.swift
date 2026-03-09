@@ -5,7 +5,9 @@
 /// ```swift
 /// OutputHead(inputSize: 4096, vocabSize: 32000, tiedToEmbedding: true)
 /// ```
-public struct OutputHead: PrimitiveModelComponent {
+public struct OutputHead: ModelComponent {
+
+    public typealias Body = Never
 
     public let inputSize: Int
     public let vocabSize: Int
@@ -25,13 +27,20 @@ public struct OutputHead: PrimitiveModelComponent {
         self.tiedToEmbedding = tiedToEmbedding
         self.bias = bias
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.outputHead(OutputHeadAttributes(
+extension OutputHead: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .outputHead(OutputHeadAttributes(
             inputSize: inputSize,
             vocabSize: vocabSize,
             tiedToEmbedding: tiedToEmbedding,
             bias: bias
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

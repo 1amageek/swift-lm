@@ -6,7 +6,9 @@
 /// ```swift
 /// StateSpace(hiddenSize: 4096, stateSize: 16, variant: "mamba")
 /// ```
-public struct StateSpace: PrimitiveModelComponent {
+public struct StateSpace: ModelComponent {
+
+    public typealias Body = Never
 
     public let hiddenSize: Int
     public let stateSize: Int
@@ -19,12 +21,19 @@ public struct StateSpace: PrimitiveModelComponent {
         self.stateSize = stateSize
         self.variant = variant
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.stateSpace(StateSpaceAttributes(
+extension StateSpace: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .stateSpace(StateSpaceAttributes(
             hiddenSize: hiddenSize,
             stateSize: stateSize,
             variant: variant
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

@@ -22,7 +22,7 @@ import SwiftLM
 /// ))
 /// let graph = try qwen.makeModelGraph()
 /// ```
-public struct Qwen35: LanguageModel {
+public struct Qwen35: ModelComponent {
 
     /// Architecture configuration for Qwen 3.5 hybrid models.
     public struct Config: Sendable {

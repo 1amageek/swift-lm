@@ -18,7 +18,7 @@ import SwiftLM
 /// ))
 /// let graph = try cohere.makeModelGraph()
 /// ```
-public struct Cohere: LanguageModel {
+public struct Cohere: ModelComponent {
 
     /// Architecture configuration for Cohere models.
     public struct Config: Sendable {

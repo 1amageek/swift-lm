@@ -9,7 +9,9 @@ import JSONSchema
 /// ```swift
 /// Custom(domain: "research", name: "sparse_attn")
 /// ```
-public struct Custom: PrimitiveModelComponent {
+public struct Custom: ModelComponent {
+
+    public typealias Body = Never
 
     public let domain: String
     public let name: String
@@ -24,12 +26,19 @@ public struct Custom: PrimitiveModelComponent {
         self.name = name
         self.attributes = attributes
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.custom(CustomNodeAttributes(
+extension Custom: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .custom(CustomNodeAttributes(
             domain: domain,
             name: name,
             attributes: attributes
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .variadic, resultArity: .variadic)
     }
 }

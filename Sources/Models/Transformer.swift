@@ -16,7 +16,7 @@ import SwiftLM
 /// ))
 /// let graph = try llama.makeModelGraph()
 /// ```
-public struct Transformer: LanguageModel {
+public struct Transformer: ModelComponent {
 
     /// Architecture configuration for standard transformers.
     public struct Config: Sendable {

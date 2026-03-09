@@ -10,7 +10,9 @@
 ///     expertIntermediateSize: 14336
 /// )
 /// ```
-public struct MoE: PrimitiveModelComponent {
+public struct MoE: ModelComponent {
+
+    public typealias Body = Never
 
     public let expertCount: Int
     public let expertsPerToken: Int
@@ -50,9 +52,12 @@ public struct MoE: PrimitiveModelComponent {
         self.expertGating = expertGating
         self.expertBias = expertBias
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.moe(MoEAttributes(
+extension MoE: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .moe(MoEAttributes(
             expertCount: expertCount,
             expertsPerToken: expertsPerToken,
             gateKind: gateKind,
@@ -64,6 +69,10 @@ public struct MoE: PrimitiveModelComponent {
                 gating: expertGating,
                 bias: expertBias
             )
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

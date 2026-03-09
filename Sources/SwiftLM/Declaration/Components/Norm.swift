@@ -3,7 +3,9 @@
 /// ```swift
 /// RMSNorm(dimension: 4096)
 /// ```
-public struct RMSNorm: PrimitiveModelComponent {
+public struct RMSNorm: ModelComponent {
+
+    public typealias Body = Never
 
     public let dimension: Int
     public let epsilon: Float
@@ -14,9 +16,16 @@ public struct RMSNorm: PrimitiveModelComponent {
         self.dimension = dimension
         self.epsilon = epsilon
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.rmsNorm(RMSNormAttributes(dimension: dimension, epsilon: epsilon)))
+extension RMSNorm: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .rmsNorm(RMSNormAttributes(dimension: dimension, epsilon: epsilon))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }
 
@@ -25,7 +34,9 @@ public struct RMSNorm: PrimitiveModelComponent {
 /// ```swift
 /// LayerNorm(dimension: 4096)
 /// ```
-public struct LayerNorm: PrimitiveModelComponent {
+public struct LayerNorm: ModelComponent {
+
+    public typealias Body = Never
 
     public let dimension: Int
     public let epsilon: Float
@@ -38,10 +49,15 @@ public struct LayerNorm: PrimitiveModelComponent {
         self.epsilon = epsilon
         self.affine = affine
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.layerNorm(LayerNormAttributes(
-            dimension: dimension, epsilon: epsilon, affine: affine
-        )))
+extension LayerNorm: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .layerNorm(LayerNormAttributes(dimension: dimension, epsilon: epsilon, affine: affine))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }

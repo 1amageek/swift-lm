@@ -14,23 +14,18 @@
 ///     Attention(hiddenSize: 4096, headCount: 32, kvHeadCount: 8)
 /// }
 /// ```
-public struct Group: ModelComponent {
+public struct Group<Content: ModelComponent>: ModelComponent {
+
+    public typealias Body = Never
 
     public let label: String?
-    public let body: ModelDeclaration
+    public let content: Content
 
     public init(
         label: String? = nil,
-        @ModelComponentBuilder content: () -> ModelDeclaration
+        @ModelComponentBuilder content: () -> Content
     ) {
         self.label = label
-        self.body = content()
-    }
-
-    public func makeDeclaration() -> ModelDeclaration {
-        if let label {
-            return .labeled(label, body)
-        }
-        return body
+        self.content = content()
     }
 }

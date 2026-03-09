@@ -315,17 +315,13 @@ struct ModelGraphTests {
     @Test("Canonicalization normalizes implementation hints")
     func canonicalizationHints() throws {
         let graphA = try normalize(
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .fused
-            )))
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .fused)
         ).graph
 
         let graphB = try normalize(
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .unfused
-            )))
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .unfused)
         ).graph
 
         #expect(graphA != graphB)
@@ -334,18 +330,18 @@ struct ModelGraphTests {
 
     @Test("Canonicalization produces stable keys and values")
     func canonicalizationIDs() throws {
-        let declA: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 32))),
-        ])
+        let compA = Group {
+            RMSNorm(dimension: 64)
+            SwiftLM.Linear(inputSize: 64, outputSize: 32)
+        }
 
-        let declB: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 32))),
-        ])
+        let compB = Group {
+            RMSNorm(dimension: 64)
+            SwiftLM.Linear(inputSize: 64, outputSize: 32)
+        }
 
-        let graphA = try normalize(declA).graph
-        let graphB = try normalize(declB).graph
+        let graphA = try normalize(compA).graph
+        let graphB = try normalize(compB).graph
 
         #expect(graphA == graphB)
         #expect(canonicalize(graphA) == canonicalize(graphB))
@@ -353,24 +349,20 @@ struct ModelGraphTests {
 
     @Test("Canonicalization normalizes nested regions")
     func canonicalizationNestedRegions() throws {
-        let declA: ModelDeclaration = .residual(strategy: .add, body: .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .fused
-            ))),
-        ]))
+        let compA = Residual {
+            RMSNorm(dimension: 64)
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .fused)
+        }
 
-        let declB: ModelDeclaration = .residual(strategy: .add, body: .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .unfused
-            ))),
-        ]))
+        let compB = Residual {
+            RMSNorm(dimension: 64)
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .unfused)
+        }
 
-        let graphA = try normalize(declA).graph
-        let graphB = try normalize(declB).graph
+        let graphA = try normalize(compA).graph
+        let graphB = try normalize(compB).graph
 
         #expect(graphA != graphB)
         #expect(canonicalize(graphA) == canonicalize(graphB))
@@ -409,10 +401,10 @@ struct ModelGraphTests {
 
     @Test("NormalizedModel bundles graph and metadata")
     func normalizedModel() throws {
-        let decl: ModelDeclaration = .repeating(count: 2, label: "layers", body:
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-        )
-        let normalized = try normalize(decl)
+        let comp = Repeat(count: 2, label: "layers") {
+            RMSNorm(dimension: 64)
+        }
+        let normalized = try normalize(comp)
 
         #expect(normalized.graph.rootRegion.operations.count == 1)
         if case .repeating(let count, _) = normalized.graph.rootRegion.operations[0].kind {
@@ -449,43 +441,39 @@ struct ModelGraphTests {
 
     @Test("GraphValidator accepts well-formed normalized graph")
     func validatorAcceptsNormalized() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .residual(strategy: .add, body:
-                .primitive(.attention(AttentionAttributes(
-                    hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16
-                )))
-            ),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Residual {
+                Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)
+            }
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
     @Test("GraphValidator accepts graph with parallel branches")
     func validatorAcceptsParallel() throws {
-        let decl: ModelDeclaration = .parallel(merge: .add, branches: [
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16
-            ))),
-            .primitive(.mlp(MLPAttributes(inputSize: 64, outputSize: 64, intermediateSize: 256))),
-        ])
+        let comp = Parallel(merge: .add) {
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)
+            MLP(inputSize: 64, intermediateSize: 256)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
     @Test("GraphValidator accepts graph with repeating")
     func validatorAcceptsRepeating() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .repeating(count: 4, label: nil, body:
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-            ),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Repeat(count: 4) {
+                RMSNorm(dimension: 64)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
@@ -868,16 +856,16 @@ struct ModelGraphTests {
 
     // MARK: - OperationSignature Tests
 
-    @Test("primitiveInfo returns per-primitive signatures")
+    @Test("primitiveSignature returns per-primitive signatures")
     func primitiveSignatures() {
         // tokenEmbedding is a source: exact(0) operands, exact(1) result
-        let (_, embSig) = primitiveInfo(from: .tokenEmbedding(
-            TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64)))
+        let embSig = primitiveSignature(from: .tokenEmbedding(
+            TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64)))!
         #expect(embSig.operandArity == .exact(0))
         #expect(embSig.resultArity == .exact(1))
 
         // All transform primitives: exact(1) operand, exact(1) result
-        let transforms: [PrimitiveDeclaration] = [
+        let transforms: [OperationKind] = [
             .positionalEmbedding(PositionalEmbeddingAttributes(maxPositions: 512, embeddingSize: 64, kind: .sinusoidal)),
             .rope(RoPEAttributes(dimension: 64)),
             .attention(AttentionAttributes(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)),
@@ -889,15 +877,15 @@ struct ModelGraphTests {
             .outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100)),
             .stateSpace(StateSpaceAttributes(hiddenSize: 64, stateSize: 16, variant: "mamba")),
         ]
-        for prim in transforms {
-            let (_, sig) = primitiveInfo(from: prim)
+        for kind in transforms {
+            let sig = primitiveSignature(from: kind)!
             #expect(sig.operandArity == .exact(1))
             #expect(sig.resultArity == .exact(1))
         }
 
         // custom is escape hatch: variadic operands, variadic results
-        let (_, customSig) = primitiveInfo(from: .custom(
-            CustomNodeAttributes(domain: "test", name: "noop")))
+        let customSig = primitiveSignature(from: .custom(
+            CustomNodeAttributes(domain: "test", name: "noop")))!
         #expect(customSig.operandArity == .variadic)
         #expect(customSig.resultArity == .variadic)
     }
@@ -914,12 +902,12 @@ struct ModelGraphTests {
 
     @Test("LLMProfileValidator accepts well-formed Llama graph")
     func profileValidatorAcceptsLlama() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
-        let graph = try normalize(decl).graph
+        let comp = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            RMSNorm(dimension: 64)
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
         try LLMProfileValidator.validate(graph)
     }
@@ -991,24 +979,22 @@ struct ModelGraphTests {
     @Test("LLMProfileValidator checks nested region primitives")
     func profileValidatorNestedArity() throws {
         // Well-formed Cohere-style model passes both validators.
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .repeating(count: 2, label: nil, body:
-                .residual(strategy: .add, body: .sequence([
-                    .primitive(.layerNorm(LayerNormAttributes(dimension: 64))),
-                    .parallel(merge: .add, branches: [
-                        .primitive(.attention(AttentionAttributes(
-                            hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16
-                        ))),
-                        .primitive(.mlp(MLPAttributes(inputSize: 64, outputSize: 64, intermediateSize: 256))),
-                    ]),
-                ]))
-            ),
-            .primitive(.layerNorm(LayerNormAttributes(dimension: 64))),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let comp = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            Repeat(count: 2) {
+                Residual {
+                    LayerNorm(dimension: 64)
+                    Parallel(merge: .add) {
+                        Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16)
+                        MLP(inputSize: 64, intermediateSize: 256)
+                    }
+                }
+            }
+            LayerNorm(dimension: 64)
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
         try LLMProfileValidator.validate(graph)
     }
@@ -1041,16 +1027,14 @@ struct ModelGraphTests {
 
     @Test("Canonicalization strips attention implementation hint")
     func canonicalizationStripsHint() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .fused
-            ))),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let comp = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .fused)
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .attention(let attrs) = canon.rootRegion.operations[1].kind {
@@ -1250,48 +1234,48 @@ struct ModelGraphTests {
 
     @Test("GraphValidator accepts parallel within parallel")
     func nestedParallel() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .parallel(merge: .add, branches: [
-                .parallel(merge: .add, branches: [
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-                ]),
-                .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64))),
-            ]),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Parallel(merge: .add) {
+                Parallel(merge: .add) {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+                SwiftLM.Linear(inputSize: 64, outputSize: 64)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
     @Test("GraphValidator accepts residual within residual")
     func nestedResidual() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .residual(strategy: .add, body:
-                .residual(strategy: .add, body:
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64)))
-                )
-            ),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Residual {
+                Residual {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
     @Test("GraphValidator accepts repeating within repeating")
     func nestedRepeating() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .repeating(count: 2, label: nil, body:
-                .repeating(count: 3, label: nil, body:
-                    .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 64)))
-                )
-            ),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Repeat(count: 2) {
+                Repeat(count: 3) {
+                    SwiftLM.Linear(inputSize: 64, outputSize: 64)
+                }
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         try GraphValidator.validate(graph)
     }
 
@@ -1576,14 +1560,12 @@ struct ModelGraphTests {
 
     @Test("Canonicalization preserves RoPE attributes")
     func canonicalizationRoPE() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rope(RoPEAttributes(
-                dimension: 128, base: 500_000.0,
-                scaling: RoPEScaling(kind: .yarn, factor: 4.0, originalMaxPositions: 8192)
-            ))),
-        ])
+        let comp = RoPE(
+            dimension: 128, base: 500_000.0,
+            scaling: RoPEScaling(kind: .yarn, factor: 4.0, originalMaxPositions: 8192)
+        )
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .rope(let attrs) = canon.rootRegion.operations[0].kind {
@@ -1599,15 +1581,12 @@ struct ModelGraphTests {
 
     @Test("Canonicalization preserves MLP attributes")
     func canonicalizationMLP() throws {
-        let decl: ModelDeclaration = .primitive(
-            .mlp(MLPAttributes(
-                inputSize: 4096, outputSize: 4096,
-                intermediateSize: 11008,
-                activation: .gelu, gating: .geglu, bias: true
-            ))
+        let comp = MLP(
+            inputSize: 4096, intermediateSize: 11008,
+            activation: .gelu, gating: .geglu, bias: true
         )
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .mlp(let attrs) = canon.rootRegion.operations[0].kind {
@@ -1623,11 +1602,9 @@ struct ModelGraphTests {
 
     @Test("Canonicalization preserves LayerNorm attributes")
     func canonicalizationLayerNorm() throws {
-        let decl: ModelDeclaration = .primitive(
-            .layerNorm(LayerNormAttributes(dimension: 2048, epsilon: 1e-5, affine: false))
-        )
+        let comp = LayerNorm(dimension: 2048, epsilon: 1e-5, affine: false)
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .layerNorm(let attrs) = canon.rootRegion.operations[0].kind {
@@ -1641,14 +1618,14 @@ struct ModelGraphTests {
 
     @Test("Canonicalization passes through unhandled kinds unchanged")
     func canonicalizationPassthrough() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .primitive(.stateSpace(StateSpaceAttributes(hiddenSize: 64, stateSize: 16, variant: "mamba"))),
-            .primitive(.custom(CustomNodeAttributes(domain: "test", name: "noop"))),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let comp = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            StateSpace(hiddenSize: 64, stateSize: 16, variant: "mamba")
+            Custom(domain: "test", name: "noop")
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         // Pass-through kinds: tokenEmbedding, stateSpace, custom, outputHead
@@ -1672,14 +1649,12 @@ struct ModelGraphTests {
     @Test("Canonicalization recurses into residual body region")
     func canonicalizationResidualBody() throws {
         // Attention with hint inside residual — hint should be stripped.
-        let decl: ModelDeclaration = .residual(strategy: .add, body:
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .fused
-            )))
-        )
+        let comp = Residual {
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .fused)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .residual(_, let body) = canon.rootRegion.operations[0].kind {
@@ -1695,18 +1670,14 @@ struct ModelGraphTests {
 
     @Test("Canonicalization recurses into parallel branch regions")
     func canonicalizationParallelBranches() throws {
-        let decl: ModelDeclaration = .parallel(merge: .add, branches: [
-            .primitive(.attention(AttentionAttributes(
-                hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                implementationHint: .unfused
-            ))),
-            .primitive(.mlp(MLPAttributes(
-                inputSize: 64, outputSize: 64, intermediateSize: 256,
-                activation: .silu, gating: .swiglu
-            ))),
-        ])
+        let comp = Parallel(merge: .add) {
+            Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                      implementationHint: .unfused)
+            MLP(inputSize: 64, intermediateSize: 256,
+                activation: .silu, gating: .swiglu)
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .parallel(_, let branches) = canon.rootRegion.operations[0].kind {
@@ -1727,17 +1698,15 @@ struct ModelGraphTests {
 
     @Test("Canonicalization recurses into repeating body region")
     func canonicalizationRepeatingBody() throws {
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .repeating(count: 4, label: nil, body:
-                .primitive(.attention(AttentionAttributes(
-                    hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
-                    implementationHint: .pagedKVPreferred
-                )))
-            ),
-        ])
+        let comp = Group {
+            RMSNorm(dimension: 64)
+            Repeat(count: 4) {
+                Attention(hiddenSize: 64, headCount: 4, kvHeadCount: 4, headDimension: 16,
+                          implementationHint: .pagedKVPreferred)
+            }
+        }
 
-        let graph = try normalize(decl).graph
+        let graph = try normalize(comp).graph
         let canon = canonicalize(graph)
 
         if case .repeating(let count, let body) = canon.rootRegion.operations[1].kind {
@@ -1893,56 +1862,11 @@ struct ModelGraphTests {
         #expect(metadata.annotation(for: StructuralPath(components: [.operation(99)])) == nil)
     }
 
-    // MARK: - ModelDeclaration Equatable
-
-    @Test("ModelDeclaration Equatable distinguishes different structures")
-    func declarationEquatable() {
-        let a: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 32))),
-        ])
-        let b: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 128))),
-            .primitive(.linear(LinearAttributes(inputSize: 128, outputSize: 32))),
-        ])
-        let c: ModelDeclaration = .sequence([
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64))),
-            .primitive(.linear(LinearAttributes(inputSize: 64, outputSize: 32))),
-        ])
-
-        #expect(a == c)
-        #expect(a != b)
-    }
-
-    @Test("ModelDeclaration Equatable handles nested structural cases")
-    func declarationEquatableNested() {
-        let a: ModelDeclaration = .residual(strategy: .add, body:
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-        )
-        let b: ModelDeclaration = .residual(strategy: .weighted, body:
-            .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-        )
-
-        #expect(a != b)
-    }
-
-    @Test("PrimitiveDeclaration Equatable for all cases")
-    func primitiveDeclarationEquatable() {
-        let a = PrimitiveDeclaration.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))
-        let b = PrimitiveDeclaration.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 200, embeddingSize: 64))
-        let c = PrimitiveDeclaration.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))
-        let d = PrimitiveDeclaration.linear(LinearAttributes(inputSize: 100, outputSize: 64))
-
-        #expect(a == c)
-        #expect(a != b)
-        #expect(a != d)
-    }
-
     // MARK: - OperationSignature Edge Cases
 
     @Test("Custom primitive has variadic arity for both operands and results")
     func customPrimitiveVariadicArity() {
-        let (_, sig) = primitiveInfo(from: .custom(CustomNodeAttributes(domain: "test", name: "multi-out")))
+        let sig = primitiveSignature(from: .custom(CustomNodeAttributes(domain: "test", name: "multi-out")))!
         #expect(sig.operandArity == .variadic)
         #expect(sig.resultArity == .variadic)
 
@@ -1990,16 +1914,15 @@ struct ModelGraphTests {
 
     @Test("Repeat label appears at correct structural path in metadata")
     func repeatLabelMetadataPath() throws {
-        // Use explicit labeled Repeat declaration.
-        let decl: ModelDeclaration = .sequence([
-            .primitive(.tokenEmbedding(TokenEmbeddingAttributes(vocabSize: 100, embeddingSize: 64))),
-            .repeating(count: 2, label: "layers", body:
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-            ),
-            .primitive(.outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100))),
-        ])
+        let comp = Group {
+            TokenEmbedding(vocabSize: 100, embeddingSize: 64)
+            Repeat(count: 2, label: "layers") {
+                RMSNorm(dimension: 64)
+            }
+            OutputHead(inputSize: 64, vocabSize: 100)
+        }
 
-        let normalized = try normalize(decl)
+        let normalized = try normalize(comp)
 
         // Repeat is the 2nd operation in root → operation(1)
         let repeatPath = StructuralPath(components: [.operation(1)])
@@ -2008,13 +1931,13 @@ struct ModelGraphTests {
 
     @Test("Labels inside repeating body use correct structural path")
     func labelsInsideRepeatingBody() throws {
-        let decl: ModelDeclaration = .repeating(count: 2, label: "layers", body:
-            .labeled("block",
-                .primitive(.rmsNorm(RMSNormAttributes(dimension: 64)))
-            )
-        )
+        let comp = Repeat(count: 2, label: "layers") {
+            Group(label: "block") {
+                RMSNorm(dimension: 64)
+            }
+        }
 
-        let normalized = try normalize(decl)
+        let normalized = try normalize(comp)
 
         // Repeat is operation(0), label "layers"
         let repeatPath = StructuralPath(components: [.operation(0)])
@@ -2058,11 +1981,11 @@ struct ModelGraphTests {
 
     @Test("Graphs with different attributes on same kind are not equal")
     func graphDifferentAttributesNotEqual() throws {
-        let declA: ModelDeclaration = .primitive(.rmsNorm(RMSNormAttributes(dimension: 64, epsilon: 1e-5)))
-        let declB: ModelDeclaration = .primitive(.rmsNorm(RMSNormAttributes(dimension: 64, epsilon: 1e-6)))
+        let compA = RMSNorm(dimension: 64, epsilon: 1e-5)
+        let compB = RMSNorm(dimension: 64, epsilon: 1e-6)
 
-        let graphA = try normalize(declA).graph
-        let graphB = try normalize(declB).graph
+        let graphA = try normalize(compA).graph
+        let graphB = try normalize(compB).graph
 
         #expect(graphA != graphB)
         #expect(canonicalize(graphA) != canonicalize(graphB))

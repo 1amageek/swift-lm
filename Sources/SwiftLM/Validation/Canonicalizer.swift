@@ -111,5 +111,10 @@ private func canonicalizeKind(_ kind: OperationKind, ctx: inout CanonContext) ->
 }
 
 private func canonicalizeRoPE(_ attrs: RoPEAttributes) -> RoPEAttributes {
-    RoPEAttributes(dimension: attrs.dimension, base: attrs.base, scaling: attrs.scaling)
+    RoPEAttributes(
+        dimension: attrs.dimension,
+        base: attrs.base,
+        scaling: attrs.scaling,
+        mropeAxes: attrs.mropeAxes
+    )
 }

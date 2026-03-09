@@ -209,6 +209,10 @@ public final class MLXExecutor {
         case .repeating(let count, let body):
             return try executeRepeating(count: count, body: body, inputs: inputs)
 
+        case .visionEncoder:
+            throw CompilerError.unsupportedOperation(
+                "visionEncoder is not yet implemented in MLXExecutor")
+
         case .custom(let attrs):
             throw CompilerError.unsupportedOperation("custom(\(attrs.domain).\(attrs.name))")
         }
@@ -274,6 +278,9 @@ public final class MLXExecutor {
             return (0..<resultCount).map { j in
                 stacked(branchResults.map { $0[j] })
             }
+        case .visionMerge:
+            throw CompilerError.unsupportedOperation(
+                "visionMerge is not yet implemented in MLXExecutor")
         case .custom:
             throw CompilerError.unsupportedOperation("custom parallel merge")
         }

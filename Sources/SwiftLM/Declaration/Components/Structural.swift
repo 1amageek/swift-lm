@@ -8,55 +8,19 @@
 ///     Attention(hiddenSize: 4096, headCount: 32, kvHeadCount: 8)
 /// }
 /// ```
-public struct Residual: ModelComponent {
+public struct Residual<Content: ModelComponent>: ModelComponent {
+
+    public typealias Body = Never
 
     public let strategy: ResidualStrategy
-    public let body: ModelDeclaration
+    public let content: Content
 
     public init(
         strategy: ResidualStrategy = .add,
-        @ModelComponentBuilder content: () -> ModelDeclaration
+        @ModelComponentBuilder content: () -> Content
     ) {
         self.strategy = strategy
-        self.body = content()
-    }
-
-    public func makeDeclaration() -> ModelDeclaration {
-        .residual(strategy: strategy, body: body)
-    }
-}
-
-/// Result builder for `Parallel` branches.
-///
-/// Each expression in the builder block becomes an independent branch.
-/// Unlike `ModelComponentBuilder`, this builder does NOT compose expressions
-/// sequentially — each expression produces a separate `ModelDeclaration`
-/// branch.
-@resultBuilder
-public enum ParallelBranchBuilder {
-
-    public static func buildExpression(_ component: any ModelComponent) -> [ModelDeclaration] {
-        [component.makeDeclaration()]
-    }
-
-    public static func buildBlock(_ branches: [ModelDeclaration]...) -> [ModelDeclaration] {
-        branches.flatMap { $0 }
-    }
-
-    public static func buildOptional(_ branches: [ModelDeclaration]?) -> [ModelDeclaration] {
-        branches ?? []
-    }
-
-    public static func buildEither(first branches: [ModelDeclaration]) -> [ModelDeclaration] {
-        branches
-    }
-
-    public static func buildEither(second branches: [ModelDeclaration]) -> [ModelDeclaration] {
-        branches
-    }
-
-    public static func buildArray(_ branches: [[ModelDeclaration]]) -> [ModelDeclaration] {
-        branches.flatMap { $0 }
+        self.content = content()
     }
 }
 
@@ -76,21 +40,19 @@ public enum ParallelBranchBuilder {
 /// }
 /// // -> 2 branches: one Attention, one MLP
 /// ```
-public struct Parallel: ModelComponent {
+public struct Parallel<Content: ModelComponent>: ModelComponent {
+
+    public typealias Body = Never
 
     public let merge: ParallelMergeStrategy
-    public let branches: [ModelDeclaration]
+    public let content: Content
 
     public init(
         merge: ParallelMergeStrategy = .add,
-        @ParallelBranchBuilder content: () -> [ModelDeclaration]
+        @ModelComponentBuilder content: () -> Content
     ) {
         self.merge = merge
-        self.branches = content()
-    }
-
-    public func makeDeclaration() -> ModelDeclaration {
-        .parallel(merge: merge, branches: branches)
+        self.content = content()
     }
 }
 
@@ -104,24 +66,22 @@ public struct Parallel: ModelComponent {
 ///     TransformerBlock(hiddenSize: 4096, headCount: 32, kvHeadCount: 8)
 /// }
 /// ```
-public struct Repeat: ModelComponent {
+public struct Repeat<Content: ModelComponent>: ModelComponent {
+
+    public typealias Body = Never
 
     public let count: Int
     public let label: String?
-    public let body: ModelDeclaration
+    public let content: Content
 
     public init(
         count: Int,
         label: String? = nil,
-        @ModelComponentBuilder content: () -> ModelDeclaration
+        @ModelComponentBuilder content: () -> Content
     ) {
         precondition(count > 0, "repeat count must be positive")
         self.count = count
         self.label = label
-        self.body = content()
-    }
-
-    public func makeDeclaration() -> ModelDeclaration {
-        .repeating(count: count, label: label, body: body)
+        self.content = content()
     }
 }

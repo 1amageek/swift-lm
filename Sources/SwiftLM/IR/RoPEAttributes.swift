@@ -10,14 +10,23 @@ public struct RoPEAttributes: Codable, Equatable, Sendable {
     /// Optional scaling configuration for extended context.
     public let scaling: RoPEScaling?
 
+    /// Optional multi-axis RoPE configuration for vision-language models.
+    ///
+    /// When `nil`, standard 1-axis RoPE is used (text-only models).
+    /// When set, the rotary dimensions are partitioned across multiple
+    /// positional axes (temporal, height, width) for M-RoPE.
+    public let mropeAxes: MRoPEAxes?
+
     public init(
         dimension: Int,
         base: Float = 10_000.0,
-        scaling: RoPEScaling? = nil
+        scaling: RoPEScaling? = nil,
+        mropeAxes: MRoPEAxes? = nil
     ) {
         self.dimension = dimension
         self.base = base
         self.scaling = scaling
+        self.mropeAxes = mropeAxes
     }
 }
 

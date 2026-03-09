@@ -5,7 +5,9 @@
 /// ```swift
 /// PositionalEmbedding(maxPositions: 2048, embeddingSize: 4096, kind: .sinusoidal)
 /// ```
-public struct PositionalEmbedding: PrimitiveModelComponent {
+public struct PositionalEmbedding: ModelComponent {
+
+    public typealias Body = Never
 
     public let maxPositions: Int
     public let embeddingSize: Int
@@ -22,12 +24,19 @@ public struct PositionalEmbedding: PrimitiveModelComponent {
         self.embeddingSize = embeddingSize
         self.kind = kind
     }
+}
 
-    public func makeDeclaration() -> ModelDeclaration {
-        .primitive(.positionalEmbedding(PositionalEmbeddingAttributes(
+extension PositionalEmbedding: PrimitiveComponent {
+
+    package var operationKind: OperationKind {
+        .positionalEmbedding(PositionalEmbeddingAttributes(
             maxPositions: maxPositions,
             embeddingSize: embeddingSize,
             kind: kind
-        )))
+        ))
+    }
+
+    package var operationSignature: OperationSignature {
+        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     }
 }
