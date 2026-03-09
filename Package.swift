@@ -13,6 +13,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
+        .package(url: "https://github.com/apple/swift-collections.git", from: "1.1.0"),
         .package(url: "https://github.com/huggingface/swift-jinja", from: "2.3.2"),
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.1"),
     ],
@@ -32,6 +33,7 @@ let package = Package(
                 "GGUFParser",
                 "GGUFTokenizer",
                 .product(name: "Jinja", package: "swift-jinja"),
+                .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
