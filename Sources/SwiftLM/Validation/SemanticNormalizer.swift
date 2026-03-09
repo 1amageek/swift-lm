@@ -186,9 +186,9 @@ extension TupleComponent: _BranchExtractable {
     }
 }
 
-// MARK: - Built-in Conformances: ArrayComponent
+// MARK: - Built-in Conformances: ForEach
 
-extension ArrayComponent: _BuiltinComponent {
+extension ForEach: _BuiltinComponent {
     fileprivate func _normalize(
         upstream: [ValueID],
         ctx: inout NormalizationContext

@@ -4,7 +4,7 @@ import MLXFast
 // MARK: - Protocol
 
 /// Key-value cache for transformer attention layers.
-public protocol KVCache: AnyObject {
+public protocol KVCache: AnyObject, Sendable {
 
     /// Number of tokens currently cached.
     var offset: Int { get }
@@ -38,7 +38,7 @@ public protocol KVCache: AnyObject {
 // MARK: - KVCacheSimple
 
 /// Simple append-only KV cache with pre-allocated growth.
-final class KVCacheSimple: KVCache {
+final class KVCacheSimple: KVCache, @unchecked Sendable {
 
     private var keys: MLXArray?
     private var values: MLXArray?
@@ -127,7 +127,7 @@ final class KVCacheSimple: KVCache {
 
 /// KV cache with a maximum size. Evicts middle tokens to maintain the size limit
 /// while preserving the initial `keep` tokens.
-final class RotatingKVCache: KVCache {
+final class RotatingKVCache: KVCache, @unchecked Sendable {
 
     private var keys: MLXArray?
     private var values: MLXArray?
@@ -252,7 +252,7 @@ final class RotatingKVCache: KVCache {
 // MARK: - QuantizedKVCache
 
 /// KV cache that stores keys and values in quantized form to reduce memory.
-final class QuantizedKVCache: KVCache {
+final class QuantizedKVCache: KVCache, @unchecked Sendable {
 
     private var keys: (MLXArray, MLXArray, MLXArray?)?
     private var values: (MLXArray, MLXArray, MLXArray?)?

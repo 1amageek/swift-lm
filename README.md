@@ -39,17 +39,20 @@ for await generation in stream {
 | **GGUFTokenizer** | GGUFParser | BPE tokenizers restored from GGUF metadata. Merges-based and scores-based. |
 | **SwiftLM** | — | Declarative model description framework. DSL → IR → validation → canonicalization. |
 | **Models** | SwiftLM | Pure architecture declarations. No MLX dependency. |
+| **MLXCompiler** | SwiftLM, MLX | Compiles ModelGraph into executable MLX modules. |
 | **MLXLM** | GGUFParser, GGUFTokenizer, MLX | GGUF→MLX bridge, chat template rendering, streaming generation. |
 
 ```
 GGUFParser          SwiftLM
     │                  │
-GGUFTokenizer      Models
-    │                  │
-    └──── MLXLM ───────┘  (future integration)
+GGUFTokenizer      Models    MLXCompiler
+    │                  │         │
+    └──── MLXLM ──────┴─────────┘
 ```
 
 ## Supported Architectures
+
+### GGUF Runtime (MLXLM)
 
 | Architecture | GGUF ID | Model |
 |-------------|---------|-------|
@@ -63,6 +66,25 @@ GGUFTokenizer      Models
 | Mixtral (MoE) | `llama` + experts | `TransformerModel` |
 | Qwen 3.5 (DeltaNet) | `qwen35` | `Qwen35Model` |
 | Command-R | `command-r` | `CohereModel` |
+
+### Declarative Models (Models)
+
+| Model | Architecture | VLM |
+|-------|-------------|-----|
+| `Transformer` | Standard pre-norm decoder (Llama, Qwen 2, Mistral, Phi, Mixtral MoE) | — |
+| `Qwen35` | Hybrid Gated DeltaNet + Full Attention with VisionEncoder + M-RoPE | Yes |
+| `Cohere` | LayerNorm + QK normalization (Command-R) | — |
+| `LFM2` | Hybrid ShortConv + GQA Attention (LiquidAI LFM2/2.5) | — |
+
+#### LFM2 Presets
+
+| Preset | Layers | MoE | Pattern |
+|--------|--------|-----|---------|
+| `lfm2_350M` | 16 | — | (conv×2+attn)×3, (conv+attn)×3, conv×1 |
+| `lfm25_1_2B` | 16 | — | (conv×2+attn)×3, (conv+attn)×3, conv×1 |
+| `lfm2_2_6B` | 30 | — | (conv×2+attn)×2, (conv×3+attn)×4, (conv×2+attn)×2, conv×2 |
+| `lfm2_8B_A1B` | 24 | 32 experts, 4 active | (conv×2+attn)×1, (conv×3+attn)×4, (conv×2+attn)×1, conv×2 |
+| `lfm2_24B_A2B` | 40 | 64 experts, 4 active | (conv×2+attn)×1, (conv×3+attn)×9, conv×1 |
 
 ## Supported Quantizations
 
@@ -91,12 +113,14 @@ SwiftLM follows the same paradigm as SwiftUI — models are declared, not constr
 
 | SwiftUI | SwiftLM |
 |---------|---------|
-| `View` protocol | `LanguageModel` protocol |
+| `View` protocol | `ModelComponent` protocol |
 | `body: some View` | `body: some ModelComponent` |
 | `@ViewBuilder` | `@ModelComponentBuilder` |
-| View tree → render | `ModelDeclaration` → `ModelGraph` |
+| `TupleView` | `TupleComponent` (parameter packs) |
+| `ForEach` | `ForEach` |
+| View tree → render | `ModelComponent` → `ModelGraph` |
 
-A `LanguageModel` is a pure declaration. It is not a file loader, not a stateful runtime module, not a forward-pass executor.
+A `ModelComponent` is a pure declaration. It is not a file loader, not a stateful runtime module, not a forward-pass executor.
 
 ### Declaring a Model
 
@@ -112,22 +136,17 @@ let llama = Transformer(config: .init(
     kvHeads: 8,
     vocabularySize: 32000
 ))
+
+let graph = try llama.makeModelGraph()
 ```
-
-The `Models` module provides concrete architecture declarations using SwiftLM components:
-
-| Model | Architecture |
-|-------|-------------|
-| `Transformer` | Standard pre-norm decoder (Llama, Qwen 2, Mistral, Phi, Mixtral MoE) |
-| `Qwen35` | Hybrid Gated DeltaNet + Full Attention |
-| `Cohere` | LayerNorm + QK normalization (Command-R) |
 
 ### Components
 
 Models are composed from semantic building blocks:
 
 ```swift
-struct MyModel: LanguageModel {
+struct MyModel: ModelComponent {
+    @ModelComponentBuilder
     var body: some ModelComponent {
         TokenEmbedding(vocabSize: 32000, embeddingSize: 4096)
         Repeat(count: 32, label: "layers") {
@@ -159,26 +178,68 @@ Available components:
 | Component | Description |
 |-----------|-------------|
 | `TokenEmbedding` | Token ID → dense vector |
-| `Attention` | Multi-head attention with GQA, RoPE, QK norm, sliding window |
+| `Attention` | Multi-head attention with GQA, RoPE, M-RoPE, QK norm, sliding window |
 | `MLP` | Feed-forward with configurable activation and gating (SwiGLU, GELU, etc.) |
 | `MoE` | Mixture-of-Experts routing |
 | `RMSNorm` / `LayerNorm` | Normalization layers |
-| `StateSpace` | SSM variants (Mamba, DeltaNet) |
+| `StateSpace` | SSM variants (Mamba, DeltaNet, ShortConv) |
+| `VisionEncoder` | Vision Transformer for VLM (patch embedding, spatial merge, temporal patch) |
 | `OutputHead` | Hidden → vocabulary logits (optional weight tying) |
 | `Residual` | Skip connection: `output = input + f(input)` |
-| `Parallel` | Multi-branch with merge strategy (add, concat, stack) |
+| `Parallel` | Multi-branch with merge strategy (add, concat, visionMerge) |
 | `Repeat` | Stack identical blocks N times |
+| `ForEach` | Data-driven iteration (type-safe, like SwiftUI's ForEach) |
+| `Group` | Labeled grouping for metadata |
 | `Linear` | Raw linear projection |
+| `RoPE` | Standalone rotary position embedding |
 | `Custom` | Escape hatch for experimental ops |
+
+### Result Builder
+
+`@ModelComponentBuilder` follows the `@ViewBuilder` pattern with type-safe parameter packs:
+
+| Builder Feature | Return Type |
+|----------------|-------------|
+| Single expression | Identity (`C`) |
+| Multiple expressions | `TupleComponent<repeat each C>` |
+| `if` without `else` | `OptionalComponent<C>` |
+| `if` / `else` | `ConditionalComponent<First, Second>` |
+
+No type erasure — the builder returns concrete generic types, not `[any ModelComponent]`.
+
+### VLM Support
+
+Vision-language models use `Parallel(merge: .visionMerge(...))` to merge vision and text branches:
+
+```swift
+struct MyVLM: ModelComponent {
+    @ModelComponentBuilder
+    var body: some ModelComponent {
+        Parallel(merge: .visionMerge(VisionMergeConfig(
+            imageTokenId: 248056,
+            videoTokenId: 248057
+        ))) {
+            TokenEmbedding(vocabSize: 248320, embeddingSize: 1024)
+            VisionEncoder(
+                hiddenSize: 768,
+                outputSize: 1024,
+                depth: 12,
+                headCount: 12,
+                patchSize: 16,
+                intermediateSize: 3072,
+                temporalPatchSize: 2
+            )
+        }
+        // ... decoder layers with M-RoPE ...
+    }
+}
+```
 
 ### Pipeline
 
 ```
-LanguageModel (DSL)
-      │  .makeModelDeclaration()
-      ▼
-ModelDeclaration (open tree)
-      │  normalize()
+ModelComponent (DSL)
+      │  .makeModelGraph()
       ▼
 NormalizedModel
   ├── ModelGraph (semantic IR)
@@ -216,7 +277,7 @@ canonicalize(graph1) == canonicalize(graph2)  // structural equivalence
 
 ### Weights Declaration
 
-Weights are attached externally via the `.weights()` modifier — they are NOT part of `LanguageModel`:
+Weights are attached externally via the `.weights()` modifier — they are NOT part of the model declaration:
 
 ```swift
 let model = Transformer(config: .init(
@@ -236,7 +297,7 @@ let weighted = model.weights {
 }
 ```
 
-`WeightedModel` carries both structure and weight source, but is intentionally NOT a `LanguageModel` — it represents a different concept (structure + weights bundle).
+`WeightedModel` carries both structure and weight source, but is intentionally NOT a `ModelComponent` — it represents a different concept (structure + weights bundle).
 
 The weight pipeline resolves declarations into concrete tensors independently from the structural graph:
 

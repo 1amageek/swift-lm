@@ -1,7 +1,7 @@
 import MLX
 
 /// Snapshot of KV cache state for prefix reuse across generations.
-public struct PromptCacheSnapshot {
+public struct PromptCacheSnapshot: @unchecked Sendable {
 
     /// Number of prefix tokens represented by this snapshot.
     public let prefixTokenCount: Int

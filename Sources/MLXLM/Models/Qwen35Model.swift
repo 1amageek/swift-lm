@@ -120,7 +120,7 @@ extension Qwen35Configuration {
 ///
 /// Stores a Conv1D sliding window buffer and a fixed-size recurrent state matrix,
 /// unlike the growing KV cache used by standard attention.
-final class DeltaNetCache: KVCache {
+final class DeltaNetCache: KVCache, @unchecked Sendable {
 
     var convState: MLXArray?
     var recurrentState: MLXArray?

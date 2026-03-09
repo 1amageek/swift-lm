@@ -155,7 +155,7 @@ public struct LFM2: ModelComponent {
     public var body: some ModelComponent {
         TokenEmbedding(vocabSize: config.vocabularySize, embeddingSize: config.hiddenSize)
 
-        for section in config.sections {
+        ForEach(config.sections) { section in
             if section.hasAttention {
                 Repeat(count: section.groupCount) {
                     Repeat(count: section.convsPerGroup) {
