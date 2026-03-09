@@ -1,4 +1,5 @@
 import Foundation
+import GGUFParser
 import MLX
 import MLXFast
 import MLXNN
@@ -150,6 +151,100 @@ struct TransformerConfiguration: Sendable {
 
     var resolvedRopeDimensions: Int {
         ropeDimensionCount ?? resolvedHeadDimensions
+    }
+
+    // MARK: - GGUF Init
+
+    /// Construct configuration from GGUF metadata using structural feature detection.
+    package init(from file: GGUFFile) throws {
+        let embed = try file.require(.embeddingLength)
+        let blocks = try file.require(.blockCount)
+        let heads = try file.require(.headCount)
+
+        let ffn = file[.feedForwardLength] ?? (embed * 4)
+        let kv = file[.headCountKV] ?? heads
+        let normEps = file[.attentionLayerNormRMSEpsilon] ?? 1e-5
+        let ropeTheta = file[.ropeFreqBase] ?? 10_000.0
+        let vocabSize = file[.tokens]?.count ?? file[.vocabularyLength] ?? 0
+
+        let tieWordEmbeddings = detectTieWordEmbeddings(from: file)
+        let hasAttentionBias = file.tensors.contains { $0.name == "blk.0.attn_q.bias" }
+        let hasMlpBias = file.tensors.contains { $0.name == "blk.0.ffn_gate.bias" }
+        let ropeScaling = extractRopeScaling(from: file)
+
+        // Feature detection from structure — no architecture strings
+        let hasPostNorm = file.tensors.contains { $0.name == "blk.0.attn_post_norm.weight" }
+        let isMoE = (file[.expertCount] ?? 0) > 0
+
+        var activation: ActivationType = .silu
+        var softcap: Float? = nil
+        var queryScalar: Float? = nil
+        var finalSoftcap: Float? = nil
+        var swPattern: SlidingWindowPattern = .none
+        var scale: Float? = nil
+        var headDims: Int? = file[.attentionKeyLength]
+            ?? (embed / heads != (file[.attentionValueLength] ?? embed / heads)
+                ? file[.attentionKeyLength] : nil)
+        var experts: Int? = nil
+        var expertsUsed: Int? = nil
+
+        // Post-normalization signals Gemma 2-style architecture
+        if hasPostNorm {
+            let headDim = file[.attentionKeyLength] ?? embed / heads
+            headDims = headDim
+            activation = .gelu
+            softcap = file[.attnLogitSoftcapping]
+            finalSoftcap = file[.finalLogitSoftcapping]
+            queryScalar = Float(headDim)
+            scale = Float(embed).squareRoot()
+            if file[.slidingWindow] != nil {
+                swPattern = .evenLayers
+            }
+        } else {
+            // Detect Phi-3 / StarCoder2 sliding window pattern
+            if file[.slidingWindow] != nil {
+                // StarCoder2 uses sliding window on all layers
+                // (distinguished from Gemma 2 by absence of post-norm)
+                swPattern = .allLayers
+            }
+        }
+
+        if isMoE {
+            experts = file[.expertCount]
+            expertsUsed = file[.expertUsedCount] ?? 2
+        }
+
+        // Phi-3 has explicit ropeDimensionCount
+        let ropeDimCount = file[.ropeDimensionCount]
+
+        self.init(
+            hiddenSize: embed,
+            hiddenLayers: blocks,
+            intermediateSize: ffn,
+            attentionHeads: heads,
+            headDimensions: headDims,
+            vocabularySize: vocabSize,
+            kvHeads: kv,
+            normEps: normEps,
+            hasPostNorm: hasPostNorm,
+            activation: activation,
+            attentionBias: hasAttentionBias,
+            mlpBias: hasMlpBias,
+            attnLogitSoftcap: softcap,
+            queryPreAttnScalar: queryScalar,
+            ropeTheta: ropeTheta,
+            ropeTraditional: false,
+            ropeScaling: ropeScaling,
+            maxPositionEmbeddings: file[.contextLength],
+            ropeDimensionCount: ropeDimCount,
+            slidingWindow: file[.slidingWindow],
+            slidingWindowPattern: swPattern,
+            expertCount: experts,
+            expertUsedCount: expertsUsed,
+            tieWordEmbeddings: tieWordEmbeddings,
+            finalLogitSoftcap: finalSoftcap,
+            embedScale: scale
+        )
     }
 }
 
@@ -558,6 +653,44 @@ class TransformerModel: Module, LanguageModel, KVCacheDimensionProvider {
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights.filter { !$0.key.contains("self_attn.rotary_emb.inv_freq") }
+    }
+}
+
+// MARK: - GGUF Loading
+
+extension TransformerModel: GGUFLoadableModel {
+
+    /// Universal fallback: can handle any standard Transformer GGUF.
+    package static func canLoad(from file: GGUFFile, context: GGUFLoadContext) -> Bool { true }
+
+    package static func load(
+        from file: GGUFFile, context: GGUFLoadContext
+    ) throws -> GGUFLoadResult {
+        let config = try TransformerConfiguration(from: file)
+        let model = TransformerModel(config)
+
+        // Mapper chosen by structure, not by name
+        let hasPostNorm = file.tensors.contains { $0.name == "blk.0.attn_post_norm.weight" }
+        let hasExperts = (file[.expertCount] ?? 0) > 0
+
+        let mapper: any GGUFTensorNameMapper
+        if hasExperts {
+            mapper = MixtralTensorNameMapper()
+        } else if hasPostNorm {
+            mapper = Gemma2TensorNameMapper()
+        } else {
+            mapper = LlamaTensorNameMapper()
+        }
+
+        return GGUFLoadResult(
+            model: model,
+            mapper: mapper,
+            makeProcessor: { tokenizer, chatTemplate, bosToken, eosToken, addBosToken in
+                GGUFUserInputProcessor(
+                    tokenizer: tokenizer, chatTemplate: chatTemplate,
+                    bosToken: bosToken, eosToken: eosToken, addBosToken: addBosToken)
+            }
+        )
     }
 }
 

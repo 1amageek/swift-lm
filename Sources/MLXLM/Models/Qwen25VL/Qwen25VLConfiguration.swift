@@ -8,19 +8,25 @@ struct Qwen25VLConfiguration: Sendable {
     /// Token IDs for vision placeholders in the text sequence.
     let imageTokenId: Int
     let videoTokenId: Int
+    let visionStartTokenId: Int
+    let visionEndTokenId: Int
 
     init(
         text: TextConfiguration,
         vision: VisionConfiguration,
         mrope: MRoPEConfiguration = MRoPEConfiguration(),
-        imageTokenId: Int = 151655,
-        videoTokenId: Int = 151656
+        imageTokenId: Int,
+        videoTokenId: Int,
+        visionStartTokenId: Int,
+        visionEndTokenId: Int
     ) {
         self.text = text
         self.vision = vision
         self.mrope = mrope
         self.imageTokenId = imageTokenId
         self.videoTokenId = videoTokenId
+        self.visionStartTokenId = visionStartTokenId
+        self.visionEndTokenId = visionEndTokenId
     }
 
     // MARK: - Text Configuration
@@ -67,7 +73,10 @@ struct Qwen25VLConfiguration: Sendable {
 
     // MARK: - Vision Configuration
 
-    /// Vision encoder configuration (shared across 3B/7B/72B, only outHiddenSize differs).
+    /// Vision encoder configuration.
+    ///
+    /// All dimension fields are extracted from mmproj GGUF metadata.
+    /// No model-specific default values — the loader must provide them.
     struct VisionConfiguration: Sendable {
         var hiddenSize: Int
         var intermediateSize: Int
@@ -82,19 +91,31 @@ struct Qwen25VLConfiguration: Sendable {
         var windowSize: Int
         var fullAttBlockIndexes: [Int]
 
+        /// Image normalization parameters from mmproj metadata.
+        var imageMean: [Float]
+        var imageStd: [Float]
+
+        /// Image dimension constraints.
+        var minPixels: Int
+        var maxPixels: Int
+
         init(
-            hiddenSize: Int = 1280,
-            intermediateSize: Int = 3420,
-            depth: Int = 32,
-            numHeads: Int = 16,
-            outHiddenSize: Int = 2048,
+            hiddenSize: Int,
+            intermediateSize: Int,
+            depth: Int,
+            numHeads: Int,
+            outHiddenSize: Int,
             patchSize: Int = 14,
             spatialMergeSize: Int = 2,
             temporalPatchSize: Int = 2,
             inChannels: Int = 3,
             normEps: Float = 1e-6,
             windowSize: Int = 112,
-            fullAttBlockIndexes: [Int] = [7, 15, 23, 31]
+            fullAttBlockIndexes: [Int],
+            imageMean: [Float] = [0.48145466, 0.4578275, 0.40821073],
+            imageStd: [Float] = [0.26862954, 0.26130258, 0.27577711],
+            minPixels: Int = 3136,
+            maxPixels: Int = 12_845_056
         ) {
             self.hiddenSize = hiddenSize
             self.intermediateSize = intermediateSize
@@ -108,6 +129,10 @@ struct Qwen25VLConfiguration: Sendable {
             self.normEps = normEps
             self.windowSize = windowSize
             self.fullAttBlockIndexes = fullAttBlockIndexes
+            self.imageMean = imageMean
+            self.imageStd = imageStd
+            self.minPixels = minPixels
+            self.maxPixels = maxPixels
         }
 
         var headDim: Int { hiddenSize / numHeads }
@@ -131,4 +156,10 @@ struct Qwen25VLConfiguration: Sendable {
 
         var totalDimensions: Int { sections.reduce(0, +) }
     }
+}
+
+// MARK: - VLMInputConfig Conformance
+
+extension Qwen25VLConfiguration: VLMInputConfig {
+    var spatialMergeSize: Int { vision.spatialMergeSize }
 }

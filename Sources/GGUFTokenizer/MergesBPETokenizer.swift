@@ -139,6 +139,10 @@ struct MergesBPETokenizer: Tokenizer, Sendable {
         return vocabulary[id]
     }
 
+    func tokenID(for string: String) -> Int? {
+        tokenToID[string]
+    }
+
     // MARK: - BPE
 
     /// Run BPE on a byte-encoded token string.

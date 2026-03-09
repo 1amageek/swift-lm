@@ -56,14 +56,14 @@ struct Qwen25VLVisionRoPE {
     ///
     /// - Parameter gridTHW: Per-image/video temporal-height-width dimensions.
     /// - Returns: Frequency tensor of shape `[totalPatches, dim]` for Q/K rotation.
-    func frequencies(gridTHW: [LMInput.THW], spatialMergeSize: Int) -> MLXArray {
+    func frequencies(gridTHW: [LMInput.THW]) -> MLXArray {
         // Build position IDs for height and width across all images/videos
         var allFreqs = [MLXArray]()
 
         for thw in gridTHW {
             let t = thw.t
-            let h = thw.h / spatialMergeSize
-            let w = thw.w / spatialMergeSize
+            let h = thw.h
+            let w = thw.w
 
             // Create height and width position grids
             let hPositions = MLXArray(0..<h)
@@ -347,9 +347,7 @@ class Qwen25VLVisionTransformer: Module, VisionEncoder {
         var hiddenStates = patchEmbed(pixels)
 
         // 2. Compute 2D rotary embeddings
-        let rotaryFreqs = rotaryEmb.frequencies(
-            gridTHW: gridTHW, spatialMergeSize: config.spatialMergeSize
-        )
+        let rotaryFreqs = rotaryEmb.frequencies(gridTHW: gridTHW)
 
         // 3. Compute attention masks
         let cuSeqlens = computeCuSeqlens(gridTHW: gridTHW)
@@ -426,7 +424,6 @@ class Qwen25VLVisionTransformer: Module, VisionEncoder {
         var windowCuSeqlens = [0]
         var allRotaryFreqs = [MLXArray]()
 
-        let spatialMerge = config.spatialMergeSize
         var globalOffset = 0
 
         for thw in gridTHW {
@@ -467,26 +464,23 @@ class Qwen25VLVisionTransformer: Module, VisionEncoder {
                 }
             }
 
-            // Compute rotary frequencies for this image/video
+            // Compute rotary frequencies for this image/video (pre-merge grid)
             let invFreqDim = config.headDim / 4  // half of dim
             let freqExponents = MLXArray(
                 stride(from: Float(0), to: Float(invFreqDim), by: 1.0)
             )
             let invFreq = 1.0 / pow(MLXArray(Float(10000)), freqExponents / Float(invFreqDim))
 
-            let hMerged = h / spatialMerge
-            let wMerged = w / spatialMerge
-
-            let hPos = MLXArray(0..<hMerged)
-            let wPos = MLXArray(0..<wMerged)
+            let hPos = MLXArray(0..<h)
+            let wPos = MLXArray(0..<w)
 
             let hFreqs = hPos.expandedDimensions(axis: 1) * invFreq.expandedDimensions(axis: 0)
             let wFreqs = wPos.expandedDimensions(axis: 1) * invFreq.expandedDimensions(axis: 0)
 
-            let hTiled = tiled(hFreqs.expandedDimensions(axis: 1), repetitions: [1, wMerged, 1])
-                .reshaped(hMerged * wMerged, invFreqDim)
-            let wTiled = tiled(wFreqs.expandedDimensions(axis: 0), repetitions: [hMerged, 1, 1])
-                .reshaped(hMerged * wMerged, invFreqDim)
+            let hTiled = tiled(hFreqs.expandedDimensions(axis: 1), repetitions: [1, w, 1])
+                .reshaped(h * w, invFreqDim)
+            let wTiled = tiled(wFreqs.expandedDimensions(axis: 0), repetitions: [h, 1, 1])
+                .reshaped(h * w, invFreqDim)
 
             let spatialFreqs = concatenated([hTiled, wTiled], axis: 1)
             let temporalTiled = tiled(spatialFreqs.expandedDimensions(axis: 0), repetitions: [t, 1, 1])

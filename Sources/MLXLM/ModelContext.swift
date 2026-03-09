@@ -11,15 +11,22 @@ public struct ModelContext: @unchecked Sendable {
     public var processor: any UserInputProcessor
     public var tokenizer: any Tokenizer
 
+    /// Diagnostic report from the GGUF loading pipeline.
+    ///
+    /// Present when loaded via `GGUFModelLoader`; `nil` when constructed manually.
+    public var loadReport: LoadReport?
+
     public init(
         configuration: ModelConfiguration,
         model: any LanguageModel,
         processor: any UserInputProcessor,
-        tokenizer: any Tokenizer
+        tokenizer: any Tokenizer,
+        loadReport: LoadReport? = nil
     ) {
         self.configuration = configuration
         self.model = model
         self.processor = processor
         self.tokenizer = tokenizer
+        self.loadReport = loadReport
     }
 }

@@ -1,4 +1,6 @@
 import Foundation
+import GGUFParser
+import GGUFTokenizer
 import MLX
 import MLXFast
 import MLXNN
@@ -76,36 +78,56 @@ class Qwen25VLAttention: Module {
         return wo(output.transposed(0, 2, 1, 3).reshaped(B, L, -1))
     }
 
-    /// Apply M-RoPE by splitting head dimensions into temporal/height/width sections.
+    /// Apply contiguous M-RoPE by splitting head dimensions into temporal/height/width sections.
     private func applyMRoPE(_ x: MLXArray, positionIds: MLXArray) -> MLXArray {
-        // positionIds: [3, B, S] — temporal, height, width position IDs
-        // x: [B, H, S, D] — queries or keys
-        let sections = mropeConfig.sections  // [16, 24, 24]
+        let sections = mropeConfig.sections
 
-        // Split head dim into 3 sections
-        // Each section gets RoPE with its corresponding position IDs
-        var parts = [MLXArray]()
+        let halfDim = headDim / 2
+        let freqExponents = MLXArray(stride(from: Float(0), to: Float(halfDim), by: 1.0))
+        let invFreq = 1.0 / pow(MLXArray(config.ropeTheta), freqExponents / Float(halfDim))
+
+        var cosPerAxis = [MLXArray]()
+        var sinPerAxis = [MLXArray]()
+
+        for axis in 0..<3 {
+            let axisPositions = positionIds[axis]
+            let freqs = expandedDimensions(axisPositions, axis: -1).asType(DType.float32)
+                * invFreq.reshaped(1, 1, halfDim)
+            let emb = concatenated([freqs, freqs], axis: -1)
+            cosPerAxis.append(cos(emb))
+            sinPerAxis.append(sin(emb))
+        }
+
+        let doubledSections = sections.map { $0 * 2 }
+        var cosChunks = [MLXArray]()
+        var sinChunks = [MLXArray]()
         var dimOffset = 0
 
-        for (i, sectionSize) in sections.enumerated() {
-            let ropeDims = sectionSize * 2  // RoPE applies to pairs
-            let sectionSlice = x[0..., 0..., 0..., dimOffset..<(dimOffset + ropeDims)]
-            let sectionPositions = positionIds[i]  // [B, S]
-
-            let rotated = MLXFast.RoPE(
-                sectionSlice, dimensions: ropeDims, traditional: false,
-                base: config.ropeTheta, scale: 1.0, offset: sectionPositions
-            )
-            parts.append(rotated)
-            dimOffset += ropeDims
+        for (i, sectionDim) in doubledSections.enumerated() {
+            let axisIdx = i % 3
+            cosChunks.append(cosPerAxis[axisIdx][0..., 0..., dimOffset..<(dimOffset + sectionDim)])
+            sinChunks.append(sinPerAxis[axisIdx][0..., 0..., dimOffset..<(dimOffset + sectionDim)])
+            dimOffset += sectionDim
         }
 
-        // Append remaining dims (if headDim > sum of sections * 2)
         if dimOffset < headDim {
-            parts.append(x[0..., 0..., 0..., dimOffset...])
+            let remaining = headDim - dimOffset
+            let axisIdx = doubledSections.count % 3
+            cosChunks.append(cosPerAxis[axisIdx][0..., 0..., dimOffset..<(dimOffset + remaining)])
+            sinChunks.append(sinPerAxis[axisIdx][0..., 0..., dimOffset..<(dimOffset + remaining)])
         }
 
-        return concatenated(parts, axis: -1)
+        var cosEmb = concatenated(cosChunks, axis: -1)
+        var sinEmb = concatenated(sinChunks, axis: -1)
+        cosEmb = cosEmb.expandedDimensions(axis: 1)
+        sinEmb = sinEmb.expandedDimensions(axis: 1)
+
+        let half = headDim / 2
+        let x1 = x[0..., 0..., 0..., ..<half]
+        let x2 = x[0..., 0..., 0..., half...]
+        let rotateHalf = concatenated([-x2, x1], axis: -1)
+
+        return x * cosEmb + rotateHalf * sinEmb
     }
 }
 
@@ -186,10 +208,7 @@ class Qwen25VLTextModel: Module {
         self._norm.wrappedValue = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
     }
 
-    /// Forward pass with pre-computed embeddings.
-    ///
-    /// When `inputEmbeddings` is provided, it is used instead of `embedTokens(inputIds)`.
-    /// This allows vision tokens to be merged into the sequence before the transformer.
+    /// Forward pass with optional embedding injection and M-RoPE position IDs.
     func callAsFunction(
         _ inputIds: MLXArray,
         inputEmbeddings: MLXArray? = nil,
@@ -212,9 +231,9 @@ class Qwen25VLTextModel: Module {
 /// Qwen2.5-VL vision-language model.
 ///
 /// Combines a ViT-based vision encoder with a Qwen2 text decoder.
-/// Vision tokens are encoded and merged into the text sequence during
-/// ``prepare(_:cache:windowSize:)``, after which generation proceeds as
-/// standard autoregressive text generation with M-RoPE positioning.
+/// All shared VLM orchestration (vision encoding, embedding merging,
+/// M-RoPE position IDs) is provided by ``VisionLanguageModel``
+/// protocol default implementations.
 class Qwen25VLModel: Module, VisionLanguageModel, KVCacheDimensionProvider {
 
     let configuration: Qwen25VLConfiguration
@@ -223,11 +242,15 @@ class Qwen25VLModel: Module, VisionLanguageModel, KVCacheDimensionProvider {
     @ModuleInfo(key: "model") var textModel: Qwen25VLTextModel
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
-    /// Cached position state for generation phase (after vision is processed).
-    private var nextPosition: Int = 0
+    // MARK: VisionLanguageModel
 
+    var nextPosition: Int = 0
     var imageTokenId: Int { configuration.imageTokenId }
     var videoTokenId: Int { configuration.videoTokenId }
+    var spatialMergeSize: Int { configuration.vision.spatialMergeSize }
+
+    // MARK: KVCacheDimensionProvider
+
     var vocabularySize: Int { configuration.text.vocabularySize }
     var layerCount: Int { textModel.layers.count }
     var kvHeads: [Int] {
@@ -246,7 +269,7 @@ class Qwen25VLModel: Module, VisionLanguageModel, KVCacheDimensionProvider {
         }
     }
 
-    // MARK: - VisionLanguageModel
+    // MARK: - Bridge Methods
 
     func encodeVision(
         image: LMInput.ProcessedImage?,
@@ -263,75 +286,23 @@ class Qwen25VLModel: Module, VisionLanguageModel, KVCacheDimensionProvider {
         return nil
     }
 
-    // MARK: - LanguageModel
-
-    func prepare(
-        _ input: LMInput, cache: [KVCache], windowSize: Int?
-    ) throws -> PrepareResult {
-        let tokens = input.text.tokens
-        let tokenCount = tokens.dim(tokens.ndim - 1)
-
-        // Encode vision on first call (before any prefill chunks)
-        let prefillOffset = cache.first?.offset ?? 0
-
-        if prefillOffset == 0 {
-            // First prepare call — encode vision and merge embeddings
-            let visionEmbeddings = try encodeVision(image: input.image, video: input.video)
-
-            // Compute M-RoPE position IDs
-            let positionIds = computeMRoPEPositionIds(
-                inputIds: tokens, image: input.image, video: input.video
-            )
-
-            // Get text embeddings and merge vision
-            var embeddings = textModel.embedTokens(tokens)
-            if let visionEmbeddings {
-                embeddings = mergeVisionEmbeddings(
-                    textEmbeddings: embeddings,
-                    visionEmbeddings: visionEmbeddings,
-                    inputIds: tokens
-                )
-            }
-
-            // Full prefill — no chunking for VLM (vision embeddings are already merged)
-            let output = forwardFromEmbeddings(
-                embeddings, inputIds: tokens, cache: cache, positionIds: positionIds
-            )
-            nextPosition = tokenCount
-            return .logits(output)
-        }
-
-        // Subsequent calls (shouldn't happen for VLM since we do full prefill)
-        let remaining = tokens[0..., prefillOffset...]
-        let output = callAsFunction(
-            LMInput.Text(tokens: remaining),
-            cache: cache,
-            state: nil
-        )
-        return .logits(output)
+    func embedTokens(_ tokens: MLXArray) -> MLXArray {
+        textModel.embedTokens(tokens)
     }
 
-    func callAsFunction(
-        _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
-    ) -> LMOutput {
-        // Generation phase: text-only with sequential M-RoPE positions
-        let positionIds = input.positionIds ?? makeSequentialPositionIds(
-            batchSize: input.tokens.dim(0),
-            seqLen: input.tokens.dim(1),
-            startPosition: nextPosition
-        )
-
-        let h = textModel(input.tokens, cache: cache, positionIds: positionIds)
-        let logits = forwardLogits(h)
-
-        nextPosition += input.tokens.dim(1)
-        return LMOutput(logits: logits)
+    func forwardTextModel(
+        _ inputs: MLXArray, cache: [KVCache]?,
+        inputEmbeddings: MLXArray?, positionIds: MLXArray?
+    ) -> MLXArray {
+        textModel(inputs, inputEmbeddings: inputEmbeddings, cache: cache, positionIds: positionIds)
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]?) -> MLXArray {
-        let h = textModel(inputs, cache: cache)
-        return forwardLogits(h)
+    func forwardLogits(_ h: MLXArray) -> MLXArray {
+        if let lmHead { return lmHead(h) }
+        return textModel.embedTokens.asLinear(h)
     }
+
+    // MARK: - Model-Specific
 
     func newCache(parameters: GenerateParameters?) -> [KVCache] {
         nextPosition = 0
@@ -342,161 +313,114 @@ class Qwen25VLModel: Module, VisionLanguageModel, KVCacheDimensionProvider {
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var result = weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
 
-        // Transpose Conv3d weights from PyTorch [O, I, D, H, W] to MLX [O, D, H, W, I]
         for key in Array(result.keys) where key.contains("patch_embed.proj.weight") {
             if let w = result[key], w.ndim == 5 {
-                // PyTorch: [O, I, D, H, W] → MLX: [O, D, H, W, I]
                 result[key] = w.transposed(0, 2, 3, 4, 1)
             }
         }
 
         return result
     }
+}
 
-    // MARK: - Private Helpers
+// MARK: - GGUF Loading
 
-    private func forwardLogits(_ h: MLXArray) -> MLXArray {
-        if let lmHead {
-            return lmHead(h)
-        }
-        return textModel.embedTokens.asLinear(h)
+extension Qwen25VLModel: GGUFLoadableModel {
+
+    /// Detects Qwen 2.5-VL: requires mmproj URL and must NOT have DeltaNet SSM tensors.
+    package static func canLoad(from file: GGUFFile, context: GGUFLoadContext) -> Bool {
+        context.mmprojURL != nil
+            && !file.tensors.contains { $0.name == "blk.0.ssm_beta.weight" }
     }
 
-    /// Forward pass from pre-computed embeddings (for prefill with vision).
-    private func forwardFromEmbeddings(
-        _ embeddings: MLXArray,
-        inputIds: MLXArray,
-        cache: [KVCache],
-        positionIds: MLXArray?
-    ) -> LMOutput {
-        let h = textModel(inputIds, inputEmbeddings: embeddings, cache: cache, positionIds: positionIds)
-        let logits = forwardLogits(h)
-        return LMOutput(logits: logits)
-    }
-
-    /// Replace placeholder token embeddings with vision encoder output.
-    private func mergeVisionEmbeddings(
-        textEmbeddings: MLXArray,
-        visionEmbeddings: MLXArray,
-        inputIds: MLXArray
-    ) -> MLXArray {
-        let B = textEmbeddings.dim(0)
-        let S = textEmbeddings.dim(1)
-        let D = textEmbeddings.dim(2)
-
-        // Find positions of image/video tokens in the input
-        let flatIds = inputIds.reshaped(-1)
-        let isImage = flatIds .== MLXArray(Int32(imageTokenId))
-        let isVideo = flatIds .== MLXArray(Int32(videoTokenId))
-        let isVision = isImage .|| isVideo
-
-        // Build vision index via cumulative sum: each vision position gets its index
-        // into visionEmbeddings. Non-vision positions get stale indices but are masked out.
-        let visionCumsum = cumsum(isVision.asType(DType.int32)) - 1
-
-        // Clamp indices to valid range for gather
-        let clampedIdx = clip(visionCumsum, min: 0, max: max(visionEmbeddings.dim(0) - 1, 0))
-
-        // Gather: create full-size tensor with vision embeddings at every position
-        // (non-vision positions will have wrong values, but we mask them out below)
-        let visionGathered = visionEmbeddings[clampedIdx]  // [B*S, D]
-
-        // Mix: use isVision mask to select between vision and text embeddings
-        let flatEmbeddings = textEmbeddings.reshaped(B * S, D)
-        let mask = isVision.reshaped(B * S, 1)
-        let merged = which(mask, visionGathered, flatEmbeddings)
-
-        return merged.reshaped(B, S, D)
-    }
-
-    /// Compute M-RoPE 3D position IDs for mixed text+vision sequences.
-    ///
-    /// Text tokens: all 3 dimensions get the same sequential position.
-    /// Image tokens: temporal=constant, height/width from grid layout.
-    private func computeMRoPEPositionIds(
-        inputIds: MLXArray,
-        image: LMInput.ProcessedImage?,
-        video: LMInput.ProcessedVideo?
-    ) -> MLXArray {
-        let B = inputIds.dim(0)
-        let S = inputIds.dim(1)
-        let spatialMerge = configuration.vision.spatialMergeSize
-
-        // Start with sequential positions for all tokens
-        var temporalPos = [Int32](repeating: 0, count: B * S)
-        var heightPos = [Int32](repeating: 0, count: B * S)
-        var widthPos = [Int32](repeating: 0, count: B * S)
-
-        let flatIds = inputIds.reshaped(-1)
-
-        var currentTextPos: Int32 = 0
-        var visionTokenIdx = 0
-
-        // Collect grid info
-        let imageGrids = image?.frames ?? []
-        let videoGrids = video?.frames ?? []
-        let allGrids = imageGrids + videoGrids
-
-        var gridIdx = 0
-
-        for i in 0..<(B * S) {
-            let tokenId: Int32 = flatIds[i].item()
-
-            if tokenId == Int32(imageTokenId) || tokenId == Int32(videoTokenId) {
-                // Vision token — assign spatial positions
-                if gridIdx < allGrids.count {
-                    let grid = allGrids[gridIdx]
-                    let mergedH = grid.h / spatialMerge
-                    let mergedW = grid.w / spatialMerge
-                    let totalMerged = grid.t * mergedH * mergedW
-
-                    // Position within the current image/video grid
-                    let posInGrid = visionTokenIdx
-                    let tPos = posInGrid / (mergedH * mergedW)
-                    let hPos = (posInGrid % (mergedH * mergedW)) / mergedW
-                    let wPos = posInGrid % mergedW
-
-                    temporalPos[i] = currentTextPos + Int32(tPos)
-                    heightPos[i] = currentTextPos + Int32(hPos)
-                    widthPos[i] = currentTextPos + Int32(wPos)
-
-                    visionTokenIdx += 1
-
-                    // Move to next grid when current one is exhausted
-                    if visionTokenIdx >= totalMerged {
-                        currentTextPos += Int32(max(grid.t, max(mergedH, mergedW)))
-                        visionTokenIdx = 0
-                        gridIdx += 1
-                    }
-                }
-            } else {
-                // Text token — all dimensions get same position
-                temporalPos[i] = currentTextPos
-                heightPos[i] = currentTextPos
-                widthPos[i] = currentTextPos
-                currentTextPos += 1
-            }
+    package static func load(
+        from file: GGUFFile, context: GGUFLoadContext
+    ) throws -> GGUFLoadResult {
+        guard let mmprojURL = context.mmprojURL else {
+            throw GGUFLoadError.missingMetadata("mmproj file required for VLM")
         }
 
-        // Shape: [3, B, S]
-        let tArray = MLXArray(temporalPos).reshaped(B, S)
-        let hArray = MLXArray(heightPos).reshaped(B, S)
-        let wArray = MLXArray(widthPos).reshaped(B, S)
+        // Build text configuration from GGUF metadata
+        let embed = try file.require(.embeddingLength)
+        let blocks = try file.require(.blockCount)
+        let heads = try file.require(.headCount)
+        let ffn = file[.feedForwardLength] ?? (embed * 4)
+        let kv = file[.headCountKV] ?? heads
+        let normEps = file[.attentionLayerNormRMSEpsilon] ?? 1e-5
+        let ropeTheta = file[.ropeFreqBase] ?? 10_000.0
+        let vocabSize = file[.tokens]?.count ?? file[.vocabularyLength] ?? 0
+        let tieWordEmbeddings = detectTieWordEmbeddings(from: file)
 
-        return stacked([tArray, hArray, wArray], axis: 0)
-    }
-
-    /// Create sequential position IDs for text-only generation.
-    private func makeSequentialPositionIds(
-        batchSize: Int, seqLen: Int, startPosition: Int
-    ) -> MLXArray {
-        let positions = tiled(
-            MLXArray(Int32(startPosition)..<Int32(startPosition + seqLen))
-                .reshaped(1, seqLen),
-            repetitions: [batchSize, 1]
+        let textConfig = Qwen25VLConfiguration.TextConfiguration(
+            hiddenSize: embed,
+            hiddenLayers: blocks,
+            intermediateSize: ffn,
+            attentionHeads: heads,
+            kvHeads: kv,
+            vocabularySize: vocabSize,
+            normEps: normEps,
+            ropeTheta: ropeTheta,
+            maxPositionEmbeddings: file[.contextLength],
+            tieWordEmbeddings: tieWordEmbeddings
         )
-        // All 3 dimensions are identical for text tokens
-        return stacked([positions, positions, positions], axis: 0)
+
+        // Load vision encoder from mmproj
+        let visionLoader = GGUFVisionLoader()
+        let (loadedVisionEncoder, loadedVisionConfig) = try visionLoader.load(url: mmprojURL)
+        var visionConfig = loadedVisionConfig
+        visionConfig.outHiddenSize = textConfig.hiddenSize
+
+        // Resolve vision token IDs
+        let tokenizer = context.tokenizer
+        guard let imageTokenId = tokenizer.tokenID(for: "<|image_pad|>") else {
+            throw GGUFLoadError.missingMetadata("tokenizer vocabulary: <|image_pad|>")
+        }
+        guard let videoTokenId = tokenizer.tokenID(for: "<|video_pad|>") else {
+            throw GGUFLoadError.missingMetadata("tokenizer vocabulary: <|video_pad|>")
+        }
+        guard let visionStartTokenId = tokenizer.tokenID(for: "<|vision_start|>") else {
+            throw GGUFLoadError.missingMetadata("tokenizer vocabulary: <|vision_start|>")
+        }
+        guard let visionEndTokenId = tokenizer.tokenID(for: "<|vision_end|>") else {
+            throw GGUFLoadError.missingMetadata("tokenizer vocabulary: <|vision_end|>")
+        }
+
+        let vlmConfig = Qwen25VLConfiguration(
+            text: textConfig,
+            vision: visionConfig,
+            imageTokenId: imageTokenId,
+            videoTokenId: videoTokenId,
+            visionStartTokenId: visionStartTokenId,
+            visionEndTokenId: visionEndTokenId
+        )
+        let vlmModel = Qwen25VLModel(vlmConfig)
+
+        let imageProcessor = Qwen25VLImageProcessor(config: visionConfig)
+
+        // Capture loadedVisionEncoder for deferred weight loading
+        let capturedVisionEncoder = loadedVisionEncoder
+        let capturedVLMModel = vlmModel
+
+        return GGUFLoadResult(
+            model: vlmModel,
+            mapper: LlamaTensorNameMapper(),
+            visionLoader: { _ in
+                let visionParams = capturedVisionEncoder.parameters()
+                capturedVLMModel.visionEncoder.update(parameters: visionParams)
+                eval(capturedVLMModel.visionEncoder)
+            },
+            makeProcessor: { tokenizer, chatTemplate, bosToken, eosToken, addBosToken in
+                VLMUserInputProcessor(
+                    tokenizer: tokenizer,
+                    chatTemplate: chatTemplate,
+                    bosToken: bosToken,
+                    eosToken: eosToken,
+                    addBosToken: addBosToken,
+                    vlmInputConfig: vlmConfig,
+                    preprocessImage: { try imageProcessor.preprocess(image: $0) }
+                )
+            }
+        )
     }
 }
 

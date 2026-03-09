@@ -6,11 +6,38 @@ import GGUFTokenizer
 
 /// Loads a complete model pipeline from a single GGUF file.
 ///
-/// Orchestrates: GGUF parse → config extraction → model construction →
+/// Orchestrates: GGUF parse → model type resolution → model construction →
 /// weight loading → tokenizer creation → ModelContext assembly.
+///
+/// Model selection is data-driven: each model type inspects the GGUF file's
+/// structure (tensor names, metadata) to determine compatibility. No
+/// architecture strings are hardcoded in the loader.
 public struct GGUFModelLoader {
 
-    public init() {}
+    private let modelTypes: [any GGUFLoadableModel.Type]
+
+    /// Default initializer with all built-in model types.
+    public init() {
+        self.modelTypes = Self.defaultModelTypes
+    }
+
+    /// Package-internal initializer for custom model type lists.
+    package init(modelTypes: [any GGUFLoadableModel.Type]) {
+        self.modelTypes = modelTypes
+    }
+
+    /// Built-in model types in priority order.
+    ///
+    /// Each model's `canLoad` is a **sufficient condition** — mutually exclusive
+    /// with all others except the universal fallback. The ordering is defense-in-depth
+    /// (most-specific first) but correctness does not depend on it.
+    package static let defaultModelTypes: [any GGUFLoadableModel.Type] = [
+        Qwen35VLModel.self,     // VLM + DeltaNet SSM tensors
+        Qwen25VLModel.self,     // VLM + standard Transformer
+        Qwen35Model.self,       // DeltaNet SSM tensors (text-only)
+        CohereModel.self,       // parallel attn+FFN with QK norm
+        TransformerModel.self,  // universal fallback
+    ]
 
     /// Download and load a model from Hugging Face Hub.
     ///
@@ -88,106 +115,53 @@ public struct GGUFModelLoader {
         // 1. Parse GGUF
         let file = try GGUFFile.parse(url: url)
 
-        // 2. Determine architecture
-        guard let arch = file.architecture else {
-            throw GGUFLoadError.missingMetadata("general.architecture")
-        }
-
-        // 3. Build model + load weights based on architecture
-        let model: any LanguageModel
-
-        // Mixtral uses "llama" as its GGUF architecture string.
-        // Detect MoE by checking for expert_count metadata.
-        let isMoE = (file.expertCount ?? 0) > 0
-        let archKey = arch.lowercased()
-
-        switch archKey {
-        case "llama", "qwen2", "qwen3", "mistral", "gemma2", "phi3", "starcoder2":
-            let configuration = try GGUFConfigExtractor.extractTransformerConfig(
-                from: file, archHint: archKey, isMoE: isMoE)
-            let transformerModel = TransformerModel(configuration)
-
-            let mapper: any GGUFTensorNameMapper
-            if isMoE {
-                mapper = MixtralTensorNameMapper()
-            } else if archKey == "gemma2" {
-                mapper = Gemma2TensorNameMapper()
-            } else {
-                mapper = LlamaTensorNameMapper()
-            }
-
-            try loadWeightsWithLoRA(into: transformerModel, from: file, mapper: mapper, quantization: quantization)
-            model = transformerModel
-
-        case "qwen35", "qwen3_5", "qwen3next":
-            let configuration = try GGUFConfigExtractor.extractQwen35Config(from: file)
-            let qwen35Model = Qwen35Model(configuration)
-            try loadWeightsWithLoRA(into: qwen35Model, from: file, mapper: Qwen35TensorNameMapper(), quantization: quantization)
-            model = qwen35Model
-
-        case "command-r", "cohere2":
-            let configuration = try GGUFConfigExtractor.extractCohereConfig(from: file)
-            let cohereModel = CohereModel(configuration)
-            try loadWeightsWithLoRA(into: cohereModel, from: file, mapper: CohereTensorNameMapper(), quantization: quantization)
-            model = cohereModel
-
-        case "qwen2vl", "qwen2_5_vl", "qwen25vl":
-            let textConfig = try GGUFConfigExtractor.extractTransformerConfig(
-                from: file, archHint: "qwen2", isMoE: false)
-            let qwen25vlTextConfig = Qwen25VLConfiguration.TextConfiguration(
-                hiddenSize: textConfig.hiddenSize,
-                hiddenLayers: textConfig.hiddenLayers,
-                intermediateSize: textConfig.intermediateSize,
-                attentionHeads: textConfig.attentionHeads,
-                kvHeads: textConfig.kvHeads,
-                vocabularySize: textConfig.vocabularySize,
-                normEps: textConfig.normEps,
-                ropeTheta: textConfig.ropeTheta,
-                tieWordEmbeddings: textConfig.tieWordEmbeddings
-            )
-
-            var visionConfig = Qwen25VLConfiguration.VisionConfiguration()
-            if let mmprojURL {
-                let visionLoader = GGUFVisionLoader()
-                let (_, loadedVisionConfig) = try visionLoader.load(url: mmprojURL)
-                visionConfig = loadedVisionConfig
-            }
-            visionConfig.outHiddenSize = qwen25vlTextConfig.hiddenSize
-
-            let vlmConfig = Qwen25VLConfiguration(text: qwen25vlTextConfig, vision: visionConfig)
-            let vlmModel = Qwen25VLModel(vlmConfig)
-
-            // Load text weights using Llama mapper (Qwen2 uses llama-style naming in GGUF)
-            try loadWeightsWithLoRA(
-                into: vlmModel, from: file, mapper: LlamaTensorNameMapper(), quantization: quantization)
-
-            // Load vision weights from mmproj if provided
-            if let mmprojURL {
-                let visionLoader = GGUFVisionLoader()
-                let (loadedEncoder, _) = try visionLoader.load(url: mmprojURL)
-                // Transfer loaded vision encoder weights into the model
-                let visionParams = loadedEncoder.parameters()
-                try vlmModel.visionEncoder.update(parameters: visionParams, verify: .noUnusedKeys)
-                eval(vlmModel.visionEncoder)
-            }
-
-            model = vlmModel
-
-        default:
-            throw GGUFLoadError.unsupportedArchitecture(arch)
-        }
-
-        // Apply external adapter if provided
-        if let adapterDir = adapterDirectory {
-            let container = try LoRAContainer.from(directory: adapterDir)
-            try container.fuse(with: model)
-            eval(model)
-        }
-
-        // 4. Create tokenizer
+        // 2. Create tokenizer early (needed for VLM token ID resolution)
         let tokenizer = try GGUFTokenizerFactory.create(from: file)
 
-        // 5. Build model configuration
+        // 3. Build loading context
+        let loadContext = GGUFLoadContext(tokenizer: tokenizer, mmprojURL: mmprojURL)
+
+        // 4. Find first model type that can handle this GGUF
+        var candidatesEvaluated = 0
+        var selectedType: (any GGUFLoadableModel.Type)?
+        for modelType in modelTypes {
+            candidatesEvaluated += 1
+            if modelType.canLoad(from: file, context: loadContext) {
+                selectedType = modelType
+                break
+            }
+        }
+        guard let modelType = selectedType else {
+            throw GGUFLoadError.unsupportedArchitecture(file.architecture ?? "unknown")
+        }
+
+        let modelResolution = LoadReport.ModelResolution(
+            selectedType: String(describing: modelType),
+            candidatesEvaluated: candidatesEvaluated,
+            totalCandidates: modelTypes.count
+        )
+
+        // 5. Model self-construction (config + empty model + mapper + processor factory)
+        let result = try modelType.load(from: file, context: loadContext)
+
+        // 6. Load weights (shared for all models)
+        let weightReport = try loadWeightsWithLoRA(
+            into: result.model, from: file, mapper: result.mapper,
+            quantization: quantization)
+
+        // 7. Load vision encoder if VLM
+        if let visionLoader = result.visionLoader, let mmprojURL {
+            try visionLoader(mmprojURL)
+        }
+
+        // 8. Apply external adapter if provided
+        if let adapterDir = adapterDirectory {
+            let container = try LoRAContainer.from(directory: adapterDir)
+            try container.fuse(with: result.model)
+            eval(result.model)
+        }
+
+        // 9. Build model configuration
         var eosTokenIds = Set<Int>()
         if let eosId = file.eosTokenID {
             eosTokenIds.insert(eosId)
@@ -216,53 +190,56 @@ public struct GGUFModelLoader {
             }
         }
 
-        // 6. Build user input processor
+        // 10. Build user input processor
         let chatTemplate = file.chatTemplate
-        let isVLM = archKey == "qwen2vl" || archKey == "qwen2_5_vl" || archKey == "qwen25vl"
-        let processor: any UserInputProcessor
+        let bosToken = tokenizer.bosTokenID.flatMap { tokenizer.tokenToString($0) }
+        let eosToken = tokenizer.eosTokenID.flatMap { tokenizer.tokenToString($0) }
+        let addBosToken = file.addBosToken ?? false
 
-        if isVLM, let vlmModel = model as? Qwen25VLModel {
-            processor = VLMUserInputProcessor(
-                tokenizer: tokenizer,
-                chatTemplate: chatTemplate,
-                bosToken: tokenizer.bosTokenID.flatMap { tokenizer.tokenToString($0) },
-                eosToken: tokenizer.eosTokenID.flatMap { tokenizer.tokenToString($0) },
-                addBosToken: file.addBosToken ?? false,
-                visionConfig: vlmModel.configuration.vision
-            )
-        } else {
-            processor = GGUFUserInputProcessor(
-                tokenizer: tokenizer,
-                chatTemplate: chatTemplate,
-                bosToken: tokenizer.bosTokenID.flatMap { tokenizer.tokenToString($0) },
-                eosToken: tokenizer.eosTokenID.flatMap { tokenizer.tokenToString($0) },
-                addBosToken: file.addBosToken ?? false
-            )
-        }
+        let processor = result.makeProcessor(
+            tokenizer, chatTemplate, bosToken, eosToken, addBosToken)
 
-        // 7. Assemble context
+        // 11. Assemble load report
+        let loadReport = LoadReport(
+            modelResolution: modelResolution,
+            weightLoading: weightReport.weightLoading,
+            quantization: weightReport.quantization
+        )
+
+        // 12. Assemble context
         return ModelContext(
             configuration: modelConfig,
-            model: model,
+            model: result.model,
             processor: processor,
-            tokenizer: tokenizer
+            tokenizer: tokenizer,
+            loadReport: loadReport
         )
     }
 
     // MARK: - Weight Loading
 
+    /// Internal result from weight loading, used to build `LoadReport`.
+    private struct WeightLoadingResult {
+        let weightLoading: LoadReport.WeightLoading
+        let quantization: LoadReport.QuantizationApplied
+    }
+
     /// Load GGUF tensor data into a model, auto-detecting and fusing embedded LoRA weights.
+    ///
+    /// Returns structured facts about the loading process for diagnostic reporting.
     private func loadWeightsWithLoRA(
-        into model: any LanguageModel & Module,
+        into model: any LanguageModel,
         from file: GGUFFile,
         mapper: some GGUFTensorNameMapper,
         quantization: QuantizationConfiguration?
-    ) throws {
+    ) throws -> WeightLoadingResult {
         let bridge = GGUFTensorBridge()
         var weights: [String: MLXArray] = [:]
+        var skippedTensors: [String] = []
 
         for tensor in file.tensors {
             guard let mlxName = mapper.mlxName(for: tensor.name) else {
+                skippedTensors.append(tensor.name)
                 continue
             }
 
@@ -271,12 +248,16 @@ public struct GGUFModelLoader {
             weights[mlxName] = array
         }
 
+        let mappedCount = weights.count
+
         // Apply model-specific weight sanitization
         let sanitized = model.sanitize(weights: weights)
 
         // Check for embedded LoRA tensors
         let hasLoRA = sanitized.keys.contains { $0.contains("lora_a") }
         let hasDoRA = sanitized.keys.contains { $0.contains(".m") && sanitized.keys.contains($0.replacingOccurrences(of: ".m", with: ".lora_a")) }
+
+        var embeddedAdapter: LoadReport.EmbeddedAdapter?
 
         if hasLoRA {
             // Split base weights and LoRA weights
@@ -301,6 +282,14 @@ public struct GGUFModelLoader {
             let loraConfig = detectLoRAConfiguration(
                 from: loraWeights, isDora: hasDoRA, model: model)
 
+            // Record adapter facts
+            embeddedAdapter = LoadReport.EmbeddedAdapter(
+                type: hasDoRA ? .dora : .lora,
+                rank: loraConfig.loraParameters.rank,
+                layerCount: loraConfig.numLayers,
+                tensorCount: loraWeights.count
+            )
+
             // Create container and fuse
             let loraParams = ModuleParameters.unflattened(loraWeights)
             let container = LoRAContainer(configuration: loraConfig, parameters: loraParams)
@@ -315,15 +304,35 @@ public struct GGUFModelLoader {
         // MLX lazy evaluation fuses the dequant→requant pipeline so the F16
         // intermediate is never fully materialized in memory.
         let resolved = quantization ?? QuantizationConfiguration.detect(from: file)
+        let quantizationReport: LoadReport.QuantizationApplied
         if let config = resolved, config.isEnabled {
             quantize(
                 model: model,
                 groupSize: config.groupSize,
                 bits: config.bits
             )
+            quantizationReport = LoadReport.QuantizationApplied(
+                source: quantization != nil ? .userSpecified : .autoDetected,
+                bits: config.bits,
+                groupSize: config.groupSize
+            )
+        } else {
+            quantizationReport = LoadReport.QuantizationApplied(
+                source: .disabled, bits: 0, groupSize: 0
+            )
         }
 
         eval(model)
+
+        return WeightLoadingResult(
+            weightLoading: LoadReport.WeightLoading(
+                mappedCount: mappedCount,
+                skippedCount: skippedTensors.count,
+                skippedTensors: skippedTensors,
+                embeddedAdapter: embeddedAdapter
+            ),
+            quantization: quantizationReport
+        )
     }
 
     /// Check if a key is a DoRA magnitude parameter.

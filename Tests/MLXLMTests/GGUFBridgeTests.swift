@@ -77,10 +77,10 @@ struct LlamaTensorNameMapperTests {
     }
 }
 
-// MARK: - GGUFConfigExtractor Tests
+// MARK: - TransformerConfiguration GGUF Tests
 
-@Suite("GGUFConfigExtractor")
-struct GGUFConfigExtractorTests {
+@Suite("TransformerConfiguration from GGUF")
+struct TransformerConfigurationGGUFTests {
 
     /// Create a minimal GGUF file with specified metadata for testing.
     private func makeGGUFData(
@@ -130,7 +130,7 @@ struct GGUFConfigExtractorTests {
     @Test("Extract basic config")
     func basicConfig() throws {
         let file = try makeGGUFData()
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
 
         #expect(config.hiddenSize == 256)
         #expect(config.hiddenLayers == 2)
@@ -142,49 +142,49 @@ struct GGUFConfigExtractorTests {
     @Test("Custom feed forward length")
     func customFFN() throws {
         let file = try makeGGUFData(feedForwardLength: 512)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.intermediateSize == 512)
     }
 
     @Test("Default feed forward length is 4x hidden")
     func defaultFFN() throws {
         let file = try makeGGUFData()
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.intermediateSize == 1024) // 256 * 4
     }
 
     @Test("KV heads override")
     func kvHeads() throws {
         let file = try makeGGUFData(headCountKV: 2)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.kvHeads == 2)
     }
 
     @Test("RMS norm eps")
     func rmsEps() throws {
         let file = try makeGGUFData(rmsEps: 1e-6)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.normEps == 1e-6)
     }
 
     @Test("RoPE theta")
     func ropeTheta() throws {
         let file = try makeGGUFData(ropeFreqBase: 500_000.0)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.ropeTheta == 500_000.0)
     }
 
     @Test("Tie word embeddings when no output.weight tensor")
     func tieEmbeddings() throws {
         let file = try makeGGUFData(includeLmHead: false)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.tieWordEmbeddings == true)
     }
 
     @Test("No tie when output.weight tensor exists")
     func noTieEmbeddings() throws {
         let file = try makeGGUFData(includeLmHead: true)
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.tieWordEmbeddings == false)
     }
 
@@ -196,8 +196,8 @@ struct GGUFConfigExtractorTests {
         builder.addMetadata("llama.attention.head_count", value: .uint32(4))
         let file = try GGUFFile.parse(data: builder.build())
 
-        #expect(throws: GGUFLoadError.self) {
-            try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        #expect(throws: (any Error).self) {
+            try TransformerConfiguration(from: file)
         }
     }
 }
@@ -679,10 +679,10 @@ struct KVCacheTests {
     }
 }
 
-// MARK: - GGUFConfigExtractor Bias Detection Tests
+// MARK: - Bias Detection Tests
 
-@Suite("GGUFConfigExtractor Bias Detection")
-struct GGUFConfigExtractorBiasTests {
+@Suite("TransformerConfiguration Bias Detection")
+struct TransformerConfigurationBiasTests {
 
     @Test("Detect attention bias from tensor names")
     func detectAttentionBias() throws {
@@ -699,7 +699,7 @@ struct GGUFConfigExtractorBiasTests {
         builder.addTensor(name: "blk.0.attn_q.bias", shape: [64], type: .f32)
 
         let file = try GGUFFile.parse(data: builder.build())
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "qwen2", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.attentionBias == true)
     }
 
@@ -715,7 +715,7 @@ struct GGUFConfigExtractorBiasTests {
         builder.addMetadata("tokenizer.ggml.tokens", value: .array(tokens.map { .string($0) }))
 
         let file = try GGUFFile.parse(data: builder.build())
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.attentionBias == false)
     }
 
@@ -733,7 +733,7 @@ struct GGUFConfigExtractorBiasTests {
         builder.addTensor(name: "blk.0.ffn_gate.bias", shape: [64], type: .f32)
 
         let file = try GGUFFile.parse(data: builder.build())
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "qwen2", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.mlpBias == true)
     }
 }
@@ -850,7 +850,7 @@ struct E2EIntegrationTests {
         #expect(file.blockCount == 1)
 
         // Extract config
-        let config = try GGUFConfigExtractor.extractTransformerConfig(from: file, archHint: "llama", isMoE: false)
+        let config = try TransformerConfiguration(from: file)
         #expect(config.hiddenSize == 32)
         #expect(config.hiddenLayers == 1)
         #expect(config.intermediateSize == 64)
@@ -929,6 +929,169 @@ struct E2EIntegrationTests {
     }
 }
 
+// MARK: - LoadReport Tests
+
+@Suite("LoadReport")
+struct LoadReportTests {
+
+    /// Build a minimal GGUF for LoadReport testing.
+    private func buildTinyModelGGUF() -> Data {
+        let hidden = 32
+        let intermediate = 64
+        let vocabSize = 16
+        let heads = 2
+
+        var builder = GGUFTestBuilder()
+
+        builder.addMetadata("general.architecture", value: .string("llama"))
+        builder.addMetadata("llama.embedding_length", value: .uint32(UInt32(hidden)))
+        builder.addMetadata("llama.block_count", value: .uint32(1))
+        builder.addMetadata("llama.attention.head_count", value: .uint32(UInt32(heads)))
+        builder.addMetadata("llama.attention.head_count_kv", value: .uint32(UInt32(heads)))
+        builder.addMetadata("llama.feed_forward_length", value: .uint32(UInt32(intermediate)))
+        builder.addMetadata("llama.context_length", value: .uint32(512))
+
+        let tokens = (0..<vocabSize).map { "<tok\($0)>" }
+        builder.addMetadata("tokenizer.ggml.tokens", value: .array(tokens.map { .string($0) }))
+        builder.addMetadata("tokenizer.ggml.scores", value: .array((0..<vocabSize).map { .float32(Float(vocabSize - $0)) }))
+        builder.addMetadata("tokenizer.ggml.model", value: .string("llama"))
+        builder.addMetadata("tokenizer.ggml.bos_token_id", value: .uint32(0))
+        builder.addMetadata("tokenizer.ggml.eos_token_id", value: .uint32(UInt32(vocabSize - 1)))
+
+        builder.addTensor(name: "token_embd.weight", shape: [UInt64(hidden), UInt64(vocabSize)], type: .f32)
+        builder.addTensor(name: "output_norm.weight", shape: [UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.attn_norm.weight", shape: [UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.ffn_norm.weight", shape: [UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.attn_q.weight", shape: [UInt64(hidden), UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.attn_k.weight", shape: [UInt64(hidden), UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.attn_v.weight", shape: [UInt64(hidden), UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.attn_output.weight", shape: [UInt64(hidden), UInt64(hidden)], type: .f32)
+        builder.addTensor(name: "blk.0.ffn_gate.weight", shape: [UInt64(hidden), UInt64(intermediate)], type: .f32)
+        builder.addTensor(name: "blk.0.ffn_up.weight", shape: [UInt64(hidden), UInt64(intermediate)], type: .f32)
+        builder.addTensor(name: "blk.0.ffn_down.weight", shape: [UInt64(intermediate), UInt64(hidden)], type: .f32)
+
+        return builder.build()
+    }
+
+    @Test("LoadReport is populated when loading via GGUFModelLoader")
+    func reportIsPopulated() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+
+        #expect(context.loadReport != nil)
+    }
+
+    @Test("Model resolution records TransformerModel as fallback")
+    func modelResolution() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report_resolution.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+        let report = try #require(context.loadReport)
+
+        // Plain Llama GGUF with ffn_norm → no specialized model matches,
+        // falls through to TransformerModel (universal fallback)
+        #expect(report.modelResolution.selectedType.contains("TransformerModel"))
+        #expect(report.modelResolution.candidatesEvaluated == report.modelResolution.totalCandidates)
+    }
+
+    @Test("Weight loading counts mapped and skipped tensors")
+    func weightLoadingCounts() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report_weights.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+        let report = try #require(context.loadReport)
+
+        // 11 tensors in the GGUF, all should be mapped by LlamaTensorNameMapper
+        #expect(report.weightLoading.mappedCount == 11)
+        #expect(report.weightLoading.skippedCount == 0)
+        #expect(report.weightLoading.skippedTensors.isEmpty)
+    }
+
+    @Test("No embedded adapter for standard model")
+    func noEmbeddedAdapter() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report_nolora.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+        let report = try #require(context.loadReport)
+
+        #expect(report.weightLoading.embeddedAdapter == nil)
+    }
+
+    @Test("Quantization disabled for F32 model")
+    func quantizationDisabledForF32() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report_quant.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+        let report = try #require(context.loadReport)
+
+        // All tensors are F32, so no quantization should be auto-detected
+        #expect(report.quantization.source == .disabled)
+        #expect(report.quantization.bits == 0)
+    }
+
+    @Test("Summary produces readable output")
+    func summaryFormat() throws {
+        let ggufData = buildTinyModelGGUF()
+        let tempURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("test_report_summary.gguf")
+        try ggufData.write(to: tempURL)
+        defer { try? FileManager.default.removeItem(at: tempURL) }
+
+        let loader = GGUFModelLoader()
+        let context = try loader.loadContext(url: tempURL)
+        let report = try #require(context.loadReport)
+
+        let summary = report.summary
+        #expect(summary.contains("Model:"))
+        #expect(summary.contains("Tensors:"))
+        #expect(summary.contains("Quantization:"))
+    }
+
+    @Test("LoadReport is nil when ModelContext is constructed manually")
+    func manualContextHasNoReport() {
+        let tokenizer = MockTokenizer()
+        let context = ModelContext(
+            configuration: ModelConfiguration(name: "test"),
+            model: TransformerModel(TransformerConfiguration(
+                hiddenSize: 32, hiddenLayers: 1, intermediateSize: 64,
+                attentionHeads: 2, vocabularySize: 16
+            )),
+            processor: GGUFUserInputProcessor(
+                tokenizer: tokenizer, chatTemplate: nil,
+                bosToken: nil, eosToken: nil, addBosToken: false),
+            tokenizer: tokenizer
+        )
+
+        #expect(context.loadReport == nil)
+    }
+}
+
 // MARK: - Test Helpers
 
 /// Minimal mock tokenizer for testing.
@@ -950,6 +1113,12 @@ struct MockTokenizer: Tokenizer, @unchecked Sendable {
         if id == 1 { return "<s>" }
         if id == 2 { return "</s>" }
         return String(UnicodeScalar(id) ?? UnicodeScalar(0))
+    }
+
+    func tokenID(for string: String) -> Int? {
+        if string == "<s>" { return 1 }
+        if string == "</s>" { return 2 }
+        return nil
     }
 }
 

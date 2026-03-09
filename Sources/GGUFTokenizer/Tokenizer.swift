@@ -19,4 +19,10 @@ public protocol Tokenizer: Sendable {
 
     /// Convert a single token ID to its string representation.
     func tokenToString(_ id: Int) -> String?
+
+    /// Look up a token ID by its exact string representation.
+    ///
+    /// Used for resolving special token IDs (e.g., `<|vision_start|>`)
+    /// from the vocabulary without going through encode/decode.
+    func tokenID(for string: String) -> Int?
 }

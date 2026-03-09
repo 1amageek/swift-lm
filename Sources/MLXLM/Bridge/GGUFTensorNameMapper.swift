@@ -1,5 +1,5 @@
 /// Maps GGUF tensor names to MLX model weight paths.
-protocol GGUFTensorNameMapper {
+package protocol GGUFTensorNameMapper {
     /// Convert a GGUF tensor name to the corresponding MLX weight key.
     func mlxName(for ggufName: String) -> String?
 }

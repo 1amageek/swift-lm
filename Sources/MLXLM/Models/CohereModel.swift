@@ -1,4 +1,5 @@
 import Foundation
+import GGUFParser
 import MLX
 import MLXFast
 import MLXNN
@@ -58,6 +59,44 @@ struct CohereConfiguration: Sendable {
 
     var resolvedHeadDimensions: Int {
         headDimensions ?? (hiddenSize / attentionHeads)
+    }
+
+    // MARK: - GGUF Init
+
+    package init(from file: GGUFFile) throws {
+        let embed = try file.require(.embeddingLength)
+        let blocks = try file.require(.blockCount)
+        let heads = try file.require(.headCount)
+
+        let ffn = file[.feedForwardLength] ?? (embed * 4)
+        let kv = file[.headCountKV] ?? heads
+        let normEps = file[.attentionLayerNormEpsilon]
+            ?? file[.attentionLayerNormRMSEpsilon] ?? 1e-5
+        let ropeTheta = file[.ropeFreqBase] ?? 10_000.0
+        let vocabSize = file[.tokens]?.count ?? file[.vocabularyLength] ?? 0
+        let tieWordEmbeddings = detectTieWordEmbeddings(from: file)
+        let ropeScaling = extractRopeScaling(from: file)
+        let hasQKNorm = file.tensors.contains { $0.name == "blk.0.attn_q_norm.weight" }
+
+        let headDim: Int? = file[.attentionKeyLength]
+
+        self.init(
+            hiddenSize: embed,
+            hiddenLayers: blocks,
+            intermediateSize: ffn,
+            attentionHeads: heads,
+            headDimensions: headDim,
+            layerNormEps: normEps,
+            vocabularySize: vocabSize,
+            kvHeads: kv,
+            maxPositionEmbeddings: file[.contextLength],
+            ropeTheta: ropeTheta,
+            ropeTraditional: false,
+            ropeScaling: ropeScaling,
+            tieWordEmbeddings: tieWordEmbeddings,
+            useQKNorm: hasQKNorm,
+            logitScale: file[.logitScale]
+        )
     }
 }
 
@@ -273,6 +312,40 @@ class CohereModel: Module, LanguageModel, KVCacheDimensionProvider {
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         weights.filter { !$0.key.contains("self_attn.rotary_emb.inv_freq") }
+    }
+}
+
+// MARK: - GGUF Loading
+
+extension CohereModel: GGUFLoadableModel {
+
+    /// Detects Cohere by its unique parallel attention + FFN structure.
+    ///
+    /// Cohere uses a single shared norm (`input_layernorm`) without a separate
+    /// `post_attention_layernorm` (`ffn_norm`). Combined with QK normalization,
+    /// this combination uniquely identifies the architecture — other models
+    /// with QK norm (e.g. Qwen 3.5) still have `ffn_norm`.
+    package static func canLoad(from file: GGUFFile, context: GGUFLoadContext) -> Bool {
+        let hasQKNorm = file.tensors.contains { $0.name == "blk.0.attn_q_norm.weight" }
+        let hasFFNNorm = file.tensors.contains { $0.name == "blk.0.ffn_norm.weight" }
+        return hasQKNorm && !hasFFNNorm
+    }
+
+    package static func load(
+        from file: GGUFFile, context: GGUFLoadContext
+    ) throws -> GGUFLoadResult {
+        let config = try CohereConfiguration(from: file)
+        let model = CohereModel(config)
+
+        return GGUFLoadResult(
+            model: model,
+            mapper: CohereTensorNameMapper(),
+            makeProcessor: { tokenizer, chatTemplate, bosToken, eosToken, addBosToken in
+                GGUFUserInputProcessor(
+                    tokenizer: tokenizer, chatTemplate: chatTemplate,
+                    bosToken: bosToken, eosToken: eosToken, addBosToken: addBosToken)
+            }
+        )
     }
 }
 

@@ -31,19 +31,33 @@ struct GGUFVisionLoader {
             file.metadata["clip.vision.\(key)"]
         }
 
-        let hiddenSize = visionMeta("embedding_length")?.intValue ?? 1280
-        let depth = visionMeta("block_count")?.intValue ?? 32
-        let numHeads = visionMeta("head_count")?.intValue ?? 16
-        let intermediateSize = visionMeta("feed_forward_length")?.intValue ?? 3420
+        // Required fields — throw if missing
+        guard let hiddenSize = visionMeta("embedding_length")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.embedding_length")
+        }
+        guard let depth = visionMeta("block_count")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.block_count")
+        }
+        guard let numHeads = visionMeta("head_count")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.head_count")
+        }
+
+        // Optional fields with safe defaults
+        let intermediateSize = visionMeta("feed_forward_length")?.intValue ?? (hiddenSize * 4)
         let outHiddenSize = visionMeta("projection_dim")?.intValue ?? hiddenSize
         let patchSize = visionMeta("patch_size")?.intValue ?? 14
-        let windowSize = visionMeta("image_size")?.intValue ?? 112
+        let windowSize = visionMeta("image_size")?.intValue ?? (patchSize * 8)
+        let spatialMergeSize = file.metadata["clip.vision.spatial_merge_size"]?.intValue ?? 2
+        let normEps = visionMeta("attention.layer_norm_epsilon")?.float32Value ?? 1e-6
 
-        // Parse full attention block pattern from metadata
+        // Parse full attention block pattern from metadata, or compute from depth
         let fullAttBlocks = parseFullAttBlockIndexes(from: file, depth: depth)
 
-        // Spatial merge size
-        let spatialMergeSize = file.metadata["clip.vision.spatial_merge_size"]?.intValue ?? 2
+        // Image normalization from mmproj metadata
+        let imageMean = extractFloatArray(from: file, key: "clip.vision.image_mean",
+                                          fallback: [0.48145466, 0.4578275, 0.40821073])
+        let imageStd = extractFloatArray(from: file, key: "clip.vision.image_std",
+                                         fallback: [0.26862954, 0.26130258, 0.27577711])
 
         return Qwen25VLConfiguration.VisionConfiguration(
             hiddenSize: hiddenSize,
@@ -53,9 +67,11 @@ struct GGUFVisionLoader {
             outHiddenSize: outHiddenSize,
             patchSize: patchSize,
             spatialMergeSize: spatialMergeSize,
-            normEps: visionMeta("attention.layer_norm_epsilon")?.float32Value ?? 1e-6,
+            normEps: normEps,
             windowSize: windowSize,
-            fullAttBlockIndexes: fullAttBlocks
+            fullAttBlockIndexes: fullAttBlocks,
+            imageMean: imageMean,
+            imageStd: imageStd
         )
     }
 
@@ -72,11 +88,161 @@ struct GGUFVisionLoader {
             return indexes
         }
 
-        // Default: Qwen2.5-VL standard pattern
-        return [7, 15, 23, 31]
+        // Compute from depth: full attention every depth/4 blocks
+        let interval = max(1, depth / 4)
+        return Array(stride(from: interval - 1, to: depth, by: interval))
     }
 
-    // MARK: - Weight Loading
+    /// Extract a float array from GGUF metadata.
+    ///
+    /// GGUF stores arrays as `.array([GGUFMetadataValue])` with each element
+    /// being `.float32(Float)` or `.float64(Double)`.
+    private func extractFloatArray(from file: GGUFFile, key: String, fallback: [Float]) -> [Float] {
+        guard let value = file.metadata[key],
+              case .array(let elements) = value else {
+            return fallback
+        }
+        let floats = elements.compactMap { $0.float32Value }
+        return floats.isEmpty ? fallback : floats
+    }
+
+    // MARK: - Qwen 3.5 Vision Loading
+
+    /// Load Qwen 3.5 vision encoder from an mmproj GGUF file.
+    func loadQwen35(url: URL) throws -> (Qwen35VLVisionTransformer, Qwen35VLConfiguration.VisionConfiguration) {
+        let file = try GGUFFile.parse(url: url)
+        let config = try extractQwen35Config(from: file)
+        let encoder = Qwen35VLVisionTransformer(config)
+
+        try loadQwen35Weights(into: encoder, from: file)
+        eval(encoder)
+
+        return (encoder, config)
+    }
+
+    private func extractQwen35Config(from file: GGUFFile) throws -> Qwen35VLConfiguration.VisionConfiguration {
+        func visionMeta(_ key: String) -> GGUFMetadataValue? {
+            file.metadata["clip.vision.\(key)"]
+        }
+
+        guard let hiddenSize = visionMeta("embedding_length")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.embedding_length")
+        }
+        guard let depth = visionMeta("block_count")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.block_count")
+        }
+        guard let numHeads = visionMeta("head_count")?.intValue else {
+            throw GGUFLoadError.missingMetadata("clip.vision.head_count")
+        }
+
+        let intermediateSize = visionMeta("feed_forward_length")?.intValue ?? (hiddenSize * 4)
+        let outHiddenSize = visionMeta("projection_dim")?.intValue ?? hiddenSize
+        let patchSize = visionMeta("patch_size")?.intValue ?? 16
+        let spatialMergeSize = file.metadata["clip.vision.spatial_merge_size"]?.intValue ?? 2
+        let normEps = visionMeta("attention.layer_norm_epsilon")?.float32Value ?? 1e-6
+
+        let imageMean = extractFloatArray(from: file, key: "clip.vision.image_mean",
+                                          fallback: [0.48145466, 0.4578275, 0.40821073])
+        let imageStd = extractFloatArray(from: file, key: "clip.vision.image_std",
+                                         fallback: [0.26862954, 0.26130258, 0.27577711])
+
+        return Qwen35VLConfiguration.VisionConfiguration(
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            depth: depth,
+            numHeads: numHeads,
+            outHiddenSize: outHiddenSize,
+            patchSize: patchSize,
+            spatialMergeSize: spatialMergeSize,
+            normEps: normEps,
+            imageMean: imageMean,
+            imageStd: imageStd
+        )
+    }
+
+    private func loadQwen35Weights(
+        into encoder: Qwen35VLVisionTransformer,
+        from file: GGUFFile
+    ) throws {
+        let mapper = Qwen35VLVisionTensorNameMapper()
+        let bridge = GGUFTensorBridge()
+        var weights: [String: MLXArray] = [:]
+
+        for tensor in file.tensors {
+            guard let mlxName = mapper.mlxName(for: tensor.name) else {
+                continue
+            }
+            let data = try file.tensorData(for: tensor)
+            let array = try bridge.convert(tensor: tensor, data: data)
+            weights[mlxName] = array
+        }
+
+        // Handle split QKV
+        weights = fuseQwen35QKVIfNeeded(weights, depth: encoder.config.depth)
+
+        // Sanitize Conv2d weights
+        weights = sanitizeQwen35VisionWeights(weights)
+
+        let parameters = ModuleParameters.unflattened(weights)
+        try encoder.update(parameters: parameters, verify: .noUnusedKeys)
+    }
+
+    private func fuseQwen35QKVIfNeeded(
+        _ weights: [String: MLXArray], depth: Int
+    ) -> [String: MLXArray] {
+        var result = weights
+
+        for i in 0..<depth {
+            let prefix = "blocks.\(i).attn"
+            let qKey = "\(prefix).q_proj.weight"
+            let kKey = "\(prefix).k_proj.weight"
+            let vKey = "\(prefix).v_proj.weight"
+            let qkvKey = "\(prefix).qkv.weight"
+
+            if let q = result[qKey], let k = result[kKey], let v = result[vKey],
+               result[qkvKey] == nil {
+                result[qkvKey] = concatenated([q, k, v], axis: 0)
+                result.removeValue(forKey: qKey)
+                result.removeValue(forKey: kKey)
+                result.removeValue(forKey: vKey)
+            }
+
+            let qBias = "\(prefix).q_proj.bias"
+            let kBias = "\(prefix).k_proj.bias"
+            let vBias = "\(prefix).v_proj.bias"
+            let qkvBias = "\(prefix).qkv.bias"
+
+            if let qb = result[qBias], let kb = result[kBias], let vb = result[vBias],
+               result[qkvBias] == nil {
+                result[qkvBias] = concatenated([qb, kb, vb], axis: 0)
+                result.removeValue(forKey: qBias)
+                result.removeValue(forKey: kBias)
+                result.removeValue(forKey: vBias)
+            }
+        }
+
+        return result
+    }
+
+    private func sanitizeQwen35VisionWeights(_ weights: [String: MLXArray]) -> [String: MLXArray] {
+        var result = weights
+
+        for key in Array(result.keys) {
+            guard let w = result[key] else { continue }
+
+            // Conv2d patch embedding: PyTorch [O, I, H, W] -> MLX [O, H, W, I]
+            if key.contains("patch_embed.proj.weight") && w.ndim == 4 {
+                let shape = w.shape
+                if shape[1] == 3 || shape[1] == 1 {
+                    result[key] = w.transposed(0, 2, 3, 1)
+                }
+            }
+        }
+
+        return result
+    }
+
+    // MARK: - Qwen 2.5-VL Weight Loading
 
     private func loadWeights(
         into encoder: Qwen25VLVisionTransformer,
@@ -117,7 +283,7 @@ struct GGUFVisionLoader {
         var result = weights
 
         for i in 0..<encoder.config.depth {
-            let prefix = "visual.blocks.\(i).attn"
+            let prefix = "blocks.\(i).attn"
             let qKey = "\(prefix).q_proj.weight"
             let kKey = "\(prefix).k_proj.weight"
             let vKey = "\(prefix).v_proj.weight"
@@ -154,8 +320,8 @@ struct GGUFVisionLoader {
     private func fusePatchEmbedIfNeeded(_ weights: [String: MLXArray]) -> [String: MLXArray] {
         var result = weights
 
-        let w0Key = "visual.patch_embed.proj.weight"
-        let w1Key = "visual.patch_embed.proj.weight.1"
+        let w0Key = "patch_embed.proj.weight"
+        let w1Key = "patch_embed.proj.weight.1"
 
         if let w0 = result[w0Key], let w1 = result[w1Key] {
             // w0, w1 are Conv2d weights: [O, H, W, I]

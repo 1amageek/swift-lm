@@ -242,6 +242,10 @@ struct SentencePieceBPETokenizer: Tokenizer, Sendable {
         return vocabulary[id]
     }
 
+    func tokenID(for string: String) -> Int? {
+        tokenToID[string]
+    }
+
     // MARK: - Helpers
 
     /// Expand a preprocessed string into initial BPE symbols.

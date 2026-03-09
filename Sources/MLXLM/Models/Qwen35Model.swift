@@ -1,4 +1,5 @@
 import Foundation
+import GGUFParser
 import MLX
 import MLXFast
 import MLXNN
@@ -44,6 +45,13 @@ struct Qwen35Configuration: Sendable {
 
     var fullAttentionInterval: Int
 
+    // MARK: M-RoPE (VLM only)
+
+    /// M-RoPE section sizes for interleaved position encoding.
+    /// Set by the VLM loader (e.g. `[11, 11, 10]` for Qwen 3.5).
+    /// `nil` for text-only mode (standard partial RoPE).
+    var mropeSections: [Int]?
+
     // MARK: Computed
 
     var keyDim: Int { linearKeyHeads * linearKeyHeadDim }
@@ -53,6 +61,56 @@ struct Qwen35Configuration: Sendable {
 
     func isFullAttentionLayer(_ index: Int) -> Bool {
         (index + 1) % fullAttentionInterval == 0
+    }
+}
+
+// MARK: - GGUF Init
+
+extension Qwen35Configuration {
+
+    package init(from file: GGUFFile) throws {
+        let embed = try file.require(.embeddingLength)
+        let blocks = try file.require(.blockCount)
+        let heads = try file.require(.headCount)
+
+        let ffn = file[.feedForwardLength] ?? (embed * 4)
+        let kv = file[.headCountKV] ?? heads
+        let normEps = file[.attentionLayerNormRMSEpsilon] ?? 1e-5
+        let ropeTheta = file[.ropeFreqBase] ?? 10_000.0
+        let vocabSize = file[.tokens]?.count ?? file[.vocabularyLength] ?? 0
+        let tieWordEmbeddings = detectTieWordEmbeddings(from: file)
+        let ropeScaling = extractRopeScaling(from: file)
+
+        guard let linearKeyHeads = file[.ssmGroupCount] else {
+            throw GGUFLoadError.missingMetadata("ssm.group_count")
+        }
+
+        let linearKeyHeadDim = file[.ssmStateSize] ?? 128
+        let convKernelSize = file[.ssmConvKernel] ?? 4
+        let fullAttInterval = file[.fullAttentionInterval] ?? 4
+        let partialRotary = file[.partialRotaryFactor] ?? 0.25
+        let headDim = file[.attentionKeyLength] ?? embed / heads
+
+        self.hiddenSize = embed
+        self.hiddenLayers = blocks
+        self.intermediateSize = ffn
+        self.vocabularySize = vocabSize
+        self.normEps = normEps
+        self.tieWordEmbeddings = tieWordEmbeddings
+        self.attentionHeads = heads
+        self.kvHeads = kv
+        self.headDim = headDim
+        self.ropeTheta = ropeTheta
+        self.ropeTraditional = false
+        self.ropeScaling = ropeScaling
+        self.maxPositionEmbeddings = file[.contextLength]
+        self.partialRotaryFactor = partialRotary
+        self.linearKeyHeads = linearKeyHeads
+        self.linearValueHeads = linearKeyHeads
+        self.linearKeyHeadDim = linearKeyHeadDim
+        self.linearValueHeadDim = linearKeyHeadDim
+        self.convKernelSize = convKernelSize
+        self.fullAttentionInterval = fullAttInterval
     }
 }
 
@@ -302,7 +360,8 @@ class Qwen35FullAttention: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
         let (B, L) = (x.dim(0), x.dim(1))
 
@@ -317,16 +376,23 @@ class Qwen35FullAttention: Module {
         keys = kNorm(keys).transposed(0, 2, 1, 3)
         values = values.transposed(0, 2, 1, 3)
 
-        let offset = cache?.offset ?? 0
-        let rpd = config.ropePartialDim
-        if rpd < config.headDim {
-            let qRot = rope(q[0..., 0..., 0..., 0..<rpd], offset: offset)
-            let kRot = rope(keys[0..., 0..., 0..., 0..<rpd], offset: offset)
-            q = concatenated([qRot, q[0..., 0..., 0..., rpd...]], axis: -1)
-            keys = concatenated([kRot, keys[0..., 0..., 0..., rpd...]], axis: -1)
+        if let positionIds {
+            // Interleaved M-RoPE for VLM mode
+            q = applyInterleavedMRoPE(q, positionIds: positionIds)
+            keys = applyInterleavedMRoPE(keys, positionIds: positionIds)
         } else {
-            q = rope(q, offset: offset)
-            keys = rope(keys, offset: offset)
+            // Standard partial RoPE with cache offset
+            let offset = cache?.offset ?? 0
+            let rpd = config.ropePartialDim
+            if rpd < config.headDim {
+                let qRot = rope(q[0..., 0..., 0..., 0..<rpd], offset: offset)
+                let kRot = rope(keys[0..., 0..., 0..., 0..<rpd], offset: offset)
+                q = concatenated([qRot, q[0..., 0..., 0..., rpd...]], axis: -1)
+                keys = concatenated([kRot, keys[0..., 0..., 0..., rpd...]], axis: -1)
+            } else {
+                q = rope(q, offset: offset)
+                keys = rope(keys, offset: offset)
+            }
         }
 
         if let cache {
@@ -341,6 +407,66 @@ class Qwen35FullAttention: Module {
         var output = attnOut.transposed(0, 2, 1, 3).reshaped(B, L, -1)
         output = output * sigmoid(gate)
         return wo(output)
+    }
+
+    /// Apply interleaved M-RoPE for VLM mode.
+    ///
+    /// Sections `[11, 11, 10]` are interleaved: dim_i uses axis `(section_index % 3)`.
+    /// Only applies to the first `ropePartialDim` dimensions of the head.
+    private func applyInterleavedMRoPE(
+        _ x: MLXArray, positionIds: MLXArray
+    ) -> MLXArray {
+        // x: [B, H, S, D=headDim], positionIds: [3, B, S]
+        let rpd = config.ropePartialDim  // 64
+        let halfRpd = rpd / 2  // 32
+
+        let freqExponents = MLXArray(stride(from: Float(0), to: Float(halfRpd), by: 1.0))
+        let invFreq = 1.0 / pow(MLXArray(config.ropeTheta), freqExponents / Float(halfRpd))
+
+        // Precompute per-axis frequencies: positions x invFreq -> [B, S, halfRpd]
+        var axisFreqs = [MLXArray]()
+        for axis in 0..<3 {
+            let positions = positionIds[axis].asType(DType.float32)
+            let f = expandedDimensions(positions, axis: -1) * invFreq.reshaped(1, 1, halfRpd)
+            axisFreqs.append(f)
+        }
+
+        // Interleave: assign dims to axes based on section boundaries
+        // e.g. sections=[11,11,10] -> dims 0-10 use axis 0, 11-21 use axis 1, 22-31 use axis 2
+        guard let sections = config.mropeSections else {
+            fatalError("mropeSections must be set for interleaved M-RoPE (VLM mode)")
+        }
+        var cosSlices = [MLXArray]()
+        var sinSlices = [MLXArray]()
+        var dimOffset = 0
+
+        for (sectionIdx, sectionSize) in sections.enumerated() {
+            let axisIdx = sectionIdx % 3
+            let slice = axisFreqs[axisIdx][0..., 0..., dimOffset..<(dimOffset + sectionSize)]
+            cosSlices.append(cos(slice))
+            sinSlices.append(sin(slice))
+            dimOffset += sectionSize
+        }
+
+        let cosHalf = concatenated(cosSlices, axis: -1)  // [B, S, 32]
+        let sinHalf = concatenated(sinSlices, axis: -1)
+        let cosEmb = concatenated([cosHalf, cosHalf], axis: -1)  // [B, S, 64]
+        let sinEmb = concatenated([sinHalf, sinHalf], axis: -1)
+
+        // Apply rotate-half to first rpd dims, pass through rest
+        let xRot = x[0..., 0..., 0..., ..<rpd]
+        let xPass = x[0..., 0..., 0..., rpd...]
+
+        let cos4d = cosEmb.expandedDimensions(axis: 1)  // [B, 1, S, 64]
+        let sin4d = sinEmb.expandedDimensions(axis: 1)
+
+        let half = rpd / 2
+        let x1 = xRot[0..., 0..., 0..., ..<half]
+        let x2 = xRot[0..., 0..., 0..., half...]
+        let rotated = concatenated([-x2, x1], axis: -1)
+
+        let xRotated = xRot * cos4d + rotated * sin4d
+        return concatenated([xRotated, xPass], axis: -1)
     }
 }
 
@@ -393,12 +519,14 @@ class Qwen35DecoderLayer: Module {
     }
 
     func callAsFunction(
-        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?
+        _ x: MLXArray, mask: MLXFast.ScaledDotProductAttentionMaskMode, cache: KVCache?,
+        positionIds: MLXArray? = nil
     ) -> MLXArray {
         let r: MLXArray
         if isFullAttention, let attn = fullAttn {
-            r = attn(inputLayerNorm(x), mask: mask, cache: cache)
+            r = attn(inputLayerNorm(x), mask: mask, cache: cache, positionIds: positionIds)
         } else if let dn = deltaNet {
+            // DeltaNet has no RoPE — positionIds are ignored
             r = dn(inputLayerNorm(x), cache: cache as? DeltaNetCache)
         } else {
             fatalError("Layer has neither full attention nor DeltaNet")
@@ -428,8 +556,12 @@ class Qwen35ModelInner: Module {
         self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
     }
 
-    func callAsFunction(_ inputs: MLXArray, cache: [KVCache]? = nil) -> MLXArray {
-        var h = embedTokens(inputs)
+    func callAsFunction(
+        _ inputs: MLXArray, cache: [KVCache]? = nil,
+        inputEmbeddings: MLXArray? = nil,
+        positionIds: MLXArray? = nil
+    ) -> MLXArray {
+        var h = inputEmbeddings ?? embedTokens(inputs)
         for (i, layer) in layers.enumerated() {
             let mask: MLXFast.ScaledDotProductAttentionMaskMode
             if layer.isFullAttention && h.dim(1) > 1 {
@@ -437,7 +569,7 @@ class Qwen35ModelInner: Module {
             } else {
                 mask = .none
             }
-            h = layer(h, mask: mask, cache: cache?[i])
+            h = layer(h, mask: mask, cache: cache?[i], positionIds: positionIds)
         }
         return norm(h)
     }
@@ -515,6 +647,34 @@ class Qwen35Model: Module, LanguageModel, KVCacheDimensionProvider {
             }
         }
         return result
+    }
+}
+
+// MARK: - GGUF Loading
+
+extension Qwen35Model: GGUFLoadableModel {
+
+    /// Detects Qwen 3.5 by the presence of DeltaNet SSM tensors (text-only).
+    package static func canLoad(from file: GGUFFile, context: GGUFLoadContext) -> Bool {
+        context.mmprojURL == nil
+            && file.tensors.contains { $0.name == "blk.0.ssm_beta.weight" }
+    }
+
+    package static func load(
+        from file: GGUFFile, context: GGUFLoadContext
+    ) throws -> GGUFLoadResult {
+        let config = try Qwen35Configuration(from: file)
+        let model = Qwen35Model(config)
+
+        return GGUFLoadResult(
+            model: model,
+            mapper: Qwen35TensorNameMapper(),
+            makeProcessor: { tokenizer, chatTemplate, bosToken, eosToken, addBosToken in
+                GGUFUserInputProcessor(
+                    tokenizer: tokenizer, chatTemplate: chatTemplate,
+                    bosToken: bosToken, eosToken: eosToken, addBosToken: addBosToken)
+            }
+        )
     }
 }
 

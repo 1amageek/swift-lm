@@ -67,7 +67,7 @@ struct TokenIterator: Sequence, IteratorProtocol {
                     switch result {
                     case .tokens(let remaining):
                         inputText = remaining
-                        fullInput = LMInput(text: inputText)
+                        fullInput = LMInput(text: inputText, image: fullInput.image, video: fullInput.video)
                         continue
                     case .logits(let logits):
                         output = logits

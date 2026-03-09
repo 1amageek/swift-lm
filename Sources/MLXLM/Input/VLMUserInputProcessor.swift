@@ -2,32 +2,39 @@ import CoreImage
 import MLX
 import GGUFTokenizer
 
-/// Vision-aware input processor for Qwen2.5-VL.
+/// Vision-aware input processor for VLMs.
 ///
 /// Extends the standard GGUF text processing with image preprocessing:
-/// inserts `<|vision_start|><|image_pad|>...<|vision_end|>` tokens and
-/// builds ``LMInput/ProcessedImage`` for the vision encoder.
+/// inserts vision placeholder tokens and builds ``LMInput/ProcessedImage``
+/// for the vision encoder. All token IDs come from ``VLMInputConfig``.
 struct VLMUserInputProcessor: UserInputProcessor {
 
+    /// Closure that preprocesses a single image into pixel tensor + grid info.
+    typealias ImagePreprocessor = @Sendable (CIImage) throws -> (MLXArray, LMInput.THW)
+
     private let textProcessor: GGUFUserInputProcessor
-    private let imageProcessor: Qwen25VLImageProcessor
+    private let preprocessImage: ImagePreprocessor
     private let tokenizer: any Tokenizer
 
     /// Token IDs for vision placeholder markup.
     private let visionStartTokenId: Int
     private let visionEndTokenId: Int
     private let imagePadTokenId: Int
+    private let videoPadTokenId: Int
+    private let spatialMergeSize: Int
 
+    /// Create a VLM input processor from any ``VLMInputConfig`` and image preprocessor.
     init(
         tokenizer: any Tokenizer,
         chatTemplate: String?,
         bosToken: String?,
         eosToken: String?,
         addBosToken: Bool,
-        visionConfig: Qwen25VLConfiguration.VisionConfiguration
+        vlmInputConfig: any VLMInputConfig,
+        preprocessImage: @escaping ImagePreprocessor
     ) {
         self.tokenizer = tokenizer
-        self.imageProcessor = Qwen25VLImageProcessor(config: visionConfig)
+        self.preprocessImage = preprocessImage
 
         self.textProcessor = GGUFUserInputProcessor(
             tokenizer: tokenizer,
@@ -37,11 +44,11 @@ struct VLMUserInputProcessor: UserInputProcessor {
             addBosToken: addBosToken
         )
 
-        // Qwen2.5-VL special tokens
-        // <|vision_start|> = 151652, <|vision_end|> = 151653, <|image_pad|> = 151655
-        self.visionStartTokenId = 151652
-        self.visionEndTokenId = 151653
-        self.imagePadTokenId = 151655
+        self.visionStartTokenId = vlmInputConfig.visionStartTokenId
+        self.visionEndTokenId = vlmInputConfig.visionEndTokenId
+        self.imagePadTokenId = vlmInputConfig.imageTokenId
+        self.videoPadTokenId = vlmInputConfig.videoTokenId
+        self.spatialMergeSize = vlmInputConfig.spatialMergeSize
     }
 
     func prepare(input: UserInput) async throws -> LMInput {
@@ -58,7 +65,7 @@ struct VLMUserInputProcessor: UserInputProcessor {
 
         for inputImage in images {
             let ciImage = try inputImage.asCIImage()
-            let (pixels, thw) = try imageProcessor.preprocess(image: ciImage)
+            let (pixels, thw) = try preprocessImage(ciImage)
             allPixels.append(pixels)
             allTHW.append(thw)
         }
@@ -92,7 +99,7 @@ struct VLMUserInputProcessor: UserInputProcessor {
         tokens: MLXArray,
         grids: [LMInput.THW]
     ) -> MLXArray {
-        let spatialMerge = imageProcessor.imageFactor / 14  // spatialMergeSize
+        let spatialMerge = spatialMergeSize
         var tokenList: [Int32] = []
         let flatTokens: [Int32] = (0..<tokens.dim(tokens.ndim - 1)).map { i in
             tokens[0, i].item()
@@ -120,8 +127,10 @@ struct VLMUserInputProcessor: UserInputProcessor {
                     tokenList.append(Int32(imagePadTokenId))
                 }
 
-                // Skip existing image_pad tokens in the original sequence
-                while i < flatTokens.count && flatTokens[i] == Int32(imagePadTokenId) {
+                // Skip existing image_pad or video_pad tokens in the original sequence
+                while i < flatTokens.count
+                    && (flatTokens[i] == Int32(imagePadTokenId) || flatTokens[i] == Int32(videoPadTokenId))
+                {
                     i += 1
                 }
 
