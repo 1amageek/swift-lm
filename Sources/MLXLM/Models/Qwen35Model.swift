@@ -163,22 +163,21 @@ final class DeltaNetCache: KVCache, @unchecked Sendable {
 
 /// RMSNorm with SiLU gating for DeltaNet output.
 ///
-/// RMSNorm with SiLU gating for DeltaNet output.
-///
-/// Matches LoweredDeltaNet convention: `rmsNorm(x, weight: 1+w) * silu(gate)`.
-/// Uses `(1 + weight)` scaling with zero-initialized weight (HuggingFace convention).
+/// HuggingFace `Qwen3_5RMSNormGated`: initializes weight to `torch.ones(dim)`,
+/// applies `self.weight * rms_norm(x) * silu(gate)`.
+/// GGUF stores the trained weight values directly (near 1.0).
 class Qwen35GatedRMSNorm: Module {
 
     let weight: MLXArray
     let eps: Float
 
     init(dimensions: Int, eps: Float = 1e-5) {
-        self.weight = MLXArray.zeros([dimensions])
+        self.weight = MLXArray.ones([dimensions])
         self.eps = eps
     }
 
     func callAsFunction(_ x: MLXArray, gate: MLXArray) -> MLXArray {
-        MLXFast.rmsNorm(x, weight: 1 + weight, eps: eps) * silu(gate)
+        MLXFast.rmsNorm(x, weight: weight, eps: eps) * silu(gate)
     }
 }
 
