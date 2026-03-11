@@ -34,14 +34,15 @@ private struct ConversionState: Sendable {
 public struct GGUFModelLoader {
 
     private let modelTypes: [any GGUFLoadableModel.Type]
-
     /// Default initializer with all built-in model types.
     public init() {
         self.modelTypes = Self.defaultModelTypes
     }
 
     /// Package-internal initializer for custom model type lists.
-    package init(modelTypes: [any GGUFLoadableModel.Type]) {
+    package init(
+        modelTypes: [any GGUFLoadableModel.Type]
+    ) {
         self.modelTypes = modelTypes
     }
 
@@ -518,37 +519,23 @@ public struct GGUFModelLoader {
         let file = try GGUFFile.parse(url: url)
         print("[GGUFModelLoader] parsed: architecture=\(file.architecture ?? "unknown") tensors=\(file.tensors.count)")
 
-        // Create tokenizer (needed for ModelContext)
-        let tokenizer = try GGUFTokenizerFactory.create(from: file)
-        let loadContext = GGUFLoadContext(tokenizer: tokenizer, mmprojURL: nil)
+        // GGUFGraphBuilder: GGUF → IR direct (no DSL intermediate)
+        let graphBuilder = GGUFGraphBuilder()
+        let buildResult = try graphBuilder.build(file: file)
+        let mapper = graphBuilder.mapper(for: buildResult.architecture)
+        let sanitize = GGUFGraphBuilder.sanitizeWeights
+        print("[GGUFModelLoader] detected architecture: \(buildResult.architecture)")
 
-        // Find a compilable model type that matches this GGUF
-        var selectedType: (any GGUFCompilableModel.Type)?
-        for modelType in modelTypes {
-            guard let compilableType = modelType as? any GGUFCompilableModel.Type,
-                  compilableType.canLoad(from: file, context: loadContext)
-            else { continue }
-            selectedType = compilableType
-            break
-        }
+        let lowered = try compileFromGraph(
+            from: file, graph: buildResult.graph, mapper: mapper,
+            sanitize: sanitize)
 
-        guard let compilableType = selectedType else {
-            throw GGUFLoadError.unsupportedArchitecture(
-                "No GGUFCompilableModel found for architecture=\(file.architecture ?? "unknown")")
-        }
-        print("[GGUFModelLoader] compilable type: \(compilableType)")
-
-        // Build ModelComponent declaration and compile
-        let result = try compilableType.load(from: file, context: loadContext)
-        let declaration = try compilableType.makeModelDeclaration(from: file)
-        let lowered = try compileModel(
-            from: file, declaration: declaration, mapper: result.mapper,
-            compilableType: compilableType)
-
-        // Wrap in CompiledLanguageModel adapter
+        // Wrap in LanguageModel adapter
         let compiledModel = CompiledLanguageModel(lowered: lowered)
 
-        // Build model configuration
+        // Tokenizer + config + processor
+        let tokenizer = try GGUFTokenizerFactory.create(from: file)
+
         var eosTokenIds = Set<Int>()
         if let eosId = file.eosTokenID {
             eosTokenIds.insert(eosId)
@@ -576,14 +563,14 @@ public struct GGUFModelLoader {
             }
         }
 
-        // Build user input processor
         let chatTemplate = file.chatTemplate
         let bosToken = tokenizer.bosTokenID.flatMap { tokenizer.tokenToString($0) }
         let eosToken = tokenizer.eosTokenID.flatMap { tokenizer.tokenToString($0) }
         let addBosToken = file.addBosToken ?? false
 
-        let processor = result.makeProcessor(
-            tokenizer, chatTemplate, bosToken, eosToken, addBosToken)
+        let processor = GGUFUserInputProcessor(
+            tokenizer: tokenizer, chatTemplate: chatTemplate,
+            bosToken: bosToken, eosToken: eosToken, addBosToken: addBosToken)
 
         print("[GGUFModelLoader] compiled ready: \(modelConfig.name) cacheSlots=\(lowered.metadata.cacheSlotCount) eos=\(modelConfig.eosTokenIds)")
         return ModelContext(
@@ -594,34 +581,20 @@ public struct GGUFModelLoader {
         )
     }
 
-    /// Compile a model graph from GGUF tensor data.
-    ///
-    /// Internal helper shared by `loadCompiledContext` and direct compilation paths.
-    private func compileModel(
+    /// Compile a ModelGraph (from GGUFGraphBuilder) with bound weights into an inference model.
+    private func compileFromGraph(
         from file: GGUFFile,
-        declaration: some ModelComponent,
+        graph: ModelGraph,
         mapper: some GGUFTensorNameMapper,
-        compilableType: any GGUFCompilableModel.Type
+        sanitize: @Sendable ([String: TensorData]) -> [String: TensorData]
     ) throws -> MLXLoweredInferenceModel {
-        // 1. Build ModelGraph from declaration
-        let normalized = try declaration.makeNormalizedModel()
-        let graph = normalized.graph
-        print("[SwiftLM] architecture dump:\n\(ModelGraphDumper.dump(normalized))")
-
-        // 2. Convert GGUF tensors to RawWeights (keyed by MLX weight paths)
         let rawWeights = try buildRawWeights(from: file, mapper: mapper)
+        let sanitizedWeights = RawWeights(tensors: sanitize(rawWeights.tensors))
 
-        // 3. Apply model-specific weight sanitization (compiled path equivalent of sanitize(weights:))
-        let sanitizedTensors = compilableType.sanitizeCompiledWeights(rawWeights.tensors)
-        let sanitizedWeights = RawWeights(tensors: sanitizedTensors)
-
-        // 4. Bind weights to ParameterSlots
         let binder = MLXWeightPathBinder()
         let boundWeights = try binder.bind(sanitizedWeights, to: graph)
 
-        // 5. Compile
-        let compiler = MLXInferenceCompiler()
-        return try compiler.compile(graph: graph, weights: boundWeights)
+        return try MLXInferenceCompiler().compile(graph: graph, weights: boundWeights)
     }
 
     /// Convert GGUF tensors to `RawWeights` keyed by MLX weight paths.

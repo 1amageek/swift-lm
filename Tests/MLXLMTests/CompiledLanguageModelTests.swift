@@ -115,7 +115,7 @@ private func compileModel(layerCount: Int) throws -> CompiledLanguageModel {
 
 // MARK: - CompiledKVCache Tests
 
-@Suite("CompiledKVCache", .tags(.unit, .compiled))
+@Suite("CompiledKVCache", .serialized, .tags(.unit, .compiled))
 struct CompiledKVCacheTests {
 
     @Test("Offset reflects nextPosition from InferenceState")
@@ -186,7 +186,7 @@ struct CompiledKVCacheTests {
 
 // MARK: - CompiledLanguageModel Protocol Conformance Tests
 
-@Suite("CompiledLanguageModel", .tags(.integration, .compiled))
+@Suite("CompiledLanguageModel", .serialized, .tags(.integration, .compiled))
 struct CompiledLanguageModelTests {
 
     @Test("Conforms to LanguageModel protocol")
@@ -384,7 +384,7 @@ struct CompiledLanguageModelTests {
 
 // MARK: - P1: Sanitize Equivalence Tests
 
-@Suite("CompiledPathSanitize", .tags(.unit, .compiled))
+@Suite("CompiledPathSanitize", .serialized, .tags(.unit, .compiled))
 struct CompiledPathSanitizeTests {
 
     @Test("Default sanitizeCompiledWeights filters rotary_emb.inv_freq")
@@ -398,7 +398,7 @@ struct CompiledPathSanitizeTests {
         weights["model.layers.0.self_attn.rotary_emb.inv_freq"] = TensorData(
             shape: [2], dtype: .float32, storage: MLXTensorStorage.dense(invFreq))
 
-        let sanitized = TransformerModel.sanitizeCompiledWeights(weights)
+        let sanitized = GGUFGraphBuilder.sanitizeWeights(weights)
 
         #expect(sanitized.count == 1)
         #expect(sanitized["model.layers.0.self_attn.q_proj.weight"] != nil)
@@ -416,7 +416,7 @@ struct CompiledPathSanitizeTests {
         weights["model.layers.0.self_attn.q_proj.weight"] = TensorData(
             shape: [4, 4], dtype: .float16, storage: MLXTensorStorage.dense(normalWeight))
 
-        let sanitized = Qwen35Model.sanitizeCompiledWeights(weights)
+        let sanitized = GGUFGraphBuilder.sanitizeWeights(weights)
 
         #expect(sanitized.count == 2)
 
@@ -447,7 +447,7 @@ struct CompiledPathSanitizeTests {
         weights["model.layers.0.linear_attn.conv1d.weight"] = TensorData(
             shape: [6, 2, 4], dtype: .float16, storage: MLXTensorStorage.dense(conv3d))
 
-        let sanitized = Qwen35Model.sanitizeCompiledWeights(weights)
+        let sanitized = GGUFGraphBuilder.sanitizeWeights(weights)
 
         guard let convTD = sanitized["model.layers.0.linear_attn.conv1d.weight"] else {
             Issue.record("conv1d.weight missing after sanitize")
@@ -467,7 +467,7 @@ struct CompiledPathSanitizeTests {
             shape: [4, 4], dtype: .float16,
             storage: MLXTensorStorage.dense(MLXRandom.normal([4, 4])))
 
-        let sanitized = Qwen35Model.sanitizeCompiledWeights(weights)
+        let sanitized = GGUFGraphBuilder.sanitizeWeights(weights)
         #expect(sanitized["model.layers.0.self_attn.rotary_emb.inv_freq"] == nil)
         #expect(sanitized["model.layers.0.self_attn.q_proj.weight"] != nil)
     }
@@ -494,7 +494,7 @@ struct CompiledPathSanitizeTests {
 
 // MARK: - P2: PromptCacheSnapshot Interop Tests
 
-@Suite("CompiledKVCacheSnapshot", .tags(.integration, .compiled))
+@Suite("CompiledKVCacheSnapshot", .serialized, .tags(.integration, .compiled))
 struct CompiledKVCacheSnapshotTests {
 
     @Test("state getter returns non-empty arrays after prefill")
@@ -630,7 +630,7 @@ struct CompiledKVCacheSnapshotTests {
 
 // MARK: - Binder Tests (retained from original)
 
-@Suite("CompiledPathBinder", .tags(.unit, .compiled))
+@Suite("CompiledPathBinder", .serialized, .tags(.unit, .compiled))
 struct CompiledPathBinderTests {
 
     @Test("MLXWeightPathBinder skips RawWeights tensors not matching any slot")
@@ -688,7 +688,7 @@ struct CompiledPathBinderTests {
 
 // MARK: - Integration: End-to-End Pipeline Tests
 
-@Suite("CompiledPipelineIntegration", .tags(.integration, .compiled))
+@Suite("CompiledPipelineIntegration", .serialized, .tags(.integration, .compiled))
 struct CompiledPipelineIntegrationTests {
 
     @Test("Compiled model works with TokenIterator-style usage pattern")

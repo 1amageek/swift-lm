@@ -20,7 +20,7 @@ import SwiftLM
 ///     weights: boundWeights
 /// )
 /// ```
-public struct MLXCompiler: ModelCompiler, Sendable {
+public struct MLXCompiler: Sendable {
 
     public init() {}
 

@@ -259,36 +259,6 @@ struct ModelGraphTests {
         #expect(kinds.count == 3)
     }
 
-    @Test("LoweredGraph Codable roundtrip")
-    func loweredGraphCodableRoundtrip() throws {
-        let lowered = LoweredGraph(
-            nodes: [
-                LoweredNode(id: 0, op: .gather),
-                LoweredNode(id: 1, op: .matmul, inputs: [0]),
-                LoweredNode(id: 2, op: .ropeApply, inputs: [1]),
-                LoweredNode(id: 3, op: .sdpa, inputs: [1, 2]),
-                LoweredNode(id: 4, op: .activation(.silu), inputs: [3]),
-                LoweredNode(id: 5, op: .rmsNorm, inputs: [4]),
-                LoweredNode(id: 6, op: .add, inputs: [0, 5]),
-                LoweredNode(id: 7, op: .softmax, inputs: [6]),
-                LoweredNode(id: 8, op: .reshape, inputs: [7]),
-                LoweredNode(id: 9, op: .transpose, inputs: [8]),
-                LoweredNode(id: 10, op: .split, inputs: [9]),
-                LoweredNode(id: 11, op: .concat, inputs: [10]),
-                LoweredNode(id: 12, op: .mul, inputs: [11]),
-                LoweredNode(id: 13, op: .layerNorm, inputs: [12]),
-                LoweredNode(id: 14, op: .custom("experimental_op"), inputs: [13]),
-            ],
-            outputs: [14]
-        )
-
-        let data = try JSONEncoder().encode(lowered)
-        let decoded = try JSONDecoder().decode(LoweredGraph.self, from: data)
-
-        #expect(lowered == decoded)
-        #expect(decoded.nodes.count == 15)
-    }
-
     @Test("ParameterSlot path construction with StructuralPath")
     func parameterSlotPath() {
         let slot = ParameterSlot(
@@ -415,26 +385,6 @@ struct ModelGraphTests {
 
         let opPath = StructuralPath(components: [.operation(0)])
         #expect(normalized.metadata.annotation(for: opPath)?.label == "layers")
-    }
-
-    @Test("WeightsDeclaration.empty case")
-    func weightsEmpty() {
-        let empty = WeightsDeclaration.empty
-        #expect(empty == .empty)
-        #expect(canonicalize(empty) == .empty)
-    }
-
-    @Test("WeightsDeclaration canonicalization simplifies merge")
-    func weightsCanonicalization() {
-        #expect(canonicalize(.merge([])) == .empty)
-
-        let single = WeightsDeclaration.gguf(location: "model.gguf")
-        #expect(canonicalize(.merge([single])) == single)
-
-        #expect(canonicalize(.override(base: single, with: .empty)) == single)
-
-        let merged = WeightsDeclaration.merge([.empty, single, .empty])
-        #expect(canonicalize(merged) == single)
     }
 
     // MARK: - GraphValidator Tests
@@ -817,41 +767,6 @@ struct ModelGraphTests {
         ))
 
         try GraphValidator.validate(graph)
-    }
-
-    // MARK: - WeightsDeclaration Canonicalization Tests
-
-    @Test("WeightsDeclaration canonicalization flattens nested merges")
-    func weightsNestedMergeFlatten() {
-        let a = WeightsDeclaration.gguf(location: "a.gguf")
-        let b = WeightsDeclaration.safetensors(directory: "b/", indexFile: nil)
-        let c = WeightsDeclaration.gguf(location: "c.gguf")
-
-        // merge([merge([a, b]), c]) should flatten to merge([a, b, c])
-        let nested = WeightsDeclaration.merge([.merge([a, b]), c])
-        let result = canonicalize(nested)
-        #expect(result == .merge([a, b, c]))
-    }
-
-    @Test("WeightsDeclaration canonicalization removes empty from nested merges")
-    func weightsNestedMergeEmpty() {
-        let a = WeightsDeclaration.gguf(location: "a.gguf")
-
-        // merge([merge([empty, a]), empty]) → a
-        let nested = WeightsDeclaration.merge([.merge([.empty, a]), .empty])
-        let result = canonicalize(nested)
-        #expect(result == a)
-    }
-
-    @Test("WeightsDeclaration canonicalization handles deeply nested merges")
-    func weightsDeeplyNestedMerge() {
-        let a = WeightsDeclaration.gguf(location: "a.gguf")
-        let b = WeightsDeclaration.gguf(location: "b.gguf")
-
-        // merge([merge([merge([a]), b])]) → merge([a, b])
-        let deep = WeightsDeclaration.merge([.merge([.merge([a]), b])])
-        let result = canonicalize(deep)
-        #expect(result == .merge([a, b]))
     }
 
     // MARK: - OperationSignature Tests
@@ -1719,96 +1634,6 @@ struct ModelGraphTests {
         } else {
             Issue.record("Expected repeating")
         }
-    }
-
-    // MARK: - LoweredGraph Structure
-
-    @Test("LoweredGraph node connections form valid DAG")
-    func loweredGraphDAG() throws {
-        let graph = LoweredGraph(
-            nodes: [
-                LoweredNode(id: 0, op: .gather),
-                LoweredNode(id: 1, op: .matmul, inputs: [0]),
-                LoweredNode(id: 2, op: .rmsNorm, inputs: [1]),
-                LoweredNode(id: 3, op: .matmul, inputs: [2]),
-                LoweredNode(id: 4, op: .add, inputs: [1, 3]),
-                LoweredNode(id: 5, op: .softmax, inputs: [4]),
-            ],
-            outputs: [5]
-        )
-
-        // Verify structure
-        #expect(graph.nodes.count == 6)
-        #expect(graph.outputs == [5])
-        #expect(graph.nodes[4].inputs == [1, 3])
-    }
-
-    @Test("LoweredNode with attributes preserves values")
-    func loweredNodeAttributes() throws {
-        let node = LoweredNode(
-            id: 0,
-            op: .rmsNorm,
-            attributes: LoweredAttributes(values: [
-                "dimension": .int(4096),
-                "epsilon": .float(1e-6),
-                "affine": .bool(true),
-                "variant": .string("pre"),
-                "shape": .ints([1, 128, 4096]),
-                "scales": .floats([1.0, 0.5, 0.25]),
-            ])
-        )
-
-        #expect(node.attributes.values["dimension"] == .int(4096))
-        #expect(node.attributes.values["epsilon"] == .float(1e-6))
-        #expect(node.attributes.values["affine"] == .bool(true))
-        #expect(node.attributes.values["variant"] == .string("pre"))
-        #expect(node.attributes.values["shape"] == .ints([1, 128, 4096]))
-        #expect(node.attributes.values["scales"] == .floats([1.0, 0.5, 0.25]))
-    }
-
-    @Test("LoweredOp activation variant roundtrips through JSON")
-    func loweredOpActivationCodable() throws {
-        let ops: [LoweredOp] = [
-            .activation(.gelu), .activation(.silu), .activation(.relu),
-            .activation(.custom("mish")), .custom("my-op"),
-        ]
-        for op in ops {
-            let data = try JSONEncoder().encode(op)
-            let decoded = try JSONDecoder().decode(LoweredOp.self, from: data)
-            #expect(op == decoded)
-        }
-    }
-
-    @Test("LoweredAttributeValue all cases roundtrip through JSON")
-    func loweredAttributeValueCodable() throws {
-        let values: [LoweredAttributeValue] = [
-            .int(42), .float(3.14), .bool(false),
-            .string("test"), .ints([1, 2, 3]), .floats([0.1, 0.2]),
-        ]
-        for value in values {
-            let data = try JSONEncoder().encode(value)
-            let decoded = try JSONDecoder().decode(LoweredAttributeValue.self, from: data)
-            #expect(value == decoded)
-        }
-    }
-
-    @Test("LoweredGraph with attributes roundtrips through JSON")
-    func loweredGraphWithAttributesCodable() throws {
-        let graph = LoweredGraph(
-            nodes: [
-                LoweredNode(id: 0, op: .gather),
-                LoweredNode(
-                    id: 1, op: .matmul, inputs: [0],
-                    attributes: LoweredAttributes(values: ["transpose": .bool(true)])
-                ),
-                LoweredNode(id: 2, op: .activation(.silu), inputs: [1]),
-            ],
-            outputs: [2]
-        )
-
-        let data = try JSONEncoder().encode(graph)
-        let decoded = try JSONDecoder().decode(LoweredGraph.self, from: data)
-        #expect(graph == decoded)
     }
 
     // MARK: - Metadata and StructuralPath Codable

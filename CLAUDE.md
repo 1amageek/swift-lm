@@ -29,45 +29,108 @@ xcodebuild test -scheme swift-mlx-lm-Package -destination 'platform=macOS' -only
 
 Swift tools version: 6.2. Platforms: macOS 15, iOS 18, visionOS 2.
 
-## Goal: Compiled Inference Path
+## Goal: GGUF-Driven Inference
 
-standard path（`loadContext`）と compiled path（`loadCompiledContext`）の2つのローディングパスがある。compiled path のゴールは以下の通り。
+### ゴール
 
-### なぜ compiled path が必要か
+**GGUF ファイルだけで推論が完結する**こと。モデル固有の Swift 型（`TransformerModel`, `Qwen35Model` 等）は不要。消費者（AnyFoundationModels）が指定するのは**モデル名だけ**。
 
-standard path は MLXNN Module ツリーを構築してから `model.update(parameters:)` で重みを注入する。これは柔軟だが、Module ツリーの構築コスト・メモリオーバーヘッド・動的ディスパッチが推論時に不要な負担になる。compiled path は SwiftLM IR（`ModelGraph`）からコンパイル時にカーネル選択を行い、MLXNN Module を経由しない軽量な推論エンジン（`MLXLoweredInferenceModel`）を直接生成する。
+```
+GGUF ファイル
+     │
+     ▼
+GGUFGraphBuilder (MLXLM)
+  ├── テンソル名パターンからアーキテクチャを検出
+  │   (blk.N.attn_q.weight → Attention, blk.N.ssm_beta.weight → DeltaNet, etc.)
+  ├── GGUF メタデータから設定値を抽出
+  │   (hidden_size, num_heads, rope_theta, etc.)
+  └── ModelGraph (IR) を直接構築
+           │
+           ▼
+     MLXCompiler
+           │
+           ▼
+     推論エンジン (MLXLoweredInferenceModel)
+           │
+           ▼
+     ModelContainer → TokenIterator → generate()
+```
 
-### ゴール: 振る舞いの同一性
+### なぜ GGUF 駆動か
 
-compiled path は standard path の**完全な代替**でなければならない。つまり、`loadCompiledContext()` が返す `ModelContext` は、`loadContext()` が返す `ModelContext` と**下流パイプラインから区別できない**こと。
+- **モデル固有型が不要** — GGUF テンソル名とメタデータがアーキテクチャの完全な記述。新アーキテクチャ対応は `GGUFGraphBuilder` のパターン追加だけで完結する
+- **消費者は何も知らなくてよい** — モデル名（= GGUF ファイルパス）を渡すだけ。`CompiledModelEntry` や `ModelComponent` の指定は不要
+- **コンパイル時カーネル選択** — 重みのストレージ型を見て `quantizedMatmul` or `matmul` を静的に確定。実行時の型判定が不要
+- **IR と実行の分離** — モデル構造（ModelGraph IR）とランタイム（MLXCompiler）が独立。将来のバックエンド追加や最適化がモデル定義に影響しない
 
-具体的に、以下の全てが成り立つ必要がある:
+### SwiftLM の役割
 
-1. **`ModelContainer` 互換** — `ModelContainer(context:)` に渡して `generate()` / `prepare()` / `perform()` が standard path と同じ振る舞いをする
-2. **`TokenIterator` 互換** — `TokenIterator` が `LanguageModel` / `KVCache` プロトコル経由で正常に動作する
-3. **`PrefixCachePool` 互換** — `KVCache.isTrimmable` / `trim()` によるプレフィックスキャッシュの再利用が機能する
-4. **`PromptCacheSnapshot` 互換** — `capturePromptCache()` でスナップショットを取得し、`materializePromptCache()` で復元できる
-5. **Weight sanitize 同等性** — standard path で `model.sanitize(weights:)` が行う変換（`rotary_emb.inv_freq` の除去、`conv1d.weight` の reshape 等）が compiled path でも等価に適用される
+SwiftLM は2つの目的を持つ:
 
-### 現在のギャップ
+1. **IR スキーマ** — `ModelGraph`, `OperationKind`, `Attributes` 等の型定義。GGUF → IR 変換と MLXCompiler の両方が依存する共通語彙
+2. **DSL（ModelComponent）** — 人間が新アーキテクチャを設計・トレーニングする際の宣言的記述。推論ロードパスでは使わない
 
-| # | 問題 | 影響 | 場所 |
-|---|------|------|------|
-| P1 | compiled path で `sanitize(weights:)` が呼ばれない | Qwen35Model の `conv1d.weight` reshape が未適用。現状は `LoweredDeltaNet` 内で実行時に ndim チェックして暗黙 reshape しているが、他の sanitize 変換が追加された場合に壊れる | `GGUFModelLoader.compileModel()` |
-| P2 | `CompiledKVCache.state` が空配列 `[]` を返す | `capturePromptCache()` が空スナップショットを保存する。`materializePromptCache()` に `CompiledKVCache` 分岐がなく復元もできない | `CompiledLanguageModel.swift`, `PromptCacheSnapshot.swift` |
-| P3 | `CompiledKVCache.isTrimmable` が `false` | `PrefixCachePool` がトリム不可と判断してキャッシュ再利用を諦め、常に新規キャッシュを生成する | `CompiledLanguageModel.swift` |
+```
+SwiftLM
+├── IR スキーマ (ModelGraph, OperationKind, Attributes)
+│   ├── ← GGUFGraphBuilder が IR を構築
+│   └── ← MLXCompiler が IR を消費
+│
+└── DSL (ModelComponent, @ModelComponentBuilder)
+    └── ← Models/ の宣言で使用（トレーニング、設計用途）
+```
 
-### 完了条件
+### モジュール依存関係
 
-- P1〜P3 が全て解消されている
-- compiled path で生成したモデルが `PrefixCachePool` / `PromptCacheSnapshot` を含む全下流パイプラインで standard path と同じ振る舞いをすることがテストで検証されている
-- `GGUFCompilableModel` に準拠するモデル型（TransformerModel, Qwen35Model）が compiled path でロードしてトークン生成できることがテストで検証されている
+```
+GGUFParser ─────────────────────────────┐
+GGUFTokenizer ──────────────────────────┤
+SwiftLM (IR + DSL) ────────────────┐    │
+                                   │    │
+MLXLMComponents (depends: SwiftLM) │    │
+  └── DSL ビルディングブロック      │    │
+      (Attention, MLP, Norm, etc.) │    │
+                                   │    │
+Models (depends: MLXLMComponents)  │    │
+  └── DSL モデル宣言               │    │
+      (Qwen35, LFM2, etc.)        │    │
+      ※ トレーニング・設計用途     │    │
+                                   │    │
+MLXCompiler (depends: SwiftLM) ────┤    │
+  └── IR → 推論エンジン            │    │
+                                   │    │
+MLXLM (depends: SwiftLM, MLXCompiler, GGUFParser, GGUFTokenizer)
+  └── GGUFGraphBuilder: GGUF → IR → compile → 推論
+      ※ Models / MLXLMComponents には依存しない
+```
+
+### 下流パイプライン互換性
+
+GGUF-driven inference が生成する `ModelContext` は全下流パイプラインで動作すること:
+
+1. **`ModelContainer` 互換** — `generate()` / `prepare()` / `perform()` が正常動作
+2. **`TokenIterator` 互換** — `LanguageModel` / `KVCache` プロトコル経由で正常動作
+3. **`PrefixCachePool` 互換** — `KVCache.isTrimmable` / `trim()` によるキャッシュ再利用が機能
+4. **`PromptCacheSnapshot` 互換** — `capturePromptCache()` / `materializePromptCache()` が機能
+5. **Weight sanitize 同等性** — `conv1d.weight` reshape、`rotary_emb.inv_freq` 除去等が適用
 
 ## Architecture
 
-6モジュール構成: GGUFParser → GGUFTokenizer → SwiftLM (IR/DSL) → Models (DSL declarations) → MLXCompiler (IR→推論エンジン) → MLXLM (ロード・生成パイプライン)。外部依存は `mlx-swift` と `swift-jinja` のみ。詳細は `/skeleton` で確認すること。
+8モジュール構成。外部依存は `mlx-swift` と `swift-jinja` のみ。詳細は `/skeleton` で確認すること。
 
-AnyFoundationModels が `MLXFoundationModels` 経由で消費する。公開インターフェースは `ModelContainer`。
+| モジュール | 役割 | 依存先 |
+|---|---|---|
+| GGUFParser | GGUF v2/v3 パーサー | なし |
+| GGUFTokenizer | BPE/SPM トークナイザ | GGUFParser |
+| SwiftLM | IR スキーマ + DSL | なし |
+| MLXLMComponents | DSL ビルディングブロック | SwiftLM |
+| Models | DSL モデル宣言（設計・トレーニング用） | MLXLMComponents |
+| MLXCompiler | IR → 推論エンジン | SwiftLM |
+| MLXLM | GGUF ローダー・生成パイプライン | SwiftLM, MLXCompiler, GGUFParser, GGUFTokenizer |
+
+**重要**: MLXLM は Models / MLXLMComponents に依存しない。GGUF → IR は `GGUFGraphBuilder` が直接構築する。
+
+AnyFoundationModels が `MLXFoundationModels` 経由で消費する。公開インターフェースは `ModelContainer`。消費者が指定するのはモデル名のみ。
 
 ### 設計ルール
 
@@ -162,18 +225,13 @@ quantization パラメータ
                              ▼
                     groupSize >= 32 (全型)
                              │
-                ┌────────────┴────────────┐
-                │                         │
-         Standard path              Compiled path
-                │                         │
-                ▼                         ▼
-         DirectQuantizedLinear     LoweredProjection
-                │                         │
-                ▼                         ▼
-           quantizedMM              .affineQuantized
-                                    → quantizedMM
+                             ▼
+                      LoweredProjection
+                             │
+                             ▼
+                      .affineQuantized
+                       → quantizedMM
 ```
 
-- **Standard path**: `DirectQuantizedLinear.callAsFunction()` が `quantizedMM` をディスパッチ
 - **Compiled path**: `LoweredProjection.init(storage:)` がコンパイル時に `.affineQuantized` カーネルを選択。`apply()` は分岐なしでディスパッチ
 - **`.dequantizeMatmul`**: `LoweredProjection` に残っているが、全型が groupSize >= 32 を生成するため実質的に未使用。将来の非標準量子化型への安全ネットとして保持

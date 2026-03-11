@@ -696,35 +696,3 @@ struct FullPipelinePerformanceTests {
     }
 }
 
-// MARK: - WeightsDeclaration Performance
-
-@Suite("Performance: Weights Declaration", .tags(.performance))
-struct WeightsDeclarationPerformanceTests {
-
-    @Test("Simple GGUF weight declaration")
-    func simpleGGUF() throws {
-        let model = makeTinyLlama(layerCount: 32)
-        let d = try measure {
-            let weighted = model.weights(.gguf(location: "model.gguf"))
-            _ = try weighted.makeModelGraph()
-        }
-        print("[perf] weights(.gguf) + makeModelGraph: \(d)")
-        #expect(d < .milliseconds(50))
-    }
-
-    @Test("Composed weight declaration with override")
-    func composedWeights() throws {
-        let model = makeTinyLlama(layerCount: 32)
-        let d = try measure {
-            let weighted = model.weights {
-                WeightsDeclaration.override(
-                    base: .gguf(location: "base.gguf"),
-                    with: .safetensors(directory: "adapter/", indexFile: nil)
-                )
-            }
-            _ = try weighted.makeModelGraph()
-        }
-        print("[perf] composed weights + makeModelGraph: \(d)")
-        #expect(d < .milliseconds(50))
-    }
-}

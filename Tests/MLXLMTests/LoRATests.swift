@@ -6,7 +6,7 @@ import MLXNN
 
 // MARK: - LoRALinear Tests
 
-@Suite("LoRALinear", .tags(.unit))
+@Suite("LoRALinear", .serialized, .tags(.unit))
 struct LoRALinearTests {
 
     @Test("Wrap Linear in LoRALinear")
@@ -87,7 +87,7 @@ struct LoRALinearTests {
 
 // MARK: - DoRALinear Tests
 
-@Suite("DoRALinear", .tags(.unit))
+@Suite("DoRALinear", .serialized, .tags(.unit))
 struct DoRALinearTests {
 
     @Test("Wrap Linear in DoRALinear")
@@ -205,7 +205,7 @@ struct TensorNameMapperLoRATests {
 
 // MARK: - TransformerModel LoRAModel Conformance Tests
 
-@Suite("TransformerModel LoRAModel", .tags(.unit))
+@Suite("TransformerModel LoRAModel", .serialized, .tags(.unit))
 struct TransformerModelLoRATests {
 
     @Test("loraLayers returns transformer layers")
@@ -241,7 +241,7 @@ struct TransformerModelLoRATests {
 
 // MARK: - LoRAContainer Lifecycle Tests
 
-@Suite("LoRAContainer Lifecycle", .tags(.unit))
+@Suite("LoRAContainer Lifecycle", .serialized, .tags(.unit))
 struct LoRAContainerLifecycleTests {
 
     @Test("Load and fuse LoRA into model")

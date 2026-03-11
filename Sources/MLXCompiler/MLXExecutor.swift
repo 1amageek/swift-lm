@@ -861,37 +861,3 @@ public final class MLXExecutor {
 ///   forward calls. Concurrent access must be synchronized externally.
 extension MLXExecutor: @unchecked Sendable {}
 
-extension MLXExecutor: Executor {
-
-    /// Execute a compiled model via the SwiftLM `Executor` protocol.
-    ///
-    /// Extracts `MLXCompiledModel` from `RuntimePlan.data`, converts
-    /// `ModelInputs.tokenIDs` to `MLXArray`, and wraps the output logits
-    /// back into `ModelOutputs`.
-    public func run(
-        _ model: CompiledModel,
-        inputs: ModelInputs
-    ) async throws -> ModelOutputs {
-        guard let tokenArray = inputs.tokenIDs.storage as? MLXArray else {
-            throw CompilerError.invalidWeightStorage(
-                ParameterSlot(
-                    path: StructuralPath(),
-                    role: .custom("tokenIDs")),
-                "Expected MLXArray for tokenIDs, got \(type(of: inputs.tokenIDs.storage))")
-        }
-
-        let logits = try forward(tokenIDs: tokenArray)
-
-        // Wrap current cache state
-        let cachedLength = self.caches.compactMap { $0 as? MLXKVCache }.first?.offset ?? 0
-        let cacheState = KVCacheState(storage: cachedLength as Int, cachedLength: cachedLength)
-
-        return ModelOutputs(
-            logits: TensorData(
-                shape: logits.shape.map { $0 },
-                dtype: .float32,
-                storage: logits),
-            cache: cacheState
-        )
-    }
-}

@@ -9,7 +9,7 @@ import GGUFParser
 /// Strategy: create synthetic data large enough to trigger GPU dispatch (>= gpuThreshold),
 /// run GGUFGPUPacker.tryPack() for GPU, and compare against CPU result from
 /// GGUFTensorBridge.convertDirect() on a small tensor of the same pattern.
-@Suite("GPU Pack Correctness", .tags(.unit))
+@Suite("GPU Pack Correctness", .serialized, .tags(.unit))
 struct GPUPackCorrectnessTests {
 
     private let bridge = GGUFTensorBridge()

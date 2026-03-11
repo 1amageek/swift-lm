@@ -82,23 +82,75 @@ struct ModelDeclarationTests {
     func qwen35VLMConfig() throws {
         let config = Qwen35.Config.qwen35_0_8B
 
-        // Vision encoder defaults
-        #expect(config.visionHiddenSize == 768)
-        #expect(config.visionDepth == 12)
-        #expect(config.visionHeadCount == 12)
-        #expect(config.visionPatchSize == 16)
-        #expect(config.visionIntermediateSize == 3072)
-        #expect(config.visionOutputSize == 1024) // matches hiddenSize
-        #expect(config.spatialMergeSize == 2)
-        #expect(config.temporalPatchSize == 2)
+        #expect(config.isVLM == true)
+        let vision = try #require(config.vision)
+
+        // Vision encoder
+        #expect(vision.hiddenSize == 768)
+        #expect(vision.depth == 12)
+        #expect(vision.headCount == 12)
+        #expect(vision.patchSize == 16)
+        #expect(vision.intermediateSize == 3072)
+        #expect(vision.outputSize == 1024) // matches hiddenSize
+        #expect(vision.spatialMergeSize == 2)
+        #expect(vision.temporalPatchSize == 2)
 
         // M-RoPE
-        #expect(config.mropeSections == [11, 11, 10])
-        #expect(config.mropeInterleaved == true)
+        #expect(vision.mropeSections == [11, 11, 10])
+        #expect(vision.mropeInterleaved == true)
 
         // Special tokens
-        #expect(config.imageTokenId == 248056)
-        #expect(config.videoTokenId == 248057)
+        #expect(vision.imageTokenId == 248056)
+        #expect(vision.videoTokenId == 248057)
+    }
+
+    @Test("Qwen35 text-only config has no vision")
+    func qwen35TextOnlyConfig() throws {
+        let config = Qwen35.Config(
+            hiddenSize: 1024,
+            hiddenLayers: 24,
+            intermediateSize: 3584,
+            vocabularySize: 248320,
+            attentionHeads: 8,
+            kvHeads: 2,
+            linearKeyHeads: 16,
+            linearValueHeads: 16
+        )
+        #expect(config.isVLM == false)
+        #expect(config.vision == nil)
+    }
+
+    @Test("Qwen35 text-only produces valid ModelGraph without VisionEncoder")
+    func qwen35TextOnlyGraph() throws {
+        let model = Qwen35(config: .init(
+            hiddenSize: 1024,
+            hiddenLayers: 24,
+            intermediateSize: 3584,
+            vocabularySize: 248320,
+            attentionHeads: 8,
+            kvHeads: 2,
+            linearKeyHeads: 16,
+            linearValueHeads: 16
+        ))
+
+        let graph = try model.makeModelGraph()
+        #expect(graph.rootRegion.operations.isEmpty == false)
+        #expect(graph.rootRegion.results.count == 1)
+
+        // First op should be tokenEmbedding, NOT parallel
+        let firstOp = graph.rootRegion.operations[0]
+        if case .tokenEmbedding = firstOp.kind {
+            // OK
+        } else {
+            Issue.record("Expected tokenEmbedding as first op for text-only, got \(firstOp.kind)")
+        }
+
+        // No vision encoder anywhere in the graph
+        let visionCount = countOperations(in: graph.rootRegion) { kind in
+            if case .visionEncoder = kind { return true }
+            return false
+        }
+        #expect(visionCount == 0)
     }
 
     @Test("Qwen35 graph contains vision encoder")

@@ -429,7 +429,7 @@ struct GGUFTensorBridgeTests {
 
 // MARK: - Direct Quantized Packing Tests
 
-@Suite("Direct GGUF→MLX Quantized Packing", .tags(.unit))
+@Suite("Direct GGUF→MLX Quantized Packing", .serialized, .tags(.unit))
 struct DirectQuantizedPackingTests {
 
     let bridge = GGUFTensorBridge()
@@ -1729,7 +1729,7 @@ struct DirectQuantizedPackingTests {
 
 // MARK: - TransformerModel Tests
 
-@Suite("TransformerModel", .tags(.unit))
+@Suite("TransformerModel", .serialized, .tags(.unit))
 struct TransformerModelTests {
 
     private func makeSmallConfig() -> TransformerConfiguration {
@@ -2137,7 +2137,7 @@ struct PromptCacheSnapshotTests {
 
 // MARK: - E2E Integration Test
 
-@Suite("E2E Integration", .tags(.unit))
+@Suite("E2E Integration", .serialized, .tags(.unit))
 struct E2EIntegrationTests {
 
     /// Build a complete minimal GGUF binary suitable for GGUFModelLoader.

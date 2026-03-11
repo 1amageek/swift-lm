@@ -2,7 +2,6 @@
 ///
 /// This is a semantic unit representing the full attention operation:
 /// Q/K/V projections, scaled dot-product attention, and output projection.
-/// The compiler lowers this into individual operations in the LoweredGraph.
 public struct AttentionAttributes: Codable, Equatable, Sendable {
 
     /// Hidden dimension of the model.

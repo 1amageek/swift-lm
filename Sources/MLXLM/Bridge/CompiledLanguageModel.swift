@@ -258,6 +258,15 @@ class CompiledLanguageModel: Module, LanguageModel, @unchecked Sendable {
         } else {
             // Decode — single token via optimized lowered path
             // (PackedProjection + FusedBlock optimizations provide the speedup)
+            //
+            // Note: MLX.compile() is NOT used here because InferenceState is a
+            // value type. lowered.decode() returns a new state rather than mutating
+            // in place. MLX.compile() tracks state via Updatable.innerState() which
+            // requires the same MLXArray references to persist across calls.
+            // The standard path works because KVCacheSimple mutates self.keys/values
+            // in place (reference type). To support MLX.compile() here, the lowered
+            // execution engine would need to be restructured to use reference-type
+            // cache state with in-place mutation.
             let (logits, newState) = lowered.decode(
                 tokenIDs: input.tokens, state: compiledCache.inferenceState)
             compiledCache.inferenceState = newState

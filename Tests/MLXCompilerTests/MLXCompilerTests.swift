@@ -1991,69 +1991,6 @@ struct StateSpaceVariantTests {
     }
 }
 
-// MARK: - Executor Protocol Conformance Tests
-
-@Suite("MLXExecutor Protocol Conformance", .tags(.unit))
-struct ExecutorProtocolTests {
-
-    @Test("Executor.run produces ModelOutputs with correct logits shape")
-    func executorProtocolRun() async throws {
-        let model = MiniLlama(layerCount: 1)
-        let graph = try model.makeModelGraph()
-        let weights = miniLlamaWeights(graph: graph, layerCount: 1)
-
-        let compiled = try MLXCompiler().compile(graph: graph, weights: weights)
-        let executor = MLXExecutor(compiledModel: compiled)
-
-        // Build CompiledModel wrapper for Executor protocol
-        let compiledModel = CompiledModel(
-            semanticGraph: graph,
-            loweredGraph: LoweredGraph(),
-            weights: weights,
-            runtimePlan: RuntimePlan(data: compiled)
-        )
-
-        let tokenArray = MLXArray([Int32(0), Int32(1)])
-        let inputs = ModelInputs(
-            tokenIDs: TensorData(
-                shape: [2],
-                dtype: .float32,
-                storage: tokenArray
-            )
-        )
-
-        let outputs = try await executor.run(compiledModel, inputs: inputs)
-
-        // Logits shape: [L=2, vocab=8]
-        #expect(outputs.logits.shape == [2, 8])
-        // Cache state is returned
-        #expect(outputs.cache != nil)
-        #expect(outputs.cache!.cachedLength == 2)
-    }
-}
-
-// MARK: - ModelCompiler Protocol Tests
-
-@Suite("ModelCompiler Protocol", .tags(.unit))
-struct ModelCompilerProtocolTests {
-
-    @Test("MLXCompiler conforms to ModelCompiler with Compiled=MLXCompiledModel")
-    func compilerConformsToProtocol() throws {
-        func useCompiler<C: ModelCompiler>(_ compiler: C, graph: ModelGraph, weights: BoundWeights) throws -> C.Compiled {
-            try compiler.compile(graph: graph, weights: weights)
-        }
-
-        let model = MiniLlama(layerCount: 1)
-        let graph = try model.makeModelGraph()
-        let weights = miniLlamaWeights(graph: graph, layerCount: 1)
-
-        let result = try useCompiler(MLXCompiler(), graph: graph, weights: weights)
-        // Compiled type is inferred as MLXCompiledModel — verify it works
-        #expect(result.cacheDescriptors.count == 1)
-        #expect(result.weightStore.count > 0)
-    }
-}
-
 // MARK: - DeltaNet End-to-End Tests
 
 @Suite("MLXExecutor DeltaNet", .tags(.unit))

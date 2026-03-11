@@ -75,33 +75,3 @@ public final class GraphModel: Module, @unchecked Sendable {
     }
 }
 
-// MARK: - Executor Protocol Conformance
-
-extension GraphModel: Executor {
-
-    public func run(
-        _ model: CompiledModel,
-        inputs: ModelInputs
-    ) async throws -> ModelOutputs {
-        guard let tokenArray = inputs.tokenIDs.storage as? MLXArray else {
-            throw CompilerError.invalidWeightStorage(
-                ParameterSlot(path: StructuralPath(), role: .custom("tokenIDs")),
-                "Expected MLXArray for tokenIDs, got \(type(of: inputs.tokenIDs.storage))")
-        }
-
-        let logits = try forward(tokenIDs: tokenArray)
-
-        let cachedLength = attentionModules.first?.kvCache.offset
-            ?? deltaNetModules.first.map { $0.cache.offset }
-            ?? 0
-        let cacheState = KVCacheState(storage: cachedLength as Int, cachedLength: cachedLength)
-
-        return ModelOutputs(
-            logits: TensorData(
-                shape: logits.shape.map { $0 },
-                dtype: .float32,
-                storage: logits),
-            cache: cacheState
-        )
-    }
-}

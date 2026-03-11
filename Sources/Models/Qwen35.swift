@@ -1,22 +1,87 @@
 import SwiftLM
 
-/// Qwen 3.5 hybrid vision-language model.
+/// Qwen 3.5 hybrid DeltaNet + Full Attention model.
 ///
-/// Architecture: Vision Transformer encoder + hybrid Gated DeltaNet / Full Attention
-/// text decoder with M-RoPE for multi-axis position encoding.
+/// Supports both text-only and vision-language modes. When `vision` config
+/// is provided, includes a Vision Transformer encoder with M-RoPE for
+/// multi-axis position encoding. When `nil`, operates as a text-only decoder.
 ///
 /// Every `fullAttentionInterval`-th layer uses full multi-head attention;
 /// all other layers use Gated DeltaNet (linear attention with O(1) per-token
-/// state update). Vision features are merged into the text sequence via
-/// placeholder token replacement.
+/// state update).
 ///
 /// ```swift
-/// let qwen = Qwen35(config: .qwen35_0_8B)
-/// let graph = try qwen.makeModelGraph()
+/// // Text-only
+/// let textModel = Qwen35(config: .init(
+///     hiddenSize: 1024, hiddenLayers: 24, intermediateSize: 3584,
+///     vocabularySize: 248320, attentionHeads: 8, kvHeads: 2,
+///     linearKeyHeads: 16, linearValueHeads: 16
+/// ))
+///
+/// // VLM
+/// let vlm = Qwen35(config: .qwen35_0_8B)
 /// ```
 public struct Qwen35: ModelComponent {
 
-    /// Architecture configuration for Qwen 3.5 VLM models.
+    /// Vision encoder and M-RoPE configuration for VLM mode.
+    public struct VisionConfig: Sendable {
+
+        // MARK: - Vision Encoder
+
+        public let hiddenSize: Int
+        public let depth: Int
+        public let headCount: Int
+        public let patchSize: Int
+        public let intermediateSize: Int
+        public let outputSize: Int
+        public let spatialMergeSize: Int
+        public let temporalPatchSize: Int
+
+        // MARK: - Vision-Text Merge
+
+        public let imageTokenId: Int
+        public let videoTokenId: Int
+
+        // MARK: - M-RoPE
+
+        /// Dimension allocation per axis [temporal, height, width].
+        /// Sum must equal ropePartialDim / 2 (half-dimensions).
+        public let mropeSections: [Int]
+
+        /// Whether M-RoPE dimensions cycle across axes (interleaved)
+        /// or are allocated in contiguous blocks.
+        public let mropeInterleaved: Bool
+
+        public init(
+            hiddenSize: Int = 768,
+            depth: Int = 12,
+            headCount: Int = 12,
+            patchSize: Int = 16,
+            intermediateSize: Int = 3072,
+            outputSize: Int,
+            spatialMergeSize: Int = 2,
+            temporalPatchSize: Int = 2,
+            imageTokenId: Int = 248056,
+            videoTokenId: Int = 248057,
+            mropeSections: [Int] = [11, 11, 10],
+            mropeInterleaved: Bool = true
+        ) {
+            self.hiddenSize = hiddenSize
+            self.depth = depth
+            self.headCount = headCount
+            self.patchSize = patchSize
+            self.intermediateSize = intermediateSize
+            self.outputSize = outputSize
+            self.spatialMergeSize = spatialMergeSize
+            self.temporalPatchSize = temporalPatchSize
+            self.imageTokenId = imageTokenId
+            self.videoTokenId = videoTokenId
+            self.mropeSections = mropeSections
+            self.mropeInterleaved = mropeInterleaved
+        }
+    }
+
+    /// Architecture configuration for Qwen 3.5 models.
     public struct Config: Sendable {
 
         // MARK: - Core Dimensions
@@ -39,16 +104,6 @@ public struct Qwen35: ModelComponent {
         public let ropeScaling: RoPEScaling?
         public let partialRotaryFactor: Float
 
-        // MARK: - M-RoPE (multi-axis for vision-language)
-
-        /// Dimension allocation per axis [temporal, height, width].
-        /// Sum must equal ropePartialDim / 2 (half-dimensions).
-        public let mropeSections: [Int]
-
-        /// Whether M-RoPE dimensions cycle across axes (interleaved)
-        /// or are allocated in contiguous blocks.
-        public let mropeInterleaved: Bool
-
         // MARK: - DeltaNet Parameters
 
         public let linearKeyHeads: Int
@@ -61,21 +116,9 @@ public struct Qwen35: ModelComponent {
 
         public let fullAttentionInterval: Int
 
-        // MARK: - Vision Encoder
+        // MARK: - Vision (optional, nil = text-only)
 
-        public let visionHiddenSize: Int
-        public let visionDepth: Int
-        public let visionHeadCount: Int
-        public let visionPatchSize: Int
-        public let visionIntermediateSize: Int
-        public let visionOutputSize: Int
-        public let spatialMergeSize: Int
-        public let temporalPatchSize: Int
-
-        // MARK: - Vision-Text Merge
-
-        public let imageTokenId: Int
-        public let videoTokenId: Int
+        public let vision: VisionConfig?
 
         // MARK: - Output
 
@@ -98,6 +141,9 @@ public struct Qwen35: ModelComponent {
             fullAttentionInterval - 1
         }
 
+        /// Whether this config includes vision encoder.
+        public var isVLM: Bool { vision != nil }
+
         public init(
             hiddenSize: Int,
             hiddenLayers: Int,
@@ -110,24 +156,13 @@ public struct Qwen35: ModelComponent {
             ropeTheta: Float = 10_000_000.0,
             ropeScaling: RoPEScaling? = nil,
             partialRotaryFactor: Float = 0.25,
-            mropeSections: [Int] = [11, 11, 10],
-            mropeInterleaved: Bool = true,
             linearKeyHeads: Int,
             linearValueHeads: Int,
             linearKeyHeadDim: Int = 128,
             linearValueHeadDim: Int = 128,
             convKernelSize: Int = 4,
             fullAttentionInterval: Int = 4,
-            visionHiddenSize: Int = 768,
-            visionDepth: Int = 12,
-            visionHeadCount: Int = 12,
-            visionPatchSize: Int = 16,
-            visionIntermediateSize: Int = 3072,
-            visionOutputSize: Int? = nil,
-            spatialMergeSize: Int = 2,
-            temporalPatchSize: Int = 2,
-            imageTokenId: Int = 248056,
-            videoTokenId: Int = 248057,
+            vision: VisionConfig? = nil,
             tieWordEmbeddings: Bool = true
         ) {
             precondition(
@@ -149,24 +184,13 @@ public struct Qwen35: ModelComponent {
             self.ropeTheta = ropeTheta
             self.ropeScaling = ropeScaling
             self.partialRotaryFactor = partialRotaryFactor
-            self.mropeSections = mropeSections
-            self.mropeInterleaved = mropeInterleaved
             self.linearKeyHeads = linearKeyHeads
             self.linearValueHeads = linearValueHeads
             self.linearKeyHeadDim = linearKeyHeadDim
             self.linearValueHeadDim = linearValueHeadDim
             self.convKernelSize = convKernelSize
             self.fullAttentionInterval = fullAttentionInterval
-            self.visionHiddenSize = visionHiddenSize
-            self.visionDepth = visionDepth
-            self.visionHeadCount = visionHeadCount
-            self.visionPatchSize = visionPatchSize
-            self.visionIntermediateSize = visionIntermediateSize
-            self.visionOutputSize = visionOutputSize ?? hiddenSize
-            self.spatialMergeSize = spatialMergeSize
-            self.temporalPatchSize = temporalPatchSize
-            self.imageTokenId = imageTokenId
-            self.videoTokenId = videoTokenId
+            self.vision = vision
             self.tieWordEmbeddings = tieWordEmbeddings
         }
     }
@@ -179,23 +203,27 @@ public struct Qwen35: ModelComponent {
 
     @ModelComponentBuilder
     public var body: some ModelComponent {
-        // Vision-text parallel input: vision encoder + token embedding,
-        // merged by replacing placeholder tokens with vision features.
-        Parallel(merge: .visionMerge(VisionMergeConfig(
-            imageTokenId: config.imageTokenId,
-            videoTokenId: config.videoTokenId
-        ))) {
+        // Input embedding: VLM uses Parallel(TokenEmbedding, VisionEncoder),
+        // text-only uses plain TokenEmbedding.
+        if let vision = config.vision {
+            Parallel(merge: .visionMerge(VisionMergeConfig(
+                imageTokenId: vision.imageTokenId,
+                videoTokenId: vision.videoTokenId
+            ))) {
+                TokenEmbedding(vocabSize: config.vocabularySize, embeddingSize: config.hiddenSize)
+                VisionEncoder(
+                    hiddenSize: vision.hiddenSize,
+                    outputSize: vision.outputSize,
+                    depth: vision.depth,
+                    headCount: vision.headCount,
+                    patchSize: vision.patchSize,
+                    spatialMergeSize: vision.spatialMergeSize,
+                    intermediateSize: vision.intermediateSize,
+                    temporalPatchSize: vision.temporalPatchSize
+                )
+            }
+        } else {
             TokenEmbedding(vocabSize: config.vocabularySize, embeddingSize: config.hiddenSize)
-            VisionEncoder(
-                hiddenSize: config.visionHiddenSize,
-                outputSize: config.visionOutputSize,
-                depth: config.visionDepth,
-                headCount: config.visionHeadCount,
-                patchSize: config.visionPatchSize,
-                spatialMergeSize: config.spatialMergeSize,
-                intermediateSize: config.visionIntermediateSize,
-                temporalPatchSize: config.temporalPatchSize
-            )
         }
 
         // Hybrid decoder: [DeltaNet x (interval-1), FullAttention x 1] groups
@@ -243,7 +271,8 @@ struct Qwen35DeltaNetDecoderLayer: ModelComponent {
 
 /// Full attention decoder layer: RMSNorm + GQA residual, then RMSNorm + MLP residual.
 ///
-/// Standard GQA with partial M-RoPE and QK RMSNorm.
+/// Standard GQA with partial RoPE (M-RoPE for VLM, standard for text-only),
+/// QK RMSNorm, and sigmoid output gate packed in Q projection.
 struct Qwen35AttnDecoderLayer: ModelComponent {
 
     let config: Qwen35.Config
@@ -261,12 +290,15 @@ struct Qwen35AttnDecoderLayer: ModelComponent {
                     dimension: config.ropePartialDim,
                     base: config.ropeTheta,
                     scaling: config.ropeScaling,
-                    mropeAxes: MRoPEAxes(
-                        sections: config.mropeSections,
-                        interleaved: config.mropeInterleaved
-                    )
+                    mropeAxes: config.vision.map {
+                        MRoPEAxes(
+                            sections: $0.mropeSections,
+                            interleaved: $0.mropeInterleaved
+                        )
+                    }
                 ),
-                qkNorm: .rmsNorm
+                qkNorm: .rmsNorm,
+                outputGate: .sigmoidPackedInQProj
             )
         }
         Residual {
@@ -280,7 +312,7 @@ struct Qwen35AttnDecoderLayer: ModelComponent {
 
 extension Qwen35.Config {
 
-    /// Qwen 3.5 0.8B
+    /// Qwen 3.5 0.8B VLM preset.
     public static let qwen35_0_8B = Qwen35.Config(
         hiddenSize: 1024,
         hiddenLayers: 24,
@@ -292,6 +324,7 @@ extension Qwen35.Config {
         linearKeyHeads: 16,
         linearValueHeads: 16,
         linearKeyHeadDim: 128,
-        linearValueHeadDim: 128
+        linearValueHeadDim: 128,
+        vision: .init(outputSize: 1024)
     )
 }
