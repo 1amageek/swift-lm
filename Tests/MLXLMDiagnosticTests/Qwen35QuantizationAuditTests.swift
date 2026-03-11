@@ -104,15 +104,15 @@ struct Qwen35QuantizationAuditTests {
     ) -> (bits: Int, groupSize: Int)? {
         switch qtype {
         case .q2_K:
-            return (2, 16)
+            return (2, 32)
         case .q3_K:
-            return (3, 16)
+            return (3, 32)
         case .q4_0, .q4_1, .q4_K, .iq4_NL, .iq4_XS:
             return (4, 32)
         case .q5_0, .q5_1, .q5_K:
             return (5, 32)
         case .q6_K:
-            return (6, 16)
+            return (6, 32)
         case .q8_0, .q8_1, .q8_K:
             return (8, 32)
         case .tq1_0:

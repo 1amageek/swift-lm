@@ -88,9 +88,22 @@ extension Qwen35Model: GGUFCompilableModel {
         var result = weights.filter { !$0.key.contains("rotary_emb.inv_freq") }
         for key in Array(result.keys) where key.contains("conv1d.weight") {
             guard let td = result[key],
-                  let storage = td.storage as? MLXTensorStorage,
-                  case .dense(let array) = storage
+                  let storage = td.storage as? MLXTensorStorage
             else { continue }
+
+            // Extract dense array — conv1d weights are small tensors where
+            // quantization provides no benefit. If quantized, dequantize here
+            // since LoweredDeltaNet requires dense conv1d weights.
+            let array: MLXArray
+            switch storage {
+            case .dense(let a):
+                array = a
+            case .affineQuantized(let qt):
+                array = dequantized(
+                    qt.packedWeight, scales: qt.scales, biases: qt.zeroBiases,
+                    groupSize: qt.groupSize, bits: qt.bits
+                )
+            }
 
             let reshaped: MLXArray
             if array.ndim == 2 {

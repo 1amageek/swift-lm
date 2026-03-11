@@ -113,11 +113,8 @@ public struct LoweredDeltaNet: @unchecked Sendable {
         let convInput = concatenated([prefix, mixedQKV], axis: 1)
         let newConvState = convInput[0..., (convInput.dim(1) - convKernelSize)..., 0...]
 
-        // Depthwise conv1d
-        let convWeight3d = convWeight.ndim == 2
-            ? convWeight.expandedDimensions(axis: -1)
-            : convWeight
-        let rawConv = conv1d(convInput, convWeight3d, stride: 1, padding: 0, groups: convDim)
+        // Depthwise conv1d — convWeight is guaranteed to be 3D after sanitizeCompiledWeights()
+        let rawConv = conv1d(convInput, convWeight, stride: 1, padding: 0, groups: convDim)
         let activated = silu(rawConv[0..., 1..., 0...])
 
         // Split Q, K, V

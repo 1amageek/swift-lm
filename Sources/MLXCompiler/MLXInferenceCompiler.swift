@@ -58,11 +58,12 @@ public struct MLXInferenceCompiler: Sendable {
 
         let embeddingPath = embeddingPaths.first
 
-        // Load embedding table for tied output head resolution
-        var embeddingTable: MLXArray?
+        // Load embedding storage for tied output head resolution.
+        // Uses `require()` (not `getDense()`) to preserve quantization metadata.
+        var embeddingStorage: MLXTensorStorage?
         if let embPath = embeddingPath {
             let slot = ParameterSlot(path: embPath, role: .embeddingTable)
-            embeddingTable = store.getDense(slot)
+            embeddingStorage = try store.require(slot)
         }
 
         // Build cache slot index for path-based lookup during lowering
@@ -75,7 +76,7 @@ public struct MLXInferenceCompiler: Sendable {
         var context = LoweringContext(
             store: store,
             cacheSlotByPath: cacheSlotByPath,
-            embeddingTable: embeddingTable
+            embeddingStorage: embeddingStorage
         )
 
         let steps = try lowerRegion(
@@ -210,7 +211,10 @@ public struct MLXInferenceCompiler: Sendable {
     private struct LoweringContext {
         let store: InferenceWeightStore
         let cacheSlotByPath: [StructuralPath: Int]
-        let embeddingTable: MLXArray?
+        /// Embedding storage for tied output head resolution.
+        /// Preserves quantization metadata (`MLXTensorStorage`) so the tied
+        /// output head can use the correct kernel (quantizedMM vs matmul).
+        let embeddingStorage: MLXTensorStorage?
         var stats: CompilationStats = CompilationStats()
     }
 
@@ -273,9 +277,15 @@ public struct MLXInferenceCompiler: Sendable {
         // MARK: Primitive Operations
 
         case .tokenEmbedding:
-            let table = try context.store.requireDense(
-                ParameterSlot(path: path, role: .embeddingTable))
-            return .op(.tokenEmbedding(LoweredEmbedding(table: table)))
+            let slot = ParameterSlot(path: path, role: .embeddingTable)
+            let embedding: LoweredEmbedding
+            switch try context.store.require(slot) {
+            case .dense(let table):
+                embedding = LoweredEmbedding(table: table)
+            case .affineQuantized(let qt):
+                embedding = LoweredEmbedding(quantized: qt)
+            }
+            return .op(.tokenEmbedding(embedding))
 
         case .attention(let attrs):
             let attn = try lowerAttention(attrs, path: path, context: &context)
@@ -554,18 +564,23 @@ public struct MLXInferenceCompiler: Sendable {
     }
 
     /// Lower an output head operation.
+    ///
+    /// For tied output heads, the embedding storage (which may be quantized) is
+    /// passed through `LoweredProjection(storage:)` for proper kernel selection.
+    /// This mirrors the standard path where `DirectQuantizedEmbedding.asLinear()`
+    /// creates a quantized linear for the tied output head.
     private func lowerOutputHead(
         _ attrs: OutputHeadAttributes,
         path: StructuralPath,
         context: inout LoweringContext
     ) throws -> LoweredOutputHead {
         if attrs.tiedToEmbedding {
-            guard let table = context.embeddingTable else {
+            guard let storage = context.embeddingStorage else {
                 throw CompilerError.invalidGraphStructure(
                     "Tied output head found but no embedding table was discovered.")
             }
             return LoweredOutputHead(
-                projection: LoweredProjection(weight: table, bias: nil),
+                projection: LoweredProjection(storage: storage, bias: nil),
                 isTied: true
             )
         }
