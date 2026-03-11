@@ -104,6 +104,108 @@ struct PackBenchmarkTests {
         print("[Q5_0] \(Self.iterations) calls, total=\(String(format: "%.1f", elapsed))ms, per-call=\(String(format: "%.2f", perCall))ms")
     }
 
+    @Test("Q6_K large tensor (embedding-sized)")
+    func benchQ6_K_large() throws {
+        // Simulate embedding tensor: 1536 × 8192 = 12.6M elements
+        let largeRows = 8192
+        let largeCols = 1536
+        let total = largeRows * largeCols
+        let superBlockCount = total / 256
+        let dataSize = superBlockCount * 210
+        var data = Data(count: dataSize)
+        for i in stride(from: 0, to: dataSize, by: 4) {
+            data[i] = UInt8(truncatingIfNeeded: i &* 7 &+ 13)
+        }
+        for sb in 0..<superBlockCount {
+            let offset = sb * 210
+            let d = Float16(0.01)
+            withUnsafeBytes(of: d.bitPattern.littleEndian) {
+                data.replaceSubrange(offset + 208..<offset + 210, with: $0)
+            }
+        }
+        let tensor = GGUFTensorInfo(
+            name: "bench", dimensions: [largeCols, largeRows],
+            quantizationType: .q6_K, offset: 0)
+
+        // Warmup
+        _ = try bridge.convertDirect(tensor: tensor, data: data)
+
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<3 {
+            _ = try bridge.convertDirect(tensor: tensor, data: data)
+        }
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+        print("[Q6_K-large] 3 calls, total=\(String(format: "%.0f", elapsed))ms, per-call=\(String(format: "%.0f", elapsed / 3))ms (\(total) elements)")
+    }
+
+    @Test("Q4_K large tensor (embedding-sized)")
+    func benchQ4_K_large() throws {
+        let largeRows = 8192
+        let largeCols = 1536
+        let total = largeRows * largeCols
+        let superBlockCount = total / 256
+        let dataSize = superBlockCount * 144
+        var data = Data(count: dataSize)
+        for i in stride(from: 0, to: dataSize, by: 4) {
+            data[i] = UInt8(truncatingIfNeeded: i &* 7 &+ 13)
+        }
+        for sb in 0..<superBlockCount {
+            let offset = sb * 144
+            let d = Float16(0.01)
+            withUnsafeBytes(of: d.bitPattern.littleEndian) {
+                data.replaceSubrange(offset..<offset + 2, with: $0)
+            }
+            withUnsafeBytes(of: d.bitPattern.littleEndian) {
+                data.replaceSubrange(offset + 2..<offset + 4, with: $0)
+            }
+        }
+        let tensor = GGUFTensorInfo(
+            name: "bench", dimensions: [largeCols, largeRows],
+            quantizationType: .q4_K, offset: 0)
+
+        _ = try bridge.convertDirect(tensor: tensor, data: data)
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<3 {
+            _ = try bridge.convertDirect(tensor: tensor, data: data)
+        }
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+        print("[Q4_K-large] 3 calls, total=\(String(format: "%.0f", elapsed))ms, per-call=\(String(format: "%.0f", elapsed / 3))ms (\(total) elements)")
+    }
+
+    @Test("Q5_K large tensor (embedding-sized)")
+    func benchQ5_K_large() throws {
+        let largeRows = 8192
+        let largeCols = 1536
+        let total = largeRows * largeCols
+        let superBlockCount = total / 256
+        let dataSize = superBlockCount * 176
+        var data = Data(count: dataSize)
+        for i in stride(from: 0, to: dataSize, by: 4) {
+            data[i] = UInt8(truncatingIfNeeded: i &* 7 &+ 13)
+        }
+        for sb in 0..<superBlockCount {
+            let offset = sb * 176
+            let d = Float16(0.01)
+            withUnsafeBytes(of: d.bitPattern.littleEndian) {
+                data.replaceSubrange(offset..<offset + 2, with: $0)
+            }
+            withUnsafeBytes(of: d.bitPattern.littleEndian) {
+                data.replaceSubrange(offset + 2..<offset + 4, with: $0)
+            }
+        }
+        let tensor = GGUFTensorInfo(
+            name: "bench", dimensions: [largeCols, largeRows],
+            quantizationType: .q5_K, offset: 0)
+
+        _ = try bridge.convertDirect(tensor: tensor, data: data)
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<3 {
+            _ = try bridge.convertDirect(tensor: tensor, data: data)
+        }
+        let elapsed = (CFAbsoluteTimeGetCurrent() - start) * 1000.0
+        print("[Q5_K-large] 3 calls, total=\(String(format: "%.0f", elapsed))ms, per-call=\(String(format: "%.0f", elapsed / 3))ms (\(total) elements)")
+    }
+
     @Test("Q8_0 pack speed (baseline)")
     func benchQ8_0() throws {
         // Q8_0: 34 bytes per 32-element block

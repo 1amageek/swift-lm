@@ -321,6 +321,11 @@ struct GGUFTensorBridge {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
 
+        if superBlockCount >= Self.parallelSuperBlockThreshold {
+            return packQ4_K_parallel(data: data, shape: shape, totalElements: totalElements,
+                                     superBlockCount: superBlockCount)
+        }
+
         var packed = [UInt32](repeating: 0, count: totalElements / 8)
         var scales = [Float](repeating: 0, count: totalElements / 32)
         var biases = [Float](repeating: 0, count: totalElements / 32)
@@ -370,6 +375,97 @@ struct GGUFTensorBridge {
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
             shape: shape, groupSize: 32, bits: 4)
+    }
+
+    /// Parallel variant of packQ4_K for large tensors.
+    private func packQ4_K_parallel(
+        data: Data, shape: [Int], totalElements: Int, superBlockCount: Int
+    ) -> ConvertedTensor {
+        let packedCount = totalElements / 8
+        let groupCount = totalElements / 32
+        let packedPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: packedCount)
+        packedPtr.initialize(repeating: 0, count: packedCount)
+        let scalesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+        let biasesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+
+        data.withUnsafeBytes { buffer in
+            let bytes = buffer.bindMemory(to: UInt8.self)
+            let cores = min(ProcessInfo.processInfo.activeProcessorCount, superBlockCount)
+
+            DispatchQueue.concurrentPerform(iterations: cores) { coreIdx in
+                let rangeStart = superBlockCount * coreIdx / cores
+                let rangeEnd = superBlockCount * (coreIdx + 1) / cores
+
+                for sb in rangeStart..<rangeEnd {
+                    let offset = sb * 144
+                    let dBits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                    let d = Float(Float16(bitPattern: dBits))
+                    let dminBits = UInt16(bytes[offset + 2]) | (UInt16(bytes[offset + 3]) << 8)
+                    let dmin = Float(Float16(bitPattern: dminBits))
+                    let q = offset + 4
+
+                    // Inline extractScaleMinK4
+                    var subScales = (Float(0), Float(0), Float(0), Float(0),
+                                     Float(0), Float(0), Float(0), Float(0))
+                    var subMins = (Float(0), Float(0), Float(0), Float(0),
+                                   Float(0), Float(0), Float(0), Float(0))
+                    withUnsafeMutablePointer(to: &subScales) { scPtr in
+                        let sc = UnsafeMutableRawPointer(scPtr).assumingMemoryBound(to: Float.self)
+                        withUnsafeMutablePointer(to: &subMins) { mnPtr in
+                            let mn = UnsafeMutableRawPointer(mnPtr).assumingMemoryBound(to: Float.self)
+                            for j in 0..<4 {
+                                sc[j] = Float(bytes[q + j] & 63) * d
+                                mn[j] = Float(bytes[q + j + 4] & 63) * dmin
+                            }
+                            for j in 4..<8 {
+                                let scVal = (bytes[q + j + 4] & 0x0F) | ((bytes[q + j - 4] >> 6) << 4)
+                                let mnVal = (bytes[q + j + 4] >> 4) | ((bytes[q + j] >> 6) << 4)
+                                sc[j] = Float(scVal) * d
+                                mn[j] = Float(mnVal) * dmin
+                            }
+
+                            let qsBase = offset + 16
+                            for chunk in 0..<4 {
+                                let qs = qsBase + chunk * 32
+
+                                let groupLow = sb * 8 + chunk * 2
+                                scalesPtr[groupLow] = sc[chunk * 2]
+                                biasesPtr[groupLow] = -mn[chunk * 2]
+                                let pLow = sb * 32 + (chunk * 2) * 4
+                                for k in 0..<4 {
+                                    var v: UInt32 = 0
+                                    let s = k * 8
+                                    for j in 0..<8 {
+                                        v |= UInt32(bytes[qs + s + j] & 0x0F) << (j * 4)
+                                    }
+                                    packedPtr[pLow + k] = v
+                                }
+
+                                let groupHigh = sb * 8 + chunk * 2 + 1
+                                scalesPtr[groupHigh] = sc[chunk * 2 + 1]
+                                biasesPtr[groupHigh] = -mn[chunk * 2 + 1]
+                                let pHigh = sb * 32 + (chunk * 2 + 1) * 4
+                                for k in 0..<4 {
+                                    var v: UInt32 = 0
+                                    let s = k * 8
+                                    for j in 0..<8 {
+                                        v |= UInt32(bytes[qs + s + j] >> 4) << (j * 4)
+                                    }
+                                    packedPtr[pHigh + k] = v
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return makeQuantizedResultFromPointers(
+            packed: packedPtr, packedCount: packedCount,
+            scales: scalesPtr, scalesCount: groupCount,
+            biases: biasesPtr,
+            shape: shape, groupSize: 32, bits: 4
+        )
     }
 
     /// Pack Q8_0 → MLX 8-bit, groupSize=32.
@@ -508,6 +604,11 @@ struct GGUFTensorBridge {
         let superBlockCount = totalElements / 256
         let groupCount = totalElements / 32
 
+        if superBlockCount >= Self.parallelSuperBlockThreshold {
+            return packQ5_K_parallel(data: data, shape: shape, superBlockCount: superBlockCount,
+                                     groupCount: groupCount)
+        }
+
         var packed = [UInt32](repeating: 0, count: groupCount * 5)
         var scales = [Float](repeating: 0, count: groupCount)
         var biases = [Float](repeating: 0, count: groupCount)
@@ -566,6 +667,101 @@ struct GGUFTensorBridge {
         )
     }
 
+    /// Parallel variant of packQ5_K for large tensors.
+    private func packQ5_K_parallel(
+        data: Data, shape: [Int], superBlockCount: Int, groupCount: Int
+    ) -> ConvertedTensor {
+        let packedCount = groupCount * 5
+        let packedPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: packedCount)
+        packedPtr.initialize(repeating: 0, count: packedCount)
+        let scalesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+        let biasesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+
+        data.withUnsafeBytes { buffer in
+            let bytes = buffer.bindMemory(to: UInt8.self)
+            let cores = min(ProcessInfo.processInfo.activeProcessorCount, superBlockCount)
+
+            DispatchQueue.concurrentPerform(iterations: cores) { coreIdx in
+                let rangeStart = superBlockCount * coreIdx / cores
+                let rangeEnd = superBlockCount * (coreIdx + 1) / cores
+
+                for block in rangeStart..<rangeEnd {
+                    let offset = block * 176
+                    let dBits = UInt16(bytes[offset]) | (UInt16(bytes[offset + 1]) << 8)
+                    let d = Float(Float16(bitPattern: dBits))
+                    let dminBits = UInt16(bytes[offset + 2]) | (UInt16(bytes[offset + 3]) << 8)
+                    let dmin = Float(Float16(bitPattern: dminBits))
+                    let q = offset + 4
+                    let qhOffset = offset + 16
+                    let qsOffset = offset + 48
+
+                    // Inline extractScaleMinK4
+                    var sc = (Float(0), Float(0), Float(0), Float(0),
+                              Float(0), Float(0), Float(0), Float(0))
+                    var mn = (Float(0), Float(0), Float(0), Float(0),
+                              Float(0), Float(0), Float(0), Float(0))
+                    withUnsafeMutablePointer(to: &sc) { scTuple in
+                        let scP = UnsafeMutableRawPointer(scTuple).assumingMemoryBound(to: Float.self)
+                        withUnsafeMutablePointer(to: &mn) { mnTuple in
+                            let mnP = UnsafeMutableRawPointer(mnTuple).assumingMemoryBound(to: Float.self)
+                            for j in 0..<4 {
+                                scP[j] = Float(bytes[q + j] & 63) * d
+                                mnP[j] = Float(bytes[q + j + 4] & 63) * dmin
+                            }
+                            for j in 4..<8 {
+                                let scVal = (bytes[q + j + 4] & 0x0F) | ((bytes[q + j - 4] >> 6) << 4)
+                                let mnVal = (bytes[q + j + 4] >> 4) | ((bytes[q + j] >> 6) << 4)
+                                scP[j] = Float(scVal) * d
+                                mnP[j] = Float(mnVal) * dmin
+                            }
+
+                            for chunk in 0..<4 {
+                                let qsBase = qsOffset + chunk * 32
+                                let group0 = block * 8 + chunk * 2
+                                let group1 = group0 + 1
+
+                                scalesPtr[group0] = scP[chunk * 2]
+                                biasesPtr[group0] = -mnP[chunk * 2]
+                                scalesPtr[group1] = scP[chunk * 2 + 1]
+                                biasesPtr[group1] = -mnP[chunk * 2 + 1]
+
+                                let pBase0 = group0 * 5
+                                let pBase1 = group1 * 5
+
+                                for l in 0..<32 {
+                                    let byte = bytes[qsBase + l]
+                                    let qh = bytes[qhOffset + l]
+
+                                    let low = UInt32(byte & 0x0F) | (UInt32((qh >> (chunk * 2)) & 1) << 4)
+                                    let high = UInt32((byte >> 4) & 0x0F) | (UInt32((qh >> (chunk * 2 + 1)) & 1) << 4)
+
+                                    let bitIdx0 = l &* 5
+                                    let w0 = bitIdx0 >> 5
+                                    let b0 = bitIdx0 & 31
+                                    packedPtr[pBase0 + w0] |= low << b0
+                                    if b0 &+ 5 > 32 {
+                                        packedPtr[pBase0 + w0 &+ 1] |= low >> (32 &- b0)
+                                    }
+                                    packedPtr[pBase1 + w0] |= high << b0
+                                    if b0 &+ 5 > 32 {
+                                        packedPtr[pBase1 + w0 &+ 1] |= high >> (32 &- b0)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return makeQuantizedResultFromPointers(
+            packed: packedPtr, packedCount: packedCount,
+            scales: scalesPtr, scalesCount: groupCount,
+            biases: biasesPtr,
+            shape: shape, groupSize: 32, bits: 5
+        )
+    }
+
     /// Pack Q6_K → MLX 6-bit affine, groupSize=16.
     ///
     /// GGUF: value = scale * (q - 32), where q ∈ [0, 63]
@@ -574,8 +770,14 @@ struct GGUFTensorBridge {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
         let groupCount = totalElements / 16
+        let packedCount = groupCount * 3
 
-        var packed = [UInt32](repeating: 0, count: groupCount * 3)
+        if superBlockCount >= Self.parallelSuperBlockThreshold {
+            return packQ6_K_parallel(data: data, shape: shape, superBlockCount: superBlockCount,
+                                     groupCount: groupCount, packedCount: packedCount)
+        }
+
+        var packed = [UInt32](repeating: 0, count: packedCount)
         var scales = [Float](repeating: 0, count: groupCount)
         var biases = [Float](repeating: 0, count: groupCount)
 
@@ -583,6 +785,7 @@ struct GGUFTensorBridge {
             let bytes = buffer.bindMemory(to: UInt8.self)
             packed.withUnsafeMutableBufferPointer { packedBuf in
                 let packedPtr = packedBuf.baseAddress!
+
                 for block in 0..<superBlockCount {
                     let offset = block * 210
                     let scalesOffset = offset + 192
@@ -593,12 +796,6 @@ struct GGUFTensorBridge {
                         let qhBase = offset + 128 + half * 32
                         let scBase = scalesOffset + half * 8
 
-                        // 8 groups of 16 elements per half.
-                        // Group mapping (lStart, qlAdd, useLowNibble, qhShift):
-                        //   g0: l=0..15,  ql[l]&0xF,     qh>>0  g1: l=16..31, ql[l]&0xF,     qh>>0
-                        //   g2: l=0..15,  ql[l+32]&0xF,  qh>>2  g3: l=16..31, ql[l+32]&0xF,  qh>>2
-                        //   g4: l=0..15,  ql[l]>>4,       qh>>4  g5: l=16..31, ql[l]>>4,       qh>>4
-                        //   g6: l=0..15,  ql[l+32]>>4,    qh>>6  g7: l=16..31, ql[l+32]>>4,    qh>>6
                         for localGroup in 0..<8 {
                             let groupIndex = block * 16 + half * 8 + localGroup
                             let scale = d * Float(Int8(bitPattern: bytes[scBase + localGroup]))
@@ -609,7 +806,6 @@ struct GGUFTensorBridge {
                             let qlAdd = ((localGroup >> 1) & 1) << 5
                             let useLow = (localGroup & 4) == 0
                             let qhShift = localGroup & 6
-
                             let pBase = groupIndex * 3
 
                             for i in 0..<16 {
@@ -618,7 +814,6 @@ struct GGUFTensorBridge {
                                 let ql = useLow ? UInt32(qlByte & 0x0F) : UInt32(qlByte >> 4)
                                 let qh = UInt32((bytes[qhBase + l] >> qhShift) & 3) << 4
                                 let q = ql | qh
-
                                 emitBits(q, at: i, bits: 6, into: packedPtr + pBase)
                             }
                         }
@@ -629,6 +824,76 @@ struct GGUFTensorBridge {
 
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
+            shape: shape, groupSize: 16, bits: 6
+        )
+    }
+
+    /// Parallel variant of packQ6_K for large tensors (superBlockCount >= threshold).
+    private func packQ6_K_parallel(
+        data: Data, shape: [Int], superBlockCount: Int,
+        groupCount: Int, packedCount: Int
+    ) -> ConvertedTensor {
+        let packedPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: packedCount)
+        packedPtr.initialize(repeating: 0, count: packedCount)
+        let scalesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+        let biasesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
+
+        data.withUnsafeBytes { buffer in
+            let bytes = buffer.bindMemory(to: UInt8.self)
+            let cores = min(ProcessInfo.processInfo.activeProcessorCount, superBlockCount)
+
+            DispatchQueue.concurrentPerform(iterations: cores) { coreIdx in
+                let rangeStart = superBlockCount * coreIdx / cores
+                let rangeEnd = superBlockCount * (coreIdx + 1) / cores
+
+                for block in rangeStart..<rangeEnd {
+                    let offset = block * 210
+                    let scalesOffset = offset + 192
+                    let dBits = UInt16(bytes[offset + 208]) | (UInt16(bytes[offset + 209]) << 8)
+                    let d = Float(Float16(bitPattern: dBits))
+
+                    for half in 0..<2 {
+                        let qlBase = offset + half * 64
+                        let qhBase = offset + 128 + half * 32
+                        let scBase = scalesOffset + half * 8
+
+                        for localGroup in 0..<8 {
+                            let groupIndex = block * 16 + half * 8 + localGroup
+                            let scale = d * Float(Int8(bitPattern: bytes[scBase + localGroup]))
+                            scalesPtr[groupIndex] = scale
+                            biasesPtr[groupIndex] = -32.0 * scale
+
+                            let lStart = (localGroup & 1) << 4
+                            let qlAdd = ((localGroup >> 1) & 1) << 5
+                            let useLow = (localGroup & 4) == 0
+                            let qhShift = localGroup & 6
+                            let pBase = groupIndex * 3
+
+                            for i in 0..<16 {
+                                let l = lStart + i
+                                let qlByte = bytes[qlBase + qlAdd + l]
+                                let ql = useLow ? UInt32(qlByte & 0x0F) : UInt32(qlByte >> 4)
+                                let qh = UInt32((bytes[qhBase + l] >> qhShift) & 3) << 4
+                                let q = ql | qh
+
+                                let bitIndex = i &* 6
+                                let wordIndex = bitIndex >> 5
+                                let bitOffset = bitIndex & 31
+                                packedPtr[pBase + wordIndex] |= q << bitOffset
+                                if bitOffset &+ 6 > 32 {
+                                    packedPtr[pBase + wordIndex &+ 1] |= q >> (32 &- bitOffset)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return makeQuantizedResultFromPointers(
+            packed: packedPtr, packedCount: packedCount,
+            scales: scalesPtr, scalesCount: groupCount,
+            biases: biasesPtr,
             shape: shape, groupSize: 16, bits: 6
         )
     }
@@ -651,6 +916,45 @@ struct GGUFTensorBridge {
             weight: weightArray, scales: scalesArray, biases: biasesArray,
             groupSize: groupSize, bits: bits)
     }
+
+    /// Create ConvertedTensor.quantized from raw pointers (avoids Array intermediates).
+    private func makeQuantizedResultFromPointers(
+        packed: UnsafeMutablePointer<UInt32>, packedCount: Int,
+        scales: UnsafeMutablePointer<Float>, scalesCount: Int,
+        biases: UnsafeMutablePointer<Float>,
+        shape: [Int], groupSize: Int, bits: Int
+    ) -> ConvertedTensor {
+        let packedColumns = shape.last! * bits / 32
+        let weightShape = shape.dropLast().map { $0 } + [packedColumns]
+        let scaleShape = shape.dropLast().map { $0 } + [shape.last! / groupSize]
+
+        let weightData = Data(
+            bytesNoCopy: packed,
+            count: packedCount * MemoryLayout<UInt32>.size,
+            deallocator: .custom { ptr, _ in ptr.deallocate() })
+        let weightArray = MLXArray(weightData, weightShape, type: UInt32.self)
+
+        let scalesData = Data(
+            bytesNoCopy: scales,
+            count: scalesCount * MemoryLayout<Float>.size,
+            deallocator: .custom { ptr, _ in ptr.deallocate() })
+        let scalesArray = MLXArray(scalesData, [scalesCount], type: Float.self)
+            .reshaped(scaleShape).asType(.float16)
+
+        let biasesData = Data(
+            bytesNoCopy: biases,
+            count: scalesCount * MemoryLayout<Float>.size,
+            deallocator: .custom { ptr, _ in ptr.deallocate() })
+        let biasesArray = MLXArray(biasesData, [scalesCount], type: Float.self)
+            .reshaped(scaleShape).asType(.float16)
+
+        return .quantized(
+            weight: weightArray, scales: scalesArray, biases: biasesArray,
+            groupSize: groupSize, bits: bits)
+    }
+
+    /// Minimum super-block count to trigger within-tensor parallelism.
+    private static let parallelSuperBlockThreshold = 2048
 
     // MARK: - Tier 1 Direct Affine Packing (Zero Loss)
 
