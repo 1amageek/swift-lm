@@ -16,10 +16,16 @@ public struct LMInput: Sendable {
         /// (e.g. M-RoPE with shape `[3, B, S]` for temporal/height/width).
         public let positionIds: MLXArray?
 
-        public init(tokens: MLXArray, mask: MLXArray? = nil, positionIds: MLXArray? = nil) {
+        /// CPU-side token IDs cached from the tokenizer output.
+        /// Avoids redundant GPU→CPU round-trips for prefix matching and
+        /// repetition processor initialization.
+        public let cpuTokenIDs: [Int]?
+
+        public init(tokens: MLXArray, mask: MLXArray? = nil, positionIds: MLXArray? = nil, cpuTokenIDs: [Int]? = nil) {
             self.tokens = tokens
             self.mask = mask
             self.positionIds = positionIds
+            self.cpuTokenIDs = cpuTokenIDs
         }
     }
 

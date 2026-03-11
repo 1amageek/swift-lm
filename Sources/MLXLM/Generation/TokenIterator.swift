@@ -11,7 +11,7 @@ struct TokenIterator: Sequence, IteratorProtocol {
     private let cache: [KVCache]
     private var sampler: any LogitSampler
     private var processor: (any LogitProcessor)?
-    private let prefillStepSize: Int
+    private let prefillStepSize: Int?
     private let maxTokens: Int?
     private let eosTokenIds: Set<Int>
 
@@ -31,25 +31,37 @@ struct TokenIterator: Sequence, IteratorProtocol {
     ///   - cache: KV caches (one per layer).
     ///   - parameters: Generation parameters.
     ///   - eosTokenIds: Token IDs that signal end of generation.
+    ///   - promptTokenIDs: CPU-side token IDs for the prompt. When provided,
+    ///     avoids a GPU→CPU sync in the repetition processor.
     init(
         input: LMInput,
         model: any LanguageModel,
         cache: [KVCache]? = nil,
         parameters: GenerateParameters,
-        eosTokenIds: Set<Int> = []
+        eosTokenIds: Set<Int> = [],
+        promptTokenIDs: [Int]? = nil
     ) throws {
         self.model = model
         self.cache = cache ?? model.newCache(parameters: parameters)
         self.sampler = parameters.sampler()
         self.processor = parameters.processor()
-        self.prefillStepSize = parameters.prefillStepSize
+        // Use model's recommended step size. Pure attention models return nil →
+        // passes nil to prepare(), which processes the full prompt in one pass.
+        self.prefillStepSize = model.recommendedPrefillStepSize
         self.maxTokens = parameters.maxTokens
         self.eosTokenIds = eosTokenIds
         self.fullInput = input
         self.inputText = input.text
 
-        // Initialize repetition processor with prompt tokens
-        self.processor?.prompt(input.text.tokens)
+        // Initialize repetition processor with prompt tokens (CPU-side when available)
+        if let ids = promptTokenIDs ?? input.text.cpuTokenIDs {
+            self.processor?.prompt(ids)
+        } else {
+            let flat = input.text.tokens.flattened()
+            eval(flat)
+            let int32s: [Int32] = flat.asArray(Int32.self)
+            self.processor?.prompt(int32s.map { Int($0) })
+        }
     }
 
     /// Sample a token from model output logits.
@@ -107,8 +119,8 @@ struct TokenIterator: Sequence, IteratorProtocol {
             let tokenID: Int32 = previousToken.item()
             let token = Int(tokenID)
 
-            // Update processor state with the materialized token
-            processor?.didSample(token: previousToken)
+            // Update processor state with the materialized token (no GPU→CPU sync)
+            processor?.didSample(tokenID: token)
 
             // Check EOS
             if eosTokenIds.contains(token) {

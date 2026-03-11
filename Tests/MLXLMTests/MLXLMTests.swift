@@ -5,7 +5,7 @@ import MLX
 
 // MARK: - LMInput Tests
 
-@Suite("LMInput")
+@Suite("LMInput", .tags(.unit))
 struct LMInputTests {
 
     @Test("Create with tokens only")
@@ -36,7 +36,7 @@ struct LMInputTests {
 
 // MARK: - ChatMessage Tests
 
-@Suite("ChatMessage")
+@Suite("ChatMessage", .tags(.unit))
 struct ChatMessageTests {
 
     @Test("Role raw values")
@@ -79,7 +79,7 @@ struct ChatMessageTests {
 
 // MARK: - UserInput Tests
 
-@Suite("UserInput")
+@Suite("UserInput", .tags(.unit))
 struct UserInputTests {
 
     @Test("Prompt convenience initializer")
@@ -126,7 +126,7 @@ struct UserInputTests {
 
 // MARK: - GenerateParameters Tests
 
-@Suite("GenerateParameters")
+@Suite("GenerateParameters", .tags(.unit))
 struct GenerateParametersTests {
 
     @Test("Default values")
@@ -169,7 +169,7 @@ struct GenerateParametersTests {
 
 // MARK: - ModelConfiguration Tests
 
-@Suite("ModelConfiguration")
+@Suite("ModelConfiguration", .tags(.unit))
 struct ModelConfigurationTests {
 
     @Test("Basic creation")
@@ -193,7 +193,7 @@ struct ModelConfigurationTests {
 
 // MARK: - Generation Types Tests
 
-@Suite("Generation")
+@Suite("Generation", .tags(.unit))
 struct GenerationTests {
 
     @Test("Completion info")
@@ -220,7 +220,7 @@ struct GenerationTests {
 
 // MARK: - StringOrNumber Tests
 
-@Suite("StringOrNumber")
+@Suite("StringOrNumber", .tags(.unit))
 struct StringOrNumberTests {
 
     @Test("String variant")

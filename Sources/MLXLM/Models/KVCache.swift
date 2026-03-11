@@ -363,6 +363,14 @@ final class QuantizedKVCache: KVCache, @unchecked Sendable {
     }
 }
 
+// MARK: - Updatable Conformance
+
+/// KV caches conform to `Updatable` for use with `MLX.compile()`.
+/// This enables graph caching for the decode phase where input shapes are fixed.
+extension KVCacheSimple: Updatable {}
+extension RotatingKVCache: Updatable {}
+extension QuantizedKVCache: Updatable {}
+
 // MARK: - Factory
 
 /// Create a cache array for each layer of a model.

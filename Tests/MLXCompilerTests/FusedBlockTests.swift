@@ -3,16 +3,16 @@ import Testing
 @testable import SwiftLM
 @testable import MLXCompiler
 
-@Suite("FusedBlock Tests")
+@Suite("FusedBlock Tests", .tags(.unit, .compiled))
 struct FusedBlockTests {
 
     // MARK: - Pattern Detection
 
     @Test("Fuse: norm + attention residual body")
     func fuseNormAttention() throws {
-        let D = 64
-        let headCount = 4
-        let headDim = 16
+        let D = 4
+        let headCount = 2
+        let headDim = 2
 
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
@@ -54,15 +54,15 @@ struct FusedBlockTests {
 
     @Test("Fuse: norm + mlp residual body")
     func fuseNormMLP() throws {
-        let D = 64
-        let inter = 128
+        let D = 4
+        let inter = 8
 
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
 
-        let gateProj = LoweredProjection(weight: MLXRandom.normal([inter, D]) * 0.02)
-        let upProj = LoweredProjection(weight: MLXRandom.normal([inter, D]) * 0.02)
-        let downProj = LoweredProjection(weight: MLXRandom.normal([D, inter]) * 0.02)
+        let gateProj = LoweredProjection(weight: MLXRandom.normal([inter, D]))
+        let upProj = LoweredProjection(weight: MLXRandom.normal([inter, D]))
+        let downProj = LoweredProjection(weight: MLXRandom.normal([D, inter]))
 
         let mlp = LoweredMLP(
             gateProj: gateProj, downProj: downProj,
@@ -84,8 +84,8 @@ struct FusedBlockTests {
 
     @Test("Fuse: norm + moe residual body")
     func fuseNormMoE() throws {
-        let D = 32
-        let inter = 64
+        let D = 4
+        let inter = 8
 
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
@@ -119,7 +119,7 @@ struct FusedBlockTests {
     @Test("No fuse: single op body")
     func noFuseSingleOp() throws {
         let norm = LoweredNorm.rms(
-            weight: MLXRandom.normal([32]), epsilon: 1e-5)
+            weight: MLXRandom.normal([4]), epsilon: 1e-5)
         let body: [LoweredStep] = [.op(.norm(norm))]
         let fused = tryFuseResidual(body)
         #expect(fused == nil)
@@ -127,12 +127,12 @@ struct FusedBlockTests {
 
     @Test("No fuse: three op body")
     func noFuseThreeOps() throws {
-        let D = 32
+        let D = 4
         let norm1 = LoweredNorm.rms(weight: MLXRandom.normal([D]), epsilon: 1e-5)
         let norm2 = LoweredNorm.rms(weight: MLXRandom.normal([D]), epsilon: 1e-5)
         let mlp = LoweredMLP(
-            gateProj: LoweredProjection(weight: MLXRandom.normal([64, D])),
-            downProj: LoweredProjection(weight: MLXRandom.normal([D, 64])),
+            gateProj: LoweredProjection(weight: MLXRandom.normal([8, D])),
+            downProj: LoweredProjection(weight: MLXRandom.normal([D, 8])),
             upProj: nil, activation: .silu)
 
         let body: [LoweredStep] = [
@@ -146,8 +146,8 @@ struct FusedBlockTests {
 
     @Test("No fuse: norm + norm body")
     func noFuseNormNorm() throws {
-        let norm1 = LoweredNorm.rms(weight: MLXRandom.normal([32]), epsilon: 1e-5)
-        let norm2 = LoweredNorm.rms(weight: MLXRandom.normal([32]), epsilon: 1e-5)
+        let norm1 = LoweredNorm.rms(weight: MLXRandom.normal([4]), epsilon: 1e-5)
+        let norm2 = LoweredNorm.rms(weight: MLXRandom.normal([4]), epsilon: 1e-5)
         let body: [LoweredStep] = [
             .op(.norm(norm1)),
             .op(.norm(norm2)),
@@ -158,9 +158,9 @@ struct FusedBlockTests {
 
     @Test("No fuse: attention + norm (wrong order)")
     func noFuseWrongOrder() throws {
-        let D = 32
+        let D = 4
         let headCount = 2
-        let headDim = 16
+        let headDim = 2
 
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
@@ -188,9 +188,9 @@ struct FusedBlockTests {
 
     @Test("flattenSteps produces fusedSubLayer for [norm, attn] residual")
     func flattenDetectsFusion() throws {
-        let D = 32
+        let D = 4
         let headCount = 2
-        let headDim = 16
+        let headDim = 2
 
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
@@ -223,7 +223,7 @@ struct FusedBlockTests {
 
     @Test("flattenSteps preserves unfuseable residuals")
     func flattenPreservesUnfuseable() throws {
-        let D = 32
+        let D = 4
         let norm = LoweredNorm.rms(
             weight: MLXRandom.normal([D]), epsilon: 1e-5)
 
@@ -247,9 +247,9 @@ struct FusedBlockTests {
 
     @Test("Fused attention sub-layer matches individual execution")
     func fusedAttentionCorrectness() throws {
-        let D = 64
-        let headCount = 4
-        let headDim = 16
+        let D = 8
+        let headCount = 2
+        let headDim = 4
 
         let normWeight = MLXRandom.normal([D]) * 0.1
         let norm = LoweredNorm.rms(weight: normWeight, epsilon: 1e-5)
@@ -297,8 +297,8 @@ struct FusedBlockTests {
 
     @Test("Fused MLP sub-layer matches individual execution")
     func fusedMLPCorrectness() throws {
-        let D = 64
-        let inter = 128
+        let D = 8
+        let inter = 16
 
         let normWeight = MLXRandom.normal([D]) * 0.1
         let norm = LoweredNorm.rms(weight: normWeight, epsilon: 1e-5)
@@ -331,10 +331,10 @@ struct FusedBlockTests {
 
     @Test("Full transformer block: fused decode matches unfused")
     func fullBlockFusedMatchesUnfused() throws {
-        let D = 64
-        let headCount = 4
-        let headDim = 16
-        let inter = 128
+        let D = 8
+        let headCount = 2
+        let headDim = 4
+        let inter = 16
 
         // Attention sub-layer
         let attnNormWeight = MLXRandom.normal([D]) * 0.1
@@ -401,10 +401,10 @@ struct FusedBlockTests {
 
     @Test("Fusion reduces step count for N-layer model")
     func fusionReducesStepCount() throws {
-        let D = 32
+        let D = 4
         let headCount = 2
-        let headDim = 16
-        let inter = 64
+        let headDim = 2
+        let inter = 8
         let numLayers = 8
 
         var steps: [LoweredStep] = []

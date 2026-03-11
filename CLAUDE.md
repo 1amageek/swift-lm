@@ -117,11 +117,14 @@ GGUFTensorBridge.convertDirect()
      │
      └── weight matrix + !preserveDenseWeights
               │
-              ├── Tier 0: 既存7型 (Q4_0,Q4_1,Q4_K,Q5_K,Q6_K,Q8_0,Q8_1)
-              │     → Direct pack (ロスなし)
+              ├── Tier 0: 既存7型 (Q4_0,Q4_1,Q4_K,Q5_K,Q8_0,Q8_1,Q8_K)
+              │     → Direct pack (ロスなし, groupSize >= 32)
               │
-              ├── Tier 1: 追加6型 (Q5_0,Q5_1,Q8_K,Q2_K,Q3_K,TQ2_0)
-              │     → Direct pack (ロスなし)
+              ├── Tier 0.5: 再量子化3型 (Q6_K,Q2_K,Q3_K)
+              │     → Decode → requantizeGroup32 (groupSize=16→32, 微小精度損失)
+              │
+              ├── Tier 1: 追加3型 (Q5_0,Q5_1,TQ2_0)
+              │     → Direct pack (ロスなし, groupSize >= 32)
               │
               ├── Tier 2: LUT型 (IQ4_NL,IQ4_XS)
               │     → LUT decode → 4-bit affine re-quantize
@@ -149,29 +152,28 @@ quantization パラメータ
 
 `preserveDenseWeights` フラグ (`GGUFModelLoader.swift:254`) が `convertDirect()` 呼び出しをゲートする。`.disabled` は「全重みを F16 にする」デバッグパスとして機能する。
 
-### カーネルディスパッチ: groupSize による分岐
+### カーネルディスパッチ: 全量子化型が quantizedMM を使用
 
-MLX `quantizedMM` Metal kernel は `groupSize >= 32` のみサポート。Q2_K/Q3_K/Q6_K は `groupSize = 16` を生成するため、両パスで分岐が必要:
+全ての GGUF 量子化型は `groupSize >= 32` でパッキングされる。Q2_K/Q3_K/Q6_K は元々 groupSize=16 だが、パッキング時に隣接する2グループ（16要素×2）をデコードし、32要素単位で再量子化する（`requantizeGroup32`）。これにより全型が `quantizedMM` Metal カーネルを使用でき、`dequantize+matmul` フォールバックは不要:
 
 ```
                     ConvertedTensor(.quantized)
+                             │
+                             ▼
+                    groupSize >= 32 (全型)
                              │
                 ┌────────────┴────────────┐
                 │                         │
          Standard path              Compiled path
                 │                         │
                 ▼                         ▼
-         DirectQuantizedLinear     LoweredProjection.init(storage:)
+         DirectQuantizedLinear     LoweredProjection
                 │                         │
-         ┌──────┴──────┐           ┌──────┴──────┐
-         │             │           │             │
-    gs >= 32      gs < 32     gs >= 32      gs < 32
-         │             │           │             │
-         ▼             ▼           ▼             ▼
-    quantizedMM   dequantized  .affineQuantized  .dequantizeMatmul
-                  + matmul     → quantizedMM     → dequantized + matmul
+                ▼                         ▼
+           quantizedMM              .affineQuantized
+                                    → quantizedMM
 ```
 
-- **Standard path**: `DirectQuantizedLinear.callAsFunction()` が `groupSize` を実行時にチェック
-- **Compiled path**: `LoweredProjection.init(storage:)` がコンパイル時に `ProjectionKernel` バリアント（`.affineQuantized` / `.dequantizeMatmul`）を決定。`apply()` は分岐なしでディスパッチ
-- **`.dequantizeMatmul`**: 量子化ストレージをメモリ上に保持しつつ、forward pass で一時的にデクォンタイズして `matmul` を実行。メモリ圧縮の利点は維持される
+- **Standard path**: `DirectQuantizedLinear.callAsFunction()` が `quantizedMM` をディスパッチ
+- **Compiled path**: `LoweredProjection.init(storage:)` がコンパイル時に `.affineQuantized` カーネルを選択。`apply()` は分岐なしでディスパッチ
+- **`.dequantizeMatmul`**: `LoweredProjection` に残っているが、全型が groupSize >= 32 を生成するため実質的に未使用。将来の非標準量子化型への安全ネットとして保持

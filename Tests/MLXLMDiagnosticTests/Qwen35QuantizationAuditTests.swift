@@ -5,7 +5,7 @@ import MLXNN
 import Testing
 @testable import MLXLM
 
-@Suite("Qwen3.5 Quantization Audit")
+@Suite("Qwen3.5 Quantization Audit", .tags(.diagnostic))
 struct Qwen35QuantizationAuditTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

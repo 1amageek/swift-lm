@@ -115,7 +115,7 @@ private func compileModel(layerCount: Int) throws -> CompiledLanguageModel {
 
 // MARK: - CompiledKVCache Tests
 
-@Suite("CompiledKVCache")
+@Suite("CompiledKVCache", .tags(.unit, .compiled))
 struct CompiledKVCacheTests {
 
     @Test("Offset reflects nextPosition from InferenceState")
@@ -186,7 +186,7 @@ struct CompiledKVCacheTests {
 
 // MARK: - CompiledLanguageModel Protocol Conformance Tests
 
-@Suite("CompiledLanguageModel")
+@Suite("CompiledLanguageModel", .tags(.integration, .compiled))
 struct CompiledLanguageModelTests {
 
     @Test("Conforms to LanguageModel protocol")
@@ -384,7 +384,7 @@ struct CompiledLanguageModelTests {
 
 // MARK: - P1: Sanitize Equivalence Tests
 
-@Suite("CompiledPathSanitize")
+@Suite("CompiledPathSanitize", .tags(.unit, .compiled))
 struct CompiledPathSanitizeTests {
 
     @Test("Default sanitizeCompiledWeights filters rotary_emb.inv_freq")
@@ -494,7 +494,7 @@ struct CompiledPathSanitizeTests {
 
 // MARK: - P2: PromptCacheSnapshot Interop Tests
 
-@Suite("CompiledKVCacheSnapshot")
+@Suite("CompiledKVCacheSnapshot", .tags(.integration, .compiled))
 struct CompiledKVCacheSnapshotTests {
 
     @Test("state getter returns non-empty arrays after prefill")
@@ -630,7 +630,7 @@ struct CompiledKVCacheSnapshotTests {
 
 // MARK: - Binder Tests (retained from original)
 
-@Suite("CompiledPathBinder")
+@Suite("CompiledPathBinder", .tags(.unit, .compiled))
 struct CompiledPathBinderTests {
 
     @Test("MLXWeightPathBinder skips RawWeights tensors not matching any slot")
@@ -688,7 +688,7 @@ struct CompiledPathBinderTests {
 
 // MARK: - Integration: End-to-End Pipeline Tests
 
-@Suite("CompiledPipelineIntegration")
+@Suite("CompiledPipelineIntegration", .tags(.integration, .compiled))
 struct CompiledPipelineIntegrationTests {
 
     @Test("Compiled model works with TokenIterator-style usage pattern")

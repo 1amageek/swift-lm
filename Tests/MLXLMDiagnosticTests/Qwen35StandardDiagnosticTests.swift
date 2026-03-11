@@ -6,7 +6,7 @@ import MLXNN
 import Testing
 @testable import MLXLM
 
-@Suite("Qwen3.5 Standard Diagnostics")
+@Suite("Qwen3.5 Standard Diagnostics", .tags(.diagnostic))
 struct Qwen35StandardDiagnosticTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

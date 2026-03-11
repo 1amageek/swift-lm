@@ -10,10 +10,10 @@
 /// - `.affineQuantized`: quantized weight with `groupSize >= 32` → `quantizedMM`
 /// - `.dequantizeMatmul`: quantized weight with `groupSize < 32` → `dequantized` + `matmul`
 ///
-/// The third variant exists because MLX's `quantizedMM` Metal kernels require
-/// `groupSize >= 32`. GGUF types Q2_K, Q3_K, and Q6_K produce `groupSize = 16`,
-/// so the packed representation is kept in memory (preserving compression) and
-/// dequantized transiently on each forward pass.
+/// The `.dequantizeMatmul` variant is a fallback for weights with `groupSize < 32`.
+/// As of the current implementation, all GGUF types (including Q2_K, Q3_K, Q6_K)
+/// are re-quantized to `groupSize = 32` during loading, so `.affineQuantized` is
+/// used for all quantized weights in practice.
 public enum ProjectionKernel: @unchecked Sendable {
 
     /// Dense (unquantized) weight — dispatches to `matmul(x, w.T)`.

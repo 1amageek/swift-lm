@@ -2,7 +2,7 @@ import Testing
 import Foundation
 @testable import SwiftLM
 
-@Suite("ModelGraph")
+@Suite("ModelGraph", .tags(.unit))
 struct ModelGraphTests {
 
     @Test("Empty graph has empty root region")

@@ -102,42 +102,44 @@ public final class PrefixCachePool {
             return (newCacheFactory(), 0)
         }
 
-        // Find slot with longest common prefix (Ollama's findLongestCacheSlot)
-        var bestIndex: Int?
-        var bestPrefixLen = 0
-
+        // Build candidates sorted by prefix length, longest first.
+        // Unlike the previous single-best approach, this tries multiple slots
+        // so that a non-trimmable slot (e.g. DeltaNet) that requires trimming
+        // doesn't prevent reuse of a shorter exact-prefix match.
+        var candidates: [(index: Int, prefixLen: Int)] = []
         for (i, slot) in slots.enumerated() {
-            guard slot.layout == layout else {
-                continue
-            }
+            guard slot.layout == layout else { continue }
             let common = countCommonPrefix(slot.tokens, tokens)
-            if common > bestPrefixLen {
-                bestPrefixLen = common
-                bestIndex = i
+            if common > 0 {
+                candidates.append((index: i, prefixLen: common))
             }
         }
+        candidates.sort { $0.prefixLen > $1.prefixLen }
 
-        if let idx = bestIndex, bestPrefixLen > 0 {
-            let slot = slots.remove(at: idx)
+        for candidate in candidates {
+            let slot = slots[candidate.index]
+            let trimCount = slot.tokens.count - candidate.prefixLen
 
-            // Trim divergent tail (Ollama's KvCacheSeqRm equivalent)
-            let trimCount = slot.tokens.count - bestPrefixLen
-            if trimCount > 0 {
-                let trimmable = slot.cache.allSatisfy { $0.isTrimmable }
-                if trimmable {
-                    for cache in slot.cache {
-                        cache.trim(trimCount)
-                    }
-                } else {
-                    // Non-trimmable cache — fall back to fresh
-                    return (newCacheFactory(), 0)
-                }
+            if trimCount == 0 {
+                // Exact prefix match — safe for all cache types including
+                // non-trimmable (DeltaNet recurrent state, CompiledKVCache).
+                // This is the common multi-turn chat pattern.
+                slots.remove(at: candidate.index)
+                return (slot.cache, candidate.prefixLen)
             }
 
-            return (slot.cache, bestPrefixLen)
+            // Trimming required — only possible if all caches support it
+            if slot.cache.allSatisfy({ $0.isTrimmable }) {
+                slots.remove(at: candidate.index)
+                for cache in slot.cache { cache.trim(trimCount) }
+                return (slot.cache, candidate.prefixLen)
+            }
+
+            // This slot can't be trimmed — keep it in the pool and try next.
+            // Previously the slot was removed and lost here (slot leak).
         }
 
-        // No match — create fresh cache
+        // No reusable slot found — create fresh cache
         return (newCacheFactory(), 0)
     }
 

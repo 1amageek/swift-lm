@@ -72,11 +72,11 @@ struct GGUFGPUPacker {
                            groupSize: 32, bits: 5)
         case .q6_K:
             let sbCount = totalElements / 256
-            guard sbCount >= gpuThreshold / 16 else { return nil }
-            let groupCount = totalElements / 16
+            guard sbCount >= gpuThreshold / 8 else { return nil }
+            let groupCount = totalElements / 32
             return packGPU(data: data, shape: shape, kernel: q6_KKernel,
-                           groupCount: groupCount, packedPerGroup: 3,
-                           groupSize: 16, bits: 6)
+                           groupCount: groupCount, packedPerGroup: 6,
+                           groupSize: 32, bits: 6)
         case .q8_K:
             let sbCount = totalElements / 256
             guard sbCount >= gpuThreshold / 8 else { return nil }
@@ -442,57 +442,74 @@ struct GGUFGPUPacker {
         ensureRowContiguous: false
     )
 
-    /// Q6_K: 210 bytes/super-block, 256 elements, 16 groups of 16, groupSize=16, 6-bit
+    /// Q6_K: 210 bytes/super-block, 256 elements → 8 groups of 32, groupSize=32, 6-bit
+    /// 1 thread decodes 2 adjacent 16-element sub-groups, finds min/max, re-quantizes to 32-element group
     private static let q6_KKernel = MLXFast.metalKernel(
         name: "gguf_repack_q6k",
         inputNames: ["raw"],
         outputNames: ["packed", "scales", "biases"],
         source: """
             uint gid = thread_position_in_grid.x;
-            uint block = gid / 16;
-            uint localIdx = gid % 16;
-            uint half_idx = localIdx / 8;
-            uint localGroup = localIdx % 8;
+            uint block = gid / 8;
+            uint pairIdx = gid % 8;
 
             uint offset = block * 210;
-            uint qlBase = offset + half_idx * 64;
-            uint qhBase = offset + 128 + half_idx * 32;
-            uint scBase = offset + 192 + half_idx * 8;
             float d = read_f16(raw, offset + 208);
 
-            int8_t subScale = as_type<int8_t>(raw[scBase + localGroup]);
-            float scale = d * float(subScale);
-            scales[gid] = scale;
-            biases[gid] = -32.0f * scale;
+            // Decode 32 float values from 2 adjacent 16-element sub-groups
+            float vals[32];
+            for (uint s = 0; s < 2; s++) {
+                uint sg = pairIdx * 2 + s;
+                uint half_idx = sg / 8;
+                uint localGroup = sg % 8;
 
-            uint lStart = (localGroup & 1) << 4;
-            uint qlAdd = ((localGroup >> 1) & 1) << 5;
-            bool useLow = (localGroup & 4) == 0;
-            uint qhShift = localGroup & 6;
+                uint qlBase = offset + half_idx * 64;
+                uint qhBase = offset + 128 + half_idx * 32;
+                uint scBase = offset + 192 + half_idx * 8;
 
-            uint pBase = gid * 3;
-            uint32_t w0 = 0, w1 = 0, w2 = 0;
-            for (uint i = 0; i < 16; i++) {
-                uint l = lStart + i;
-                uint8_t qlByte = raw[qlBase + qlAdd + l];
-                uint32_t ql = useLow ? uint32_t(qlByte & 0x0F) : uint32_t(qlByte >> 4);
-                uint32_t qh = uint32_t((raw[qhBase + l] >> qhShift) & 3) << 4;
-                uint32_t q_val = ql | qh;
+                int8_t subScale = as_type<int8_t>(raw[scBase + localGroup]);
+                float scale = d * float(subScale);
+                float bias = -32.0f * scale;
 
-                uint bi = i * 6;
-                if (bi < 32) {
-                    w0 |= q_val << bi;
-                    if (bi + 6 > 32) w1 |= q_val >> (32 - bi);
-                } else if (bi < 64) {
-                    w1 |= q_val << (bi - 32);
-                    if (bi + 6 > 64) w2 |= q_val >> (64 - bi);
-                } else {
-                    w2 |= q_val << (bi - 64);
+                uint lStart = (localGroup & 1) << 4;
+                uint qlAdd = ((localGroup >> 1) & 1) << 5;
+                bool useLow = (localGroup & 4) == 0;
+                uint qhShift = localGroup & 6;
+
+                for (uint i = 0; i < 16; i++) {
+                    uint l = lStart + i;
+                    uint8_t qlByte = raw[qlBase + qlAdd + l];
+                    uint32_t ql = useLow ? uint32_t(qlByte & 0x0F) : uint32_t(qlByte >> 4);
+                    uint32_t qh = uint32_t((raw[qhBase + l] >> qhShift) & 3) << 4;
+                    vals[s * 16 + i] = float(ql | qh) * scale + bias;
                 }
             }
-            packed[pBase + 0] = w0;
-            packed[pBase + 1] = w1;
-            packed[pBase + 2] = w2;
+
+            // Find min/max of 32 values
+            float vmin = vals[0], vmax = vals[0];
+            for (uint i = 1; i < 32; i++) {
+                vmin = min(vmin, vals[i]);
+                vmax = max(vmax, vals[i]);
+            }
+            float range = vmax - vmin;
+            float newScale = range > 0.0f ? range / 63.0f : 0.0f;
+            scales[gid] = newScale;
+            biases[gid] = vmin;
+
+            // Re-quantize and pack 32 6-bit values into 6 UInt32
+            uint pBase = gid * 6;
+            uint32_t w[6] = {0, 0, 0, 0, 0, 0};
+            float invScale = newScale > 0.0f ? 1.0f / newScale : 0.0f;
+            for (uint i = 0; i < 32; i++) {
+                int q = int(round((vals[i] - vmin) * invScale));
+                q = clamp(q, 0, 63);
+                uint bi = i * 6;
+                uint wi = bi / 32;
+                uint bo = bi % 32;
+                w[wi] |= uint32_t(q) << bo;
+                if (bo + 6 > 32) w[wi + 1] |= uint32_t(q) >> (32 - bo);
+            }
+            for (uint i = 0; i < 6; i++) packed[pBase + i] = w[i];
         """,
         header: metalHeader,
         ensureRowContiguous: false

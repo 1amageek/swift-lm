@@ -614,6 +614,14 @@ class TransformerModel: Module, LanguageModel, KVCacheDimensionProvider {
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
+    /// Cached compiled decode function for fixed [1,1] input shape.
+    /// Created lazily on first decode call. Reduces graph construction overhead
+    /// by reusing the pre-traced computation graph.
+    private var compiledDecode: (@Sendable ([MLXArray]) -> [MLXArray])?
+
+    /// The cache array used during compilation. Must match the cache used in generation.
+    private var compiledDecodeCache: [KVCache]?
+
     init(_ config: TransformerConfiguration) {
         self.configuration = config
         self.vocabularySize = config.vocabularySize
@@ -625,7 +633,16 @@ class TransformerModel: Module, LanguageModel, KVCacheDimensionProvider {
     }
 
     func callAsFunction(_ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?) -> LMOutput {
-        var logits = forwardLogits(input.tokens, cache: cache)
+        let tokens = input.tokens
+        let tokenCount = tokens.dim(tokens.ndim - 1)
+
+        // Use compiled decode for single-token inputs (autoregressive decode phase)
+        if tokenCount == 1, let cache {
+            let logits = compiledForwardLogits(tokens, cache: cache)
+            return LMOutput(logits: logits)
+        }
+
+        var logits = forwardLogits(tokens, cache: cache)
 
         if let cap = configuration.finalLogitSoftcap, cap > 0 {
             logits = cap * MLX.tanh(logits / cap)
@@ -651,6 +668,47 @@ class TransformerModel: Module, LanguageModel, KVCacheDimensionProvider {
         } else {
             return model.embedTokens.asLinear(out)
         }
+    }
+
+    /// Forward pass using compiled (graph-cached) decode for single-token inputs.
+    ///
+    /// On first call, traces the decode computation and caches the graph.
+    /// Subsequent calls reuse the cached graph, saving graph construction time.
+    private func compiledForwardLogits(_ inputs: MLXArray, cache: [KVCache]) -> MLXArray {
+        // Rebuild compiled function if cache changed (new generation session)
+        if compiledDecodeCache == nil || !cacheIdentical(compiledDecodeCache!, cache) {
+            let updatableCaches = cache.compactMap { $0 as? (any Updatable) }
+
+            // Only compile if all caches support Updatable
+            guard updatableCaches.count == cache.count else {
+                return forwardLogits(inputs, cache: cache)
+            }
+
+            compiledDecodeCache = cache
+            compiledDecode = compile(
+                inputs: [self] + updatableCaches,
+                outputs: [self] + updatableCaches
+            ) { [self] args in
+                let tokenInput = args[0]
+                var logits = forwardLogits(tokenInput, cache: cache)
+                if let cap = configuration.finalLogitSoftcap, cap > 0 {
+                    logits = cap * MLX.tanh(logits / cap)
+                }
+                return [logits]
+            }
+        }
+
+        guard let compiled = compiledDecode else {
+            return forwardLogits(inputs, cache: cache)
+        }
+
+        return compiled([inputs])[0]
+    }
+
+    /// Check if two cache arrays refer to the same objects.
+    private func cacheIdentical(_ a: [KVCache], _ b: [KVCache]) -> Bool {
+        guard a.count == b.count else { return false }
+        return zip(a, b).allSatisfy { $0 === $1 }
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {

@@ -212,7 +212,7 @@ struct TinyJamba: ModelComponent {
 
 // MARK: - Invariant Tests
 
-@Suite("IR Invariants")
+@Suite("IR Invariants", .tags(.unit))
 struct IRInvariantTests {
 
     // MARK: - Fundamental: normalize always produces valid graphs

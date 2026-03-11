@@ -10,7 +10,7 @@ import Testing
 /// Step 1: Configuration (verified manually against GGUF metadata)
 /// Step 2: Weight loading — modules have correct shapes and non-trivial values
 /// Step 3: Single-component forward pass (future)
-@Suite("Qwen3.5 Weight Verification")
+@Suite("Qwen3.5 Weight Verification", .tags(.diagnostic))
 struct Qwen35WeightVerificationTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

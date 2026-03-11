@@ -207,7 +207,7 @@ private let mediumConfig = (
 
 // MARK: - Fusion Benchmarks (Realistic Dimensions)
 
-@Suite("Fusion Benchmarks (Realistic)")
+@Suite("Fusion Benchmarks (Realistic)", .tags(.performance, .compiled))
 struct FusionRealisticBenchmarks {
 
     // MARK: - Small Model (Qwen3.5-0.6B scale)

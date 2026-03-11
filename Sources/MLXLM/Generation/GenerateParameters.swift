@@ -1,3 +1,34 @@
+import MLX
+
+/// Configuration for speculative decoding with a draft model.
+///
+/// The draft model generates `candidateCount` candidate tokens, which the target
+/// model verifies in a single batched forward pass. Accepted tokens skip
+/// individual decode steps on the target, yielding significant speedup when
+/// the draft model's predictions align with the target.
+public struct SpeculativeConfig: Sendable {
+
+    /// Model context for the draft (smaller, faster) model.
+    public var draftContext: ModelContext
+
+    /// Number of candidate tokens the draft model proposes per step.
+    public var candidateCount: Int
+
+    /// MLX Stream for draft model execution.
+    /// `nil` uses the default device (GPU). Set to `Stream.cpu` for CPU execution.
+    public var draftStream: Stream?
+
+    public init(
+        draftContext: ModelContext,
+        candidateCount: Int = 4,
+        draftStream: Stream? = nil
+    ) {
+        self.draftContext = draftContext
+        self.candidateCount = candidateCount
+        self.draftStream = draftStream
+    }
+}
+
 /// Parameters controlling text generation.
 public struct GenerateParameters: Sendable {
 
@@ -34,6 +65,9 @@ public struct GenerateParameters: Sendable {
     /// Number of prefix tokens reused from a previous generation.
     public var reusedPrefixTokenCount: Int
 
+    /// Speculative decoding configuration (nil = disabled).
+    public var speculative: SpeculativeConfig?
+
     public init(
         maxTokens: Int? = nil,
         maxKVSize: Int? = nil,
@@ -45,7 +79,8 @@ public struct GenerateParameters: Sendable {
         repetitionPenalty: Float? = nil,
         repetitionContextSize: Int = 20,
         reusedPrefixTokenCount: Int = 0,
-        prefillStepSize: Int = 512
+        prefillStepSize: Int = 512,
+        speculative: SpeculativeConfig? = nil
     ) {
         self.maxTokens = maxTokens
         self.maxKVSize = maxKVSize
@@ -58,5 +93,6 @@ public struct GenerateParameters: Sendable {
         self.repetitionContextSize = repetitionContextSize
         self.reusedPrefixTokenCount = reusedPrefixTokenCount
         self.prefillStepSize = prefillStepSize
+        self.speculative = speculative
     }
 }

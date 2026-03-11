@@ -8,7 +8,7 @@ import GGUFParser
 
 // MARK: - GGUFTensorNameMapper Tests
 
-@Suite("LlamaTensorNameMapper")
+@Suite("LlamaTensorNameMapper", .tags(.unit))
 struct LlamaTensorNameMapperTests {
 
     let mapper = LlamaTensorNameMapper()
@@ -80,7 +80,7 @@ struct LlamaTensorNameMapperTests {
 
 // MARK: - TransformerConfiguration GGUF Tests
 
-@Suite("TransformerConfiguration from GGUF")
+@Suite("TransformerConfiguration from GGUF", .tags(.unit))
 struct TransformerConfigurationGGUFTests {
 
     /// Create a minimal GGUF file with specified metadata for testing.
@@ -205,7 +205,7 @@ struct TransformerConfigurationGGUFTests {
 
 // MARK: - GGUFTensorBridge Tests
 
-@Suite("GGUFTensorBridge")
+@Suite("GGUFTensorBridge", .tags(.unit))
 struct GGUFTensorBridgeTests {
 
     let bridge = GGUFTensorBridge()
@@ -429,7 +429,7 @@ struct GGUFTensorBridgeTests {
 
 // MARK: - Direct Quantized Packing Tests
 
-@Suite("Direct GGUF→MLX Quantized Packing")
+@Suite("Direct GGUF→MLX Quantized Packing", .tags(.unit))
 struct DirectQuantizedPackingTests {
 
     let bridge = GGUFTensorBridge()
@@ -1729,7 +1729,7 @@ struct DirectQuantizedPackingTests {
 
 // MARK: - TransformerModel Tests
 
-@Suite("TransformerModel")
+@Suite("TransformerModel", .tags(.unit))
 struct TransformerModelTests {
 
     private func makeSmallConfig() -> TransformerConfiguration {
@@ -1811,7 +1811,7 @@ struct TransformerModelTests {
 
 // MARK: - ChatTemplateRenderer Tests
 
-@Suite("ChatTemplateRenderer")
+@Suite("ChatTemplateRenderer", .tags(.unit))
 struct ChatTemplateRendererTests {
 
     @Test("Simple template rendering")
@@ -1914,7 +1914,7 @@ struct ChatTemplateRendererTests {
 
 // MARK: - GGUFUserInputProcessor Tests
 
-@Suite("GGUFUserInputProcessor")
+@Suite("GGUFUserInputProcessor", .tags(.unit))
 struct GGUFUserInputProcessorTests {
 
     @Test("Fallback formatting without template")
@@ -2012,7 +2012,7 @@ struct GGUFUserInputProcessorTests {
 
 // MARK: - KVCache Tests
 
-@Suite("KVCache")
+@Suite("KVCache", .tags(.unit))
 struct KVCacheTests {
 
     @Test("Simple cache creation")
@@ -2034,7 +2034,7 @@ struct KVCacheTests {
 
 // MARK: - Bias Detection Tests
 
-@Suite("TransformerConfiguration Bias Detection")
+@Suite("TransformerConfiguration Bias Detection", .tags(.unit))
 struct TransformerConfigurationBiasTests {
 
     @Test("Detect attention bias from tensor names")
@@ -2093,7 +2093,7 @@ struct TransformerConfigurationBiasTests {
 
 // MARK: - PromptCacheSnapshot Tests
 
-@Suite("PromptCacheSnapshot")
+@Suite("PromptCacheSnapshot", .tags(.unit))
 struct PromptCacheSnapshotTests {
 
     @Test("Capture and materialize simple cache")
@@ -2137,7 +2137,7 @@ struct PromptCacheSnapshotTests {
 
 // MARK: - E2E Integration Test
 
-@Suite("E2E Integration")
+@Suite("E2E Integration", .tags(.unit))
 struct E2EIntegrationTests {
 
     /// Build a complete minimal GGUF binary suitable for GGUFModelLoader.
@@ -2311,7 +2311,7 @@ struct E2EIntegrationTests {
 
 // MARK: - LoadReport Tests
 
-@Suite("LoadReport")
+@Suite("LoadReport", .tags(.unit))
 struct LoadReportTests {
 
     /// Build a minimal GGUF for LoadReport testing.

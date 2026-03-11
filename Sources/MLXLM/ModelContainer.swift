@@ -95,6 +95,11 @@ public actor ModelContainer {
         cache: [KVCache]? = nil,
         parameters: GenerateParameters
     ) throws -> AsyncStream<Generation> {
+        // Speculative decoding path
+        if parameters.speculative != nil {
+            return try generateSpeculative(input: input, parameters: parameters)
+        }
+
         if let cache {
             // External cache management (caller controls lifecycle)
             return try MLXLM.generate(
@@ -147,8 +152,8 @@ public actor ModelContainer {
         let tokenizer = context.tokenizer
         let configuration = context.configuration
 
-        // Extract input token IDs for prefix matching (GPU→CPU sync, before generation)
-        let inputTokens = extractTokenIDs(input.text.tokens)
+        // Extract input token IDs for prefix matching (uses CPU cache when available)
+        let inputTokens = extractTokenIDs(input.text)
         let layout = CacheLayout(parameters: parameters)
 
         // Acquire cache from pool (finds best prefix match, trims divergent tail)
@@ -175,7 +180,8 @@ public actor ModelContainer {
             model: model,
             cache: cache,
             parameters: effectiveParameters,
-            eosTokenIds: allEosIds
+            eosTokenIds: allEosIds,
+            promptTokenIDs: inputTokens
         )
 
         // Wrap non-Sendable state for safe transfer into Task.
@@ -265,9 +271,11 @@ public actor ModelContainer {
         cachePool.release(cache: cache, layout: layout, tokens: tokens)
     }
 
-    /// Extract token IDs from an MLXArray for prefix matching.
-    private func extractTokenIDs(_ tokens: MLXArray) -> [Int] {
-        let flat = tokens.flattened()
+    /// Extract token IDs for prefix matching.
+    /// Uses CPU-side cache when available, falling back to GPU→CPU sync.
+    private func extractTokenIDs(_ input: LMInput.Text) -> [Int] {
+        if let cached = input.cpuTokenIDs { return cached }
+        let flat = input.tokens.flattened()
         eval(flat)
         let int32Tokens: [Int32] = flat.asArray(Int32.self)
         return int32Tokens.map { Int($0) }
@@ -284,6 +292,148 @@ public actor ModelContainer {
 
         return input.text.positionIds == nil
     }
+
+    // MARK: - Private: Speculative Decoding
+
+    /// Generate using speculative decoding with a draft model.
+    ///
+    /// The draft model proposes candidate tokens, which the target model verifies
+    /// in batched forward passes. When predictions align, multiple tokens are
+    /// accepted per step.
+    private func generateSpeculative(
+        input: LMInput,
+        parameters: GenerateParameters
+    ) throws -> AsyncStream<Generation> {
+        guard let spec = parameters.speculative else {
+            fatalError("generateSpeculative called without speculative config")
+        }
+
+        let targetModel = context.model
+        let tokenizer = context.tokenizer
+        let configuration = context.configuration
+        let draftModel = spec.draftContext.model
+
+        let targetCache = targetModel.newCache(parameters: parameters)
+        let draftCache = draftModel.newCache(parameters: parameters)
+
+        let sampler = parameters.sampler()
+        let promptTokenCount = input.text.tokens.dim(input.text.tokens.ndim - 1)
+
+        var eosIds = configuration.eosTokenIds
+        if let eos = tokenizer.eosTokenID {
+            eosIds.insert(eos)
+        }
+        let allEosIds = eosIds
+
+        let generator = SpeculativeGenerator(
+            draft: draftModel,
+            draftCache: draftCache,
+            target: targetModel,
+            targetCache: targetCache,
+            candidateCount: spec.candidateCount,
+            sampler: sampler
+        )
+
+        let state = SpeculativeGenerationState(
+            generator: generator,
+            detokenizer: StreamingDetokenizer(tokenizer: tokenizer),
+            rawTokenLogger: RawTokenTraceLogger(tokenizer: tokenizer)
+        )
+
+        let maxTokens = parameters.maxTokens
+        let prefillStepSize = targetModel.recommendedPrefillStepSize
+
+        return AsyncStream { continuation in
+            let task = Task {
+                var s = state
+                var generationTokenCount = 0
+                let promptStart = Date()
+                var generateStart = promptStart
+                var stopReason: GenerateStopReason = .stop
+
+                // Prefill both models and get first token
+                let firstTokenID: Int32
+                do {
+                    firstTokenID = try s.generator.prefill(
+                        input: input, prefillStepSize: prefillStepSize
+                    )
+                } catch {
+                    print("[speculative] prefill error: \(error)")
+                    continuation.finish()
+                    return
+                }
+
+                generateStart = Date()
+                let prefillTime = generateStart.timeIntervalSince(promptStart)
+                print("[speculative] first token latency=\(String(format: "%.2f", prefillTime))s")
+
+                // Yield first token
+                let firstToken = Int(firstTokenID)
+                if allEosIds.contains(firstToken) {
+                    stopReason = .stop
+                } else {
+                    generationTokenCount += 1
+                    if let text = s.detokenizer.append(token: firstToken) {
+                        continuation.yield(.chunk(text))
+                    }
+
+                    // Speculative decode loop
+                    var lastToken = firstTokenID
+                    while !Task.isCancelled {
+                        let accepted = s.generator.step(lastToken: lastToken)
+
+                        var hitEos = false
+                        for token in accepted {
+                            if allEosIds.contains(token) {
+                                hitEos = true
+                                break
+                            }
+                            generationTokenCount += 1
+                            if let text = s.detokenizer.append(token: token) {
+                                continuation.yield(.chunk(text))
+                            }
+                            lastToken = Int32(token)
+                        }
+
+                        if hitEos {
+                            stopReason = .stop
+                            break
+                        }
+
+                        if let max = maxTokens, generationTokenCount >= max {
+                            stopReason = .length
+                            break
+                        }
+                    }
+
+                    if Task.isCancelled {
+                        stopReason = .cancelled
+                    }
+                }
+
+                Stream().synchronize()
+
+                let now = Date()
+                let promptTime = generateStart.timeIntervalSince(promptStart)
+                let generateTime = now.timeIntervalSince(generateStart)
+
+                let info = GenerateCompletionInfo(
+                    promptTokenCount: promptTokenCount,
+                    generationTokenCount: generationTokenCount,
+                    promptTime: promptTime,
+                    generateTime: generateTime,
+                    stopReason: stopReason
+                )
+                print("[speculative] done tokens=\(generationTokenCount) prefill=\(String(format: "%.2f", promptTime))s generate=\(String(format: "%.2f", generateTime))s stop=\(stopReason)")
+                continuation.yield(.info(info))
+                continuation.finish()
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
+    }
 }
 
 /// Wraps non-Sendable generation state for safe transfer into a Task.
@@ -292,6 +442,16 @@ public actor ModelContainer {
 /// which is actor-isolated. The model and cache are never accessed concurrently.
 private struct CacheAwareGenerationState: @unchecked Sendable {
     var iterator: TokenIterator
+    var detokenizer: StreamingDetokenizer
+    var rawTokenLogger: RawTokenTraceLogger
+}
+
+/// Wraps speculative generation state for safe transfer into a Task.
+///
+/// Safety: Used exclusively within `ModelContainer.generateSpeculative()`,
+/// which is actor-isolated. The model and caches are never accessed concurrently.
+private struct SpeculativeGenerationState: @unchecked Sendable {
+    var generator: SpeculativeGenerator
     var detokenizer: StreamingDetokenizer
     var rawTokenLogger: RawTokenTraceLogger
 }

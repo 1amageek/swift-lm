@@ -14,7 +14,7 @@ import SwiftLM
 ///
 /// Design: `LanguageModel.newCache()` returns `[CompiledKVCache]` (single element).
 /// `callAsFunction` reads/writes through this shared reference.
-final class CompiledKVCache: KVCache, @unchecked Sendable {
+final class CompiledKVCache: KVCache, Updatable, @unchecked Sendable {
 
     /// The mutable inference state (contains all layer caches + position).
     var inferenceState: InferenceState
@@ -29,7 +29,18 @@ final class CompiledKVCache: KVCache, @unchecked Sendable {
 
     var maxSize: Int? { nil }
 
-    var isTrimmable: Bool { false }
+    var isTrimmable: Bool {
+        // Trimmable only if all internal cache slots are KV (no recurrent/DeltaNet).
+        // For hybrid models like Qwen3.5, this is false — which is correct because
+        // DeltaNet recurrent state cannot discard individual token contributions.
+        // PrefixCachePool handles this by reusing without trimming (trimCount == 0).
+        inferenceState.caches.allSatisfy { cache in
+            switch cache {
+            case .kv: return true
+            case .recurrent, .empty: return false
+            }
+        }
+    }
 
     func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
         fatalError("CompiledKVCache does not support direct KV updates")
@@ -37,7 +48,22 @@ final class CompiledKVCache: KVCache, @unchecked Sendable {
 
     @discardableResult
     func trim(_ n: Int) -> Int {
-        0
+        guard isTrimmable, n > 0 else { return 0 }
+
+        var minTrimmed = n
+        for i in 0..<inferenceState.caches.count {
+            switch inferenceState.caches[i] {
+            case .kv(var kv):
+                let trimmed = min(n, kv.offset)
+                kv.offset -= trimmed
+                inferenceState.caches[i] = .kv(kv)
+                minTrimmed = min(minTrimmed, trimmed)
+            default:
+                return 0
+            }
+        }
+        inferenceState.nextPosition -= minTrimmed
+        return minTrimmed
     }
 
     var state: [MLXArray] {
@@ -224,11 +250,14 @@ class CompiledLanguageModel: Module, LanguageModel, @unchecked Sendable {
         let tokenCount = input.tokens.dim(input.tokens.ndim - 1)
 
         if tokenCount > 1 {
+            // Prefill — processes the full prompt sequence
             let (logits, newState) = lowered.prefill(
                 tokenIDs: input.tokens, state: compiledCache.inferenceState)
             compiledCache.inferenceState = newState
             return LMOutput(logits: logits)
         } else {
+            // Decode — single token via optimized lowered path
+            // (PackedProjection + FusedBlock optimizations provide the speedup)
             let (logits, newState) = lowered.decode(
                 tokenIDs: input.tokens, state: compiledCache.inferenceState)
             compiledCache.inferenceState = newState
@@ -256,6 +285,11 @@ class CompiledLanguageModel: Module, LanguageModel, @unchecked Sendable {
 
     var kvHeads: [Int] {
         Array(repeating: 1, count: lowered.metadata.cacheSlotCount)
+    }
+
+    var recommendedPrefillStepSize: Int? {
+        let hasRecurrent = lowered.metadata.cacheDescriptors.contains { $0.kind == .recurrent }
+        return hasRecurrent ? 512 : nil
     }
 
     func prepare(

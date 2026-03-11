@@ -8,7 +8,7 @@ import GGUFParser
 ///
 /// These tests download the model on first run (~600MB, cached locally).
 /// Requires network access and Metal GPU.
-@Suite("Qwen3.5-0.8B")
+@Suite("Qwen3.5-0.8B", .tags(.diagnostic))
 struct Qwen3_5Tests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

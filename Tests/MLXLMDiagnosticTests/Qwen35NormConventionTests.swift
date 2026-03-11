@@ -18,7 +18,7 @@ import Testing
 /// - Ours: (1 + weight) * rms_norm(x) ≈ 2 * rms_norm(x) ← WRONG
 ///
 /// This test checks what values the loaded norm weights actually have.
-@Suite("Qwen3.5 Norm Convention Verification")
+@Suite("Qwen3.5 Norm Convention Verification", .tags(.diagnostic))
 struct Qwen35NormConventionTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

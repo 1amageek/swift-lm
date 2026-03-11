@@ -30,7 +30,7 @@ private func bind(_ pairs: [ParameterSlot: MLXArray]) -> BoundWeights {
 
 // MARK: - Compiler Tests
 
-@Suite("MLXCompiler")
+@Suite("MLXCompiler", .tags(.unit))
 struct CompilerTests {
 
     @Test("Cache descriptors for Llama-style model: 2 KV caches per layer")
@@ -101,7 +101,7 @@ struct CompilerTests {
 
 // MARK: - Weight Store Tests
 
-@Suite("MLXWeightStore")
+@Suite("MLXWeightStore", .tags(.unit))
 struct WeightStoreTests {
 
     @Test("Weight store extracts MLXArrays from BoundWeights")
@@ -139,7 +139,7 @@ struct WeightStoreTests {
 
 // MARK: - Executor Operation Tests
 
-@Suite("MLXExecutor Operations")
+@Suite("MLXExecutor Operations", .tags(.unit))
 struct ExecutorOperationTests {
 
     @Test("TokenEmbedding looks up embeddings by token ID")
@@ -346,7 +346,7 @@ struct ExecutorOperationTests {
 
 // MARK: - Structural Execution Tests
 
-@Suite("MLXExecutor Structural Operations")
+@Suite("MLXExecutor Structural Operations", .tags(.unit))
 struct ExecutorStructuralTests {
 
     @Test("Residual adds body output to input")
@@ -465,7 +465,7 @@ struct ExecutorStructuralTests {
 
 // MARK: - Attention Tests
 
-@Suite("MLXExecutor Attention")
+@Suite("MLXExecutor Attention", .tags(.unit))
 struct ExecutorAttentionTests {
 
     @Test("Attention produces correct output shape and caches keys/values")
@@ -554,7 +554,7 @@ struct ExecutorAttentionTests {
 
 // MARK: - End-to-End Tests
 
-@Suite("MLXExecutor End-to-End")
+@Suite("MLXExecutor End-to-End", .tags(.unit))
 struct ExecutorEndToEndTests {
 
     @Test("Mini transformer forward pass: embed → repeat(norm+attn, norm+mlp) → norm → head")
@@ -667,7 +667,7 @@ struct ExecutorEndToEndTests {
 
 // MARK: - LayerNorm Tests
 
-@Suite("MLXExecutor LayerNorm")
+@Suite("MLXExecutor LayerNorm", .tags(.unit))
 struct ExecutorLayerNormTests {
 
     @Test("LayerNorm normalizes input with affine transform")
@@ -747,7 +747,7 @@ struct ExecutorLayerNormTests {
 
 // MARK: - GQA Attention Tests
 
-@Suite("MLXExecutor GQA Attention")
+@Suite("MLXExecutor GQA Attention", .tags(.unit))
 struct ExecutorGQATests {
 
     @Test("GQA with kvHeadCount < headCount produces correct shape")
@@ -833,7 +833,7 @@ struct ExecutorGQATests {
 
 // MARK: - Attention Bias and QK Norm Tests
 
-@Suite("MLXExecutor Attention Variants")
+@Suite("MLXExecutor Attention Variants", .tags(.unit))
 struct ExecutorAttentionVariantTests {
 
     @Test("Attention with bias adds bias to projections")
@@ -950,7 +950,7 @@ struct ExecutorAttentionVariantTests {
 
 // MARK: - Linear and OutputHead Variant Tests
 
-@Suite("MLXExecutor Linear Variants")
+@Suite("MLXExecutor Linear Variants", .tags(.unit))
 struct ExecutorLinearVariantTests {
 
     @Test("Linear with bias adds bias vector")
@@ -1021,7 +1021,7 @@ struct ExecutorLinearVariantTests {
 
 // MARK: - MLP Variant Tests
 
-@Suite("MLXExecutor MLP Variants")
+@Suite("MLXExecutor MLP Variants", .tags(.unit))
 struct ExecutorMLPVariantTests {
 
     @Test("MLP without gating (no up_proj): gate → activate → down")
@@ -1159,7 +1159,7 @@ struct ExecutorMLPVariantTests {
 
 // MARK: - Parallel Merge Variant Tests
 
-@Suite("MLXExecutor Parallel Merge Variants")
+@Suite("MLXExecutor Parallel Merge Variants", .tags(.unit))
 struct ExecutorParallelMergeTests {
 
     @Test("Parallel with concat merge concatenates branch outputs")
@@ -1206,7 +1206,7 @@ struct ExecutorParallelMergeTests {
 
 // MARK: - Batch Dimension Tests
 
-@Suite("MLXExecutor Batch Handling")
+@Suite("MLXExecutor Batch Handling", .tags(.unit))
 struct ExecutorBatchTests {
 
     @Test("2D tokenIDs [B, L] preserves batch dimension in output")
@@ -1269,7 +1269,7 @@ struct ExecutorBatchTests {
 
 // MARK: - Attention Numerical Correctness Tests
 
-@Suite("MLXExecutor Attention Numerics")
+@Suite("MLXExecutor Attention Numerics", .tags(.unit))
 struct ExecutorAttentionNumericsTests {
 
     @Test("Single-head attention with identity projections computes correct output")
@@ -1337,7 +1337,7 @@ struct ExecutorAttentionNumericsTests {
 
 // MARK: - Cache State Tests
 
-@Suite("MLXExecutor Cache Behavior")
+@Suite("MLXExecutor Cache Behavior", .tags(.unit))
 struct ExecutorCacheTests {
 
     @Test("Cache offset increments correctly across multiple forward passes")
@@ -1412,7 +1412,7 @@ struct ExecutorCacheTests {
 
 // MARK: - Compiler Edge Case Tests
 
-@Suite("MLXCompiler Edge Cases")
+@Suite("MLXCompiler Edge Cases", .tags(.unit))
 struct CompilerEdgeCaseTests {
 
     @Test("Deeply nested structure produces correct weight paths")
@@ -1511,7 +1511,7 @@ struct CompilerEdgeCaseTests {
 
 // MARK: - Compiler Error Path Tests
 
-@Suite("MLXCompiler Error Paths")
+@Suite("MLXCompiler Error Paths", .tags(.unit))
 struct CompilerErrorPathTests {
 
     @Test("Multiple embeddings with tied head throws invalidGraphStructure")
@@ -1577,7 +1577,7 @@ struct CompilerErrorPathTests {
 
 // MARK: - Executor Error Path Tests
 
-@Suite("MLXExecutor Error Paths")
+@Suite("MLXExecutor Error Paths", .tags(.unit))
 struct ExecutorErrorPathTests {
 
     @Test("Custom operation throws unsupportedOperation")
@@ -1647,7 +1647,7 @@ struct ExecutorErrorPathTests {
 
 // MARK: - Standalone RoPE Tests
 
-@Suite("MLXExecutor Standalone RoPE")
+@Suite("MLXExecutor Standalone RoPE", .tags(.unit))
 struct ExecutorStandaloneRoPETests {
 
     @Test("Standalone RoPE applies rotation and preserves shape")
@@ -1740,7 +1740,7 @@ struct ExecutorStandaloneRoPETests {
 
 // MARK: - Positional Embedding Tests
 
-@Suite("MLXExecutor Positional Embedding")
+@Suite("MLXExecutor Positional Embedding", .tags(.unit))
 struct ExecutorPositionalEmbeddingTests {
 
     @Test("Positional embedding adds learned positions to input")
@@ -1791,7 +1791,7 @@ struct ExecutorPositionalEmbeddingTests {
 
 // MARK: - MoE Tests
 
-@Suite("MLXExecutor MoE")
+@Suite("MLXExecutor MoE", .tags(.unit))
 struct ExecutorMoETests {
 
     @Test("MoE routes tokens to experts and produces correct shape")
@@ -1841,7 +1841,7 @@ struct ExecutorMoETests {
 
 // MARK: - Parallel Stack Merge Tests
 
-@Suite("MLXExecutor Parallel Stack Merge")
+@Suite("MLXExecutor Parallel Stack Merge", .tags(.unit))
 struct ExecutorParallelStackTests {
 
     @Test("Parallel with stack merge adds new axis")
@@ -1884,7 +1884,7 @@ struct ExecutorParallelStackTests {
 
 // MARK: - KV Cache Capacity Tests
 
-@Suite("MLXKVCacheSimple Internals")
+@Suite("MLXKVCacheSimple Internals", .tags(.unit))
 struct KVCacheCapacityTests {
 
     @Test("KV cache grows beyond initial capacity without errors")
@@ -1937,7 +1937,7 @@ struct KVCacheCapacityTests {
 
 // MARK: - Recurrent Cache Tests
 
-@Suite("MLXRecurrentCache Internals")
+@Suite("MLXRecurrentCache Internals", .tags(.unit))
 struct RecurrentCacheTests {
 
     @Test("Recurrent cache tracks conv state and offset")
@@ -1965,7 +1965,7 @@ struct RecurrentCacheTests {
 
 // MARK: - MLXStateSpaceVariant Tests
 
-@Suite("MLXStateSpaceVariant")
+@Suite("MLXStateSpaceVariant", .tags(.unit))
 struct StateSpaceVariantTests {
 
     @Test("Parses known variant strings correctly")
@@ -1993,7 +1993,7 @@ struct StateSpaceVariantTests {
 
 // MARK: - Executor Protocol Conformance Tests
 
-@Suite("MLXExecutor Protocol Conformance")
+@Suite("MLXExecutor Protocol Conformance", .tags(.unit))
 struct ExecutorProtocolTests {
 
     @Test("Executor.run produces ModelOutputs with correct logits shape")
@@ -2034,7 +2034,7 @@ struct ExecutorProtocolTests {
 
 // MARK: - ModelCompiler Protocol Tests
 
-@Suite("ModelCompiler Protocol")
+@Suite("ModelCompiler Protocol", .tags(.unit))
 struct ModelCompilerProtocolTests {
 
     @Test("MLXCompiler conforms to ModelCompiler with Compiled=MLXCompiledModel")
@@ -2056,7 +2056,7 @@ struct ModelCompilerProtocolTests {
 
 // MARK: - DeltaNet End-to-End Tests
 
-@Suite("MLXExecutor DeltaNet")
+@Suite("MLXExecutor DeltaNet", .tags(.unit))
 struct ExecutorDeltaNetTests {
 
     @Test("DeltaNet forward pass produces correct shape and finite values")
@@ -2157,7 +2157,7 @@ struct ExecutorDeltaNetTests {
 
 // MARK: - MLP Activation/Gating Variant Tests
 
-@Suite("MLXExecutor MLP Activation Variants")
+@Suite("MLXExecutor MLP Activation Variants", .tags(.unit))
 struct ExecutorMLPActivationTests {
 
     @Test("MLP with ReLU activation")
@@ -2258,7 +2258,7 @@ struct ExecutorMLPActivationTests {
 
 // MARK: - Attention QK LayerNorm Tests
 
-@Suite("MLXExecutor Attention LayerNorm QK")
+@Suite("MLXExecutor Attention LayerNorm QK", .tags(.unit))
 struct ExecutorAttentionLayerNormQKTests {
 
     @Test("Attention with LayerNorm QK normalization applies per-head normalization")
@@ -2309,7 +2309,7 @@ struct ExecutorAttentionLayerNormQKTests {
 
 // MARK: - OutputHead Variants Tests
 
-@Suite("MLXExecutor OutputHead Variants")
+@Suite("MLXExecutor OutputHead Variants", .tags(.unit))
 struct ExecutorOutputHeadVariantTests {
 
     @Test("OutputHead with bias adds bias vector to logits")
@@ -2347,7 +2347,7 @@ struct ExecutorOutputHeadVariantTests {
 
 // MARK: - Parallel Custom Merge Tests
 
-@Suite("MLXExecutor Parallel Custom Merge")
+@Suite("MLXExecutor Parallel Custom Merge", .tags(.unit))
 struct ExecutorParallelCustomMergeTests {
 
     @Test("Parallel with custom merge throws unsupportedOperation")
@@ -2402,7 +2402,7 @@ struct ExecutorParallelCustomMergeTests {
 
 // MARK: - Mixed Cache Type Tests
 
-@Suite("MLXCompiler Mixed Cache Types")
+@Suite("MLXCompiler Mixed Cache Types", .tags(.unit))
 struct CompilerMixedCacheTests {
 
     @Test("Model with both attention and stateSpace produces mixed cache descriptors")
@@ -2439,7 +2439,7 @@ struct CompilerMixedCacheTests {
 
 // MARK: - Single Token Forward Tests
 
-@Suite("MLXExecutor Single Token")
+@Suite("MLXExecutor Single Token", .tags(.unit))
 struct ExecutorSingleTokenTests {
 
     @Test("Single token forward pass with L=1 uses non-causal mask")
@@ -2481,7 +2481,7 @@ struct ExecutorSingleTokenTests {
 
 // MARK: - WeightStore Property Tests
 
-@Suite("MLXWeightStore Properties")
+@Suite("MLXWeightStore Properties", .tags(.unit))
 struct WeightStorePropertyTests {
 
     @Test("allSlots returns all stored parameter slots")
@@ -2513,7 +2513,7 @@ struct WeightStorePropertyTests {
 
 // MARK: - CacheSlotByPath Tests
 
-@Suite("MLXCompiledModel CacheSlotByPath")
+@Suite("MLXCompiledModel CacheSlotByPath", .tags(.unit))
 struct CacheSlotByPathTests {
 
     @Test("cacheSlotByPath maps each cache descriptor path to its slot index")
@@ -2536,7 +2536,7 @@ struct CacheSlotByPathTests {
 
 // MARK: - MoE Top-K Variants Tests
 
-@Suite("MLXExecutor MoE Variants")
+@Suite("MLXExecutor MoE Variants", .tags(.unit))
 struct ExecutorMoEVariantTests {
 
     @Test("MoE with top-2 routing activates multiple experts per token")
@@ -2619,7 +2619,7 @@ struct ExecutorMoEVariantTests {
 
 // MARK: - Batch Dimension Tests
 
-@Suite("MLXExecutor Batch Variants")
+@Suite("MLXExecutor Batch Variants", .tags(.unit))
 struct ExecutorBatchVariantTests {
 
     @Test("Batch size > 1 with 2D tokens processes all sequences")
@@ -2654,7 +2654,7 @@ struct ExecutorBatchVariantTests {
 
 // MARK: - CompilerError Description Tests
 
-@Suite("CompilerError Descriptions")
+@Suite("CompilerError Descriptions", .tags(.unit))
 struct CompilerErrorDescriptionTests {
 
     @Test("All error cases produce non-empty descriptions")
@@ -2847,7 +2847,7 @@ private func miniCohereWeights(graph: ModelGraph, layerCount: Int) -> BoundWeigh
 
 // MARK: - Module Compiler Tests
 
-@Suite("MLXModuleCompiler")
+@Suite("MLXModuleCompiler", .tags(.unit))
 struct ModuleCompilerTests {
 
     @Test("Compile Llama-style model into Module tree")
@@ -2999,7 +2999,7 @@ struct ModuleCompilerTests {
     }
 }
 
-@Suite("ModuleCompiler Cohere Parallel Match")
+@Suite("ModuleCompiler Cohere Parallel Match", .tags(.unit))
 struct ModuleCompilerCohereMatchTests {
 
     @Test("Cohere module output matches executor output")

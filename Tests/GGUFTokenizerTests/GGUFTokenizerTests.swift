@@ -5,7 +5,7 @@ import Foundation
 
 // MARK: - ByteEncoder Tests
 
-@Suite("ByteEncoder")
+@Suite("ByteEncoder", .tags(.unit))
 struct ByteEncoderTests {
 
     @Test("All 256 bytes are mapped")
@@ -96,7 +96,7 @@ struct ByteEncoderTests {
 
 // MARK: - PreTokenizer Tests
 
-@Suite("PreTokenizer")
+@Suite("PreTokenizer", .tags(.unit))
 struct PreTokenizerTests {
 
     @Test("Empty text returns empty array")
@@ -187,7 +187,7 @@ struct PreTokenizerTests {
 
 // MARK: - MergesBPETokenizer Tests
 
-@Suite("MergesBPETokenizer")
+@Suite("MergesBPETokenizer", .tags(.unit))
 struct MergesBPETokenizerTests {
 
     // Build a small test vocabulary and merges for testing
@@ -371,7 +371,7 @@ struct MergesBPETokenizerTests {
 
 // MARK: - SentencePieceBPETokenizer Tests
 
-@Suite("SentencePieceBPETokenizer")
+@Suite("SentencePieceBPETokenizer", .tags(.unit))
 struct SentencePieceBPETokenizerTests {
 
     static func makeTestTokenizer() throws -> SentencePieceBPETokenizer {
@@ -533,7 +533,7 @@ struct SentencePieceBPETokenizerTests {
 
 // MARK: - StreamingDetokenizer Tests
 
-@Suite("StreamingDetokenizer")
+@Suite("StreamingDetokenizer", .tags(.unit))
 struct StreamingDetokenizerTests {
 
     static func makeSimpleTokenizer() throws -> MergesBPETokenizer {
@@ -590,7 +590,7 @@ struct StreamingDetokenizerTests {
 
 // MARK: - GGUFTokenizerFactory Tests
 
-@Suite("GGUFTokenizerFactory")
+@Suite("GGUFTokenizerFactory", .tags(.unit))
 struct GGUFTokenizerFactoryTests {
 
     @Test("Create merges-based tokenizer from GGUF")
@@ -636,7 +636,7 @@ struct GGUFTokenizerFactoryTests {
 
 // MARK: - BPE Algorithm Correctness Tests
 
-@Suite("BPE Algorithm")
+@Suite("BPE Algorithm", .tags(.unit))
 struct BPEAlgorithmTests {
 
     @Test("Merge priority order is respected")

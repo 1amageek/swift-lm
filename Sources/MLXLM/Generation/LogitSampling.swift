@@ -8,9 +8,9 @@ protocol LogitSampler {
 
 /// Transforms logits before sampling (e.g., repetition penalty).
 protocol LogitProcessor: Sendable {
-    mutating func prompt(_ prompt: MLXArray)
+    mutating func prompt(_ tokenIDs: [Int])
     func process(logits: MLXArray) -> MLXArray
-    mutating func didSample(token: MLXArray)
+    mutating func didSample(tokenID: Int)
 }
 
 // MARK: - Sampler Implementations
@@ -89,14 +89,10 @@ struct RepetitionProcessor: LogitProcessor, Sendable {
         self.recentTokens = []
     }
 
-    mutating func prompt(_ prompt: MLXArray) {
-        let flat = prompt.flattened()
-        eval(flat)
-        let tokens: [Int32] = flat.asArray(Int32.self)
-        recentTokens = tokens.map { Int($0) }
-        if recentTokens.count > contextSize {
-            recentTokens = Array(recentTokens.suffix(contextSize))
-        }
+    mutating func prompt(_ tokenIDs: [Int]) {
+        recentTokens = tokenIDs.count > contextSize
+            ? Array(tokenIDs.suffix(contextSize))
+            : tokenIDs
     }
 
     func process(logits: MLXArray) -> MLXArray {
@@ -127,10 +123,8 @@ struct RepetitionProcessor: LogitProcessor, Sendable {
         return result.reshaped(originalShape)
     }
 
-    mutating func didSample(token: MLXArray) {
-        // token is already materialized by the caller's .item() call
-        let tokenID: Int32 = token.item()
-        recentTokens.append(Int(tokenID))
+    mutating func didSample(tokenID: Int) {
+        recentTokens.append(tokenID)
         if recentTokens.count > contextSize {
             recentTokens.removeFirst()
         }

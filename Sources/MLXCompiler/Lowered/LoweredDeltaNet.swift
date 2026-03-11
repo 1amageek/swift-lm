@@ -202,6 +202,11 @@ public struct LoweredDeltaNet: @unchecked Sendable {
             let qE = qt.expandedDimensions(axis: -1)
             let ot = (S * qE).sum(axis: -2)
             outputs.append(ot.expandedDimensions(axis: 1))
+
+            // Periodically evaluate to prevent graph explosion during long prefills
+            if T > 1 && (t + 1) % 64 == 0 {
+                eval(S)
+            }
         }
 
         return (concatenated(outputs, axis: 1), S)

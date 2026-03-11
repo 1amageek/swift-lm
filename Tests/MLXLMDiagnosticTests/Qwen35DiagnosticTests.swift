@@ -6,7 +6,7 @@ import GGUFTokenizer
 import Testing
 @testable import MLXLM
 
-@Suite("Qwen3.5 Diagnostics")
+@Suite("Qwen3.5 Diagnostics", .tags(.diagnostic))
 struct Qwen35DiagnosticTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

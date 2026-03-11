@@ -552,6 +552,37 @@ struct GGUFTensorBridge {
         }
     }
 
+    /// Re-quantize 32 dequantized float values to N-bit unsigned affine format.
+    ///
+    /// Finds min/max, computes scale = (max-min)/(2^bits-1), bias = min,
+    /// then quantizes each value to [0, 2^bits-1].
+    /// Returns (scale, bias, packed UInt32 words).
+    @inline(__always)
+    private func requantizeGroup32(
+        _ values: UnsafePointer<Float>, bits: Int
+    ) -> (scale: Float, bias: Float, packed: [UInt32]) {
+        let maxQ = (1 << bits) - 1
+        var vmin = values[0]
+        var vmax = values[0]
+        for i in 1..<32 {
+            vmin = min(vmin, values[i])
+            vmax = max(vmax, values[i])
+        }
+        let range = vmax - vmin
+        let scale = range > 0 ? range / Float(maxQ) : 0
+        let bias = vmin
+
+        var qvals = [UInt8](repeating: 0, count: 32)
+        if scale > 0 {
+            let invScale = 1.0 / scale
+            for i in 0..<32 {
+                let q = Int(((values[i] - bias) * invScale).rounded())
+                qvals[i] = UInt8(clamping: max(0, min(maxQ, q)))
+            }
+        }
+        return (scale, bias, packUnsignedValues(qvals, bits: bits))
+    }
+
     /// Pack quantized unsigned values into UInt32 words, LSB-first.
     ///
     /// MLX expects quantized weights packed little-endian within each UInt32:
@@ -766,53 +797,65 @@ struct GGUFTensorBridge {
     ///
     /// GGUF: value = scale * (q - 32), where q ∈ [0, 63]
     /// MLX:  value = q * scale + (-32 * scale)
+    /// Pack Q6_K → MLX 6-bit affine, groupSize=32.
+    ///
+    /// GGUF Q6_K has 16 sub-groups of 16 elements. We merge adjacent pairs
+    /// into 8 groups of 32, re-quantizing with a single scale/bias per group.
+    /// This enables quantizedMatmul (requires groupSize >= 32).
     private func packQ6_K(data: Data, shape: [Int]) -> ConvertedTensor {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
-        let groupCount = totalElements / 16
-        let packedCount = groupCount * 3
+        let groupCount = totalElements / 32
+        let wordsPerGroup = 32 * 6 / 32  // = 6
 
-        // GPU path handled by GGUFGPUPacker.tryPack() in convertDirect()
-
-        var packed = [UInt32](repeating: 0, count: packedCount)
+        var packed = [UInt32](repeating: 0, count: groupCount * wordsPerGroup)
         var scales = [Float](repeating: 0, count: groupCount)
         var biases = [Float](repeating: 0, count: groupCount)
 
         data.withUnsafeBytes { buffer in
             let bytes = buffer.bindMemory(to: UInt8.self)
-            packed.withUnsafeMutableBufferPointer { packedBuf in
-                let packedPtr = packedBuf.baseAddress!
 
-                for block in 0..<superBlockCount {
-                    let offset = block * 210
-                    let scalesOffset = offset + 192
-                    let d = readFloat16(bytes, offset + 208)
+            for block in 0..<superBlockCount {
+                let offset = block * 210
+                let d = readFloat16(bytes, offset + 208)
 
-                    for half in 0..<2 {
-                        let qlBase = offset + half * 64
-                        let qhBase = offset + 128 + half * 32
-                        let scBase = scalesOffset + half * 8
+                // Decode all 256 values to float
+                var decoded = [Float](repeating: 0, count: 256)
+                for half in 0..<2 {
+                    let qlBase = offset + half * 64
+                    let qhBase = offset + 128 + half * 32
+                    let scBase = offset + 192 + half * 8
 
-                        for localGroup in 0..<8 {
-                            let groupIndex = block * 16 + half * 8 + localGroup
-                            let scale = d * Float(Int8(bitPattern: bytes[scBase + localGroup]))
-                            scales[groupIndex] = scale
-                            biases[groupIndex] = -32.0 * scale
+                    for localGroup in 0..<8 {
+                        let scale = d * Float(Int8(bitPattern: bytes[scBase + localGroup]))
+                        let bias = -32.0 * scale
 
-                            let lStart = (localGroup & 1) << 4
-                            let qlAdd = ((localGroup >> 1) & 1) << 5
-                            let useLow = (localGroup & 4) == 0
-                            let qhShift = localGroup & 6
-                            let pBase = groupIndex * 3
+                        let lStart = (localGroup & 1) << 4
+                        let qlAdd = ((localGroup >> 1) & 1) << 5
+                        let useLow = (localGroup & 4) == 0
+                        let qhShift = localGroup & 6
+                        let outBase = (half * 8 + localGroup) * 16
 
-                            for i in 0..<16 {
-                                let l = lStart + i
-                                let qlByte = bytes[qlBase + qlAdd + l]
-                                let ql = useLow ? UInt32(qlByte & 0x0F) : UInt32(qlByte >> 4)
-                                let qh = UInt32((bytes[qhBase + l] >> qhShift) & 3) << 4
-                                let q = ql | qh
-                                emitBits(q, at: i, bits: 6, into: packedPtr + pBase)
-                            }
+                        for i in 0..<16 {
+                            let l = lStart + i
+                            let qlByte = bytes[qlBase + qlAdd + l]
+                            let ql = useLow ? Int(qlByte & 0x0F) : Int(qlByte >> 4)
+                            let qh = Int((bytes[qhBase + l] >> qhShift) & 3) << 4
+                            decoded[outBase + i] = Float(ql | qh) * scale + bias
+                        }
+                    }
+                }
+
+                // Re-quantize into 8 groups of 32 with groupSize=32
+                for g in 0..<8 {
+                    let groupIdx = block * 8 + g
+                    decoded.withUnsafeBufferPointer { buf in
+                        let (sc, bi, words) = requantizeGroup32(buf.baseAddress! + g * 32, bits: 6)
+                        scales[groupIdx] = sc
+                        biases[groupIdx] = bi
+                        let pBase = groupIdx * wordsPerGroup
+                        for w in 0..<wordsPerGroup {
+                            packed[pBase + w] = words[w]
                         }
                     }
                 }
@@ -821,7 +864,7 @@ struct GGUFTensorBridge {
 
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
-            shape: shape, groupSize: 16, bits: 6
+            shape: shape, groupSize: 32, bits: 6
         )
     }
 
@@ -1027,19 +1070,19 @@ struct GGUFTensorBridge {
         )
     }
 
-    /// Pack Q2_K → MLX 2-bit affine, groupSize=16.
+    /// Pack Q2_K → MLX 2-bit affine, groupSize=32.
     ///
-    /// GGUF Q2_K super-block: 84 bytes / 256 elements.
-    /// Layout: scales(16) + qs(64) + d(f16, 2) + dmin(f16, 2).
-    /// 16 sub-groups of 16 elements each.
-    /// value = sub_scale * q - sub_min → MLX: q * sub_scale + (-sub_min)
+    /// GGUF Q2_K has 16 sub-groups of 16 elements. We merge adjacent pairs
+    /// into 8 groups of 32, re-quantizing with a single scale/bias per group.
+    /// This enables quantizedMatmul (requires groupSize >= 32).
     private func packQ2_K(data: Data, shape: [Int]) -> ConvertedTensor {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
-        let groupCount = totalElements / 16
+        let groupCount = totalElements / 32
+        // 2-bit * 32 values = 64 bits = 2 UInt32 words per group
+        let wordsPerGroup = 2
 
-        // 2-bit: 16 values × 2 bits = 32 bits = 1 UInt32 word per group
-        var packed = [UInt32](repeating: 0, count: groupCount)
+        var packed = [UInt32](repeating: 0, count: groupCount * wordsPerGroup)
         var scales = [Float](repeating: 0, count: groupCount)
         var biases = [Float](repeating: 0, count: groupCount)
 
@@ -1052,50 +1095,53 @@ struct GGUFTensorBridge {
                 let d = readFloat16(bytes, offset + 80)
                 let dmin = readFloat16(bytes, offset + 82)
 
-                var groupIndex = sb * 16
+                // Decode all 256 values to float
+                var decoded = [Float](repeating: 0, count: 256)
+                var valueIdx = 0
                 var scaleIdx = 0
 
-                // Two 128-element halves, each with 32 qs bytes
                 for half in 0..<2 {
                     let qBase = qsOffset + half * 32
                     var shift = 0
 
                     for _ in 0..<4 {
-                        // First 16 elements: q[0..15] >> shift
                         let scByte1 = bytes[scalesOffset + scaleIdx]
                         let sc1 = Float(scByte1 & 0x0F) * d
                         let mn1 = Float((scByte1 >> 4) & 0x0F) * dmin
                         scaleIdx += 1
 
-                        scales[groupIndex] = sc1
-                        biases[groupIndex] = -mn1
-
-                        var values1 = [UInt8](repeating: 0, count: 16)
                         for l in 0..<16 {
-                            values1[l] = (bytes[qBase + l] >> shift) & 0x03
+                            let q = Int((bytes[qBase + l] >> shift) & 0x03)
+                            decoded[valueIdx] = Float(q) * sc1 - mn1
+                            valueIdx += 1
                         }
-                        let packedGroup1 = packUnsignedValues(values1, bits: 2)
-                        packed[groupIndex] = packedGroup1[0]
-                        groupIndex += 1
 
-                        // Next 16 elements: q[16..31] >> shift
                         let scByte2 = bytes[scalesOffset + scaleIdx]
                         let sc2 = Float(scByte2 & 0x0F) * d
                         let mn2 = Float((scByte2 >> 4) & 0x0F) * dmin
                         scaleIdx += 1
 
-                        scales[groupIndex] = sc2
-                        biases[groupIndex] = -mn2
-
-                        var values2 = [UInt8](repeating: 0, count: 16)
                         for l in 0..<16 {
-                            values2[l] = (bytes[qBase + 16 + l] >> shift) & 0x03
+                            let q = Int((bytes[qBase + 16 + l] >> shift) & 0x03)
+                            decoded[valueIdx] = Float(q) * sc2 - mn2
+                            valueIdx += 1
                         }
-                        let packedGroup2 = packUnsignedValues(values2, bits: 2)
-                        packed[groupIndex] = packedGroup2[0]
-                        groupIndex += 1
 
                         shift += 2
+                    }
+                }
+
+                // Re-quantize into 8 groups of 32
+                for g in 0..<8 {
+                    let groupIdx = sb * 8 + g
+                    decoded.withUnsafeBufferPointer { buf in
+                        let (sc, bi, words) = requantizeGroup32(buf.baseAddress! + g * 32, bits: 2)
+                        scales[groupIdx] = sc
+                        biases[groupIdx] = bi
+                        let pBase = groupIdx * wordsPerGroup
+                        for w in 0..<wordsPerGroup {
+                            packed[pBase + w] = words[w]
+                        }
                     }
                 }
             }
@@ -1103,27 +1149,23 @@ struct GGUFTensorBridge {
 
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
-            shape: shape, groupSize: 16, bits: 2
+            shape: shape, groupSize: 32, bits: 2
         )
     }
 
-    /// Pack Q3_K → MLX 3-bit affine, groupSize=16.
+    /// Pack Q3_K → MLX 3-bit affine, groupSize=32.
     ///
-    /// GGUF Q3_K super-block: 110 bytes / 256 elements.
-    /// Layout: hmask(32) + qs(64) + scales(12) + d(f16, 2).
-    /// 16 sub-groups of 16 elements each.
-    /// 3-bit unsigned = qval (2-bit from qs) + hmBit (1-bit from hmask).
-    /// value = effective_scale * (q3 - 4) → MLX: q * scale + bias,
-    /// where scale = effective_scale, bias = -4 * effective_scale
+    /// GGUF Q3_K has 16 sub-groups of 16 elements. We merge adjacent pairs
+    /// into 8 groups of 32, re-quantizing with a single scale/bias per group.
+    /// This enables quantizedMatmul (requires groupSize >= 32).
     private func packQ3_K(data: Data, shape: [Int]) -> ConvertedTensor {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
-        let groupCount = totalElements / 16
-        // 3-bit packing: 256 values × 3 bits = 768 bits = 24 UInt32 words per super-block.
-        // Groups of 16 are not word-aligned (48 bits each), so pack all 256 values
-        // per super-block as a contiguous bitstream.
-        let wordsPerSuperBlock = 256 * 3 / 32  // = 24
-        var packed = [UInt32](repeating: 0, count: superBlockCount * wordsPerSuperBlock)
+        let groupCount = totalElements / 32
+        // 3-bit * 32 values = 96 bits = 3 UInt32 words per group
+        let wordsPerGroup = 3
+
+        var packed = [UInt32](repeating: 0, count: groupCount * wordsPerGroup)
         var scales = [Float](repeating: 0, count: groupCount)
         var biases = [Float](repeating: 0, count: groupCount)
 
@@ -1136,50 +1178,39 @@ struct GGUFTensorBridge {
                 let scalesOffset = offset + 96
                 let d = readFloat16(bytes, offset + 108)
 
-                // Unpack 12 bytes → 16 6-bit scale values
                 var rawScales = [Int](repeating: 0, count: 16)
                 unpackQ3KScales(bytes: bytes, offset: scalesOffset, scales: &rawScales)
 
-                // Collect all 256 values in output order
-                var allValues = [UInt8](repeating: 0, count: 256)
+                // Decode all 256 values to float
+                var decoded = [Float](repeating: 0, count: 256)
                 var valueIdx = 0
                 var scaleIdx = 0
                 var m: UInt8 = 1
-                var groupIndex = sb * 16
 
-                // Two 128-element halves, each with 32 qs bytes
                 for _ in 0..<2 {
                     let qBase = qsOffset + (valueIdx / 128) * 32
                     var shift = 0
 
                     for _ in 0..<4 {
-                        // First 16 elements: q[0..15] >> shift
                         let effectiveScale = d * Float(rawScales[scaleIdx] - 32)
                         scaleIdx += 1
-                        scales[groupIndex] = effectiveScale
-                        biases[groupIndex] = -4.0 * effectiveScale
-                        groupIndex += 1
 
                         for l in 0..<16 {
                             let qval = Int((bytes[qBase + l] >> shift) & 0x03)
                             let hmBit = (bytes[hmaskOffset + l] & m) != 0
                             let q3 = hmBit ? (qval + 4) : qval
-                            allValues[valueIdx] = UInt8(q3)
+                            decoded[valueIdx] = Float(q3 - 4) * effectiveScale
                             valueIdx += 1
                         }
 
-                        // Next 16 elements: q[16..31] >> shift
                         let effectiveScale2 = d * Float(rawScales[scaleIdx] - 32)
                         scaleIdx += 1
-                        scales[groupIndex] = effectiveScale2
-                        biases[groupIndex] = -4.0 * effectiveScale2
-                        groupIndex += 1
 
                         for l in 0..<16 {
                             let qval = Int((bytes[qBase + 16 + l] >> shift) & 0x03)
                             let hmBit = (bytes[hmaskOffset + 16 + l] & m) != 0
                             let q3 = hmBit ? (qval + 4) : qval
-                            allValues[valueIdx] = UInt8(q3)
+                            decoded[valueIdx] = Float(q3 - 4) * effectiveScale2
                             valueIdx += 1
                         }
 
@@ -1188,16 +1219,25 @@ struct GGUFTensorBridge {
                     }
                 }
 
-                // Pack all 256 values as contiguous 3-bit bitstream
-                let packedBlock = packUnsignedValues(allValues, bits: 3)
-                let base = sb * wordsPerSuperBlock
-                packed.replaceSubrange(base..<(base + wordsPerSuperBlock), with: packedBlock)
+                // Re-quantize into 8 groups of 32
+                for g in 0..<8 {
+                    let groupIdx = sb * 8 + g
+                    decoded.withUnsafeBufferPointer { buf in
+                        let (sc, bi, words) = requantizeGroup32(buf.baseAddress! + g * 32, bits: 3)
+                        scales[groupIdx] = sc
+                        biases[groupIdx] = bi
+                        let pBase = groupIdx * wordsPerGroup
+                        for w in 0..<wordsPerGroup {
+                            packed[pBase + w] = words[w]
+                        }
+                    }
+                }
             }
         }
 
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
-            shape: shape, groupSize: 16, bits: 3
+            shape: shape, groupSize: 32, bits: 3
         )
     }
 

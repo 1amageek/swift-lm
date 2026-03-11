@@ -73,7 +73,7 @@ private func makeTransformer(hiddenLayers: Int, moe: Transformer.MoEConfig? = ni
 
 // MARK: - Primitive Component Normalization
 
-@Suite("Performance: Primitive Normalization")
+@Suite("Performance: Primitive Normalization", .tags(.performance))
 struct PrimitiveNormalizationPerformanceTests {
 
     @Test("TokenEmbedding normalization")
@@ -206,7 +206,7 @@ struct PrimitiveNormalizationPerformanceTests {
 
 // MARK: - Structural Component Normalization
 
-@Suite("Performance: Structural Normalization")
+@Suite("Performance: Structural Normalization", .tags(.performance))
 struct StructuralNormalizationPerformanceTests {
 
     @Test("Residual normalization")
@@ -276,7 +276,7 @@ struct StructuralNormalizationPerformanceTests {
 
 // MARK: - End-to-End Model Normalization
 
-@Suite("Performance: Model Normalization")
+@Suite("Performance: Model Normalization", .tags(.performance))
 struct ModelNormalizationPerformanceTests {
 
     @Test("TinyLlama 2 layers normalization")
@@ -357,7 +357,7 @@ struct ModelNormalizationPerformanceTests {
 
 // MARK: - Canonicalization Performance
 
-@Suite("Performance: Canonicalization")
+@Suite("Performance: Canonicalization", .tags(.performance))
 struct CanonicalizationPerformanceTests {
 
     @Test("Canonicalize small graph (2 layers)")
@@ -409,7 +409,7 @@ struct CanonicalizationPerformanceTests {
 
 // MARK: - Validation Performance
 
-@Suite("Performance: Validation")
+@Suite("Performance: Validation", .tags(.performance))
 struct ValidationPerformanceTests {
 
     @Test("GraphValidator small graph (2 layers)")
@@ -458,7 +458,7 @@ struct ValidationPerformanceTests {
 
 // MARK: - Codable Roundtrip Performance
 
-@Suite("Performance: Codable Roundtrip")
+@Suite("Performance: Codable Roundtrip", .tags(.performance))
 struct CodablePerformanceTests {
 
     @Test("JSON encode small graph (2 layers)")
@@ -524,7 +524,7 @@ struct CodablePerformanceTests {
 
 // MARK: - Scaling Performance
 
-@Suite("Performance: Scaling")
+@Suite("Performance: Scaling", .tags(.performance))
 struct ScalingPerformanceTests {
 
     @Test("Normalization scales linearly with non-repeated operations")
@@ -605,7 +605,7 @@ struct ScalingPerformanceTests {
 
 // MARK: - Equality Comparison Performance
 
-@Suite("Performance: Equality")
+@Suite("Performance: Equality", .tags(.performance))
 struct EqualityPerformanceTests {
 
     @Test("Graph equality comparison (identical, 32 layers)")
@@ -642,7 +642,7 @@ struct EqualityPerformanceTests {
 
 // MARK: - Full Pipeline Performance
 
-@Suite("Performance: Full Pipeline")
+@Suite("Performance: Full Pipeline", .tags(.performance))
 struct FullPipelinePerformanceTests {
 
     @Test("Full pipeline: normalize → canonicalize → validate → encode (32 layers)")
@@ -698,7 +698,7 @@ struct FullPipelinePerformanceTests {
 
 // MARK: - WeightsDeclaration Performance
 
-@Suite("Performance: Weights Declaration")
+@Suite("Performance: Weights Declaration", .tags(.performance))
 struct WeightsDeclarationPerformanceTests {
 
     @Test("Simple GGUF weight declaration")

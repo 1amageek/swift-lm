@@ -2,7 +2,7 @@ import Testing
 @testable import SwiftLM
 @testable import Models
 
-@Suite("Model Declaration Tests")
+@Suite("Model Declaration Tests", .tags(.unit))
 struct ModelDeclarationTests {
 
     // MARK: - Transformer

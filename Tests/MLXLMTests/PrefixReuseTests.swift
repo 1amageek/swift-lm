@@ -4,7 +4,7 @@ import MLXNN
 import Testing
 @testable import MLXLM
 
-@Suite("Prefix Reuse")
+@Suite("Prefix Reuse", .tags(.unit))
 struct PrefixReuseTests {
 
     @Test("Pool reuses only compatible cache layouts")
@@ -94,6 +94,131 @@ struct PrefixReuseTests {
                 tokenizer: TestTokenizer()
             )
         )
+    }
+
+    // MARK: - Non-Trimmable Cache (DeltaNet-like)
+
+    @Test("Non-trimmable cache with exact prefix match is reused")
+    func nonTrimmableExactPrefixReuse() {
+        let pool = PrefixCachePool(maxSlots: 2)
+        let layout = CacheLayout.simple
+        let cache: [KVCache] = [NonTrimmableCache(), KVCacheSimple()]
+
+        pool.release(cache: cache, layout: layout, tokens: [1, 2, 3])
+
+        // Request extends stored tokens — trimCount == 0
+        let (reused, prefixLen) = pool.acquire(
+            for: [1, 2, 3, 4, 5],
+            layout: layout,
+            newCacheFactory: { [NonTrimmableCache(), KVCacheSimple()] }
+        )
+
+        #expect(prefixLen == 3)
+        #expect(reused[0] === cache[0])
+    }
+
+    @Test("Non-trimmable cache with trimCount > 0 falls back without slot leak")
+    func nonTrimmableNoSlotLeak() {
+        let pool = PrefixCachePool(maxSlots: 4)
+        let layout = CacheLayout.simple
+        let cache: [KVCache] = [NonTrimmableCache()]
+
+        // Store [1,2,3,4,5] — longer than the new request's common prefix
+        pool.release(cache: cache, layout: layout, tokens: [1, 2, 3, 4, 5])
+        #expect(pool.count == 1)
+
+        // Request [1,2,9] — prefix=2, trimCount=3 — can't trim
+        let (_, prefixLen) = pool.acquire(
+            for: [1, 2, 9],
+            layout: layout,
+            newCacheFactory: { [NonTrimmableCache()] }
+        )
+
+        // Should fall back to fresh cache
+        #expect(prefixLen == 0)
+        // Slot should NOT be leaked — it stays in the pool for future use
+        #expect(pool.count == 1)
+    }
+
+    @Test("Pool tries shorter candidate when best match is non-trimmable")
+    func fallbackToShorterTrimmableCandidate() {
+        let pool = PrefixCachePool(maxSlots: 4)
+        let layout = CacheLayout.simple
+
+        // Slot A: non-trimmable, stored [1,2,3,4,5] — will be best prefix match (5)
+        // but needs trimCount=3 for request [1,2,X] which it can't handle
+        let slotA: [KVCache] = [NonTrimmableCache()]
+        pool.release(cache: slotA, layout: layout, tokens: [1, 2, 3, 4, 5])
+
+        // Slot B: trimmable, stored [1,2,3] — shorter match (2) but CAN trim
+        let slotB: [KVCache] = [KVCacheSimple()]
+        pool.release(cache: slotB, layout: layout, tokens: [1, 2, 3])
+
+        // Request [1,2,9] — prefix match with A=2 (trimCount=3), B=2 (trimCount=1)
+        let (reused, prefixLen) = pool.acquire(
+            for: [1, 2, 9],
+            layout: layout,
+            newCacheFactory: { [KVCacheSimple()] }
+        )
+
+        // Should fall back to slot B (trimmable) with prefix=2
+        #expect(prefixLen == 2)
+        #expect(reused[0] === slotB[0])
+        // Slot A should still be in pool (not leaked)
+        #expect(pool.count == 1)
+    }
+
+    @Test("Pool prefers exact-match non-trimmable over trimmable shorter match")
+    func exactMatchNonTrimmablePreferred() {
+        let pool = PrefixCachePool(maxSlots: 4)
+        let layout = CacheLayout.simple
+
+        // Slot A: non-trimmable, stored [1,2,3]
+        let slotA: [KVCache] = [NonTrimmableCache()]
+        pool.release(cache: slotA, layout: layout, tokens: [1, 2, 3])
+
+        // Slot B: trimmable, stored [1,2]
+        let slotB: [KVCache] = [KVCacheSimple()]
+        pool.release(cache: slotB, layout: layout, tokens: [1, 2])
+
+        // Request [1,2,3,4] — A matches 3 (trimCount=0), B matches 2 (trimCount=0)
+        let (reused, prefixLen) = pool.acquire(
+            for: [1, 2, 3, 4],
+            layout: layout,
+            newCacheFactory: { [KVCacheSimple()] }
+        )
+
+        // Prefer longer prefix match (slot A with 3 tokens)
+        #expect(prefixLen == 3)
+        #expect(reused[0] === slotA[0])
+    }
+
+    /// Mock non-trimmable cache simulating DeltaNet recurrent state.
+    private final class NonTrimmableCache: KVCache, @unchecked Sendable {
+        var offset: Int = 0
+        var maxSize: Int? { nil }
+        var isTrimmable: Bool { false }
+
+        func update(keys: MLXArray, values: MLXArray) -> (MLXArray, MLXArray) {
+            fatalError("Not used in tests")
+        }
+
+        @discardableResult
+        func trim(_ n: Int) -> Int { 0 }
+
+        var state: [MLXArray] {
+            get { [] }
+            set {}
+        }
+
+        var metaState: [String] {
+            get { ["0"] }
+            set {}
+        }
+
+        func innerState() -> [MLXArray] { [] }
+
+        func makeMask(queryLength: Int) -> MLXFast.ScaledDotProductAttentionMaskMode { .none }
     }
 
     private struct TestProcessor: UserInputProcessor {

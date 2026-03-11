@@ -3,16 +3,16 @@ import Testing
 @testable import SwiftLM
 @testable import MLXCompiler
 
-@Suite("PackedProjection Tests")
+@Suite("PackedProjection Tests", .tags(.unit, .compiled))
 struct PackedProjectionTests {
 
     // MARK: - Dense Packing
 
     @Test("Dense: packed QKV matches individual projections")
     func densePackedMatchesIndividual() throws {
-        let D = 64
-        let qDim = 32
-        let kvDim = 16
+        let D = 8
+        let qDim = 4
+        let kvDim = 4
 
         let wQ = MLXRandom.normal([qDim, D]) * 0.02
         let wK = MLXRandom.normal([kvDim, D]) * 0.02
@@ -47,8 +47,8 @@ struct PackedProjectionTests {
 
     @Test("Dense: packed gate+up matches individual projections")
     func denseGateUpPackedMatchesIndividual() throws {
-        let D = 64
-        let inter = 128
+        let D = 8
+        let inter = 16
 
         let wGate = MLXRandom.normal([inter, D]) * 0.02
         let wUp = MLXRandom.normal([inter, D]) * 0.02
@@ -79,10 +79,10 @@ struct PackedProjectionTests {
 
     @Test("Dense: GQA with headCount != kvHeadCount")
     func denseGQAPacking() throws {
-        let D = 64
-        let headCount = 8
+        let D = 8
+        let headCount = 4
         let kvHeadCount = 2
-        let headDim = 8
+        let headDim = 2
 
         let qDim = headCount * headDim      // 64
         let kvDim = kvHeadCount * headDim    // 16
@@ -131,9 +131,9 @@ struct PackedProjectionTests {
 
     @Test("Dense: packed with biases")
     func densePackedWithBias() throws {
-        let D = 32
-        let outA = 16
-        let outB = 8
+        let D = 8
+        let outA = 4
+        let outB = 4
 
         let wA = MLXRandom.normal([outA, D]) * 0.02
         let bA = MLXRandom.normal([outA]) * 0.01
@@ -161,9 +161,9 @@ struct PackedProjectionTests {
 
     @Test("Dense: packed with mixed bias (some nil)")
     func densePackedWithMixedBias() throws {
-        let D = 32
-        let outA = 16
-        let outB = 16
+        let D = 8
+        let outA = 4
+        let outB = 4
 
         let wA = MLXRandom.normal([outA, D]) * 0.02
         let bA = MLXRandom.normal([outA]) * 0.01
@@ -192,7 +192,7 @@ struct PackedProjectionTests {
 
     @Test("Single projection returns nil (requires >= 2)")
     func singleProjectionReturnsNil() throws {
-        let w = MLXRandom.normal([16, 32])
+        let w = MLXRandom.normal([4, 8])
         let proj = LoweredProjection(weight: w)
         let packed = PackedProjection.pack([proj])
         #expect(packed == nil)
@@ -208,9 +208,9 @@ struct PackedProjectionTests {
 
     @Test("AffineQuantized: packed projections with same bits/groupSize")
     func affineQuantizedPacking() throws {
-        let D = 64
-        let outA = 32
-        let outB = 16
+        let D = 32
+        let outA = 8
+        let outB = 4
 
         let groupSize = 32
         let bits = 4
@@ -257,20 +257,20 @@ struct PackedProjectionTests {
 
     @Test("Mixed kernel variants return nil")
     func mixedKernelReturnsNil() throws {
-        let D = 64
+        let D = 32
 
-        let wDense = MLXRandom.normal([32, D])
+        let wDense = MLXRandom.normal([8, D])
         let projDense = LoweredProjection(weight: wDense)
 
         let groupSize = 32
         let bits = 4
         let elemsPerInt32 = 32 / bits
-        let pw = MLXArray.zeros([16, D / elemsPerInt32]).asType(.uint32)
-        let sc = MLXRandom.normal([16, D / groupSize]).asType(.float16)
-        let zb = MLXRandom.normal([16, D / groupSize]).asType(.float16)
+        let pw = MLXArray.zeros([4, D / elemsPerInt32]).asType(.uint32)
+        let sc = MLXRandom.normal([4, D / groupSize]).asType(.float16)
+        let zb = MLXRandom.normal([4, D / groupSize]).asType(.float16)
 
         let qt = AffineQuantizedTensor(
-            logicalShape: [16, D],
+            logicalShape: [4, D],
             packedWeight: pw, scales: sc, zeroBiases: zb,
             groupSize: groupSize, bits: bits, origin: .unknown
         )
@@ -285,10 +285,10 @@ struct PackedProjectionTests {
 
     @Test("LoweredAttention uses packed QKV projection")
     func attentionUsesPackedQKV() throws {
-        let D = 64
-        let headCount = 4
-        let kvHeadCount = 4
-        let headDim = 16
+        let D = 8
+        let headCount = 2
+        let kvHeadCount = 2
+        let headDim = 4
 
         let qDim = headCount * headDim
         let kvDim = kvHeadCount * headDim
@@ -296,7 +296,7 @@ struct PackedProjectionTests {
         let wQ = MLXRandom.normal([qDim, D]) * 0.02
         let wK = MLXRandom.normal([kvDim, D]) * 0.02
         let wV = MLXRandom.normal([kvDim, D]) * 0.02
-        let wO = MLXRandom.normal([D, qDim]) * 0.02
+        let wO = MLXRandom.normal([D, D]) * 0.02
 
         let qProj = LoweredProjection(weight: wQ)
         let kProj = LoweredProjection(weight: wK)
@@ -352,8 +352,8 @@ struct PackedProjectionTests {
 
     @Test("LoweredMLP uses packed gate+up projection")
     func mlpUsesPackedGateUp() throws {
-        let D = 64
-        let inter = 128
+        let D = 8
+        let inter = 16
 
         let wGate = MLXRandom.normal([inter, D]) * 0.02
         let wUp = MLXRandom.normal([inter, D]) * 0.02

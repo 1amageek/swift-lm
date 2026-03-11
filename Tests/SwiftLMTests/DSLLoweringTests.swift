@@ -70,7 +70,7 @@ struct TinyCohere: ModelComponent {
 
 // MARK: - Tests
 
-@Suite("DSL Lowering")
+@Suite("DSL Lowering", .tags(.unit))
 struct DSLLoweringTests {
 
     // MARK: - Component Structure Tests

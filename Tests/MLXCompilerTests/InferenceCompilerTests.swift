@@ -141,7 +141,7 @@ private func tinyLlamaWeights(layerCount: Int) -> BoundWeights {
 
 // MARK: - LoweredProjection Tests
 
-@Suite("LoweredProjection")
+@Suite("LoweredProjection", .tags(.unit, .compiled))
 struct LoweredProjectionTests {
 
     @Test("Dense kernel matches matmul(x, w.T)")
@@ -234,7 +234,7 @@ struct LoweredProjectionTests {
 
 // MARK: - InferenceWeightStore Tests
 
-@Suite("InferenceWeightStore")
+@Suite("InferenceWeightStore", .tags(.unit, .compiled))
 struct InferenceWeightStoreTests {
 
     @Test("Accepts MLXArray from BoundWeights")
@@ -286,7 +286,7 @@ struct InferenceWeightStoreTests {
 
 // MARK: - Inference Compiler Tests
 
-@Suite("MLXInferenceCompiler")
+@Suite("MLXInferenceCompiler", .tags(.unit, .compiled))
 struct InferenceCompilerTests {
 
     @Test("Compile TinyLlama: correct cache slot count")
@@ -448,7 +448,7 @@ struct InferenceCompilerTests {
 
 // MARK: - Position Tracking Tests
 
-@Suite("PositionTracking")
+@Suite("PositionTracking", .tags(.unit, .compiled))
 struct PositionTrackingTests {
 
     @Test("nextPosition updates after prefill and decode")
@@ -579,7 +579,7 @@ private func tinyUntiedWeights() -> BoundWeights {
     return bind(dict)
 }
 
-@Suite("UntiedOutputHead")
+@Suite("UntiedOutputHead", .tags(.unit, .compiled))
 struct UntiedOutputHeadTests {
 
     @Test("Untied output head compiles and produces correct output shape")
@@ -678,7 +678,7 @@ private func tinyPosEmbWeights() -> BoundWeights {
 
 // MARK: - Standalone Position Op Tests
 
-@Suite("StandalonePositionOps")
+@Suite("StandalonePositionOps", .tags(.unit, .compiled))
 struct StandalonePositionOpTests {
 
     @Test("Standalone RoPE uses state.nextPosition as offset")
@@ -797,7 +797,7 @@ struct StandalonePositionOpTests {
 
 // MARK: - LoweredNorm Tests
 
-@Suite("LoweredNorm")
+@Suite("LoweredNorm", .tags(.unit, .compiled))
 struct LoweredNormTests {
 
     @Test("RMSNorm matches MLXFast.rmsNorm")
@@ -816,7 +816,7 @@ struct LoweredNormTests {
 
 // MARK: - LoweredMLP Tests
 
-@Suite("LoweredMLP")
+@Suite("LoweredMLP", .tags(.unit, .compiled))
 struct LoweredMLPTests {
 
     @Test("Gated MLP (SwiGLU) produces correct shape")
@@ -863,7 +863,7 @@ struct LoweredMLPTests {
 
 // MARK: - LoweredCacheState Tests
 
-@Suite("LoweredCacheState")
+@Suite("LoweredCacheState", .tags(.unit, .compiled))
 struct LoweredCacheStateTests {
 
     @Test("KV cache grows correctly")
@@ -906,7 +906,7 @@ struct LoweredCacheStateTests {
 
 // MARK: - ModelGraphSlotEnumerator Tests
 
-@Suite("ModelGraphSlotEnumerator")
+@Suite("ModelGraphSlotEnumerator", .tags(.unit, .compiled))
 struct ModelGraphSlotEnumeratorTests {
 
     @Test("Enumerates TinyLlama slots with correct MLX paths")

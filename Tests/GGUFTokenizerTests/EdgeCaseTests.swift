@@ -5,7 +5,7 @@ import Foundation
 
 // MARK: - ByteEncoder Edge Cases
 
-@Suite("ByteEncoder Edge Cases")
+@Suite("ByteEncoder Edge Cases", .tags(.unit))
 struct ByteEncoderEdgeCaseTests {
 
     @Test("Empty input encode")
@@ -58,7 +58,7 @@ struct ByteEncoderEdgeCaseTests {
 
 // MARK: - PreTokenizer Edge Cases
 
-@Suite("PreTokenizer Edge Cases")
+@Suite("PreTokenizer Edge Cases", .tags(.unit))
 struct PreTokenizerEdgeCaseTests {
 
     @Test("Only whitespace")
@@ -149,7 +149,7 @@ struct PreTokenizerEdgeCaseTests {
 
 // MARK: - MergesBPETokenizer Edge Cases
 
-@Suite("MergesBPE Edge Cases")
+@Suite("MergesBPE Edge Cases", .tags(.unit))
 struct MergesBPEEdgeCaseTests {
 
     static func makeFullTokenizer(
@@ -414,7 +414,7 @@ struct MergesBPEEdgeCaseTests {
 
 // MARK: - SentencePieceBPE Edge Cases
 
-@Suite("SentencePieceBPE Edge Cases")
+@Suite("SentencePieceBPE Edge Cases", .tags(.unit))
 struct SentencePieceBPEEdgeCaseTests {
 
     static func makeTokenizer(
@@ -669,7 +669,7 @@ struct SentencePieceBPEEdgeCaseTests {
 
 // MARK: - StreamingDetokenizer Edge Cases
 
-@Suite("StreamingDetokenizer Edge Cases")
+@Suite("StreamingDetokenizer Edge Cases", .tags(.unit))
 struct StreamingDetokenizerEdgeCaseTests {
 
     static func makeTokenizer() throws -> MergesBPETokenizer {
@@ -781,7 +781,7 @@ struct StreamingDetokenizerEdgeCaseTests {
 
 // MARK: - BPE Algorithm Edge Cases
 
-@Suite("BPE Algorithm Edge Cases")
+@Suite("BPE Algorithm Edge Cases", .tags(.unit))
 struct BPEAlgorithmEdgeCaseTests {
 
     @Test("Overlapping merge candidates at same position")
@@ -931,7 +931,7 @@ struct BPEAlgorithmEdgeCaseTests {
 
 // MARK: - GGUFTokenizerFactory Edge Cases
 
-@Suite("GGUFTokenizerFactory Edge Cases")
+@Suite("GGUFTokenizerFactory Edge Cases", .tags(.unit))
 struct GGUFTokenizerFactoryEdgeCaseTests {
 
     @Test("Missing merges for gpt2 model throws")

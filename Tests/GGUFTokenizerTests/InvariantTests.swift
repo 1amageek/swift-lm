@@ -5,7 +5,7 @@ import Foundation
 
 // MARK: - tokenID(for:) Tests
 
-@Suite("tokenID(for:)")
+@Suite("tokenID(for:)", .tags(.unit))
 struct TokenIDForStringTests {
 
     // MARK: - MergesBPE
@@ -164,7 +164,7 @@ struct TokenIDForStringTests {
 
 // MARK: - SpecialTokens Tests
 
-@Suite("SpecialTokens")
+@Suite("SpecialTokens", .tags(.unit))
 struct SpecialTokensTests {
 
     @Test("Default init has all nil and false")
@@ -278,7 +278,7 @@ struct SpecialTokensTests {
 
 // MARK: - Encode-Decode Roundtrip Invariants
 
-@Suite("Encode-Decode Roundtrip Invariants")
+@Suite("Encode-Decode Roundtrip Invariants", .tags(.unit))
 struct EncodeDecodeRoundtripTests {
 
     @Test("MergesBPE roundtrip preserves ASCII text")
@@ -390,7 +390,7 @@ struct EncodeDecodeRoundtripTests {
 
 // MARK: - SentencePiece Score Edge Cases
 
-@Suite("SentencePiece Score Edge Cases")
+@Suite("SentencePiece Score Edge Cases", .tags(.unit))
 struct SentencePieceScoreEdgeCaseTests {
 
     @Test("All tokens with same score - leftmost merge wins")
@@ -471,7 +471,7 @@ struct SentencePieceScoreEdgeCaseTests {
 
 // MARK: - StreamingDetokenizer State Management
 
-@Suite("StreamingDetokenizer State Management")
+@Suite("StreamingDetokenizer State Management", .tags(.unit))
 struct StreamingDetokenizerStateTests {
 
     @Test("BOS token in stream is skipped by control token filter")
@@ -575,7 +575,7 @@ struct StreamingDetokenizerStateTests {
 
 // MARK: - Unicode Coverage
 
-@Suite("Unicode Coverage")
+@Suite("Unicode Coverage", .tags(.unit))
 struct UnicodeCoverageTests {
 
     @Test("Devanagari script roundtrip via MergesBPE")
@@ -646,7 +646,7 @@ struct UnicodeCoverageTests {
 
 // MARK: - GGUFTokenizerFactory Additional Tests
 
-@Suite("GGUFTokenizerFactory Invariants")
+@Suite("GGUFTokenizerFactory Invariants", .tags(.unit))
 struct GGUFTokenizerFactoryInvariantTests {
 
     @Test("Factory-created MergesBPE tokenizer exposes tokenID(for:)")
@@ -770,7 +770,7 @@ struct GGUFTokenizerFactoryInvariantTests {
 
 // MARK: - Vocabulary Consistency Invariants
 
-@Suite("Vocabulary Consistency")
+@Suite("Vocabulary Consistency", .tags(.unit))
 struct VocabularyConsistencyTests {
 
     @Test("MergesBPE: vocabularySize matches actual vocabulary length")

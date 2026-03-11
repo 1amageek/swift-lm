@@ -111,6 +111,7 @@ struct GGUFUserInputProcessor: UserInputProcessor {
         let tokenIDs = tokenizer.encode(text: text)
         RawTokenTraceLogger(tokenizer: tokenizer).logPrompt(prompt: text, tokens: tokenIDs)
         let tokenArray = MLXArray(tokenIDs.map { Int32($0) }).reshaped([1, tokenIDs.count])
-        return LMInput(tokens: tokenArray)
+        let textInput = LMInput.Text(tokens: tokenArray, cpuTokenIDs: tokenIDs)
+        return LMInput(text: textInput)
     }
 }

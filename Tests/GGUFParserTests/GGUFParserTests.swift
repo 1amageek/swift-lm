@@ -2,7 +2,7 @@ import Testing
 @testable import GGUFParser
 import Foundation
 
-@Suite("GGUF Metadata Value")
+@Suite("GGUF Metadata Value", .tags(.unit))
 struct GGUFMetadataValueTests {
 
     @Test("Integer coercion")
@@ -44,7 +44,7 @@ struct GGUFMetadataValueTests {
     }
 }
 
-@Suite("GGUF Quantization Type")
+@Suite("GGUF Quantization Type", .tags(.unit))
 struct GGUFQuantizationTypeTests {
 
     @Test("Q4_0 block properties")
@@ -71,7 +71,7 @@ struct GGUFQuantizationTypeTests {
     }
 }
 
-@Suite("GGUF Tensor Info")
+@Suite("GGUF Tensor Info", .tags(.unit))
 struct GGUFTensorInfoTests {
 
     @Test("Element count and data size")
@@ -100,7 +100,7 @@ struct GGUFTensorInfoTests {
     }
 }
 
-@Suite("GGUF File Parsing")
+@Suite("GGUF File Parsing", .tags(.unit))
 struct GGUFFileParsingTests {
 
     @Test("Parse minimal GGUF")

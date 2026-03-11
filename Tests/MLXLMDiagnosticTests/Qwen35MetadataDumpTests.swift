@@ -3,7 +3,7 @@ import GGUFParser
 import Testing
 @testable import MLXLM
 
-@Suite("Qwen3.5 GGUF Metadata Dump")
+@Suite("Qwen3.5 GGUF Metadata Dump", .tags(.diagnostic))
 struct Qwen35MetadataDumpTests {
 
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"

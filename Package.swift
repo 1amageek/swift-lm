@@ -59,5 +59,9 @@ let package = Package(
             "MLXLM",
             .product(name: "MLXNN", package: "mlx-swift"),
         ]),
+        .testTarget(name: "MLXLMDiagnosticTests", dependencies: [
+            "MLXLM",
+            .product(name: "MLXNN", package: "mlx-swift"),
+        ]),
     ]
 )

@@ -32,16 +32,26 @@ public protocol LanguageModel: Module {
 
     /// Number of KV heads per layer (for quantized cache sizing).
     var kvHeads: [Int] { get }
+
+    /// Recommended prefill step size for this model, or `nil` to process the
+    /// entire prompt in a single forward pass.
+    ///
+    /// Models with recurrent layers (e.g. DeltaNet) should return a finite value
+    /// (e.g. 512) to bound the computation graph per chunk. Pure attention models
+    /// can return `nil` to avoid unnecessary chunking and intermediate `eval()` calls.
+    var recommendedPrefillStepSize: Int? { get }
 }
 
 // MARK: - Default Implementations
 
 extension LanguageModel {
 
+    public var recommendedPrefillStepSize: Int? { nil }
+
     public func prepare(_ input: LMInput, cache: [KVCache], windowSize: Int?) throws -> PrepareResult {
         let tokens = input.text.tokens
         let tokenCount = tokens.dim(tokens.ndim - 1)
-        let windowSize = windowSize ?? tokenCount
+        let windowSize = windowSize ?? (recommendedPrefillStepSize ?? tokenCount)
         let prefillOffset = cache.first?.offset ?? 0
 
         if prefillOffset + windowSize < tokenCount {
