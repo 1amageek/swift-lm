@@ -1,5 +1,6 @@
 import Foundation
 import MLX
+import MLXFast
 import GGUFParser
 import MLXCompiler
 
@@ -44,6 +45,11 @@ struct GGUFTensorBridge {
         // 1D tensors (norms, biases) always go to F16.
         guard shape.count >= 2 else {
             return .float16(try convertToFloat16(qtype: qtype, data: data, shape: shape))
+        }
+
+        // GPU-accelerated path for large tensors
+        if let gpuResult = GGUFGPUPacker.tryPack(qtype: qtype, data: data, shape: shape) {
+            return gpuResult
         }
 
         switch qtype {
@@ -321,10 +327,7 @@ struct GGUFTensorBridge {
         let totalElements = shape.reduce(1, *)
         let superBlockCount = totalElements / 256
 
-        if superBlockCount >= Self.parallelSuperBlockThreshold {
-            return packQ4_K_parallel(data: data, shape: shape, totalElements: totalElements,
-                                     superBlockCount: superBlockCount)
-        }
+        // GPU path handled by GGUFGPUPacker.tryPack() in convertDirect()
 
         var packed = [UInt32](repeating: 0, count: totalElements / 8)
         var scales = [Float](repeating: 0, count: totalElements / 32)
@@ -604,10 +607,7 @@ struct GGUFTensorBridge {
         let superBlockCount = totalElements / 256
         let groupCount = totalElements / 32
 
-        if superBlockCount >= Self.parallelSuperBlockThreshold {
-            return packQ5_K_parallel(data: data, shape: shape, superBlockCount: superBlockCount,
-                                     groupCount: groupCount)
-        }
+        // GPU path handled by GGUFGPUPacker.tryPack() in convertDirect()
 
         var packed = [UInt32](repeating: 0, count: groupCount * 5)
         var scales = [Float](repeating: 0, count: groupCount)
@@ -772,10 +772,7 @@ struct GGUFTensorBridge {
         let groupCount = totalElements / 16
         let packedCount = groupCount * 3
 
-        if superBlockCount >= Self.parallelSuperBlockThreshold {
-            return packQ6_K_parallel(data: data, shape: shape, superBlockCount: superBlockCount,
-                                     groupCount: groupCount, packedCount: packedCount)
-        }
+        // GPU path handled by GGUFGPUPacker.tryPack() in convertDirect()
 
         var packed = [UInt32](repeating: 0, count: packedCount)
         var scales = [Float](repeating: 0, count: groupCount)
@@ -824,76 +821,6 @@ struct GGUFTensorBridge {
 
         return makeQuantizedResult(
             packed: packed, scales: scales, biases: biases,
-            shape: shape, groupSize: 16, bits: 6
-        )
-    }
-
-    /// Parallel variant of packQ6_K for large tensors (superBlockCount >= threshold).
-    private func packQ6_K_parallel(
-        data: Data, shape: [Int], superBlockCount: Int,
-        groupCount: Int, packedCount: Int
-    ) -> ConvertedTensor {
-        let packedPtr = UnsafeMutablePointer<UInt32>.allocate(capacity: packedCount)
-        packedPtr.initialize(repeating: 0, count: packedCount)
-        let scalesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
-        let biasesPtr = UnsafeMutablePointer<Float>.allocate(capacity: groupCount)
-
-        data.withUnsafeBytes { buffer in
-            let bytes = buffer.bindMemory(to: UInt8.self)
-            let cores = min(ProcessInfo.processInfo.activeProcessorCount, superBlockCount)
-
-            DispatchQueue.concurrentPerform(iterations: cores) { coreIdx in
-                let rangeStart = superBlockCount * coreIdx / cores
-                let rangeEnd = superBlockCount * (coreIdx + 1) / cores
-
-                for block in rangeStart..<rangeEnd {
-                    let offset = block * 210
-                    let scalesOffset = offset + 192
-                    let dBits = UInt16(bytes[offset + 208]) | (UInt16(bytes[offset + 209]) << 8)
-                    let d = Float(Float16(bitPattern: dBits))
-
-                    for half in 0..<2 {
-                        let qlBase = offset + half * 64
-                        let qhBase = offset + 128 + half * 32
-                        let scBase = scalesOffset + half * 8
-
-                        for localGroup in 0..<8 {
-                            let groupIndex = block * 16 + half * 8 + localGroup
-                            let scale = d * Float(Int8(bitPattern: bytes[scBase + localGroup]))
-                            scalesPtr[groupIndex] = scale
-                            biasesPtr[groupIndex] = -32.0 * scale
-
-                            let lStart = (localGroup & 1) << 4
-                            let qlAdd = ((localGroup >> 1) & 1) << 5
-                            let useLow = (localGroup & 4) == 0
-                            let qhShift = localGroup & 6
-                            let pBase = groupIndex * 3
-
-                            for i in 0..<16 {
-                                let l = lStart + i
-                                let qlByte = bytes[qlBase + qlAdd + l]
-                                let ql = useLow ? UInt32(qlByte & 0x0F) : UInt32(qlByte >> 4)
-                                let qh = UInt32((bytes[qhBase + l] >> qhShift) & 3) << 4
-                                let q = ql | qh
-
-                                let bitIndex = i &* 6
-                                let wordIndex = bitIndex >> 5
-                                let bitOffset = bitIndex & 31
-                                packedPtr[pBase + wordIndex] |= q << bitOffset
-                                if bitOffset &+ 6 > 32 {
-                                    packedPtr[pBase + wordIndex &+ 1] |= q >> (32 &- bitOffset)
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        return makeQuantizedResultFromPointers(
-            packed: packedPtr, packedCount: packedCount,
-            scales: scalesPtr, scalesCount: groupCount,
-            biases: biasesPtr,
             shape: shape, groupSize: 16, bits: 6
         )
     }
