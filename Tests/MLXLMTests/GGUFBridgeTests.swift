@@ -1910,6 +1910,45 @@ struct ChatTemplateRendererTests {
         #expect(result.contains("<|im_start|>user\nhi<|im_end|>\n"))
         #expect(result.hasSuffix("<|im_start|>assistant\n"))
     }
+
+    @Test("Tool specs render deterministically across multiple calls")
+    func toolSpecDeterminism() throws {
+        let template = """
+            {% for tool in tools %}{{ tool | tojson }}{% endfor %}
+            {% for m in messages %}{{ m.content }}{% endfor %}
+            """
+        let renderer = try ChatTemplateRenderer(
+            templateString: template,
+            bosToken: nil,
+            eosToken: nil
+        )
+
+        let toolSpec: ToolSpec = [
+            "type": "function" as any Sendable,
+            "function": [
+                "name": "search",
+                "description": "Search the web",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "query": ["type": "string", "description": "Search query"] as [String: any Sendable]
+                    ] as [String: any Sendable],
+                    "required": ["query"]
+                ] as [String: any Sendable],
+            ] as [String: any Sendable],
+        ]
+
+        var results: Set<String> = []
+        for _ in 0..<20 {
+            let result = try renderer.render(
+                messages: [.user("test")],
+                tools: [toolSpec]
+            )
+            results.insert(result)
+        }
+
+        #expect(results.count == 1, "Tool spec rendering should be deterministic, got \(results.count) distinct outputs")
+    }
 }
 
 // MARK: - GGUFUserInputProcessor Tests
