@@ -136,25 +136,27 @@ private func buildDeltaNetExecutor(
     let graph = try model.makeModelGraph()
     let ssPath: [StructuralPathComponent] = [.operation(1)]
 
-    // Derive dimension relationships from weight shapes.
-    // keyDim = stateSize, valueDim derived from z projection
-    let keyDim = stateSize
-    let valueDim = hiddenSize  // Simplified: z maps to full hidden
-    let totalQKV = keyDim + keyDim + valueDim
-    let linearKeyHeads = keyDim / stateSize  // = 1
-    let linearValueHeadDim = valueDim / (valueDim / stateSize > 0 ? valueDim / stateSize : 1)
+    // Derive dimensions matching executor computation:
+    //   numHeads=1, groupCount=1 (default), dk=stateSize, dv=stateSize
+    //   keyDim = groupCount * dk, valueDim = numHeads * dv
+    let numHeads = 1
+    let dk = stateSize
+    let dv = stateSize
+    let keyDim = numHeads * dk   // groupCount defaults to numHeads
+    let valueDim = numHeads * dv
+    let totalQKV = 2 * keyDim + valueDim
 
     let weights = bind([
         slot([.operation(0)], role: .embeddingTable): MLXRandom.normal([vocabSize, hiddenSize]) * 0.1,
         slot(ssPath + [.field("in_proj_qkv")], role: .weight): MLXRandom.normal([totalQKV, hiddenSize]) * 0.1,
         slot(ssPath + [.field("in_proj_z")], role: .weight): MLXRandom.normal([valueDim, hiddenSize]) * 0.1,
-        slot(ssPath + [.field("in_proj_b")], role: .weight): MLXRandom.normal([linearKeyHeads, hiddenSize]) * 0.1,
-        slot(ssPath + [.field("in_proj_a")], role: .weight): MLXRandom.normal([linearKeyHeads, hiddenSize]) * 0.1,
+        slot(ssPath + [.field("in_proj_b")], role: .weight): MLXRandom.normal([numHeads, hiddenSize]) * 0.1,
+        slot(ssPath + [.field("in_proj_a")], role: .weight): MLXRandom.normal([numHeads, hiddenSize]) * 0.1,
         slot(ssPath + [.field("conv1d")], role: .weight): MLXRandom.normal([totalQKV, 4]) * 0.01,
         slot(ssPath + [.field("out_proj")], role: .weight): MLXRandom.normal([hiddenSize, valueDim]) * 0.1,
-        slot(ssPath + [.field("norm")], role: .scale): MLXArray.ones([linearValueHeadDim]),
-        slot(ssPath + [.field("dt_bias")], role: .bias): MLXArray.zeros([linearKeyHeads]),
-        slot(ssPath + [.field("A_log")], role: .weight): MLXArray(converting: [-1.0] as [Double], [linearKeyHeads]),
+        slot(ssPath + [.field("norm")], role: .scale): MLXArray.ones([dv]),
+        slot(ssPath + [.field("dt_bias")], role: .bias): MLXArray.zeros([numHeads]),
+        slot(ssPath + [.field("A_log")], role: .weight): MLXArray(converting: [-1.0] as [Double], [numHeads]),
     ])
 
     let compiled = try MLXCompiler().compile(graph: graph, weights: weights)
@@ -222,12 +224,14 @@ private func buildMixedMoEDeltaNetExecutor(
     // Embedding
     dict[slot([.operation(0)], role: .embeddingTable)] = MLXRandom.normal([vocabSize, hiddenSize]) * 0.1
 
-    // Derive DeltaNet dimensions
-    let keyDim = stateSize
-    let valueDim = hiddenSize
-    let totalQKV = keyDim + keyDim + valueDim
-    let linearKeyHeads = keyDim / stateSize  // = 1
-    let linearValueHeadDim = valueDim / (valueDim / stateSize > 0 ? valueDim / stateSize : 1)
+    // Derive DeltaNet dimensions matching executor computation:
+    //   numHeads=1, groupCount=1 (default), dk=stateSize, dv=stateSize
+    let numHeads = 1
+    let dk = stateSize
+    let dv = stateSize
+    let keyDim = numHeads * dk   // groupCount defaults to numHeads
+    let valueDim = numHeads * dv
+    let totalQKV = 2 * keyDim + valueDim
 
     for i in 0..<layerCount {
         let layerPrefix: [StructuralPathComponent] = [
@@ -241,13 +245,13 @@ private func buildMixedMoEDeltaNetExecutor(
         let ssPath = layerPrefix + [.operation(0), .regionBody, .operation(1)]
         dict[slot(ssPath + [.field("in_proj_qkv")], role: .weight)] = MLXRandom.normal([totalQKV, hiddenSize]) * 0.1
         dict[slot(ssPath + [.field("in_proj_z")], role: .weight)] = MLXRandom.normal([valueDim, hiddenSize]) * 0.1
-        dict[slot(ssPath + [.field("in_proj_b")], role: .weight)] = MLXRandom.normal([linearKeyHeads, hiddenSize]) * 0.1
-        dict[slot(ssPath + [.field("in_proj_a")], role: .weight)] = MLXRandom.normal([linearKeyHeads, hiddenSize]) * 0.1
+        dict[slot(ssPath + [.field("in_proj_b")], role: .weight)] = MLXRandom.normal([numHeads, hiddenSize]) * 0.1
+        dict[slot(ssPath + [.field("in_proj_a")], role: .weight)] = MLXRandom.normal([numHeads, hiddenSize]) * 0.1
         dict[slot(ssPath + [.field("conv1d")], role: .weight)] = MLXRandom.normal([totalQKV, 4]) * 0.01
         dict[slot(ssPath + [.field("out_proj")], role: .weight)] = MLXRandom.normal([hiddenSize, valueDim]) * 0.1
-        dict[slot(ssPath + [.field("norm")], role: .scale)] = MLXArray.ones([linearValueHeadDim])
-        dict[slot(ssPath + [.field("dt_bias")], role: .bias)] = MLXArray.zeros([linearKeyHeads])
-        dict[slot(ssPath + [.field("A_log")], role: .weight)] = MLXArray(converting: [-1.0] as [Double], [linearKeyHeads])
+        dict[slot(ssPath + [.field("norm")], role: .scale)] = MLXArray.ones([dv])
+        dict[slot(ssPath + [.field("dt_bias")], role: .bias)] = MLXArray.zeros([numHeads])
+        dict[slot(ssPath + [.field("A_log")], role: .weight)] = MLXArray(converting: [-1.0] as [Double], [numHeads])
 
         // Residual 1: RMSNorm + MoE
         let moeNormPath = layerPrefix + [.operation(1), .regionBody, .operation(0)]
