@@ -220,8 +220,10 @@ struct ConfigExtractorTests {
         let file = try makeLlamaGGUF(
             arch: "qwen3moe",
             extraMetadata: [
+                ("qwen3moe.attention.key_length", .uint32(256)),
                 ("qwen3moe.full_attention_interval", .uint32(4)),
                 ("qwen3moe.ssm.group_count", .uint32(16)),
+                ("qwen3moe.ssm.time_step_rank", .uint32(16)),
                 ("qwen3moe.ssm.state_size", .uint32(128)),
                 ("qwen3moe.ssm.conv_kernel", .uint32(4)),
                 ("qwen3moe.rope.partial_rotary_factor", .float32(0.25)),
@@ -230,10 +232,9 @@ struct ConfigExtractorTests {
         let config = try extractor.extract(from: file, architecture: .hybridDeltaNetAttention)
 
         #expect(config.fullAttentionInterval == 4)
-        #expect(config.linearKeyHeads == 16)
-        #expect(config.linearValueHeads == 16)
-        #expect(config.linearKeyHeadDim == 128)
-        #expect(config.linearValueHeadDim == 128)
+        #expect(config.ssmNumHeads == 16)
+        #expect(config.ssmKeyHeadDim == 128)
+        #expect(config.ssmValueHeadDim == 128)
         #expect(config.convKernelSize == 4)
         #expect(config.partialRotaryFactor == 0.25)
     }
@@ -243,6 +244,7 @@ struct ConfigExtractorTests {
         let file = try makeLlamaGGUF(
             arch: "qwen35",
             extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.full_attention_interval", .uint32(4)),
                 ("qwen35.ssm.group_count", .uint32(16)),
                 ("qwen35.ssm.state_size", .uint32(128)),
@@ -251,6 +253,29 @@ struct ConfigExtractorTests {
         )
         #expect(throws: GGUFGraphBuildError.self) {
             try extractor.extract(from: file, architecture: .hybridDeltaNetAttention)
+        }
+    }
+
+    @Test("Hybrid state-space / attention extraction throws when attention key length is missing")
+    func extractHybridDeltaNetAttentionMissingAttentionKeyLength() throws {
+        let file = try makeLlamaGGUF(
+            arch: "qwen35",
+            extraMetadata: [
+                ("qwen35.full_attention_interval", .uint32(4)),
+                ("qwen35.ssm.group_count", .uint32(16)),
+                ("qwen35.ssm.state_size", .uint32(128)),
+                ("qwen35.ssm.conv_kernel", .uint32(4)),
+                ("qwen35.rope.partial_rotary_factor", .float32(0.25)),
+            ]
+        )
+
+        do {
+            _ = try extractor.extract(from: file, architecture: .hybridDeltaNetAttention)
+            Issue.record("Expected missing metadata error")
+        } catch let error as GGUFGraphBuildError {
+            let description = error.description
+            #expect(description.contains("qwen35.attention.key_length"))
+            #expect(description.contains("inferred head dimension would be 64"))
         }
     }
 
@@ -321,6 +346,7 @@ struct Qwen35LoadConfigurationTests {
         let file = try makeLlamaGGUF(
             arch: "qwen35",
             extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.ssm.group_count", .uint32(16)),
                 ("qwen35.ssm.conv_kernel", .uint32(4)),
                 ("qwen35.full_attention_interval", .uint32(4)),
@@ -329,7 +355,7 @@ struct Qwen35LoadConfigurationTests {
         )
 
         #expect(throws: GGUFLoadError.self) {
-            try Qwen35Configuration(from: file)
+            try HybridDeltaNetAttentionConfiguration(from: file)
         }
     }
 
@@ -338,6 +364,7 @@ struct Qwen35LoadConfigurationTests {
         let file = try makeLlamaGGUF(
             arch: "qwen35",
             extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.ssm.group_count", .uint32(16)),
                 ("qwen35.ssm.state_size", .uint32(128)),
                 ("qwen35.full_attention_interval", .uint32(4)),
@@ -346,7 +373,7 @@ struct Qwen35LoadConfigurationTests {
         )
 
         #expect(throws: GGUFLoadError.self) {
-            try Qwen35Configuration(from: file)
+            try HybridDeltaNetAttentionConfiguration(from: file)
         }
     }
 
@@ -355,6 +382,7 @@ struct Qwen35LoadConfigurationTests {
         let file = try makeLlamaGGUF(
             arch: "qwen35",
             extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.ssm.group_count", .uint32(16)),
                 ("qwen35.ssm.state_size", .uint32(128)),
                 ("qwen35.ssm.conv_kernel", .uint32(4)),
@@ -363,7 +391,7 @@ struct Qwen35LoadConfigurationTests {
         )
 
         #expect(throws: GGUFLoadError.self) {
-            try Qwen35Configuration(from: file)
+            try HybridDeltaNetAttentionConfiguration(from: file)
         }
     }
 
@@ -372,6 +400,7 @@ struct Qwen35LoadConfigurationTests {
         let file = try makeLlamaGGUF(
             arch: "qwen35",
             extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.ssm.group_count", .uint32(16)),
                 ("qwen35.ssm.state_size", .uint32(128)),
                 ("qwen35.ssm.conv_kernel", .uint32(4)),
@@ -380,7 +409,30 @@ struct Qwen35LoadConfigurationTests {
         )
 
         #expect(throws: GGUFLoadError.self) {
-            try Qwen35Configuration(from: file)
+            try HybridDeltaNetAttentionConfiguration(from: file)
+        }
+    }
+
+    @Test("Qwen35 loader requires attention.key_length metadata")
+    func qwen35LoaderRequiresAttentionKeyLength() throws {
+        let file = try makeLlamaGGUF(
+            arch: "qwen35",
+            extraMetadata: [
+                ("qwen35.ssm.group_count", .uint32(16)),
+                ("qwen35.ssm.state_size", .uint32(128)),
+                ("qwen35.ssm.conv_kernel", .uint32(4)),
+                ("qwen35.full_attention_interval", .uint32(4)),
+                ("qwen35.rope.partial_rotary_factor", .float32(0.25)),
+            ]
+        )
+
+        do {
+            _ = try HybridDeltaNetAttentionConfiguration(from: file)
+            Issue.record("Expected missing metadata error")
+        } catch let error as GGUFLoadError {
+            let description = error.description
+            #expect(description.contains("qwen35.attention.key_length"))
+            #expect(description.contains("inferred head dimension would be 64"))
         }
     }
 
@@ -391,6 +443,7 @@ struct Qwen35LoadConfigurationTests {
             extraMetadata: [
                 ("qwen35.attention.key_length", .uint32(256)),
                 ("qwen35.ssm.group_count", .uint32(16)),
+                ("qwen35.ssm.time_step_rank", .uint32(16)),
                 ("qwen35.ssm.state_size", .uint32(128)),
                 ("qwen35.ssm.conv_kernel", .uint32(4)),
                 ("qwen35.full_attention_interval", .uint32(4)),
@@ -399,7 +452,7 @@ struct Qwen35LoadConfigurationTests {
         )
 
         do {
-            _ = try Qwen35Configuration(from: file)
+            _ = try HybridDeltaNetAttentionConfiguration(from: file)
             Issue.record("Expected missing metadata error")
         } catch let error as GGUFLoadError {
             let description = error.description
@@ -407,6 +460,28 @@ struct Qwen35LoadConfigurationTests {
             #expect(description.contains("qwen35.attention.key_length=256"))
             #expect(description.contains("inferred factor would be 0.25"))
         }
+    }
+
+    @Test("Qwen35 loader derives asymmetric DeltaNet dimensions from metadata")
+    func qwen35LoaderDerivesAsymmetricDeltaNetDimensions() throws {
+        let file = try makeLlamaGGUF(
+            arch: "qwen35",
+            extraMetadata: [
+                ("qwen35.attention.key_length", .uint32(256)),
+                ("qwen35.ssm.group_count", .uint32(16)),
+                ("qwen35.ssm.time_step_rank", .uint32(32)),
+                ("qwen35.ssm.state_size", .uint32(128)),
+                ("qwen35.ssm.conv_kernel", .uint32(4)),
+                ("qwen35.full_attention_interval", .uint32(4)),
+                ("qwen35.rope.partial_rotary_factor", .float32(0.25)),
+            ]
+        )
+
+        let config = try HybridDeltaNetAttentionConfiguration(from: file)
+        #expect(config.linearKeyHeads == 32)
+        #expect(config.linearValueHeads == 32)
+        #expect(config.linearKeyHeadDim == 64)
+        #expect(config.linearValueHeadDim == 128)
     }
 }
 
@@ -441,10 +516,8 @@ struct IRAssemblerTransformerTests {
             expertsPerToken: nil,
             qkNorm: false,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil,
-            linearValueHeads: nil,
-            linearKeyHeadDim: nil,
-            linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil,
             partialRotaryFactor: nil,
             slidingWindow: nil,
@@ -645,8 +718,8 @@ struct IRAssemblerVariantTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: true,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .parallelAttentionMLP)
@@ -685,8 +758,8 @@ struct IRAssemblerVariantTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: true,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .parallelAttentionMLP)
@@ -716,8 +789,8 @@ struct IRAssemblerVariantTests {
             expertCount: 8, expertsPerToken: 2,
             qkNorm: false,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .moe)
@@ -828,8 +901,8 @@ struct IRAssemblerVariantTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: false,
             fullAttentionInterval: interval,
-            linearKeyHeads: 8, linearValueHeads: 8,
-            linearKeyHeadDim: 64, linearValueHeadDim: 64,
+            ssmNumHeads: 8, ssmKeyHeadDim: 64,
+            ssmValueHeadDim: 64,
             convKernelSize: 4, partialRotaryFactor: 0.25, slidingWindow: nil, mropeAxes: nil
         )
     }
@@ -854,8 +927,8 @@ struct SlotEnumerationTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: false,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .transformer)
@@ -902,8 +975,8 @@ struct SlotEnumerationTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: true,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .parallelAttentionMLP)
@@ -930,8 +1003,8 @@ struct SlotEnumerationTests {
             expertCount: 4, expertsPerToken: 2,
             qkNorm: false,
             fullAttentionInterval: nil,
-            linearKeyHeads: nil, linearValueHeads: nil,
-            linearKeyHeadDim: nil, linearValueHeadDim: nil,
+            ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil,
             convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .moe)
@@ -960,8 +1033,8 @@ struct SlotEnumerationTests {
             expertCount: nil, expertsPerToken: nil,
             qkNorm: false,
             fullAttentionInterval: 4,
-            linearKeyHeads: 8, linearValueHeads: 8,
-            linearKeyHeadDim: 64, linearValueHeadDim: 64,
+            ssmNumHeads: 8, ssmKeyHeadDim: 64,
+            ssmValueHeadDim: 64,
             convKernelSize: 4, partialRotaryFactor: 0.25, slidingWindow: nil, mropeAxes: nil
         )
         let graph = try assembler.assemble(config: config, architecture: .hybridDeltaNetAttention)
@@ -1054,8 +1127,10 @@ struct GGUFGraphBuilderIntegrationTests {
             arch: "qwen3moe",
             layers: 4,
             extraMetadata: [
+                ("qwen3moe.attention.key_length", .uint32(256)),
                 ("qwen3moe.full_attention_interval", .uint32(4)),
                 ("qwen3moe.ssm.group_count", .uint32(8)),
+                ("qwen3moe.ssm.time_step_rank", .uint32(8)),
                 ("qwen3moe.ssm.state_size", .uint32(64)),
                 ("qwen3moe.ssm.conv_kernel", .uint32(4)),
                 ("qwen3moe.rope.partial_rotary_factor", .float32(0.25)),

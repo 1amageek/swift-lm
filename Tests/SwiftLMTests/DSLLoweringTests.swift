@@ -556,7 +556,7 @@ struct DSLLoweringTests {
             LayerNorm(dimension: 64)
             SwiftLM.Linear(inputSize: 64, outputSize: 32)
             OutputHead(inputSize: 32, vocabSize: 100)
-            StateSpace(hiddenSize: 64, stateSize: 16, variant: "mamba")
+            StateSpace(hiddenSize: 64, numHeads: 1, keyHeadDim: 16, valueHeadDim: 16, variant: "mamba")
             Custom(domain: "test", name: "noop")
         }
 

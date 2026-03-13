@@ -20,10 +20,10 @@ public struct HybridDeltaNetAttentionTransformer: ModelComponent {
         public let ropeScaling: RoPEScaling?
         public let partialRotaryFactor: Float
 
-        public let linearKeyHeads: Int
-        public let linearValueHeads: Int
-        public let linearKeyHeadDim: Int
-        public let linearValueHeadDim: Int
+        public let ssmNumHeads: Int
+        public let ssmGroupCount: Int
+        public let ssmKeyHeadDim: Int
+        public let ssmValueHeadDim: Int
         public let convKernelSize: Int
 
         public let fullAttentionInterval: Int
@@ -53,10 +53,10 @@ public struct HybridDeltaNetAttentionTransformer: ModelComponent {
             ropeTheta: Float,
             ropeScaling: RoPEScaling?,
             partialRotaryFactor: Float,
-            linearKeyHeads: Int,
-            linearValueHeads: Int,
-            linearKeyHeadDim: Int,
-            linearValueHeadDim: Int,
+            ssmNumHeads: Int,
+            ssmGroupCount: Int? = nil,
+            ssmKeyHeadDim: Int,
+            ssmValueHeadDim: Int,
             convKernelSize: Int,
             fullAttentionInterval: Int,
             tieWordEmbeddings: Bool,
@@ -74,10 +74,10 @@ public struct HybridDeltaNetAttentionTransformer: ModelComponent {
             self.ropeTheta = ropeTheta
             self.ropeScaling = ropeScaling
             self.partialRotaryFactor = partialRotaryFactor
-            self.linearKeyHeads = linearKeyHeads
-            self.linearValueHeads = linearValueHeads
-            self.linearKeyHeadDim = linearKeyHeadDim
-            self.linearValueHeadDim = linearValueHeadDim
+            self.ssmNumHeads = ssmNumHeads
+            self.ssmGroupCount = ssmGroupCount ?? ssmNumHeads
+            self.ssmKeyHeadDim = ssmKeyHeadDim
+            self.ssmValueHeadDim = ssmValueHeadDim
             self.convKernelSize = convKernelSize
             self.fullAttentionInterval = fullAttentionInterval
             self.tieWordEmbeddings = tieWordEmbeddings
@@ -128,7 +128,10 @@ public struct HybridDeltaNetAttentionTransformer: ModelComponent {
                     RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
                     DeltaNet(
                         hiddenSize: config.hiddenSize,
-                        stateSize: config.linearKeyHeadDim,
+                        numHeads: config.ssmNumHeads,
+                        groupCount: config.ssmGroupCount,
+                        keyHeadDim: config.ssmKeyHeadDim,
+                        valueHeadDim: config.ssmValueHeadDim,
                         variant: .gated
                     )
                 }

@@ -179,6 +179,53 @@ What not to do:
 - Do not hide a new family behind generic strings if it deserves an explicit component.
 - Do not merge “missing metadata” and “known architecture default” into the same code path.
 
+### Component Authoring Flow
+
+New families must not be implemented from the first working model alone. The family specification has to be completed before the component/IR is considered valid.
+
+Required authoring flow:
+
+1. Write a family spec before writing the component.
+2. List every semantic degree of freedom in that family.
+3. Distinguish required metadata from derived values.
+4. Define cache/state layout explicitly.
+5. Verify the spec against at least two model variants when available.
+6. Only then add the `ModelComponent`, GGUF builder logic, mapper, and lowering.
+
+The family spec must include:
+
+- required GGUF/mmproj metadata keys
+- derived formulas and invariants
+- tensor packing assumptions
+- head/group/expert/window/state relationships
+- cache/state tensor shapes
+- layer schedule rules
+- gating/norm/position-encoding semantics
+
+Rules:
+
+- If a degree of freedom exists in the paper or official implementation, it must exist in the family-level type system even if the first model variant does not exercise it.
+- Do not collapse distinct concepts just because one shipped model makes them numerically equal.
+- Do not infer missing runtime-critical values inside the runtime path. Inference belongs in tooling only.
+- Do not treat “loads successfully” as sufficient validation. Family work is incomplete until cross-variant differential tests exist.
+
+Minimum validation for a new family:
+
+- metadata extraction test
+- tensor shape and mapper test
+- strict missing-metadata failure test
+- at least two model variants when available
+- layer-wise logit/activation trace on representative prompts
+- compiled vs standard parity check when both paths exist
+
+Failure pattern to avoid:
+
+- using a small model as the implicit family spec
+- encoding a product-specific coincidence into the family abstraction
+- discovering missing dimensions only after a larger variant fails
+
+If two variants disagree, assume the family spec is incomplete until the missing axis is represented explicitly in the component/IR/configuration types.
+
 ### Current Performance Goals
 
 The current performance milestone is to close the largest architectural gaps versus Ollama/llama.cpp-style GGUF serving. Work that touches inference performance should be evaluated against these four goals:

@@ -125,10 +125,14 @@ public struct GGUFModelConfig: Sendable {
     // MARK: Hybrid State-Space / Attention (optional)
 
     public let fullAttentionInterval: Int?
-    public let linearKeyHeads: Int?
-    public let linearValueHeads: Int?
-    public let linearKeyHeadDim: Int?
-    public let linearValueHeadDim: Int?
+    /// Number of DeltaNet recurrence heads.
+    public let ssmNumHeads: Int?
+    /// Number of DeltaNet key-state groups.
+    public let ssmGroupCount: Int?
+    /// Per-head key dimension (dk). May differ from valueHeadDim for asymmetric DeltaNet.
+    public let ssmKeyHeadDim: Int?
+    /// Per-head value dimension (dv).
+    public let ssmValueHeadDim: Int?
     public let convKernelSize: Int?
     public let partialRotaryFactor: Float?
 
@@ -160,12 +164,84 @@ public struct GGUFModelConfig: Sendable {
             expertCount: expertCount, expertsPerToken: expertsPerToken,
             qkNorm: qkNorm,
             fullAttentionInterval: fullAttentionInterval,
-            linearKeyHeads: linearKeyHeads, linearValueHeads: linearValueHeads,
-            linearKeyHeadDim: linearKeyHeadDim, linearValueHeadDim: linearValueHeadDim,
+            ssmNumHeads: ssmNumHeads, ssmGroupCount: ssmGroupCount,
+            ssmKeyHeadDim: ssmKeyHeadDim,
+            ssmValueHeadDim: ssmValueHeadDim,
             convKernelSize: convKernelSize, partialRotaryFactor: partialRotaryFactor,
             slidingWindow: slidingWindow, mropeAxes: axes
         )
     }
+
+    public init(
+        hiddenSize: Int,
+        layerCount: Int,
+        intermediateSize: Int,
+        vocabSize: Int,
+        attentionHeads: Int,
+        kvHeads: Int,
+        headDim: Int,
+        attentionBias: Bool,
+        mlpBias: Bool,
+        normEps: Float,
+        normKind: NormKind,
+        ropeTheta: Float,
+        ropeDimension: Int,
+        ropeScaling: RoPEScaling?,
+        tiedEmbeddings: Bool,
+        expertCount: Int?,
+        expertsPerToken: Int?,
+        qkNorm: Bool,
+        fullAttentionInterval: Int?,
+        ssmNumHeads: Int?,
+        ssmGroupCount: Int? = nil,
+        ssmKeyHeadDim: Int?,
+        ssmValueHeadDim: Int?,
+        convKernelSize: Int?,
+        partialRotaryFactor: Float?,
+        slidingWindow: Int?,
+        mropeAxes: MRoPEAxes? = nil
+    ) {
+        self.hiddenSize = hiddenSize
+        self.layerCount = layerCount
+        self.intermediateSize = intermediateSize
+        self.vocabSize = vocabSize
+        self.attentionHeads = attentionHeads
+        self.kvHeads = kvHeads
+        self.headDim = headDim
+        self.attentionBias = attentionBias
+        self.mlpBias = mlpBias
+        self.normEps = normEps
+        self.normKind = normKind
+        self.ropeTheta = ropeTheta
+        self.ropeDimension = ropeDimension
+        self.ropeScaling = ropeScaling
+        self.tiedEmbeddings = tiedEmbeddings
+        self.expertCount = expertCount
+        self.expertsPerToken = expertsPerToken
+        self.qkNorm = qkNorm
+        self.fullAttentionInterval = fullAttentionInterval
+        self.ssmNumHeads = ssmNumHeads
+        self.ssmGroupCount = ssmGroupCount
+        self.ssmKeyHeadDim = ssmKeyHeadDim
+        self.ssmValueHeadDim = ssmValueHeadDim
+        self.convKernelSize = convKernelSize
+        self.partialRotaryFactor = partialRotaryFactor
+        self.slidingWindow = slidingWindow
+        self.mropeAxes = mropeAxes
+    }
+}
+
+// MARK: - MetadataResolutionMode
+
+/// Controls how missing GGUF metadata is handled during config extraction.
+public enum MetadataResolutionMode: Sendable, Equatable {
+    /// All required metadata must be explicitly present. Missing keys cause errors.
+    /// Use this for validation and when working with well-formed GGUF files.
+    case strict
+
+    /// Apply deterministic fallbacks for missing metadata where possible.
+    /// For example, `ssm.time_step_rank` falls back to `ssm.group_count` (symmetric assumption).
+    case lenient
 }
 
 // MARK: - GGUFConfigExtractor
@@ -176,15 +252,31 @@ public struct GGUFConfigExtractor: Sendable {
     public init() {}
 
     /// Extract configuration from GGUF file.
+    ///
+    /// - Parameters:
+    ///   - file: Parsed GGUF file.
+    ///   - architecture: Detected architecture variant.
+    ///   - metadataMode: `.strict` requires all metadata keys; `.lenient` applies fallbacks.
     public func extract(
         from file: GGUFFile,
-        architecture: DetectedArchitecture
+        architecture: DetectedArchitecture,
+        metadataMode: MetadataResolutionMode = .strict
     ) throws -> GGUFModelConfig {
         let hiddenSize = try require(file.embeddingLength, "embedding_length")
         let layerCount = try require(file.blockCount, "block_count")
         let headCount = try require(file.headCount, "head_count")
         let kvHeads = file.headCountKV ?? headCount
-        let headDim = file.headDimension ?? (hiddenSize / headCount)
+        let headDim: Int
+        if architecture == .hybridDeltaNetAttention {
+            guard let explicitHeadDim = file.attentionKeyLength else {
+                throw GGUFGraphBuildError.missingMetadata(
+                    GGUFMetadataDiagnostics.missingMetadataMessage("attention.key_length", in: file)
+                )
+            }
+            headDim = explicitHeadDim
+        } else {
+            headDim = file.headDimension ?? (hiddenSize / headCount)
+        }
         let intermediateSize = try require(file.feedForwardLength, "feed_forward_length")
         let vocabSize = file.vocabularyLength ?? file.vocabularySize ?? 0
 
@@ -225,10 +317,6 @@ public struct GGUFConfigExtractor: Sendable {
 
         // Hybrid state-space / attention
         let fullAttentionInterval = file.fullAttentionInterval
-        let linearKeyHeads = file.linearKeyHeadCount
-        let linearValueHeads = file.linearValueHeadCount
-        let linearKeyHeadDim = file.linearKeyHeadDim
-        let linearValueHeadDim = file.linearValueHeadDim
         let convKernelSize = file.linearConvKernelSize
         let partialRotaryFactor: Float?
         switch architecture {
@@ -238,6 +326,15 @@ public struct GGUFConfigExtractor: Sendable {
         default:
             partialRotaryFactor = file.partialRotaryFactor
         }
+
+        // DeltaNet head dimensions from GGUF metadata.
+        // ssm.time_step_rank maps to the number of value heads.
+        // ssm.group_count maps to the number of key/query heads.
+        // ssm.state_size is the per-head state dimension used by both key and value.
+        let ssmNumHeads = file.ssmNumHeads
+        let ssmGroupCount = file.ssmGroupCount
+        let ssmKeyHeadDim = file.ssmStateSize
+        let ssmValueHeadDim = file.ssmStateSize
 
         // Sliding window
         let slidingWindow = file.slidingWindow
@@ -262,10 +359,10 @@ public struct GGUFConfigExtractor: Sendable {
             expertsPerToken: expertsPerToken,
             qkNorm: qkNorm,
             fullAttentionInterval: fullAttentionInterval,
-            linearKeyHeads: linearKeyHeads,
-            linearValueHeads: linearValueHeads,
-            linearKeyHeadDim: linearKeyHeadDim,
-            linearValueHeadDim: linearValueHeadDim,
+            ssmNumHeads: ssmNumHeads,
+            ssmGroupCount: ssmGroupCount,
+            ssmKeyHeadDim: ssmKeyHeadDim,
+            ssmValueHeadDim: ssmValueHeadDim,
             convKernelSize: convKernelSize,
             partialRotaryFactor: partialRotaryFactor,
             slidingWindow: slidingWindow,
@@ -436,7 +533,7 @@ private extension IRGraphAssembler {
                 if isFullAttention {
                     layers.append(makeHybridDeltaNetAttentionFullAttnBlock(config: config, ctx: &ctx))
                 } else {
-                    layers.append(makeHybridDeltaNetAttentionStateSpaceBlock(config: config, ctx: &ctx))
+                    layers.append(try makeHybridDeltaNetAttentionStateSpaceBlock(config: config, ctx: &ctx))
                 }
             }
             let (op, val) = ctx.makePrimitive(
@@ -869,10 +966,24 @@ private extension IRGraphAssembler {
         )
     }
 
-    func makeHybridDeltaNetAttentionStateSpaceBlock(config: GGUFModelConfig, ctx: inout IRContext) -> Region {
+    func makeHybridDeltaNetAttentionStateSpaceBlock(config: GGUFModelConfig, ctx: inout IRContext) throws -> Region {
+        guard let numHeads = config.ssmNumHeads else {
+            throw GGUFGraphBuildError.missingMetadata("ssm.time_step_rank (ssmNumHeads) is required for DeltaNet")
+        }
+        guard let keyHeadDim = config.ssmKeyHeadDim else {
+            throw GGUFGraphBuildError.missingMetadata("ssm.state_size (ssmKeyHeadDim) is required for DeltaNet")
+        }
+        guard let valueHeadDim = config.ssmValueHeadDim else {
+            throw GGUFGraphBuildError.missingMetadata("ssm.state_size (ssmValueHeadDim) is required for DeltaNet")
+        }
+        let groupCount = config.ssmGroupCount ?? numHeads
+
         let ssAttrs = StateSpaceAttributes(
             hiddenSize: config.hiddenSize,
-            stateSize: config.linearKeyHeadDim ?? config.headDim,
+            numHeads: numHeads,
+            groupCount: groupCount,
+            keyHeadDim: keyHeadDim,
+            valueHeadDim: valueHeadDim,
             variant: DeltaNet.Variant.gated.rawValue
         )
 

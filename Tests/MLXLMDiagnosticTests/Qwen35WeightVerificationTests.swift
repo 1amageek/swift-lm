@@ -17,12 +17,12 @@ struct Qwen35WeightVerificationTests {
     private static let repo = "unsloth/Qwen3.5-0.8B-GGUF"
     private static let filename = "Qwen3.5-0.8B-Q4_K_M.gguf"
 
-    private func loadModel() async throws -> (Qwen35Model, ModelContext) {
+    private func loadModel() async throws -> (HybridDeltaNetAttentionModel, ModelContext) {
         let downloader = HuggingFaceDownloader()
         let url = try await downloader.download(repo: Self.repo, filename: Self.filename)
         let loader = GGUFModelLoader()
         let context = try loader.loadContext(url: url)
-        let model = try #require(context.model as? Qwen35Model)
+        let model = try #require(context.model as? HybridDeltaNetAttentionModel)
         return (model, context)
     }
 
@@ -82,7 +82,7 @@ struct Qwen35WeightVerificationTests {
         #expect(convWeight.dim(1) == 4)
         #expect(convWeight.dim(2) == 1)
 
-        // norm weight: should be [128] (linearValueHeadDim)
+        // norm weight: should be [128] (ssmValueHeadDim)
         let normWeight = delta0.gatedNorm.weight
         eval(normWeight)
         print("[verify][delta0] norm.weight shape=\(normWeight.shape)")

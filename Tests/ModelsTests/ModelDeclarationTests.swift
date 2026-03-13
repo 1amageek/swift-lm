@@ -113,8 +113,7 @@ struct ModelDeclarationTests {
             vocabularySize: 248320,
             attentionHeads: 8,
             kvHeads: 2,
-            linearKeyHeads: 16,
-            linearValueHeads: 16
+            ssmNumHeads: 16
         )
         #expect(config.isVLM == false)
         #expect(config.vision == nil)
@@ -129,8 +128,7 @@ struct ModelDeclarationTests {
             vocabularySize: 248320,
             attentionHeads: 8,
             kvHeads: 2,
-            linearKeyHeads: 16,
-            linearValueHeads: 16
+            ssmNumHeads: 16
         ))
 
         let graph = try model.makeModelGraph()

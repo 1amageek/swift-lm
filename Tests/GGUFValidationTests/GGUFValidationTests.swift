@@ -9,7 +9,11 @@ import Testing
 struct GGUFValidationTests {
     @Test("Qwen35-like file reports missing partial rotary factor")
     func missingPartialRotaryFactorProducesIssue() throws {
-        let file = try makeQwen35Fixture(includePartialRotaryFactor: false, includeAttentionKeyLength: true)
+        let file = try makeQwen35Fixture(
+            includePartialRotaryFactor: false,
+            includeAttentionKeyLength: true,
+            includeTimeStepRank: true
+        )
         let report = GGUFValidationRegistry.default.validate(file: file)
 
         #expect(report.family == "hybridDeltaNetAttention")
@@ -20,7 +24,11 @@ struct GGUFValidationTests {
 
     @Test("repair plan adds inferred partial rotary factor")
     func repairPlanAddsInferredPartialRotaryFactor() throws {
-        let file = try makeQwen35Fixture(includePartialRotaryFactor: false, includeAttentionKeyLength: true)
+        let file = try makeQwen35Fixture(
+            includePartialRotaryFactor: false,
+            includeAttentionKeyLength: true,
+            includeTimeStepRank: true
+        )
         let plan = GGUFValidationRegistry.default.makeRepairPlan(
             file: file,
             mode: .includeInferredRepairs
@@ -40,7 +48,11 @@ struct GGUFValidationTests {
 
     @Test("complete file yields no repair actions")
     func completeFileHasNoRepairActions() throws {
-        let file = try makeQwen35Fixture(includePartialRotaryFactor: true, includeAttentionKeyLength: true)
+        let file = try makeQwen35Fixture(
+            includePartialRotaryFactor: true,
+            includeAttentionKeyLength: true,
+            includeTimeStepRank: true
+        )
         let report = GGUFValidationRegistry.default.validate(file: file)
         let plan = GGUFValidationRegistry.default.makeRepairPlan(
             file: file,
@@ -53,18 +65,50 @@ struct GGUFValidationTests {
 
     @Test("missing inference evidence reports issue without suggested value")
     func missingInferenceEvidenceHasNoSuggestedValue() throws {
-        let file = try makeQwen35Fixture(includePartialRotaryFactor: false, includeAttentionKeyLength: false)
+        let file = try makeQwen35Fixture(
+            includePartialRotaryFactor: false,
+            includeAttentionKeyLength: false,
+            includeTimeStepRank: true
+        )
+        let report = GGUFValidationRegistry.default.validate(file: file)
+
+        #expect(report.issues.count == 2)
+        let partialRotaryIssue = report.issues.first { $0.metadataKey == "qwen35.rope.partial_rotary_factor" }
+        let attentionKeyLengthIssue = report.issues.first { $0.metadataKey == "qwen35.attention.key_length" }
+        #expect(partialRotaryIssue?.suggestedValue == nil)
+        #expect(attentionKeyLengthIssue?.suggestedValue == nil)
+    }
+
+    @Test("missing ssm.time_step_rank is detected and inferred from inner_size / state_size")
+    func missingTimeStepRankIsDetectedAndInferred() throws {
+        let file = try makeQwen35Fixture(
+            includePartialRotaryFactor: true,
+            includeAttentionKeyLength: true,
+            includeTimeStepRank: false
+        )
         let report = GGUFValidationRegistry.default.validate(file: file)
 
         #expect(report.issues.count == 1)
-        #expect(report.issues.first?.suggestedValue == nil)
+        let issue = report.issues.first { $0.metadataKey == "qwen35.ssm.time_step_rank" }
+        #expect(issue != nil)
+        #expect(issue?.severity == .error)
+        // inner_size=1024, state_size=128 → inferred time_step_rank = 8
+        #expect(issue?.suggestedValue == .uint32(8))
+
+        let plan = GGUFValidationRegistry.default.makeRepairPlan(
+            file: file,
+            mode: .includeInferredRepairs
+        )
+        #expect(plan.actions.count == 1)
+        #expect(plan.actions.first?.key == "qwen35.ssm.time_step_rank")
     }
 
     @Test("repaired file loads past hybrid config extraction failure")
     func repairedFileLoadsPastConfigExtractionFailure() throws {
         let originalURL = try writeTemporaryFixture(
             includePartialRotaryFactor: false,
-            includeAttentionKeyLength: true
+            includeAttentionKeyLength: true,
+            includeTimeStepRank: true
         )
         let repairedURL = originalURL.deletingPathExtension().appendingPathExtension("repaired.gguf")
         let original = try GGUFFile.parse(url: originalURL)
@@ -86,7 +130,8 @@ struct GGUFValidationTests {
 
     private func makeQwen35Fixture(
         includePartialRotaryFactor: Bool,
-        includeAttentionKeyLength: Bool
+        includeAttentionKeyLength: Bool,
+        includeTimeStepRank: Bool
     ) throws -> GGUFFile {
         var builder = TestGGUFBuilder()
         builder.addMetadata("general.architecture", value: .string("qwen35"))
@@ -96,6 +141,7 @@ struct GGUFValidationTests {
         builder.addMetadata("qwen35.feed_forward_length", value: .uint32(3584))
         builder.addMetadata("qwen35.ssm.group_count", value: .uint32(8))
         builder.addMetadata("qwen35.ssm.state_size", value: .uint32(128))
+        builder.addMetadata("qwen35.ssm.inner_size", value: .uint32(1024))
         builder.addMetadata("qwen35.ssm.conv_kernel", value: .uint32(4))
         builder.addMetadata("qwen35.full_attention_interval", value: .uint32(4))
         builder.addMetadata("qwen35.rope.dimension_count", value: .uint32(64))
@@ -109,6 +155,9 @@ struct GGUFValidationTests {
         if includePartialRotaryFactor {
             builder.addMetadata("qwen35.rope.partial_rotary_factor", value: .float32(0.25))
         }
+        if includeTimeStepRank {
+            builder.addMetadata("qwen35.ssm.time_step_rank", value: .uint32(8))
+        }
         builder.addTensor(
             name: "blk.0.ssm_beta.weight",
             shape: [256, 1],
@@ -120,11 +169,13 @@ struct GGUFValidationTests {
 
     private func writeTemporaryFixture(
         includePartialRotaryFactor: Bool,
-        includeAttentionKeyLength: Bool
+        includeAttentionKeyLength: Bool,
+        includeTimeStepRank: Bool
     ) throws -> URL {
         let file = try makeQwen35Fixture(
             includePartialRotaryFactor: includePartialRotaryFactor,
-            includeAttentionKeyLength: includeAttentionKeyLength
+            includeAttentionKeyLength: includeAttentionKeyLength,
+            includeTimeStepRank: includeTimeStepRank
         )
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString)

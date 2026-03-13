@@ -82,7 +82,7 @@ private func referenceContiguousMRoPE(
     return x * cosEmb + rotateHalf * sinEmb
 }
 
-/// Reference implementation of interleaved M-RoPE (matches Qwen35FullAttention.applyInterleavedMRoPE).
+/// Reference implementation of interleaved M-RoPE (matches SigmoidGatedFullAttention.applyInterleavedMRoPE).
 private func referenceInterleavedMRoPE(
     _ x: MLXArray, positionIds: MLXArray,
     ropeDim: Int, ropeBase: Float, sections: [Int], headDim: Int

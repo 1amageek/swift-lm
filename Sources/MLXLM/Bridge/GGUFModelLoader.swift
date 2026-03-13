@@ -52,7 +52,7 @@ public struct GGUFModelLoader {
     /// with all others except the universal fallback. The ordering is defense-in-depth
     /// (most-specific first) but correctness does not depend on it.
     package static let defaultModelTypes: [any GGUFLoadableModel.Type] = [
-        Qwen35Model.self,       // DeltaNet SSM tensors (text-only)
+        HybridDeltaNetAttentionModel.self,  // DeltaNet SSM tensors (text-only)
         CohereModel.self,       // parallel attn+FFN with QK norm
         TransformerModel.self,  // universal fallback
     ]

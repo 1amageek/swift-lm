@@ -124,7 +124,7 @@ private func buildDeltaNetExecutor(
 
         @ModelComponentBuilder var body: some ModelComponent {
             TokenEmbedding(vocabSize: vocabSize, embeddingSize: hiddenSize)
-            StateSpace(hiddenSize: hiddenSize, stateSize: stateSize, variant: "deltanet")
+            StateSpace(hiddenSize: hiddenSize, numHeads: 1, keyHeadDim: stateSize, valueHeadDim: stateSize, variant: "deltanet")
         }
     }
 
@@ -188,7 +188,7 @@ private func buildMixedMoEDeltaNetExecutor(
             Repeat(count: layerCount) {
                 Residual {
                     RMSNorm(dimension: hiddenSize)
-                    StateSpace(hiddenSize: hiddenSize, stateSize: stateSize, variant: "deltanet")
+                    StateSpace(hiddenSize: hiddenSize, numHeads: 1, keyHeadDim: stateSize, valueHeadDim: stateSize, variant: "deltanet")
                 }
                 Residual {
                     RMSNorm(dimension: hiddenSize)

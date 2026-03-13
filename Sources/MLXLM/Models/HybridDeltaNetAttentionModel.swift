@@ -1,16 +1,16 @@
-import Foundation
 import GGUFParser
 import MLX
+import MLXCompiler
 import MLXFast
 import MLXNN
 
 // MARK: - Configuration
 
-/// Configuration for the Qwen 3.5 hybrid DeltaNet + Full Attention architecture.
+/// Configuration for the hybrid DeltaNet + full-attention decoder family.
 ///
 /// Alternates between Gated DeltaNet (linear attention, O(1) per token)
 /// and standard Full Attention layers in a metadata-defined ratio.
-struct Qwen35Configuration: Sendable {
+struct HybridDeltaNetAttentionConfiguration: Sendable {
 
     // MARK: Core Dimensions
 
@@ -47,7 +47,7 @@ struct Qwen35Configuration: Sendable {
     // MARK: M-RoPE (VLM only)
 
     /// M-RoPE section sizes for interleaved position encoding.
-    /// Set by the VLM loader (e.g. `[11, 11, 10]` for Qwen 3.5).
+    /// Set by the VLM loader for interleaved M-RoPE variants.
     /// `nil` for text-only mode (standard partial RoPE).
     var mropeSections: [Int]?
 
@@ -56,6 +56,7 @@ struct Qwen35Configuration: Sendable {
     var keyDim: Int { linearKeyHeads * linearKeyHeadDim }
     var valueDim: Int { linearValueHeads * linearValueHeadDim }
     var convDim: Int { 2 * keyDim + valueDim }
+    var valueHeadsPerKeyHead: Int { linearValueHeads / linearKeyHeads }
     var ropePartialDim: Int { Int(Float(headDim) * partialRotaryFactor) }
 
     func isFullAttentionLayer(_ index: Int) -> Bool {
@@ -65,7 +66,7 @@ struct Qwen35Configuration: Sendable {
 
 // MARK: - GGUF Init
 
-extension Qwen35Configuration {
+extension HybridDeltaNetAttentionConfiguration {
 
     package init(from file: GGUFFile) throws {
         let embed = try file.require(.embeddingLength)
@@ -84,10 +85,21 @@ extension Qwen35Configuration {
             throw GGUFLoadError.missingMetadata(
                 GGUFMetadataDiagnostics.missingMetadataMessage("ssm.group_count", in: file))
         }
-
-        guard let linearKeyHeadDim = file[.ssmStateSize] else {
+        guard let linearValueHeads = file.ssmNumHeads else {
+            throw GGUFLoadError.missingMetadata(
+                GGUFMetadataDiagnostics.missingMetadataMessage("ssm.time_step_rank", in: file))
+        }
+        guard let linearStateSize = file[.ssmStateSize] else {
             throw GGUFLoadError.missingMetadata(
                 GGUFMetadataDiagnostics.missingMetadataMessage("ssm.state_size", in: file))
+        }
+        guard linearValueHeads > 0 else {
+            throw GGUFLoadError.invalidData("Invalid GGUF data: ssm.time_step_rank must be greater than 0")
+        }
+        guard linearValueHeads.isMultiple(of: linearKeyHeads) else {
+            throw GGUFLoadError.invalidData(
+                "Invalid GGUF data: ssm.time_step_rank must be divisible by ssm.group_count"
+            )
         }
         guard let convKernelSize = file[.ssmConvKernel] else {
             throw GGUFLoadError.missingMetadata(
@@ -101,7 +113,11 @@ extension Qwen35Configuration {
             throw GGUFLoadError.missingMetadata(
                 GGUFMetadataDiagnostics.missingMetadataMessage("rope.partial_rotary_factor", in: file))
         }
-        let headDim = file[.attentionKeyLength] ?? embed / heads
+        guard let headDim = file[.attentionKeyLength] else {
+            throw GGUFLoadError.missingMetadata(
+                GGUFMetadataDiagnostics.missingMetadataMessage("attention.key_length", in: file)
+            )
+        }
 
         self.hiddenSize = embed
         self.hiddenLayers = blocks
@@ -118,9 +134,9 @@ extension Qwen35Configuration {
         self.maxPositionEmbeddings = file[.contextLength]
         self.partialRotaryFactor = partialRotary
         self.linearKeyHeads = linearKeyHeads
-        self.linearValueHeads = linearKeyHeads
-        self.linearKeyHeadDim = linearKeyHeadDim
-        self.linearValueHeadDim = linearKeyHeadDim
+        self.linearValueHeads = linearValueHeads
+        self.linearKeyHeadDim = linearStateSize
+        self.linearValueHeadDim = linearStateSize
         self.convKernelSize = convKernelSize
         self.fullAttentionInterval = fullAttInterval
     }
@@ -175,10 +191,10 @@ final class DeltaNetCache: KVCache, Updatable, @unchecked Sendable {
 
 /// RMSNorm with SiLU gating for DeltaNet output.
 ///
-/// HuggingFace `Qwen3_5RMSNormGated`: initializes weight to `torch.ones(dim)`,
+/// HuggingFace-style gated RMSNorm initializes weight to `torch.ones(dim)`,
 /// applies `self.weight * rms_norm(x) * silu(gate)`.
 /// GGUF stores the trained weight values directly (near 1.0).
-class Qwen35GatedRMSNorm: Module {
+class GatedRMSNorm: Module {
 
     let weight: MLXArray
     let eps: Float
@@ -200,9 +216,9 @@ class Qwen35GatedRMSNorm: Module {
 /// Uses a fixed-size state matrix S instead of a growing KV cache.
 /// State update: `S_t = exp(g) * S_{t-1} + k ⊗ [β(v − exp(g)·S^T·k)]`
 /// Output: `o = S^T · (q / √d_k)`
-class Qwen35GatedDeltaNet: Module {
+class GatedDeltaNet: Module {
 
-    let config: Qwen35Configuration
+    let config: HybridDeltaNetAttentionConfiguration
     let scale: Float
     let ssmDType: DType = .float32
 
@@ -211,13 +227,13 @@ class Qwen35GatedDeltaNet: Module {
     @ModuleInfo(key: "in_proj_b") var inProjB: Linear
     @ModuleInfo(key: "in_proj_a") var inProjA: Linear
     @ModuleInfo(key: "conv1d") var conv: Conv1d
-    @ModuleInfo(key: "norm") var gatedNorm: Qwen35GatedRMSNorm
+    @ModuleInfo(key: "norm") var gatedNorm: GatedRMSNorm
     @ModuleInfo(key: "out_proj") var outProj: Linear
 
     var dt_bias: MLXArray
     var A_log: MLXArray
 
-    init(_ config: Qwen35Configuration) {
+    init(_ config: HybridDeltaNetAttentionConfiguration) {
         self.config = config
         self.scale = 1.0 / Float(config.linearKeyHeadDim).squareRoot()
 
@@ -232,7 +248,7 @@ class Qwen35GatedDeltaNet: Module {
             kernelSize: config.convKernelSize, padding: 0,
             groups: config.convDim, bias: false)
 
-        self._gatedNorm.wrappedValue = Qwen35GatedRMSNorm(
+        self._gatedNorm.wrappedValue = GatedRMSNorm(
             dimensions: config.linearValueHeadDim, eps: config.normEps)
         self._outProj.wrappedValue = Linear(config.valueDim, h, bias: false)
 
@@ -269,25 +285,47 @@ class Qwen35GatedDeltaNet: Module {
         // Split Q, K, V
         let kd = config.keyDim
         let parts = activated.split(indices: [kd, 2 * kd], axis: -1)
-        let query = parts[0].reshaped(B, T, config.linearKeyHeads, config.linearKeyHeadDim)
-        let key = parts[1].reshaped(B, T, config.linearKeyHeads, config.linearKeyHeadDim)
+        var query = parts[0].reshaped(B, T, config.linearKeyHeads, config.linearKeyHeadDim)
+        var key = parts[1].reshaped(B, T, config.linearKeyHeads, config.linearKeyHeadDim)
         let value = parts[2].reshaped(B, T, config.linearValueHeads, config.linearValueHeadDim)
 
         // Gates
-        let beta = sigmoid(b)
+        let beta = sigmoid(b).reshaped(B, T, config.linearValueHeads)
         let g = -MLX.exp(A_log) * softplus(a + dt_bias)
-        let decay = MLX.exp(g)
+        let decay = MLX.exp(g).reshaped(B, T, config.linearValueHeads)
 
-        // Delta rule recurrence
-        let (attnOut, newState) = recurrence(
-            query: query, key: key, value: value,
-            decay: decay, beta: beta, state: cache?.recurrentState)
+        if config.valueHeadsPerKeyHead > 1 {
+            // GGUF stores V heads in tiled order via convert_hf_to_gguf.py's _reorder_v_heads:
+            //   grouped [G0_v0, G0_v1, G1_v0, G1_v1, ...] → tiled [G0_v0, G1_v0, ..., G0_v1, G1_v1, ...]
+            // ggml_repeat_4d tiles Q/K: [K0,...,K15] → [K0,...,K15, K0,...,K15]
+            // Must use tiled() (not repeated()) to match this convention.
+            // repeated() interleaves [K0,K0,K1,K1,...] which mismatches tiled V heads.
+            query = tiled(query, repetitions: [1, 1, config.valueHeadsPerKeyHead, 1])
+            key = tiled(key, repetitions: [1, 1, config.valueHeadsPerKeyHead, 1])
+        }
+
+        // Delta rule recurrence — chunked for prefill (T>1), token-by-token for decode
+        let gReshaped = g.reshaped(B, T, config.linearValueHeads)
+        let (attnOut, newState): (MLXArray, MLXArray)
+        if T > 1 {
+            let qN = l2Norm(query) * MLXArray(scale)
+            let kN = l2Norm(key)
+            let initState = cache?.recurrentState?.asType(ssmDType)
+                ?? MLXArray.zeros([B, config.linearValueHeads, config.linearKeyHeadDim, config.linearValueHeadDim], dtype: ssmDType)
+            (attnOut, newState) = chunkedGatedDeltaNetRecurrence(
+                query: qN, key: kN, value: value,
+                gateLog: gReshaped, beta: beta, state: initState,
+                dtype: ssmDType)
+        } else {
+            (attnOut, newState) = recurrence(
+                query: query, key: key, value: value,
+                decay: decay, beta: beta, state: cache?.recurrentState)
+        }
         cache?.recurrentState = newState.asType(ssmDType)
         cache?.incrementOffset(by: T)
 
-        // Gated output norm: applied per-head on the last dimension (dv).
-        // GGUF stores norm weight as [dv] (per-head), shared across all heads.
-        // attnOut: [B, T, H, dv], z: [B, T, H*dv]
+        // Gated output norm: applied per value-head on the last dimension (dv).
+        // GGUF stores norm weight as [dv] (per-head), shared across all value heads.
         let numHeads = config.linearValueHeads
         let dv = config.linearValueHeadDim
         let flat = attnOut.reshaped(B * T * numHeads, dv)
@@ -310,7 +348,8 @@ class Qwen35GatedDeltaNet: Module {
         let qN = l2Norm(query) * MLXArray(scale)
         let kN = l2Norm(key)
 
-        var S = state?.asType(ssmDType) ?? MLXArray.zeros([B, H, dk, dv], dtype: ssmDType)
+        var S = state?.asType(ssmDType)
+            ?? MLXArray.zeros([B, H, dk, dv], dtype: ssmDType)
         var outputs = [MLXArray]()
 
         for t in 0..<T {
@@ -320,7 +359,7 @@ class Qwen35GatedDeltaNet: Module {
             let gt = decay[0..., t..<(t + 1), 0...].squeezed(axis: 1)
             let bt = beta[0..., t..<(t + 1), 0...].squeezed(axis: 1)
 
-            let gE = gt.expandedDimensions(axes: [-1, -2])
+            let gE = gt.expandedDimensions(axis: -1).expandedDimensions(axis: -1)
             S = S * gE
 
             let kE = kt.expandedDimensions(axis: -1)
@@ -344,6 +383,12 @@ class Qwen35GatedDeltaNet: Module {
     private func l2Norm(_ x: MLXArray, eps: Float = 1e-6) -> MLXArray {
         x / MLX.sqrt((x * x).sum(axis: -1, keepDims: true) + MLXArray(eps))
     }
+
+    private func softplus(_ x: MLXArray) -> MLXArray {
+        let zero = MLXArray(0.0, dtype: x.dtype)
+        let maxPart = maximum(x, zero)
+        return maxPart + log1p(exp(-abs(x)))
+    }
 }
 
 // MARK: - Full Attention
@@ -352,9 +397,9 @@ class Qwen35GatedDeltaNet: Module {
 ///
 /// q_proj outputs 2x dim: first half = queries, second half = sigmoid gate.
 /// Partial RoPE is applied only to the first `partialRotaryFactor * headDim` dimensions.
-class Qwen35FullAttention: Module {
+class SigmoidGatedFullAttention: Module {
 
-    let config: Qwen35Configuration
+    let config: HybridDeltaNetAttentionConfiguration
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var wq: Linear
@@ -366,9 +411,9 @@ class Qwen35FullAttention: Module {
 
     let rope: RoPELayer
 
-    init(_ config: Qwen35Configuration) {
+    init(_ config: HybridDeltaNetAttentionConfiguration) {
         self.config = config
-        self.scale = pow(Float(config.headDim), -0.5)
+        self.scale = 1.0 / Float(config.headDim).squareRoot()
 
         let h = config.hiddenSize
         self._wq.wrappedValue = Linear(h, config.attentionHeads * config.headDim * 2, bias: false)
@@ -498,13 +543,13 @@ class Qwen35FullAttention: Module {
 
 // MARK: - MLP
 
-class Qwen35MLP: Module {
+class SwiGLUMLP: Module {
 
     @ModuleInfo(key: "gate_proj") var gate: Linear
     @ModuleInfo(key: "down_proj") var down: Linear
     @ModuleInfo(key: "up_proj") var up: Linear
 
-    init(_ config: Qwen35Configuration) {
+    init(_ config: HybridDeltaNetAttentionConfiguration) {
         self._gate.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: false)
         self._down.wrappedValue = Linear(config.intermediateSize, config.hiddenSize, bias: false)
         self._up.wrappedValue = Linear(config.hiddenSize, config.intermediateSize, bias: false)
@@ -518,17 +563,17 @@ class Qwen35MLP: Module {
 // MARK: - Decoder Layer
 
 /// Routes to DeltaNet or Full Attention based on layer index.
-class Qwen35DecoderLayer: Module {
+class HybridDeltaNetAttentionDecoderLayer: Module {
 
     let isFullAttention: Bool
 
-    @ModuleInfo(key: "self_attn") var fullAttn: Qwen35FullAttention?
-    @ModuleInfo(key: "linear_attn") var deltaNet: Qwen35GatedDeltaNet?
-    @ModuleInfo(key: "mlp") var mlp: Qwen35MLP
+    @ModuleInfo(key: "self_attn") var fullAttn: SigmoidGatedFullAttention?
+    @ModuleInfo(key: "linear_attn") var deltaNet: GatedDeltaNet?
+    @ModuleInfo(key: "mlp") var mlp: SwiGLUMLP
     @ModuleInfo(key: "input_layernorm") var inputLayerNorm: RMSNorm
     @ModuleInfo(key: "post_attention_layernorm") var postAttentionLayerNorm: RMSNorm
 
-    init(_ config: Qwen35Configuration, layerIndex: Int) {
+    init(_ config: HybridDeltaNetAttentionConfiguration, layerIndex: Int) {
         self.isFullAttention = config.isFullAttentionLayer(layerIndex)
 
         // Always initialize both modules so all layers share a uniform Module structure.
@@ -536,10 +581,10 @@ class Qwen35DecoderLayer: Module {
         // Optional-nil entries create heterogeneous structure → mismatchedContainers crash.
         // Only the relevant module receives GGUF weights; the other keeps its init values
         // and is never called in the forward pass.
-        self._fullAttn.wrappedValue = Qwen35FullAttention(config)
-        self._deltaNet.wrappedValue = Qwen35GatedDeltaNet(config)
+        self._fullAttn.wrappedValue = SigmoidGatedFullAttention(config)
+        self._deltaNet.wrappedValue = GatedDeltaNet(config)
 
-        self._mlp.wrappedValue = Qwen35MLP(config)
+        self._mlp.wrappedValue = SwiGLUMLP(config)
         self._inputLayerNorm.wrappedValue = RMSNorm(
             dimensions: config.hiddenSize, eps: config.normEps)
         self._postAttentionLayerNorm.wrappedValue = RMSNorm(
@@ -566,20 +611,20 @@ class Qwen35DecoderLayer: Module {
 
 // MARK: - Inner Model
 
-class Qwen35ModelInner: Module {
+class HybridDeltaNetAttentionModelInner: Module {
 
     @ModuleInfo(key: "embed_tokens") var embedTokens: Embedding
-    let layers: [Qwen35DecoderLayer]
+    let layers: [HybridDeltaNetAttentionDecoderLayer]
     let norm: RMSNorm
-    let config: Qwen35Configuration
+    let config: HybridDeltaNetAttentionConfiguration
 
-    init(_ config: Qwen35Configuration) {
+    init(_ config: HybridDeltaNetAttentionConfiguration) {
         self.config = config
         precondition(config.vocabularySize > 0)
         self._embedTokens.wrappedValue = Embedding(
             embeddingCount: config.vocabularySize, dimensions: config.hiddenSize)
         self.layers = (0..<config.hiddenLayers).map {
-            Qwen35DecoderLayer(config, layerIndex: $0)
+            HybridDeltaNetAttentionDecoderLayer(config, layerIndex: $0)
         }
         self.norm = RMSNorm(dimensions: config.hiddenSize, eps: config.normEps)
     }
@@ -605,25 +650,25 @@ class Qwen35ModelInner: Module {
 
 // MARK: - Top-Level Model
 
-class Qwen35Model: Module, LanguageModel, KVCacheDimensionProvider {
+class HybridDeltaNetAttentionModel: Module, LanguageModel, KVCacheDimensionProvider {
 
     let vocabularySize: Int
     let kvHeads: [Int]
     var layerCount: Int { model.layers.count }
     var recommendedPrefillStepSize: Int? { 512 }
 
-    let model: Qwen35ModelInner
-    let configuration: Qwen35Configuration
+    let model: HybridDeltaNetAttentionModelInner
+    let configuration: HybridDeltaNetAttentionConfiguration
 
     @ModuleInfo(key: "lm_head") var lmHead: Linear?
 
-    init(_ config: Qwen35Configuration) {
+    init(_ config: HybridDeltaNetAttentionConfiguration) {
         self.configuration = config
         self.vocabularySize = config.vocabularySize
         self.kvHeads = (0..<config.hiddenLayers).map { i in
             config.isFullAttentionLayer(i) ? config.kvHeads : 0
         }
-        self.model = Qwen35ModelInner(config)
+        self.model = HybridDeltaNetAttentionModelInner(config)
         if !config.tieWordEmbeddings {
             self._lmHead.wrappedValue = Linear(
                 config.hiddenSize, config.vocabularySize, bias: false)
@@ -681,9 +726,9 @@ class Qwen35Model: Module, LanguageModel, KVCacheDimensionProvider {
 
 // MARK: - GGUF Loading
 
-extension Qwen35Model: GGUFLoadableModel {
+extension HybridDeltaNetAttentionModel: GGUFLoadableModel {
 
-    /// Detects Qwen 3.5 by the presence of DeltaNet SSM tensors (text-only).
+    /// Detects text-only hybrid DeltaNet/attention models by the presence of SSM tensors.
     package static func canLoad(from file: GGUFFile, context: GGUFLoadContext) -> Bool {
         context.mmprojURL == nil
             && file.tensors.contains { $0.name == "blk.0.ssm_beta.weight" }
@@ -692,8 +737,8 @@ extension Qwen35Model: GGUFLoadableModel {
     package static func load(
         from file: GGUFFile, context: GGUFLoadContext
     ) throws -> GGUFLoadResult {
-        let config = try Qwen35Configuration(from: file)
-        let model = Qwen35Model(config)
+        let config = try HybridDeltaNetAttentionConfiguration(from: file)
+        let model = HybridDeltaNetAttentionModel(config)
 
         return GGUFLoadResult(
             model: model,
@@ -709,6 +754,6 @@ extension Qwen35Model: GGUFLoadableModel {
 
 // MARK: - LoRA
 
-extension Qwen35Model: LoRAModel {
+extension HybridDeltaNetAttentionModel: LoRAModel {
     var loraLayers: [Module] { model.layers }
 }

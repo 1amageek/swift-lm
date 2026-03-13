@@ -31,7 +31,7 @@ struct Qwen35StandardDiagnosticTests {
             print(report.summary)
         }
 
-        let model = try #require(context.model as? Qwen35Model)
+        let model = try #require(context.model as? HybridDeltaNetAttentionModel)
         let delta0 = try #require(model.model.layers[0].deltaNet)
         let attn3 = try #require(model.model.layers[3].fullAttn)
 

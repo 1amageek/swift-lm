@@ -228,7 +228,7 @@ struct ModelGraphTests {
             .layerNorm(LayerNormAttributes(dimension: 64)),
             .linear(LinearAttributes(inputSize: 64, outputSize: 32)),
             .outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100)),
-            .stateSpace(StateSpaceAttributes(hiddenSize: 64, stateSize: 16, variant: "mamba")),
+            .stateSpace(StateSpaceAttributes(hiddenSize: 64, numHeads: 1, keyHeadDim: 16, valueHeadDim: 16, variant: "mamba")),
             .custom(CustomNodeAttributes(domain: "test", name: "noop")),
         ]
 
@@ -790,7 +790,7 @@ struct ModelGraphTests {
             .layerNorm(LayerNormAttributes(dimension: 64)),
             .linear(LinearAttributes(inputSize: 64, outputSize: 32)),
             .outputHead(OutputHeadAttributes(inputSize: 64, vocabSize: 100)),
-            .stateSpace(StateSpaceAttributes(hiddenSize: 64, stateSize: 16, variant: "mamba")),
+            .stateSpace(StateSpaceAttributes(hiddenSize: 64, numHeads: 1, keyHeadDim: 16, valueHeadDim: 16, variant: "mamba")),
         ]
         for kind in transforms {
             let sig = primitiveSignature(from: kind)!
@@ -1121,7 +1121,7 @@ struct ModelGraphTests {
 
     @Test("StateSpaceAttributes roundtrips through JSON")
     func stateSpaceCodable() throws {
-        let attrs = StateSpaceAttributes(hiddenSize: 2048, stateSize: 64, variant: "mamba2")
+        let attrs = StateSpaceAttributes(hiddenSize: 2048, numHeads: 1, keyHeadDim: 64, valueHeadDim: 64, variant: "mamba2")
         let data = try JSONEncoder().encode(attrs)
         let decoded = try JSONDecoder().decode(StateSpaceAttributes.self, from: data)
         #expect(attrs == decoded)
@@ -1535,7 +1535,7 @@ struct ModelGraphTests {
     func canonicalizationPassthrough() throws {
         let comp = Group {
             TokenEmbedding(vocabSize: 100, embeddingSize: 64)
-            StateSpace(hiddenSize: 64, stateSize: 16, variant: "mamba")
+            StateSpace(hiddenSize: 64, numHeads: 1, keyHeadDim: 16, valueHeadDim: 16, variant: "mamba")
             Custom(domain: "test", name: "noop")
             OutputHead(inputSize: 64, vocabSize: 100)
         }

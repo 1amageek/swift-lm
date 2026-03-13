@@ -67,6 +67,7 @@ let package = Package(
                 .product(name: "MLX", package: "mlx-swift"),
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
+                .product(name: "MLXLinalg", package: "mlx-swift"),
             ]
         ),
         .testTarget(name: "MLXCompilerTests", dependencies: [
@@ -107,6 +108,8 @@ let package = Package(
         ]),
         .testTarget(name: "MLXLMDiagnosticTests", dependencies: [
             "MLXLM",
+            "GGUFToolingCore",
+            "GGUFValidation",
             .product(name: "MLXNN", package: "mlx-swift"),
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
         ]),

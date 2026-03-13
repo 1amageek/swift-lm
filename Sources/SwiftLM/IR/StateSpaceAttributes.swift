@@ -2,13 +2,52 @@
 ///
 /// Represents SSM variants such as Mamba, DeltaNet, or similar
 /// recurrent/selective-state-space architectures.
+///
+/// ## DeltaNet dimensions
+///
+/// The state matrix S is described by two structural axes:
+///
+/// - `numHeads`: number of value heads
+/// - `groupCount`: number of recurrent key/query heads
+///
+/// Symmetric models use `groupCount == numHeads`, yielding a state layout of
+/// `[B, numHeads, keyHeadDim, valueHeadDim]`.
+///
+/// Asymmetric DeltaNet variants may use fewer key heads than value heads.
+/// In that case:
+///
+/// - `query` / `key` are projected to `groupCount` heads
+/// - `value`, `beta`, and `decay` use `numHeads`
+/// - `query` / `key` are expanded to value-head count before the recurrence
+/// - the recurrent state still has layout `[B, numHeads, keyHeadDim, valueHeadDim]`
+///
+/// Key and value dimensions can differ (asymmetric DeltaNet). For example:
+///
+/// - Qwen3.5-0.8B: numHeads=16, groupCount=16, dk=128, dv=128 (symmetric)
+/// - Qwen3.5-4B: numHeads=32, groupCount=16, dk=128, dv=128 (asymmetric head counts)
+///
+/// All dimensions come from GGUF metadata, not tensor shape inference.
 public struct StateSpaceAttributes: Codable, Equatable, Sendable {
 
     /// Hidden dimension of the state-space block.
     public let hiddenSize: Int
 
-    /// State dimension (latent state size).
-    public let stateSize: Int
+    /// Number of recurrence heads. Each head maintains an independent
+    /// state matrix of shape `[keyHeadDim, valueHeadDim]`.
+    public let numHeads: Int
+
+    /// Number of recurrent key/query heads.
+    ///
+    /// Symmetric DeltaNet uses one key head per value head.
+    /// Asymmetric variants may use fewer key heads and expand them to match the
+    /// value-head count before the recurrence update.
+    public let groupCount: Int
+
+    /// Per-head key/query dimension (dk). Controls the "memory address" space.
+    public let keyHeadDim: Int
+
+    /// Per-head value dimension (dv). Controls the "memory content" width.
+    public let valueHeadDim: Int
 
     /// SSM variant identifier (e.g., "mamba", "deltanet").
     public let variant: String
@@ -42,11 +81,14 @@ public struct StateSpaceAttributes: Codable, Equatable, Sendable {
     }
 
     public init(
-        hiddenSize: Int, stateSize: Int, variant: String,
-        computeDType: ComputeDType = .float32
+        hiddenSize: Int, numHeads: Int, groupCount: Int? = nil, keyHeadDim: Int, valueHeadDim: Int,
+        variant: String, computeDType: ComputeDType = .float32
     ) {
         self.hiddenSize = hiddenSize
-        self.stateSize = stateSize
+        self.numHeads = numHeads
+        self.groupCount = groupCount ?? numHeads
+        self.keyHeadDim = keyHeadDim
+        self.valueHeadDim = valueHeadDim
         self.variant = variant
         self.computeDType = computeDType
     }

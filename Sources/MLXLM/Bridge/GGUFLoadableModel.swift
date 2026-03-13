@@ -141,11 +141,31 @@ package enum GGUFMetadataDiagnostics {
 
     private static func diagnosticDetail(for key: String, in file: GGUFFile) -> String? {
         switch key {
+        case "attention.key_length":
+            return attentionKeyLengthDetail(in: file)
         case "rope.partial_rotary_factor":
             return partialRotaryFactorDetail(in: file)
         default:
             return nil
         }
+    }
+
+    private static func attentionKeyLengthDetail(in file: GGUFFile) -> String? {
+        guard let architecture = file.architecture else { return nil }
+
+        let expectedKey = "\(architecture).attention.key_length"
+        guard let embeddingLength = file.embeddingLength,
+            let headCount = file.headCount,
+            headCount > 0
+        else {
+            return "expected key: \(expectedKey)"
+        }
+
+        let embeddingKey = "\(architecture).embedding_length"
+        let headCountKey = "\(architecture).attention.head_count"
+        let inferred = embeddingLength / headCount
+        return
+            "expected key: \(expectedKey); found \(embeddingKey)=\(embeddingLength) and \(headCountKey)=\(headCount); inferred head dimension would be \(inferred), but strict loading requires explicit metadata"
     }
 
     private static func partialRotaryFactorDetail(in file: GGUFFile) -> String? {
@@ -157,9 +177,7 @@ package enum GGUFMetadataDiagnostics {
         }
 
         let ropeDimensionKey = "\(architecture).rope.dimension_count"
-        let attentionKeyLength = file.attentionKeyLength ?? file.headDimension
-
-        guard let attentionKeyLength, attentionKeyLength > 0 else {
+        guard let attentionKeyLength = file.attentionKeyLength, attentionKeyLength > 0 else {
             return "expected key: \(expectedKey); found \(ropeDimensionKey)=\(ropeDimension)"
         }
 

@@ -13,18 +13,30 @@ public struct DeltaNet: ModelComponent {
     }
 
     public let hiddenSize: Int
-    public let stateSize: Int
+    public let numHeads: Int
+    public let groupCount: Int
+    public let keyHeadDim: Int
+    public let valueHeadDim: Int
     public let variant: Variant
 
     public init(
         hiddenSize: Int,
-        stateSize: Int,
+        numHeads: Int,
+        groupCount: Int? = nil,
+        keyHeadDim: Int,
+        valueHeadDim: Int,
         variant: Variant = .standard
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
-        precondition(stateSize > 0, "stateSize must be positive")
+        precondition(numHeads > 0, "numHeads must be positive")
+        precondition((groupCount ?? numHeads) > 0, "groupCount must be positive")
+        precondition(keyHeadDim > 0, "keyHeadDim must be positive")
+        precondition(valueHeadDim > 0, "valueHeadDim must be positive")
         self.hiddenSize = hiddenSize
-        self.stateSize = stateSize
+        self.numHeads = numHeads
+        self.groupCount = groupCount ?? numHeads
+        self.keyHeadDim = keyHeadDim
+        self.valueHeadDim = valueHeadDim
         self.variant = variant
     }
 }
@@ -34,7 +46,10 @@ extension DeltaNet: PrimitiveComponent {
     package var operationKind: OperationKind {
         .stateSpace(StateSpaceAttributes(
             hiddenSize: hiddenSize,
-            stateSize: stateSize,
+            numHeads: numHeads,
+            groupCount: groupCount,
+            keyHeadDim: keyHeadDim,
+            valueHeadDim: valueHeadDim,
             variant: variant.rawValue
         ))
     }

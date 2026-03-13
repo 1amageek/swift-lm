@@ -3,7 +3,7 @@ import GGUFParser
 
 /// Downloads model files from Hugging Face Hub with local caching.
 ///
-/// Files are stored at `~/Library/Application Support/swift-mlx-lm/huggingface/{repo}/{revision}/`.
+/// Files are stored at `~/.cache/huggingface/hub/{repo}/{revision}/`.
 /// Subsequent calls return the cached path without re-downloading unless the remote
 /// file has changed (ETag-based validation).
 ///
@@ -171,10 +171,11 @@ public struct HuggingFaceDownloader: Sendable {
     }
 
     private func buildCacheDirectory(repo: String, revision: String) -> URL {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        return appSupport
-            .appendingPathComponent("swift-mlx-lm")
+        let home = URL(fileURLWithPath: NSHomeDirectory())
+        return home
+            .appendingPathComponent(".cache")
             .appendingPathComponent("huggingface")
+            .appendingPathComponent("hub")
             .appendingPathComponent(repo.replacingOccurrences(of: "/", with: "--"))
             .appendingPathComponent(revision)
     }
@@ -210,7 +211,7 @@ public struct HuggingFaceDownloader: Sendable {
         }
 
         #if os(macOS)
-        let tokenPath = FileManager.default.homeDirectoryForCurrentUser
+        let tokenPath = URL(fileURLWithPath: NSHomeDirectory())
             .appendingPathComponent(".cache/huggingface/token")
         if let fileToken = try? String(contentsOf: tokenPath, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines),
            !fileToken.isEmpty {

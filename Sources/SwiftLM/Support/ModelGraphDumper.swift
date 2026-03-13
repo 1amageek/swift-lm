@@ -219,7 +219,7 @@ public enum ModelGraphDumper {
             return s + ")"
 
         case .stateSpace(let a):
-            return "stateSpace(hidden=\(a.hiddenSize), state=\(a.stateSize), variant=\(a.variant))"
+            return "stateSpace(hidden=\(a.hiddenSize), heads=\(a.numHeads), dk=\(a.keyHeadDim), dv=\(a.valueHeadDim), variant=\(a.variant))"
 
         case .custom(let a):
             return "custom(\(a.domain).\(a.name))"

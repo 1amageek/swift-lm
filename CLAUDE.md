@@ -224,6 +224,53 @@ SwiftLM
 - metadata 欠落を convenience default で埋める
 - 新しい family を既存モデル名で代表させる
 
+### Component を作るときのフロー
+
+新しい family は、最初に動いた 1 モデルをそのまま一般化して作ってはいけない。`ModelComponent` を書く前に **family spec** を完成させること。
+
+必須フロー:
+
+1. component を書く前に family spec を書く
+2. family の可変軸を全部列挙する
+3. required metadata と derived value を分離する
+4. cache / recurrent state / routing state の shape を先に確定する
+5. 可能なら 2 variant 以上で spec を照合する
+6. その後に `ModelComponent` / mapper / lowering / kernel を実装する
+
+family spec に必ず含めるもの:
+
+- 必須 metadata key 一覧
+- 導出式と invariant
+- tensor packing の前提
+- head / group / expert / window / state の関係
+- cache/state tensor shape
+- layer schedule 規則
+- gate / norm / positional encoding の意味論
+
+ルール:
+
+- 論文や公式実装に自由度があるなら、最初のモデルでその値が固定に見えても型に載せる
+- あるモデルでたまたま一致している 2 つの概念を、family レベルで 1 つに潰さない
+- runtime-critical な値を runtime path で推定しない。推定は tooling に閉じ込める
+- 「ロードできる」「少し生成できる」を完成条件にしない
+
+新しい family の最低検証項目:
+
+- metadata extraction test
+- tensor shape / mapper test
+- missing metadata failure test
+- variant 間 differential test
+- layer-wise activation / logit trace
+- compiled path と standard path の parity check（両方ある場合）
+
+避けるべき失敗パターン:
+
+- 小さい variant を family spec の代わりにしてしまう
+- product-specific な偶然を family abstraction に埋め込む
+- 大きい variant で初めて必要軸が露呈する
+
+variant 間で解釈差が出たら、「どちらかを例外扱いする」のではなく「family spec が未完成」と見なして、足りない軸を type / IR / configuration に追加すること。
+
 ### モジュール依存関係
 
 ```
@@ -480,6 +527,20 @@ gateValues = queries[0..., 0..., qDim...]
 let perHead = queries.reshaped(B, L, headCount, 2 * headDim)
 gateValues = perHead[0..., 0..., 0..., headDim...].reshaped(B, L, -1)
 queries = perHead[0..., 0..., 0..., 0..<headDim].reshaped(B, L, -1)
+```
+
+### 禁止: DeltaNet Q/K 拡張に `repeated()` を使う
+
+非対称ヘッドモデル（`ssmGroupCount < ssmNumHeads`、例: 4B で keyHeads=16, valueHeads=32）で Q/K を拡張する際、MLX の `repeated(count:axis:)` を使ってはならない。
+
+`convert_hf_to_gguf.py` の `_reorder_v_heads` が V heads 関連の全テンソル（V, beta, alpha, A_log, dt_bias, conv1d V channels, out_proj columns）を grouped → tiled order に並び替えている。llama.cpp の `ggml_repeat_4d` は Q/K を **tile**（ブロック複製: `[K0,...,K15,K0,...,K15]`）するが、`repeated()` は **interleave**（要素複製: `[K0,K0,K1,K1,...]`）する。この不一致で Q/K と V/beta/gate のペアリングが壊れ、長いシーケンスほど DeltaNet 状態が劣化する。
+
+```swift
+// ✗ WRONG — interleaves, mismatches GGUF tiled V head layout
+query = repeated(query, count: repeatFactor, axis: 2)
+
+// ✓ CORRECT — tiles, matches ggml_repeat_4d behavior
+query = tiled(query, repetitions: [1, 1, repeatFactor, 1])
 ```
 
 ### 参照実装との一致検証

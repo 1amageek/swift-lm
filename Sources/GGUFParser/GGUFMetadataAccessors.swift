@@ -283,24 +283,28 @@ extension GGUFFile {
 
     // MARK: - DeltaNet / Hybrid Attention (Qwen 3.5)
 
-    /// Number of linear attention heads (DeltaNet groups).
-    public var linearKeyHeadCount: Int? {
+    /// Number of recurrence heads (value heads) for DeltaNet.
+    ///
+    /// Source: `ssm.time_step_rank`.
+    /// If missing, use `gguf-tool repair` to infer from `ssm.inner_size / ssm.state_size`.
+    public var ssmNumHeads: Int? {
+        architectureMetadata("ssm.time_step_rank")?.intValue
+    }
+
+    /// SSM group count. For asymmetric DeltaNet, this is the number of key groups
+    /// (distinct from head count). Used to derive per-head key dimension.
+    public var ssmGroupCount: Int? {
         architectureMetadata("ssm.group_count")?.intValue
     }
 
-    /// Number of linear attention value heads (same as key heads).
-    public var linearValueHeadCount: Int? {
-        architectureMetadata("ssm.group_count")?.intValue
-    }
-
-    /// Per-head key dimension for linear attention (SSM state size).
-    public var linearKeyHeadDim: Int? {
+    /// Per-head state/value dimension (d_state from GGUF).
+    public var ssmStateSize: Int? {
         architectureMetadata("ssm.state_size")?.intValue
     }
 
-    /// Per-head value dimension for linear attention (SSM state size).
-    public var linearValueHeadDim: Int? {
-        architectureMetadata("ssm.state_size")?.intValue
+    /// Total DeltaNet inner size (valueDim = numHeads * valueHeadDim).
+    public var ssmInnerSize: Int? {
+        architectureMetadata("ssm.inner_size")?.intValue
     }
 
     /// Conv1D kernel size for linear attention.
@@ -317,16 +321,6 @@ extension GGUFFile {
     public var partialRotaryFactor: Float? {
         architectureMetadata("rope.partial_rotary_factor")?.float32Value
             ?? architectureMetadata("rope.partial_rotary_factor")?.doubleValue.map(Float.init)
-    }
-
-    /// SSM inner size (total DeltaNet projection size).
-    public var ssmInnerSize: Int? {
-        architectureMetadata("ssm.inner_size")?.intValue
-    }
-
-    /// SSM time step rank.
-    public var ssmTimeStepRank: Int? {
-        architectureMetadata("ssm.time_step_rank")?.intValue
     }
 
     // MARK: - Vocabulary Size

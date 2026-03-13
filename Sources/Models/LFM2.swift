@@ -231,7 +231,9 @@ struct LFM2ConvDecoderLayer: ModelComponent {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
             StateSpace(
                 hiddenSize: config.hiddenSize,
-                stateSize: config.convLCache,
+                numHeads: 1,
+                keyHeadDim: config.convLCache,
+                valueHeadDim: config.convLCache,
                 variant: "short_conv"
             )
         }

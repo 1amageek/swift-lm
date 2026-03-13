@@ -175,7 +175,7 @@ struct PrimitiveNormalizationPerformanceTests {
 
     @Test("StateSpace normalization")
     func stateSpace() throws {
-        let comp = StateSpace(hiddenSize: 4096, stateSize: 16, variant: "mamba")
+        let comp = StateSpace(hiddenSize: 4096, numHeads: 1, keyHeadDim: 16, valueHeadDim: 16, variant: "mamba")
         let d = try measure { _ = try normalize(comp) }
         print("[perf] StateSpace normalize: \(d)")
         #expect(d < .milliseconds(10))

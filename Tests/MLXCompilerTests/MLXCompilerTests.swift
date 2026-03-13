@@ -1559,7 +1559,7 @@ struct CompilerErrorPathTests {
         struct SSModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
-                StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
+                StateSpace(hiddenSize: 4, numHeads: 1, keyHeadDim: 2, valueHeadDim: 2, variant: "deltanet")
             }
         }
 
@@ -1998,20 +1998,20 @@ struct ExecutorDeltaNetTests {
 
     @Test("DeltaNet forward pass produces correct shape and finite values")
     func deltaNetForwardPass() throws {
-        // Minimal DeltaNet: 1 head, keyDim=2, valueDim=2, stateSize=2
+        // Minimal DeltaNet: 1 head, keyDim=2, valueDim=2
         // Weight dimensions derived from Qwen 3.5 structure:
         //   in_proj_qkv: [keyDim + keyDim + valueDim, hiddenSize] = [6, 4]
         //   in_proj_z:   [valueDim, hiddenSize] = [2, 4]
-        //   in_proj_b/a: [linearKeyHeads, hiddenSize] = [1, 4]
+        //   in_proj_b/a: [ssmNumHeads, hiddenSize] = [1, 4]
         //   conv1d:      [convDim=6, kernelSize=4]
         //   out_proj:    [hiddenSize, valueDim] = [4, 2]
-        //   norm:        [linearValueHeadDim=2]
-        //   dt_bias:     [linearKeyHeads=1]
-        //   A_log:       [linearKeyHeads=1]
+        //   norm:        [ssmValueHeadDim=2]
+        //   dt_bias:     [ssmNumHeads=1]
+        //   A_log:       [ssmNumHeads=1]
         struct DeltaNetModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
-                StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
+                StateSpace(hiddenSize: 4, numHeads: 1, keyHeadDim: 2, valueHeadDim: 2, variant: "deltanet")
             }
         }
 
@@ -2050,7 +2050,7 @@ struct ExecutorDeltaNetTests {
         struct DeltaNetModel: ModelComponent {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
-                StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
+                StateSpace(hiddenSize: 4, numHeads: 1, keyHeadDim: 2, valueHeadDim: 2, variant: "deltanet")
             }
         }
 
@@ -2348,7 +2348,7 @@ struct CompilerMixedCacheTests {
             @ModelComponentBuilder var body: some ModelComponent {
                 TokenEmbedding(vocabSize: 4, embeddingSize: 4)
                 Attention(hiddenSize: 4, headCount: 2, kvHeadCount: 2, headDimension: 2)
-                StateSpace(hiddenSize: 4, stateSize: 2, variant: "deltanet")
+                StateSpace(hiddenSize: 4, numHeads: 1, keyHeadDim: 2, valueHeadDim: 2, variant: "deltanet")
                 Attention(hiddenSize: 4, headCount: 2, kvHeadCount: 2, headDimension: 2)
             }
         }

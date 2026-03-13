@@ -106,10 +106,10 @@ public struct Qwen35: ModelComponent {
 
         // MARK: - DeltaNet Parameters
 
-        public let linearKeyHeads: Int
-        public let linearValueHeads: Int
-        public let linearKeyHeadDim: Int
-        public let linearValueHeadDim: Int
+        public let ssmNumHeads: Int
+        public let ssmGroupCount: Int
+        public let ssmKeyHeadDim: Int
+        public let ssmValueHeadDim: Int
         public let convKernelSize: Int
 
         // MARK: - Hybrid Routing
@@ -156,10 +156,10 @@ public struct Qwen35: ModelComponent {
             ropeTheta: Float = 10_000_000.0,
             ropeScaling: RoPEScaling? = nil,
             partialRotaryFactor: Float = 0.25,
-            linearKeyHeads: Int,
-            linearValueHeads: Int,
-            linearKeyHeadDim: Int = 128,
-            linearValueHeadDim: Int = 128,
+            ssmNumHeads: Int,
+            ssmGroupCount: Int? = nil,
+            ssmKeyHeadDim: Int = 128,
+            ssmValueHeadDim: Int = 128,
             convKernelSize: Int = 4,
             fullAttentionInterval: Int = 4,
             vision: VisionConfig? = nil,
@@ -184,10 +184,10 @@ public struct Qwen35: ModelComponent {
             self.ropeTheta = ropeTheta
             self.ropeScaling = ropeScaling
             self.partialRotaryFactor = partialRotaryFactor
-            self.linearKeyHeads = linearKeyHeads
-            self.linearValueHeads = linearValueHeads
-            self.linearKeyHeadDim = linearKeyHeadDim
-            self.linearValueHeadDim = linearValueHeadDim
+            self.ssmNumHeads = ssmNumHeads
+            self.ssmGroupCount = ssmGroupCount ?? ssmNumHeads
+            self.ssmKeyHeadDim = ssmKeyHeadDim
+            self.ssmValueHeadDim = ssmValueHeadDim
             self.convKernelSize = convKernelSize
             self.fullAttentionInterval = fullAttentionInterval
             self.vision = vision
@@ -239,7 +239,10 @@ struct Qwen35DeltaNetDecoderLayer: ModelComponent {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
             DeltaNet(
                 hiddenSize: config.hiddenSize,
-                stateSize: config.linearKeyHeadDim,
+                numHeads: config.ssmNumHeads,
+                groupCount: config.ssmGroupCount,
+                keyHeadDim: config.ssmKeyHeadDim,
+                valueHeadDim: config.ssmValueHeadDim,
                 variant: .gated
             )
         }
@@ -302,10 +305,9 @@ extension Qwen35.Config {
         attentionHeads: 8,
         kvHeads: 2,
         headDim: 256,
-        linearKeyHeads: 16,
-        linearValueHeads: 16,
-        linearKeyHeadDim: 128,
-        linearValueHeadDim: 128,
+        ssmNumHeads: 16,
+        ssmKeyHeadDim: 128,
+        ssmValueHeadDim: 128,
         vision: .init(outputSize: 1024)
     )
 }

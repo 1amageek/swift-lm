@@ -75,18 +75,15 @@ final class GraphDeltaNet: Module, UnaryLayer {
         let B = x.dim(0)
         let T = x.dim(1)
 
-        // Infer dimensions from weight shapes
-        let qkvWeight = inProjQKV.weight
-        let totalQKV = qkvWeight.dim(0)
-        let valueDim = inProjZ.weight.dim(0)
-        let keyDim = (totalQKV - valueDim) / 2
-        let linearKeyHeadDim = attrs.stateSize
-        let linearKeyHeads = keyDim / linearKeyHeadDim
-        let linearValueHeadDim = normWeight.dim(0)
-        let linearValueHeads = valueDim / linearValueHeadDim
-        let convDim = totalQKV
+        // Dimensions from IR attributes (resolved from GGUF metadata at build time)
+        let numHeads = attrs.numHeads
+        let dk = attrs.keyHeadDim
+        let dv = attrs.valueHeadDim
+        let keyHeadCount = attrs.groupCount
+        let keyDim = keyHeadCount * dk
+        let valueDim = numHeads * dv
+        let convDim = 2 * keyDim + valueDim
         let convKernelSize = convWeight.dim(1)
-        let scale = 1.0 / Float(linearKeyHeadDim).squareRoot()
 
         // Projections through Linear modules (quantizedMM-compatible)
         let mixedQKV = inProjQKV(x)
@@ -113,27 +110,63 @@ final class GraphDeltaNet: Module, UnaryLayer {
 
         // === Dtype boundary: projection output → recurrence dtype ===
         let parts = activated.asType(recurrenceDType).split(indices: [keyDim, 2 * keyDim], axis: -1)
-        let query = parts[0].reshaped(B, T, linearKeyHeads, linearKeyHeadDim)
-        let key = parts[1].reshaped(B, T, linearKeyHeads, linearKeyHeadDim)
-        let value = parts[2].reshaped(B, T, linearValueHeads, linearValueHeadDim)
 
         // Gates (computed in recurrence dtype)
-        let beta = sigmoid(b.asType(recurrenceDType))
+        let betaRaw = sigmoid(b.asType(recurrenceDType))
         let g = -MLX.exp(aLog.asType(recurrenceDType)) * softplus(a.asType(recurrenceDType) + dtBias.asType(recurrenceDType))
-        let decay = MLX.exp(g)
+        let decayRaw = MLX.exp(g)
 
-        // Delta rule recurrence (entirely in recurrence dtype)
-        let (attnOut, newState) = deltaNetRecurrence(
-            query: query, key: key, value: value,
-            decay: decay, beta: beta, state: cache.recurrentState,
-            scale: scale
-        )
+        // Prepare Q, K, V with head repetition for asymmetric models
+        let repeatFactor = numHeads / keyHeadCount
+        let scale = 1.0 / Float(dk).squareRoot()
+        let query: MLXArray
+        let key: MLXArray
+        if repeatFactor > 1 {
+            // GGUF stores V heads in tiled order (convert_hf_to_gguf.py _reorder_v_heads).
+            // Must tile Q/K to match: [K0,...,K15] → [K0,...,K15, K0,...,K15].
+            query = tiled(parts[0].reshaped(B, T, keyHeadCount, dk), repetitions: [1, 1, repeatFactor, 1])
+            key = tiled(parts[1].reshaped(B, T, keyHeadCount, dk), repetitions: [1, 1, repeatFactor, 1])
+        } else {
+            query = parts[0].reshaped(B, T, numHeads, dk)
+            key = parts[1].reshaped(B, T, numHeads, dk)
+        }
+        let value = parts[2].reshaped(B, T, numHeads, dv)
+        let betaGate = betaRaw.reshaped(B, T, numHeads)
+        let initState = cache.recurrentState ?? MLXArray.zeros([B, numHeads, dk, dv], dtype: recurrenceDType)
+
+        let attnOut: MLXArray
+        let newState: MLXArray
+
+        if T == 1 {
+            // Decode: use token-by-token recurrence
+            if keyHeadCount == numHeads {
+                (attnOut, newState) = deltaNetRecurrence(
+                    query: query, key: key, value: value,
+                    decay: decayRaw, beta: betaRaw, state: initState,
+                    scale: scale
+                )
+            } else {
+                (attnOut, newState) = repeatedKeyDeltaNetRecurrence(
+                    query: query, key: key, value: value,
+                    decay: decayRaw.reshaped(B, T, numHeads),
+                    beta: betaGate, state: initState, scale: scale
+                )
+            }
+        } else {
+            // Prefill: use chunked WY algorithm
+            let qN = l2Norm(query) * MLXArray(scale).asType(recurrenceDType)
+            let kN = l2Norm(key)
+            let gReshaped = g.reshaped(B, T, numHeads)
+            (attnOut, newState) = chunkedGatedDeltaNetRecurrence(
+                query: qN, key: kN, value: value,
+                gateLog: gReshaped, beta: betaGate, state: initState,
+                dtype: recurrenceDType
+            )
+        }
         cache.recurrentState = newState
         cache.incrementOffset(by: T)
 
         // === Dtype boundary: recurrence output → activation dtype ===
-        let dv = linearValueHeadDim
-        let numHeads = linearValueHeads
         let flat = attnOut.asType(inputDType).reshaped(B * T * numHeads, dv)
         let zFlat = z.reshaped(B, T, numHeads, dv).reshaped(B * T * numHeads, dv)
         let normed = MLXFast.rmsNorm(flat, weight: normWeight, eps: 1e-6) * silu(zFlat)
@@ -142,7 +175,7 @@ final class GraphDeltaNet: Module, UnaryLayer {
         return outProj(gated)
     }
 
-    // MARK: - Recurrence
+    // MARK: - Token-by-token recurrence (decode)
 
     /// Per-token DeltaNet state update.
     ///
@@ -188,14 +221,57 @@ final class GraphDeltaNet: Module, UnaryLayer {
             let qE = qt.expandedDimensions(axis: -1)
             let ot = (S * qE).sum(axis: -2)
             outputs.append(ot.expandedDimensions(axis: 1))
-
-            // Periodically evaluate to prevent graph explosion during long prefills
-            if T > 1 && (t + 1) % 64 == 0 {
-                eval(S)
-            }
         }
 
         return (concatenated(outputs, axis: 1), S)
+    }
+
+    private func repeatedKeyDeltaNetRecurrence(
+        query: MLXArray,
+        key: MLXArray,
+        value: MLXArray,
+        decay: MLXArray,
+        beta: MLXArray,
+        state: MLXArray?,
+        scale: Float
+    ) -> (MLXArray, MLXArray) {
+        let B = query.dim(0), T = query.dim(1), H = query.dim(2)
+        let dk = query.dim(3), dv = value.dim(3)
+
+        let qN = l2Norm(query) * MLXArray(scale).asType(recurrenceDType)
+        let kN = l2Norm(key)
+
+        let qSlices = qN.split(parts: T, axis: 1)
+        let kSlices = kN.split(parts: T, axis: 1)
+        let vSlices = value.split(parts: T, axis: 1)
+        let gSlices = decay.split(parts: T, axis: 1)
+        let bSlices = beta.split(parts: T, axis: 1)
+
+        var S = state ?? MLXArray.zeros([B, H, dk, dv], dtype: recurrenceDType)
+        var outputs = [MLXArray]()
+        outputs.reserveCapacity(T)
+
+        for t in 0..<T {
+            let qt = qSlices[t].squeezed(axis: 1)
+            let kt = kSlices[t].squeezed(axis: 1)
+            let vt = vSlices[t].squeezed(axis: 1)
+            let gt = gSlices[t].squeezed(axis: 1)
+            let bt = bSlices[t].squeezed(axis: 1)
+
+            let gE = gt.expandedDimensions(axis: -1).expandedDimensions(axis: -1)
+            S = S * gE
+
+            let kE = kt.expandedDimensions(axis: -1)
+            let kvMem = (S * kE).sum(axis: -2)
+            let delta = bt.expandedDimensions(axis: -1) * (vt - kvMem)
+            S = S + kE * delta.expandedDimensions(axis: -2)
+
+            let qE = qt.expandedDimensions(axis: -1)
+            let ot = (S * qE).sum(axis: -2)
+            outputs.append(ot.expandedDimensions(axis: 1))
+        }
+
+        return (concatenated(outputs, axis: 1).reshaped(B, T, H, dv), S)
     }
 
     // MARK: - Utility
@@ -205,6 +281,8 @@ final class GraphDeltaNet: Module, UnaryLayer {
     }
 
     private func softplus(_ x: MLXArray) -> MLXArray {
-        MLX.log(1 + MLX.exp(x))
+        let zero = MLXArray(0.0, dtype: x.dtype)
+        let maxPart = maximum(x, zero)
+        return maxPart + log1p(exp(-abs(x)))
     }
 }

@@ -31,7 +31,7 @@ struct Qwen35NormConventionTests {
         let url = try await downloader.download(repo: Self.repo, filename: Self.filename)
         let loader = GGUFModelLoader()
         let context = try loader.loadContext(url: url)
-        let model = try #require(context.model as? Qwen35Model)
+        let model = try #require(context.model as? HybridDeltaNetAttentionModel)
 
         // Check gated norm weights across multiple DeltaNet layers
         let deltaNetLayers = [0, 1, 2, 4, 5, 6]
@@ -72,7 +72,7 @@ struct Qwen35NormConventionTests {
         let url = try await downloader.download(repo: Self.repo, filename: Self.filename)
         let loader = GGUFModelLoader()
         let context = try loader.loadContext(url: url)
-        let model = try #require(context.model as? Qwen35Model)
+        let model = try #require(context.model as? HybridDeltaNetAttentionModel)
         let delta0 = try #require(model.model.layers[0].deltaNet)
 
         let normWeight = delta0.gatedNorm.weight

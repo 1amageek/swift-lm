@@ -184,7 +184,7 @@ struct TinyJamba: ModelComponent {
         // Layer 1: Mamba block
         Residual {
             RMSNorm(dimension: hiddenSize)
-            StateSpace(hiddenSize: hiddenSize, stateSize: stateSize, variant: "mamba")
+            StateSpace(hiddenSize: hiddenSize, numHeads: 1, keyHeadDim: stateSize, valueHeadDim: stateSize, variant: "mamba")
         }
         Residual {
             RMSNorm(dimension: hiddenSize)
@@ -689,7 +689,7 @@ struct IRInvariantTests {
         if case .residual(_, let body) = graph.rootRegion.operations[1].kind {
             if case .stateSpace(let attrs) = body.operations[1].kind {
                 #expect(attrs.variant == "mamba")
-                #expect(attrs.stateSize == 16)
+                #expect(attrs.keyHeadDim == 16)
             } else {
                 Issue.record("Expected stateSpace in first residual")
             }
