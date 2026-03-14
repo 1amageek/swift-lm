@@ -388,7 +388,7 @@ struct MPSGraphInferenceCompilerTests {
 // MARK: - Level 3: Forward Pass
 // ============================================================================
 
-@Suite("MPSGraph Forward", .tags(.unit), .heartbeat)
+@Suite("MPSGraphForward", .tags(.unit), .heartbeat)
 struct MPSGraphForwardTests {
 
     @Test("Single token forward produces finite logits")

@@ -2,10 +2,11 @@ import Foundation
 import Metal
 import MetalPerformanceShadersGraph
 @preconcurrency import MLX
+import SwiftLM
 
 /// Compiled MPSGraph model ready for inference.
 ///
-/// Causal mask and RoPE tables are generated at call time and passed as inputs,
+/// Causal mask and RoPE tables are generated at call time from model config,
 /// avoiding MPSGraph MLIR issues with dynamic coordinate ops.
 public struct MPSGraphInferenceModel: @unchecked Sendable {
 
@@ -17,20 +18,17 @@ public struct MPSGraphInferenceModel: @unchecked Sendable {
     let ropeCosPh: MPSGraphTensor?
     let ropeSinPh: MPSGraphTensor?
     let ropeHeadDim: Int
+    let ropeTheta: Float
+    let ropeScaling: RoPEScaling?
     let outputTensor: MPSGraphTensor
 
     public let metadata: InferenceMetadata
-
-    /// RoPE theta — needed to build cos/sin tables at call time.
-    /// Defaults to 500000 if not configured.
-    public var ropeTheta: Float = 500000.0
 
     /// Forward pass: token IDs → logits.
     public func forward(_ tokenIDs: [Int32]) -> MLXArray {
         let T = tokenIDs.count
         let mpsDevice = MPSGraphDevice(mtlDevice: device)
 
-        // Input tokens
         let inputData = tokenIDs.withUnsafeBytes { ptr in
             MPSGraphTensorData(device: mpsDevice, data: Data(ptr),
                                 shape: [1, T as NSNumber], dataType: .int32)
@@ -49,11 +47,11 @@ public struct MPSGraphInferenceModel: @unchecked Sendable {
             maskPlaceholder: maskData,
         ]
 
-        // RoPE cos/sin tables [1, 1, T, hd/2]
+        // RoPE cos/sin tables [1, 1, T, hd/2] — using model's theta and scaling
         if let cosPh = ropeCosPh, let sinPh = ropeSinPh, ropeHeadDim > 0 {
             let halfDim = ropeHeadDim / 2
             let (cosData, sinData) = MPSGraphOps.buildRoPETables(
-                seqLen: T, headDim: ropeHeadDim, theta: ropeTheta)
+                seqLen: T, headDim: ropeHeadDim, theta: ropeTheta, scaling: ropeScaling)
             feeds[cosPh] = MPSGraphTensorData(
                 device: mpsDevice, data: cosData,
                 shape: [1, 1, T as NSNumber, halfDim as NSNumber], dataType: .float16)
