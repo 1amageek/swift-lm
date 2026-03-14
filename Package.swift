@@ -75,13 +75,6 @@ let package = Package(
             "MLXCompiler", "SwiftLM", "ModelDeclarations",
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
         ]),
-        .testTarget(name: "CoreMLBenchmarkTests", dependencies: [
-            "MLXCompiler",
-            .product(name: "MLX", package: "mlx-swift"),
-            .product(name: "MLXFast", package: "mlx-swift"),
-            .product(name: "MLXNN", package: "mlx-swift"),
-            .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
-        ]),
         .testTarget(name: "ModelsTests", dependencies: [
             "ModelDeclarations", "SwiftLM",
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
