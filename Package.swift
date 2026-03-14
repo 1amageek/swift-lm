@@ -8,11 +8,6 @@ let package = Package(
         .library(name: "SwiftLM", targets: ["SwiftLM"]),
         .library(name: "ModelDeclarations", targets: ["ModelDeclarations"]),
         .library(name: "MLXLM", targets: ["MLXLM"]),
-        .library(name: "GGUFParser", targets: ["GGUFParser"]),
-        .library(name: "GGUFTokenizer", targets: ["GGUFTokenizer"]),
-        .library(name: "GGUFToolingCore", targets: ["GGUFToolingCore"]),
-        .library(name: "GGUFValidation", targets: ["GGUFValidation"]),
-        .executable(name: "gguf-tool", targets: ["gguf-tool"]),
     ],
     dependencies: [
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.30.6")),
@@ -21,7 +16,6 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", .upToNextMinor(from: "1.1.9")),
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.1"),
         .package(url: "https://github.com/1amageek/swift-testing-heartbeat", from: "0.1.0"),
-        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
     ],
     targets: [
         .target(
@@ -31,13 +25,6 @@ let package = Package(
             ]
         ),
         .target(name: "ModelDeclarations", dependencies: ["SwiftLM"], path: "Sources/Models"),
-        .target(name: "GGUFParser"),
-        .target(name: "GGUFTokenizer", dependencies: ["GGUFParser"]),
-        .target(name: "GGUFToolingCore", dependencies: ["GGUFParser"]),
-        .target(
-            name: "GGUFValidation",
-            dependencies: ["GGUFParser", "MLXLM", "GGUFToolingCore"]
-        ),
         .target(
             name: "MLXLM",
             dependencies: [
@@ -50,15 +37,6 @@ let package = Package(
                 .product(name: "MLXNN", package: "mlx-swift"),
                 .product(name: "MLXFast", package: "mlx-swift"),
                 .product(name: "MLXLinalg", package: "mlx-swift"),
-            ]
-        ),
-        .executableTarget(
-            name: "gguf-tool",
-            dependencies: [
-                "GGUFParser",
-                "GGUFToolingCore",
-                "GGUFValidation",
-                .product(name: "ArgumentParser", package: "swift-argument-parser"),
             ]
         ),
         .target(
@@ -83,25 +61,6 @@ let package = Package(
             "SwiftLM",
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
         ]),
-        .testTarget(name: "GGUFParserTests", dependencies: [
-            "GGUFParser",
-            .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
-        ]),
-        .testTarget(name: "GGUFTokenizerTests", dependencies: [
-            "GGUFTokenizer",
-            .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
-        ]),
-        .testTarget(name: "GGUFToolingCoreTests", dependencies: [
-            "GGUFParser",
-            "GGUFToolingCore",
-            .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
-        ]),
-        .testTarget(name: "GGUFValidationTests", dependencies: [
-            "GGUFParser",
-            "GGUFValidation",
-            "GGUFToolingCore",
-            .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
-        ]),
         .testTarget(name: "MLXLMTests", dependencies: [
             "MLXLM",
             .product(name: "MLXNN", package: "mlx-swift"),
@@ -109,8 +68,6 @@ let package = Package(
         ]),
         .testTarget(name: "MLXLMDiagnosticTests", dependencies: [
             "MLXLM",
-            "GGUFToolingCore",
-            "GGUFValidation",
             .product(name: "MLXNN", package: "mlx-swift"),
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
         ]),
