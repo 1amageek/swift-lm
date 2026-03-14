@@ -42,9 +42,19 @@ public struct ModelBundleLoader: Sendable {
         let architecture = try bundle.architecture()
         print("[ModelBundleLoader] config: hiddenSize=\(config.hiddenSize) layers=\(config.layerCount) arch=\(architecture) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 2. Compile model
-        let model: any LanguageModel = try loadMLX(
-            config: config, architecture: architecture, bundle: bundle)
+        // 2. Compile model — MPSGraph for standard transformers, MLX for hybrid
+        let model: any LanguageModel
+        switch architecture {
+        case .transformer, .parallelAttentionMLP:
+            do {
+                model = try loadMPSGraph(config: config, bundle: bundle)
+            } catch {
+                print("[ModelBundleLoader] MPSGraph failed (\(error.localizedDescription)), falling back to MLX")
+                model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
+            }
+        case .moe, .hybridDeltaNetAttention, .hybridConvAttention:
+            model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
+        }
 
         // 4. Create tokenizer
         t0 = CFAbsoluteTimeGetCurrent()
@@ -69,6 +79,44 @@ public struct ModelBundleLoader: Sendable {
             processor: processor,
             tokenizer: tokenizer
         )
+    }
+
+    // MARK: - MPSGraph Loading
+
+    private func loadMPSGraph(
+        config: ModelConfig, bundle: any ModelBundle
+    ) throws -> MPSGraphLanguageModel {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Load safetensors weights as raw Float16 Data keyed by HF parameter name
+        let manifest = try bundle.loadWeights()
+        var weightData: [String: Data] = [:]
+
+        for (name, array) in manifest.weights {
+            // Convert MLXArray to Float16 Data
+            let f16Array = array.asType(.float16)
+            eval(f16Array)
+            let count = f16Array.size
+            var bytes = [Float16](repeating: 0, count: count)
+            f16Array.asArray(Float16.self).withUnsafeBufferPointer { ptr in
+                bytes = Array(ptr)
+            }
+            weightData[name] = Data(bytes: &bytes, count: count * MemoryLayout<Float16>.size)
+        }
+
+        let engineConfig = MPSGraphInferenceEngine.Config(
+            hiddenSize: config.hiddenSize,
+            headCount: config.attentionHeads,
+            kvHeadCount: config.kvHeads,
+            headDim: config.hiddenSize / config.attentionHeads,
+            intermediateSize: config.intermediateSize,
+            layerCount: config.layerCount,
+            vocabSize: config.vocabSize)
+
+        let engine = try MPSGraphInferenceEngine(config: engineConfig, weights: weightData)
+        print("[ModelBundleLoader] MPSGraph compiled: D=\(config.hiddenSize) L=\(config.layerCount) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
+
+        return MPSGraphLanguageModel(engine: engine)
     }
 
     // MARK: - MLX Loading
