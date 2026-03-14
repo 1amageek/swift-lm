@@ -26,7 +26,7 @@ public final class MPSGraphLanguageModel: Module, LanguageModel, @unchecked Send
     }
 
     public func newCache(parameters: GenerateParameters?) -> [KVCache] {
-        [TokenHistoryCache()]
+        [MPSGraphInferenceKVCache()]
     }
 
     public func callAsFunction(
@@ -37,7 +37,7 @@ public final class MPSGraphLanguageModel: Module, LanguageModel, @unchecked Send
         let newTokens: [Int32] = flat.asArray(Int32.self)
 
         let allTokens: [Int32]
-        if let history = cache?.first as? TokenHistoryCache {
+        if let history = cache?.first as? MPSGraphInferenceKVCache {
             history.append(newTokens)
             allTokens = history.tokens
         } else {
@@ -58,10 +58,10 @@ public final class MPSGraphLanguageModel: Module, LanguageModel, @unchecked Send
     }
 }
 
-// MARK: - Token History Cache
+// MARK: - MPSGraphInferenceKVCache
 
-/// Tracks token history for MPSGraph full-sequence replay.
-private final class TokenHistoryCache: KVCache, @unchecked Sendable {
+/// KV cache for MPSGraph backend via full-sequence replay.
+private final class MPSGraphInferenceKVCache: KVCache, @unchecked Sendable {
 
     private(set) var tokens: [Int32] = []
 
