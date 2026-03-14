@@ -41,6 +41,7 @@ public struct MLXModuleCompiler: Sendable {
         var embeddingModule: GraphEmbedding?
         var attentionModules: [GraphAttention] = []
         var deltaNetModules: [GraphDeltaNet] = []
+        var shortConvModules: [GraphShortConv] = []
 
         let modules = try compileRegion(
             graph.rootRegion,
@@ -48,7 +49,8 @@ public struct MLXModuleCompiler: Sendable {
             pathComponents: [],
             embeddingModule: &embeddingModule,
             attentionModules: &attentionModules,
-            deltaNetModules: &deltaNetModules
+            deltaNetModules: &deltaNetModules,
+            shortConvModules: &shortConvModules
         )
 
         let root = GraphSequential(modules)
@@ -56,7 +58,8 @@ public struct MLXModuleCompiler: Sendable {
         return GraphModel(
             root: root,
             attentionModules: attentionModules,
-            deltaNetModules: deltaNetModules
+            deltaNetModules: deltaNetModules,
+            shortConvModules: shortConvModules
         )
     }
 
@@ -68,7 +71,8 @@ public struct MLXModuleCompiler: Sendable {
         pathComponents: [StructuralPathComponent],
         embeddingModule: inout GraphEmbedding?,
         attentionModules: inout [GraphAttention],
-        deltaNetModules: inout [GraphDeltaNet]
+        deltaNetModules: inout [GraphDeltaNet],
+        shortConvModules: inout [GraphShortConv]
     ) throws -> [Module] {
         var modules: [Module] = []
 
@@ -80,7 +84,8 @@ public struct MLXModuleCompiler: Sendable {
                 op, store: store, pathComponents: opPath, path: path,
                 embeddingModule: &embeddingModule,
                 attentionModules: &attentionModules,
-                deltaNetModules: &deltaNetModules
+                deltaNetModules: &deltaNetModules,
+                shortConvModules: &shortConvModules
             )
             modules.append(module)
         }
@@ -97,7 +102,8 @@ public struct MLXModuleCompiler: Sendable {
         path: StructuralPath,
         embeddingModule: inout GraphEmbedding?,
         attentionModules: inout [GraphAttention],
-        deltaNetModules: inout [GraphDeltaNet]
+        deltaNetModules: inout [GraphDeltaNet],
+        shortConvModules: inout [GraphShortConv]
     ) throws -> Module {
         switch op.kind {
 
@@ -143,24 +149,21 @@ public struct MLXModuleCompiler: Sendable {
             // Validate variant
             let variant = attrs.variant.lowercased()
             guard variant == "deltanet" || variant == "gated_deltanet"
-                || variant == "gated-deltanet" || variant == "short_conv"
+                || variant == "gated-deltanet"
             else {
                 throw CompilerError.unsupportedVariant(attrs.variant)
-            }
-
-            if variant == "short_conv" {
-                // Short conv is compiled as a simplified DeltaNet with only conv
-                // For now, use the full DeltaNet module which handles both
-                let cache = MLXRecurrentCache()
-                let dn = try GraphDeltaNet(attrs: attrs, store: store, path: path, cache: cache)
-                deltaNetModules.append(dn)
-                return dn
             }
 
             let cache = MLXRecurrentCache()
             let dn = try GraphDeltaNet(attrs: attrs, store: store, path: path, cache: cache)
             deltaNetModules.append(dn)
             return dn
+
+        case .shortConv(let attrs):
+            let cache = MLXRecurrentCache()
+            let sc = try GraphShortConv(attrs: attrs, store: store, path: path, cache: cache)
+            shortConvModules.append(sc)
+            return sc
 
         case .rope(let attrs):
             return GraphRoPE(attrs: attrs)
@@ -176,7 +179,8 @@ public struct MLXModuleCompiler: Sendable {
                 body, store: store, pathComponents: bodyPath,
                 embeddingModule: &embeddingModule,
                 attentionModules: &attentionModules,
-                deltaNetModules: &deltaNetModules
+                deltaNetModules: &deltaNetModules,
+                shortConvModules: &shortConvModules
             )
             return GraphResidual(body: GraphSequential(bodyModules), strategy: strategy)
 
@@ -189,7 +193,8 @@ public struct MLXModuleCompiler: Sendable {
                     body, store: store, pathComponents: iterPath,
                     embeddingModule: &embeddingModule,
                     attentionModules: &attentionModules,
-                    deltaNetModules: &deltaNetModules
+                    deltaNetModules: &deltaNetModules,
+                    shortConvModules: &shortConvModules
                 )
                 iterations.append(GraphSequential(iterModules))
             }
@@ -204,7 +209,8 @@ public struct MLXModuleCompiler: Sendable {
                     layer, store: store, pathComponents: iterPath,
                     embeddingModule: &embeddingModule,
                     attentionModules: &attentionModules,
-                    deltaNetModules: &deltaNetModules
+                    deltaNetModules: &deltaNetModules,
+                    shortConvModules: &shortConvModules
                 )
                 iterations.append(GraphSequential(iterModules))
             }
@@ -219,7 +225,8 @@ public struct MLXModuleCompiler: Sendable {
                     branch, store: store, pathComponents: branchPath,
                     embeddingModule: &embeddingModule,
                     attentionModules: &attentionModules,
-                    deltaNetModules: &deltaNetModules
+                    deltaNetModules: &deltaNetModules,
+                    shortConvModules: &shortConvModules
                 )
                 branchModules.append(GraphSequential(modules))
             }

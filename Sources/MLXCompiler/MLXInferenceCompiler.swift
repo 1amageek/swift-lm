@@ -187,6 +187,12 @@ public struct MLXInferenceCompiler: Sendable {
                     CacheDescriptor(path: path, kind: .recurrent, slotIndex: cacheIndex))
                 cacheIndex += 1
 
+            case .shortConv:
+                let path = StructuralPath(components: opPath)
+                cacheDescriptors.append(
+                    CacheDescriptor(path: path, kind: .recurrent, slotIndex: cacheIndex))
+                cacheIndex += 1
+
             case .residual(_, let body):
                 scanRegion(
                     body,
@@ -358,6 +364,10 @@ public struct MLXInferenceCompiler: Sendable {
         case .stateSpace(let attrs):
             let dn = try lowerDeltaNet(attrs, path: path, context: &context)
             return .op(.deltaNet(dn))
+
+        case .shortConv(let attrs):
+            let sc = try lowerShortConv(attrs, path: path, context: &context)
+            return .op(.shortConv(sc))
 
         case .rope(let attrs):
             return .op(.rope(LoweredRoPE(attrs: attrs)))
@@ -589,6 +599,35 @@ public struct MLXInferenceCompiler: Sendable {
             inProjB: inProjB, inProjA: inProjA, outProj: outProj,
             convWeight: convWeight, normWeight: normWeight,
             dtBias: dtBias, aLog: aLog,
+            attrs: attrs, cacheSlotIndex: slotIndex
+        )
+    }
+
+    /// Lower a ShortConv operation.
+    private func lowerShortConv(
+        _ attrs: ShortConvAttributes,
+        path: StructuralPath,
+        context: inout LoweringContext
+    ) throws -> LoweredShortConv {
+        let inProj = try makeProjection(
+            store: context.store, path: path, field: "in_proj", hasBias: false)
+        let outProj = try makeProjection(
+            store: context.store, path: path, field: "out_proj", hasBias: false)
+
+        // Depthwise conv1d kernel (raw array, not quantized)
+        let convWeight = try context.store.requireDense(
+            ParameterSlot(path: path.appending(.field("conv")), role: .weight))
+
+        guard let slotIndex = context.cacheSlotByPath[path] else {
+            throw CompilerError.invalidGraphStructure(
+                "No cache slot found for ShortConv at \(path.components)")
+        }
+
+        context.stats.shortConvCount += 1
+
+        return LoweredShortConv(
+            inProj: inProj, outProj: outProj,
+            convWeight: convWeight,
             attrs: attrs, cacheSlotIndex: slotIndex
         )
     }

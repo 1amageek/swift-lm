@@ -15,23 +15,49 @@ public struct SlotManifestEntry: Sendable {
     }
 }
 
+/// Weight naming convention for different model families.
+///
+/// Each model family uses different naming patterns in safetensors/checkpoints.
+/// The enumerator uses this to produce correct `mlxWeightPath` strings.
+public enum WeightNamingConvention: Sendable {
+
+    /// Llama-family naming (Llama, Qwen2, Mistral, Phi-3, StarCoder2, Mixtral, Qwen3.5).
+    ///
+    /// Norms: `input_layernorm`, `post_attention_layernorm`
+    /// Attention: `self_attn.{q_proj,k_proj,v_proj,o_proj}`, QK norm: `q_norm`/`k_norm`
+    /// MLP: `mlp.{gate_proj,down_proj,up_proj}`
+    /// StateSpace: `linear_attn.{in_proj_qkv,...}`
+    case llamaFamily
+
+    /// LFM2-family naming (LiquidAI LFM2, LFM2.5).
+    ///
+    /// Norms: `operator_norm`, `ffn_norm`
+    /// Attention: `self_attn.{q_proj,k_proj,v_proj,out_proj}`, QK norm: `q_layernorm`/`k_layernorm`
+    /// MLP: `feed_forward.{w1,w2,w3}`
+    /// StateSpace: `conv.{in_proj,conv,out_proj}`
+    case lfm2Family
+}
+
 /// Walks a ModelGraph to enumerate all expected weight slots.
 ///
 /// Produces a manifest of `(ParameterSlot, mlxWeightPath)` pairs by walking
 /// the graph the same way `MLXInferenceCompiler` does. Each entry maps a
-/// semantic slot to the MLX-convention weight path that GGUF name mappers
-/// produce.
-///
-/// Currently supports Llama-family naming (Llama, Qwen2, Mistral, Phi-3,
-/// StarCoder2, Mixtral, Qwen3.5).
+/// semantic slot to the MLX-convention weight path in the checkpoint.
 public struct ModelGraphSlotEnumerator: Sendable {
 
     public init() {}
 
     /// Enumerate all parameter slots expected by the model graph.
-    public func enumerate(_ graph: ModelGraph) -> [SlotManifestEntry] {
+    ///
+    /// - Parameters:
+    ///   - graph: The model graph to walk.
+    ///   - naming: Weight naming convention. Defaults to `.llamaFamily`.
+    public func enumerate(
+        _ graph: ModelGraph,
+        naming: WeightNamingConvention = .llamaFamily
+    ) -> [SlotManifestEntry] {
         var entries: [SlotManifestEntry] = []
-        var context = WalkContext()
+        var context = WalkContext(naming: naming)
         enumerateRegion(
             graph.rootRegion,
             pathComponents: [],
@@ -56,8 +82,14 @@ private enum NamingScope {
 
 /// Mutable walk context.
 private struct WalkContext {
+    /// Weight naming convention.
+    let naming: WeightNamingConvention
+
     /// Tracks residual block position within a layer body (0, 1, 2, ...).
     var residualIndexInLayer: Int = 0
+
+    /// Tracks root-level norm index (0 = embedding_norm, 1 = final norm).
+    var rootNormIndex: Int = 0
 }
 
 private extension ModelGraphSlotEnumerator {
@@ -88,7 +120,7 @@ private extension ModelGraphSlotEnumerator {
             case .repeating(let count, let body):
                 for idx in 0..<count {
                     let iterPath = opPath + [.regionBody, .index(idx)]
-                    var layerContext = WalkContext()
+                    var layerContext = WalkContext(naming: context.naming)
                     enumerateRegion(
                         body,
                         pathComponents: iterPath,
@@ -101,7 +133,7 @@ private extension ModelGraphSlotEnumerator {
             case .layerStack(let layers):
                 for (idx, layer) in layers.enumerated() {
                     let iterPath = opPath + [.regionBody, .index(idx)]
-                    var layerContext = WalkContext()
+                    var layerContext = WalkContext(naming: context.naming)
                     enumerateRegion(
                         layer,
                         pathComponents: iterPath,
@@ -131,10 +163,22 @@ private extension ModelGraphSlotEnumerator {
                 let mlxPath: String
                 switch namingScope {
                 case .root:
-                    mlxPath = "model.norm.weight"
+                    if context.naming == .lfm2Family && context.rootNormIndex == 0 {
+                        mlxPath = "model.embedding_norm.weight"
+                    } else {
+                        mlxPath = "model.norm.weight"
+                    }
+                    context.rootNormIndex += 1
                 case .layer(let idx):
-                    let normName = context.residualIndexInLayer == 0
-                        ? "input_layernorm" : "post_attention_layernorm"
+                    let normName: String
+                    switch context.naming {
+                    case .llamaFamily:
+                        normName = context.residualIndexInLayer == 0
+                            ? "input_layernorm" : "post_attention_layernorm"
+                    case .lfm2Family:
+                        normName = context.residualIndexInLayer == 0
+                            ? "operator_norm" : "ffn_norm"
+                    }
                     mlxPath = "model.layers.\(idx).\(normName).weight"
                 }
                 entries.append(SlotManifestEntry(
@@ -172,7 +216,16 @@ private extension ModelGraphSlotEnumerator {
                 guard case .layer(let idx) = namingScope else { continue }
                 let attnPrefix = "model.layers.\(idx).self_attn"
 
-                for field in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                // Projection field names differ by convention
+                let projFields: [String]
+                switch context.naming {
+                case .llamaFamily:
+                    projFields = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                case .lfm2Family:
+                    projFields = ["q_proj", "k_proj", "v_proj", "out_proj"]
+                }
+
+                for field in projFields {
                     let fieldPath = path.appending(.field(field))
                     entries.append(SlotManifestEntry(
                         slot: ParameterSlot(path: fieldPath, role: .weight),
@@ -188,11 +241,18 @@ private extension ModelGraphSlotEnumerator {
 
                 // QK normalization weights
                 if attrs.qkNorm != nil {
-                    for normField in ["q_norm", "k_norm"] {
-                        let normPath = path.appending(.field(normField))
+                    let normFields: [(irField: String, hfField: String)]
+                    switch context.naming {
+                    case .llamaFamily:
+                        normFields = [("q_norm", "q_norm"), ("k_norm", "k_norm")]
+                    case .lfm2Family:
+                        normFields = [("q_norm", "q_layernorm"), ("k_norm", "k_layernorm")]
+                    }
+                    for (irField, hfField) in normFields {
+                        let normPath = path.appending(.field(irField))
                         entries.append(SlotManifestEntry(
                             slot: ParameterSlot(path: normPath, role: .scale),
-                            mlxWeightPath: "\(attnPrefix).\(normField).weight"
+                            mlxWeightPath: "\(attnPrefix).\(hfField).weight"
                         ))
                     }
                 }
@@ -201,53 +261,17 @@ private extension ModelGraphSlotEnumerator {
 
             case .mlp(let attrs):
                 guard case .layer(let idx) = namingScope else { continue }
-                let mlpPrefix = "model.layers.\(idx).mlp"
 
-                entries.append(SlotManifestEntry(
-                    slot: ParameterSlot(
-                        path: path.appending(.field("gate_proj")), role: .weight),
-                    mlxWeightPath: "\(mlpPrefix).gate_proj.weight"
-                ))
-                entries.append(SlotManifestEntry(
-                    slot: ParameterSlot(
-                        path: path.appending(.field("down_proj")), role: .weight),
-                    mlxWeightPath: "\(mlpPrefix).down_proj.weight"
-                ))
+                switch context.naming {
+                case .llamaFamily:
+                    let mlpPrefix = "model.layers.\(idx).mlp"
+                    enumerateLlamaFamilyMLP(
+                        attrs: attrs, path: path, mlpPrefix: mlpPrefix, entries: &entries)
 
-                // upProj exists when gating is enabled
-                switch attrs.gating {
-                case .none:
-                    break
-                default:
-                    entries.append(SlotManifestEntry(
-                        slot: ParameterSlot(
-                            path: path.appending(.field("up_proj")), role: .weight),
-                        mlxWeightPath: "\(mlpPrefix).up_proj.weight"
-                    ))
-                }
-
-                // Biases
-                if attrs.bias {
-                    entries.append(SlotManifestEntry(
-                        slot: ParameterSlot(
-                            path: path.appending(.field("gate_proj")), role: .bias),
-                        mlxWeightPath: "\(mlpPrefix).gate_proj.bias"
-                    ))
-                    entries.append(SlotManifestEntry(
-                        slot: ParameterSlot(
-                            path: path.appending(.field("down_proj")), role: .bias),
-                        mlxWeightPath: "\(mlpPrefix).down_proj.bias"
-                    ))
-                    switch attrs.gating {
-                    case .none:
-                        break
-                    default:
-                        entries.append(SlotManifestEntry(
-                            slot: ParameterSlot(
-                                path: path.appending(.field("up_proj")), role: .bias),
-                            mlxWeightPath: "\(mlpPrefix).up_proj.bias"
-                        ))
-                    }
+                case .lfm2Family:
+                    let ffPrefix = "model.layers.\(idx).feed_forward"
+                    enumerateLFM2FamilyMLP(
+                        attrs: attrs, path: path, ffPrefix: ffPrefix, entries: &entries)
                 }
 
             // MARK: MoE
@@ -284,10 +308,12 @@ private extension ModelGraphSlotEnumerator {
                     }
                 }
 
-            // MARK: DeltaNet (State Space)
+            // MARK: State Space (DeltaNet)
 
             case .stateSpace:
                 guard case .layer(let idx) = namingScope else { continue }
+
+                // DeltaNet family
                 let dnPrefix = "model.layers.\(idx).linear_attn"
 
                 // Projections (weight + bias)
@@ -323,6 +349,29 @@ private extension ModelGraphSlotEnumerator {
                     slot: ParameterSlot(
                         path: path.appending(.field("A_log")), role: .weight),
                     mlxWeightPath: "\(dnPrefix).A_log"
+                ))
+
+            // MARK: Short Convolution (LFM2 family)
+
+            case .shortConv:
+                guard case .layer(let idx) = namingScope else { continue }
+
+                let convPrefix = "model.layers.\(idx).conv"
+
+                // in_proj and out_proj (quantizable Linear)
+                for field in ["in_proj", "out_proj"] {
+                    let fieldPath = path.appending(.field(field))
+                    entries.append(SlotManifestEntry(
+                        slot: ParameterSlot(path: fieldPath, role: .weight),
+                        mlxWeightPath: "\(convPrefix).\(field).weight"
+                    ))
+                }
+
+                // Depthwise conv1d kernel (raw weight, not quantized)
+                entries.append(SlotManifestEntry(
+                    slot: ParameterSlot(
+                        path: path.appending(.field("conv")), role: .weight),
+                    mlxWeightPath: "\(convPrefix).conv.weight"
                 ))
 
             // MARK: Output Head
@@ -376,6 +425,117 @@ private extension ModelGraphSlotEnumerator {
             case .rope, .custom:
                 // No weight parameters
                 break
+            }
+        }
+    }
+
+    // MARK: - MLP Enumeration Helpers
+
+    /// Llama-family MLP: gate_proj, down_proj, up_proj
+    func enumerateLlamaFamilyMLP(
+        attrs: MLPAttributes,
+        path: StructuralPath,
+        mlpPrefix: String,
+        entries: inout [SlotManifestEntry]
+    ) {
+        entries.append(SlotManifestEntry(
+            slot: ParameterSlot(
+                path: path.appending(.field("gate_proj")), role: .weight),
+            mlxWeightPath: "\(mlpPrefix).gate_proj.weight"
+        ))
+        entries.append(SlotManifestEntry(
+            slot: ParameterSlot(
+                path: path.appending(.field("down_proj")), role: .weight),
+            mlxWeightPath: "\(mlpPrefix).down_proj.weight"
+        ))
+
+        switch attrs.gating {
+        case .none:
+            break
+        default:
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("up_proj")), role: .weight),
+                mlxWeightPath: "\(mlpPrefix).up_proj.weight"
+            ))
+        }
+
+        if attrs.bias {
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("gate_proj")), role: .bias),
+                mlxWeightPath: "\(mlpPrefix).gate_proj.bias"
+            ))
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("down_proj")), role: .bias),
+                mlxWeightPath: "\(mlpPrefix).down_proj.bias"
+            ))
+            switch attrs.gating {
+            case .none:
+                break
+            default:
+                entries.append(SlotManifestEntry(
+                    slot: ParameterSlot(
+                        path: path.appending(.field("up_proj")), role: .bias),
+                    mlxWeightPath: "\(mlpPrefix).up_proj.bias"
+                ))
+            }
+        }
+    }
+
+    /// LFM2-family MLP: w1 (gate), w2 (down), w3 (up)
+    func enumerateLFM2FamilyMLP(
+        attrs: MLPAttributes,
+        path: StructuralPath,
+        ffPrefix: String,
+        entries: inout [SlotManifestEntry]
+    ) {
+        // w1 = gate_proj
+        entries.append(SlotManifestEntry(
+            slot: ParameterSlot(
+                path: path.appending(.field("gate_proj")), role: .weight),
+            mlxWeightPath: "\(ffPrefix).w1.weight"
+        ))
+        // w2 = down_proj
+        entries.append(SlotManifestEntry(
+            slot: ParameterSlot(
+                path: path.appending(.field("down_proj")), role: .weight),
+            mlxWeightPath: "\(ffPrefix).w2.weight"
+        ))
+
+        // w3 = up_proj (when gating is enabled)
+        switch attrs.gating {
+        case .none:
+            break
+        default:
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("up_proj")), role: .weight),
+                mlxWeightPath: "\(ffPrefix).w3.weight"
+            ))
+        }
+
+        if attrs.bias {
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("gate_proj")), role: .bias),
+                mlxWeightPath: "\(ffPrefix).w1.bias"
+            ))
+            entries.append(SlotManifestEntry(
+                slot: ParameterSlot(
+                    path: path.appending(.field("down_proj")), role: .bias),
+                mlxWeightPath: "\(ffPrefix).w2.bias"
+            ))
+            switch attrs.gating {
+            case .none:
+                break
+            default:
+                entries.append(SlotManifestEntry(
+                    slot: ParameterSlot(
+                        path: path.appending(.field("up_proj")), role: .bias),
+                    mlxWeightPath: "\(ffPrefix).w3.bias"
+                ))
             }
         }
     }

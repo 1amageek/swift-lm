@@ -55,6 +55,10 @@ public struct HFConfigDecoder: Sendable {
                     ?? optionalFloat(textConfig, "layer_norm_epsilon") {
             normEps = layerNormEps
             normKind = .layerNorm
+        } else if let eps = optionalFloat(textConfig, "norm_eps") {
+            // LFM2 family uses "norm_eps" for RMS norm
+            normEps = eps
+            normKind = .rmsNorm
         } else {
             normEps = 1e-5
             normKind = .rmsNorm
@@ -66,6 +70,8 @@ public struct HFConfigDecoder: Sendable {
         // Output
         let tiedEmbeddings = optionalBool(textConfig, "tie_word_embeddings")
             ?? optionalBool(root, "tie_word_embeddings")
+            ?? optionalBool(textConfig, "tie_embedding")
+            ?? optionalBool(root, "tie_embedding")
             ?? false
 
         // MoE
@@ -85,6 +91,9 @@ public struct HFConfigDecoder: Sendable {
         let ssmKeyHeadDim = optionalInt(textConfig, "linear_key_head_dim")
         let ssmValueHeadDim = optionalInt(textConfig, "linear_value_head_dim")
         let convKernelSize = optionalInt(textConfig, "linear_conv_kernel_dim")
+
+        // Short convolution (LFM2 family)
+        let convLCache = optionalInt(textConfig, "conv_L_cache")
 
         // Sliding window
         let slidingWindow = optionalInt(textConfig, "sliding_window")
@@ -128,6 +137,7 @@ public struct HFConfigDecoder: Sendable {
             ssmKeyHeadDim: ssmKeyHeadDim,
             ssmValueHeadDim: ssmValueHeadDim,
             convKernelSize: convKernelSize,
+            convLCache: convLCache,
             partialRotaryFactor: ropeConfig.partialRotaryFactor,
             slidingWindow: slidingWindow,
             layerTypes: layerTypes,

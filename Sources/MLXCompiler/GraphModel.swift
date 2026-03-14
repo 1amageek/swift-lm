@@ -31,16 +31,21 @@ public final class GraphModel: Module, @unchecked Sendable {
     /// All attention modules for cache reset.
     private var attentionModules: [GraphAttention]
 
-    /// All state-space modules for cache reset.
+    /// All DeltaNet state-space modules for cache reset.
     private var deltaNetModules: [GraphDeltaNet]
+
+    /// All short convolution modules for cache reset.
+    private var shortConvModules: [GraphShortConv]
 
     init(
         root: GraphSequential,
         attentionModules: [GraphAttention],
-        deltaNetModules: [GraphDeltaNet]
+        deltaNetModules: [GraphDeltaNet],
+        shortConvModules: [GraphShortConv] = []
     ) {
         self.attentionModules = attentionModules
         self.deltaNetModules = deltaNetModules
+        self.shortConvModules = shortConvModules
         self._root.wrappedValue = root
     }
 
@@ -71,6 +76,9 @@ public final class GraphModel: Module, @unchecked Sendable {
         }
         for ssm in deltaNetModules {
             ssm.cache = MLXRecurrentCache()
+        }
+        for sc in shortConvModules {
+            sc.cache = MLXRecurrentCache()
         }
     }
 }

@@ -102,6 +102,12 @@ public struct MLXCompiler: Sendable {
                     CacheDescriptor(path: path, kind: .recurrent, slotIndex: cacheIndex))
                 cacheIndex += 1
 
+            case .shortConv:
+                let path = StructuralPath(components: opPath)
+                cacheDescriptors.append(
+                    CacheDescriptor(path: path, kind: .recurrent, slotIndex: cacheIndex))
+                cacheIndex += 1
+
             case .residual(_, let body):
                 scanRegion(
                     body,

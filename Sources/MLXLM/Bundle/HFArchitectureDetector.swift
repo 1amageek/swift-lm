@@ -80,6 +80,9 @@ public struct HFArchitectureDetector: Sendable {
 
         // Hybrid DeltaNet / attention family
         "qwen3_5": .hybridDeltaNetAttention,
+
+        // Hybrid short-convolution / attention family
+        "lfm2": .hybridConvAttention,
     ]
 
     /// Maps `text_config.model_type` for VLM wrappers.
@@ -101,6 +104,9 @@ public struct HFArchitectureDetector: Sendable {
         if let layerTypes = inspectConfig["layer_types"] as? [String] {
             if layerTypes.contains("linear_attention") {
                 return .hybridDeltaNetAttention
+            }
+            if layerTypes.contains("conv") {
+                return .hybridConvAttention
             }
         }
         if inspectConfig["full_attention_interval"] != nil

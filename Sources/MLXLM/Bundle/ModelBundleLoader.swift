@@ -1,4 +1,5 @@
 import Foundation
+import CoreML
 @preconcurrency import MLX
 import MLXCompiler
 import SwiftLM
@@ -32,7 +33,8 @@ public struct ModelBundleLoader: Sendable {
     /// - Returns: A fully initialized `ModelContext` ready for generation.
     public func loadCompiled(
         bundle: any ModelBundle,
-        configOverride: ModelConfigurationOverride? = nil
+        configOverride: ModelConfigurationOverride? = nil,
+        backend: InferenceBackend = .auto
     ) throws -> ModelContext {
         let loadStart = CFAbsoluteTimeGetCurrent()
 
@@ -42,8 +44,116 @@ public struct ModelBundleLoader: Sendable {
         let architecture = try bundle.architecture()
         print("[ModelBundleLoader] config: hiddenSize=\(config.hiddenSize) layers=\(config.layerCount) arch=\(architecture) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 2. Assemble IR graph
+        // 2. Resolve backend
+        let resolvedBackend = resolveBackend(backend, architecture: architecture)
+        print("[ModelBundleLoader] backend: \(resolvedBackend)")
+
+        // 3. Compile model using selected backend
+        let model: any LanguageModel
+
+        switch resolvedBackend {
+        case .coreml:
+            model = try loadCoreML(config: config, architecture: architecture)
+        case .mlx:
+            model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
+        case .auto:
+            // auto should be resolved by resolveBackend, but fallback to MLX
+            model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
+        }
+
+        // 4. Create tokenizer
         t0 = CFAbsoluteTimeGetCurrent()
+        let tokenizer = try bundle.tokenizer()
+        print("[ModelBundleLoader] tokenizer created [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
+
+        // 5. Build model configuration
+        let modelConfig = makeModelConfiguration(
+            config: config, tokenizer: tokenizer, configOverride: configOverride)
+
+        // 6. Build user input processor
+        let chatTemplate = try bundle.chatTemplate()
+        let processor = makeUserInputProcessor(
+            tokenizer: tokenizer, chatTemplate: chatTemplate)
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - loadStart
+        print("[ModelBundleLoader] ready: \(modelConfig.name) eos=\(modelConfig.eosTokenIds) backend=\(resolvedBackend) [\(String(format: "%.3f", totalTime))s]")
+
+        return ModelContext(
+            configuration: modelConfig,
+            model: model,
+            processor: processor,
+            tokenizer: tokenizer
+        )
+    }
+
+    // MARK: - Backend Resolution
+
+    private func resolveBackend(
+        _ requested: InferenceBackend,
+        architecture: DetectedArchitecture
+    ) -> InferenceBackend {
+        switch requested {
+        case .mlx: return .mlx
+        case .coreml: return .coreml
+        case .auto:
+            // CoreML for pure attention models (graph compiler fusion is 1.6x faster)
+            // MLX for hybrid models (recurrent state not supported in CoreML stateful model)
+            switch architecture {
+            case .transformer, .parallelAttentionMLP, .moe:
+                return .coreml
+            case .hybridDeltaNetAttention, .hybridConvAttention:
+                return .mlx
+            }
+        }
+    }
+
+    // MARK: - CoreML Loading
+
+    private func loadCoreML(
+        config: ModelConfig,
+        architecture: DetectedArchitecture
+    ) throws -> CoreMLLanguageModel {
+        let t0 = CFAbsoluteTimeGetCurrent()
+
+        // Determine optimal compute units based on D
+        let computeUnits: MLComputeUnits = config.hiddenSize <= 1024 ? .all : .cpuAndGPU
+
+        let manager = CoreMLCompilationManager()
+        let mlModel = try manager.compileAndLoad(
+            D: config.hiddenSize,
+            H: config.attentionHeads,
+            KVH: config.kvHeads,
+            hd: config.hiddenSize / config.attentionHeads,
+            I: config.intermediateSize,
+            L: config.layerCount,
+            maxSeqLen: 512,
+            vocabSize: config.vocabSize,
+            computeUnits: computeUnits
+        )
+
+        let coremlConfig = CoreMLLanguageModel.CoreMLModelConfig(
+            hiddenSize: config.hiddenSize,
+            numLayers: config.layerCount,
+            vocabSize: config.vocabSize,
+            kvHeadCount: config.kvHeads,
+            headDim: config.hiddenSize / config.attentionHeads,
+            maxSeqLen: 512
+        )
+
+        print("[ModelBundleLoader] CoreML compiled: D=\(config.hiddenSize) L=\(config.layerCount) units=\(computeUnits == .all ? "all" : "GPU") [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
+
+        return CoreMLLanguageModel(model: mlModel, config: coremlConfig)
+    }
+
+    // MARK: - MLX Loading (existing path)
+
+    private func loadMLX(
+        config: ModelConfig,
+        architecture: DetectedArchitecture,
+        bundle: any ModelBundle
+    ) throws -> CompiledLanguageModel {
+        // 2. Assemble IR graph
+        var t0 = CFAbsoluteTimeGetCurrent()
         let assembler = IRGraphAssembler()
         let graph = try assembler.assemble(config: config, architecture: architecture)
         print("[ModelBundleLoader] IR assembled: \(graph.rootRegion.operations.count) ops [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
@@ -55,41 +165,17 @@ public struct ModelBundleLoader: Sendable {
         print("[ModelBundleLoader] weights loaded: \(manifest.weights.count) tensors [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
         // 4. Sanitize, bind, and compile
-        //    - Remove rotary_emb.inv_freq (unused at inference)
         t0 = CFAbsoluteTimeGetCurrent()
         let sanitizedTensors = WeightSanitizer.filterRotaryEmbeddings(rawWeights.tensors)
         let sanitizedWeights = RawWeights(tensors: sanitizedTensors)
-        let binder = MLXWeightPathBinder()
+        let naming: WeightNamingConvention = architecture == .hybridConvAttention
+            ? .lfm2Family : .llamaFamily
+        let binder = MLXWeightPathBinder(naming: naming)
         let boundWeights = try binder.bind(sanitizedWeights, to: graph)
         let lowered = try MLXInferenceCompiler().compile(graph: graph, weights: boundWeights)
         print("[ModelBundleLoader] compiled: cacheSlots=\(lowered.metadata.cacheSlotCount) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 5. Wrap in LanguageModel adapter
-        let compiledModel = CompiledLanguageModel(lowered: lowered)
-
-        // 6. Create tokenizer
-        t0 = CFAbsoluteTimeGetCurrent()
-        let tokenizer = try bundle.tokenizer()
-        print("[ModelBundleLoader] tokenizer created [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
-
-        // 7. Build model configuration
-        let modelConfig = makeModelConfiguration(
-            config: config, tokenizer: tokenizer, configOverride: configOverride)
-
-        // 8. Build user input processor
-        let chatTemplate = try bundle.chatTemplate()
-        let processor = makeUserInputProcessor(
-            tokenizer: tokenizer, chatTemplate: chatTemplate)
-
-        let totalTime = CFAbsoluteTimeGetCurrent() - loadStart
-        print("[ModelBundleLoader] ready: \(modelConfig.name) eos=\(modelConfig.eosTokenIds) [\(String(format: "%.3f", totalTime))s]")
-
-        return ModelContext(
-            configuration: modelConfig,
-            model: compiledModel,
-            processor: processor,
-            tokenizer: tokenizer
-        )
+        return CompiledLanguageModel(lowered: lowered)
     }
 
     /// Load a compiled model and wrap in a `ModelContainer`.
@@ -98,9 +184,10 @@ public struct ModelBundleLoader: Sendable {
     /// and wraps the result in a `ModelContainer`.
     public func load(
         bundle: any ModelBundle,
-        configOverride: ModelConfigurationOverride? = nil
+        configOverride: ModelConfigurationOverride? = nil,
+        backend: InferenceBackend = .auto
     ) throws -> ModelContainer {
-        let context = try loadCompiled(bundle: bundle, configOverride: configOverride)
+        let context = try loadCompiled(bundle: bundle, configOverride: configOverride, backend: backend)
         return ModelContainer(context: context)
     }
 
@@ -118,13 +205,14 @@ public struct ModelBundleLoader: Sendable {
         repo: String,
         token: String? = nil,
         configOverride: ModelConfigurationOverride? = nil,
+        backend: InferenceBackend = .auto,
         progress: Progress? = nil
     ) async throws -> ModelContainer {
         let downloader = HuggingFaceDownloader()
         let directory = try await downloader.downloadBundle(
             repo: repo, token: token, progress: progress)
         let bundle = try HFDirectoryBundle(directory: directory)
-        return try load(bundle: bundle, configOverride: configOverride)
+        return try load(bundle: bundle, configOverride: configOverride, backend: backend)
     }
 
     // MARK: - Private

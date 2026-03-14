@@ -4,11 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Goal
 
-swift-mlx-lm は Apple Silicon 上での LLM 推論パッケージ。[AnyFoundationModels](https://github.com/1amageek) の `MLXFoundationModels` バックエンドとして消費される。3つの層で構成される:
+swift-mlx-lm は Apple Silicon 上での高速 LLM 推論パッケージ。[AnyFoundationModels](https://github.com/1amageek) の `MLXFoundationModels` バックエンドとして消費される。3つの層で構成される:
 
 1. **SwiftLM** — モデルアーキテクチャを宣言的に記述する DSL と IR。フォーマットにもランタイムにも依存しない
-2. **MLXCompiler** — SwiftLM IR を MLX/Metal 上で最適化された推論エンジンにコンパイルする
-3. **MLXLM** — HF ディレクトリ（config.json + safetensors + tokenizer.json）からの重み読み込み、トークナイザ、生成パイプラインを提供する
+2. **MLXCompiler** — SwiftLM IR を MLX/Metal 上で最適化された推論エンジンにコンパイルする（MLX バックエンド）
+3. **MLXLM** — HF ディレクトリからの重み読み込み、トークナイザ、生成パイプライン、**CoreML / MLX バックエンド選択**を提供する
+
+### 推論バックエンド
+
+**CoreML がデフォルト**（transformer / parallelAttentionMLP / MoE）。MLX は hybrid モデル（DeltaNet / ShortConv）のフォールバック。
+
+```
+ModelBundleLoader(backend: .auto)
+  ├── .coreml (default): CoreMLCompilationManager → .mlpackage → MLModel + MLState
+  │   → MPSGraph グラフコンパイラ。全層を fused 実行計画に。MLX の 1.62x 高速
+  └── .mlx (fallback): MLXInferenceCompiler → MLXLoweredInferenceModel
+      → fused RMSNorm, fused SDPA, QKV packing, flat decode plan。全最適化済み
+```
+
+ベンチマーク根拠（M4 Max, D=896, 24L, 全層 1 実行）:
+- MLX: 8.04ms (0.335ms/layer) — lazy eval + fused kernels
+- CoreML GPU: 4.97ms (0.207ms/layer) — MPSGraph compiled plan
+- 詳細: `reports/full-model-coreml-vs-mlx.md`
 
 ## Build & Test
 
@@ -111,12 +128,17 @@ ModelBundleLoader (MLXLM)
   ├── HFConfigDecoder: config.json → ModelConfig
   ├── HFArchitectureDetector: model_type → DetectedArchitecture
   ├── IRGraphAssembler: (ModelConfig, DetectedArchitecture) → ModelGraph (IR)
-  ├── HFDirectoryBundle: safetensors → WeightManifest → RawWeights
-  ├── MLXWeightPathBinder: RawWeights → BoundWeights
-  └── MLXInferenceCompiler: (ModelGraph, BoundWeights) → MLXLoweredInferenceModel
-           │
-           ▼
-     CompiledLanguageModel
+  │
+  ├── [CoreML path — default for transformer/MoE]
+  │   └── CoreMLCompilationManager → compile_full_model.py
+  │       → MIL (stateful KV cache + fused SDPA) → .mlpackage
+  │       → CoreMLLanguageModel (MLModel + MLState)
+  │
+  └── [MLX path — fallback for hybrid/recurrent]
+      ├── HFDirectoryBundle: safetensors → WeightManifest → RawWeights
+      ├── MLXWeightPathBinder: RawWeights → BoundWeights
+      └── MLXInferenceCompiler: (ModelGraph, BoundWeights) → MLXLoweredInferenceModel
+          → CompiledLanguageModel
            │
            ▼
      ModelContainer → TokenIterator → generate()
@@ -129,7 +151,8 @@ ModelBundleLoader (MLXLM)
 - **消費者は何も知らなくてよい** — HuggingFace repo ID を渡すだけ。`CompiledModelEntry` や `ModelComponent` の指定は不要
 - **mlx-community の事前量子化モデル** — safetensors に MLX ネイティブ形式で格納済み。GGUF 量子化パッキングコード（270KB+）が不要
 - **コンパイル時カーネル選択** — 重みのストレージ型を見て `quantizedMatmul` or `matmul` を静的に確定。実行時の型判定が不要
-- **IR と実行の分離** — モデル構造（ModelGraph IR）とランタイム（MLXCompiler）が独立。将来のバックエンド追加や最適化がモデル定義に影響しない
+- **IR と実行の分離** — モデル構造（ModelGraph IR）とランタイム（MLXCompiler / CoreML）が独立。バックエンド追加がモデル定義に影響しない
+- **CoreML がデフォルト** — MPSGraph のグラフコンパイラが Metal op-at-a-time より 1.6x 高速（全層 1 実行のベンチマークで実証済み）
 
 ### SwiftLM の役割
 
@@ -253,11 +276,16 @@ ModelDeclarations (depends: SwiftLM)│
       ※ トレーニング・設計用途     │
                                    │
 MLXCompiler (depends: SwiftLM) ────┤
-  └── IR → 推論エンジン            │
+  └── IR → MLX 推論エンジン        │
                                    │
-MLXLM (depends: SwiftLM, MLXCompiler)
-  └── ModelBundleLoader: HF config → IR → compile → 推論
-      ※ ModelDeclarations には依存しない
+MLXLM (depends: SwiftLM, MLXCompiler, CoreML)
+  ├── ModelBundleLoader: HF config → IR → backend selection
+  │     ├── CoreML path: CoreMLCompilationManager → CoreMLLanguageModel
+  │     └── MLX path: MLXInferenceCompiler → CompiledLanguageModel
+  └── ※ ModelDeclarations には依存しない
+
+scripts/compile_full_model.py (coremltools)
+  └── CoreML stateful model 生成（Python tooling、runtime 依存ではない）
 
 GGUFParser ─────────────────────────┐
 GGUFTokenizer ──────────────────────┤ (独立ツールモジュール)
@@ -283,13 +311,26 @@ GGUFValidation (depends: GGUFParser, MLXLM)
 |---|---|---|
 | SwiftLM | IR スキーマ + DSL | なし |
 | ModelDeclarations | DSL モデル宣言（設計・トレーニング用） | SwiftLM |
-| MLXCompiler | IR → 推論エンジン | SwiftLM |
-| MLXLM | HF ローダー・生成パイプライン | SwiftLM, MLXCompiler |
+| MLXCompiler | IR → MLX 推論エンジン | SwiftLM |
+| MLXLM | HF ローダー・生成パイプライン・**CoreML/MLX バックエンド選択** | SwiftLM, MLXCompiler, CoreML |
 | GGUFParser | GGUF v2/v3 パーサー（ツール用） | なし |
 | GGUFTokenizer | BPE/SPM トークナイザ（ツール用） | GGUFParser |
 | GGUFValidation | GGUF ファイル検証（ツール用） | GGUFParser, MLXLM |
 
 **重要**: MLXLM は ModelDeclarations / GGUFParser / GGUFTokenizer に依存しない。config.json → IR は `IRGraphAssembler` が直接構築する。
+
+### 推論バックエンドの使い分け
+
+| バックエンド | 対象アーキテクチャ | 利点 | 制約 |
+|---|---|---|---|
+| **CoreML** (default) | transformer, parallelAttentionMLP, MoE | MPSGraph fused execution (1.6x) | 固定 shape、weight bake、Python (coremltools) 必要 |
+| **MLX** (fallback) | hybridDeltaNet, hybridConvAttention, 全て | 動的 shape、LoRA、量子化、常時利用可 | op-at-a-time dispatch |
+
+```swift
+// 使い方
+let container = try await ModelBundleLoader().load(repo: "...", backend: .auto)  // default: CoreML
+let container = try await ModelBundleLoader().load(repo: "...", backend: .mlx)   // force MLX
+```
 
 AnyFoundationModels が `MLXFoundationModels` 経由で消費する。公開インターフェースは `ModelContainer`。消費者が指定するのは HuggingFace repo ID のみ。
 
@@ -372,43 +413,45 @@ llama.cpp の `llama_batch` と同じ方式。text decoder に対して token ID
 
 ## Weight Loading Flow
 
-HF safetensors から重みがロードされ推論カーネルに到達するまでの全体フロー。
+### CoreML パス（デフォルト）
 
-### HF safetensors → MLX 推論エンジン
+```
+config.json → ModelConfig → CoreMLCompilationManager
+     │                           │
+     │                    scripts/compile_full_model.py
+     │                    (coremltools MIL Builder)
+     │                           │
+     │                           ▼
+     │                    .mlpackage (stateful KV cache)
+     │                           │
+     │                           ▼
+     └──────────────────→ MLModel + MLState → CoreMLLanguageModel
+```
+
+重みは Python スクリプト内で numpy ランダム初期化（現状）。実モデル対応には safetensors → CoreML weight 変換が必要（Phase 3）。
+
+### MLX パス（フォールバック）
 
 ```
 HF ディレクトリ (*.safetensors)
      │
      ▼
-HFDirectoryBundle.loadWeights()
-     │
-     ▼
-WeightManifest (MLXArray + quantization info)
+HFDirectoryBundle.loadWeights() → WeightManifest
      │
      ▼
 ModelBundleLoader.convertToRawWeights()
      │
-     ├── weight + scales + biases あり → AffineQuantizedTensor
-     │     → MLXTensorStorage.affineQuantized
-     │
-     └── それ以外 → MLXTensorStorage.dense
-              │
-              ▼
-RawWeights → WeightSanitizer.filterRotaryEmbeddings
+     ├── weight + scales + biases → AffineQuantizedTensor → quantizedMatmul
+     └── それ以外 → dense → matmul
      │
      ▼
-MLXWeightPathBinder.bind() → BoundWeights
+WeightSanitizer.filterRotaryEmbeddings → MLXWeightPathBinder.bind()
      │
      ▼
 MLXInferenceCompiler.compile() → MLXLoweredInferenceModel
 ```
 
-### カーネルディスパッチ
-
-mlx-community の事前量子化モデルは safetensors に MLX ネイティブ形式（weight + scales + biases）で格納されている。`LoweredProjection` がコンパイル時にカーネルを選択:
-
-- **量子化 weight（scales + biases あり）** → `.affineQuantized` → `quantizedMatmul`
-- **Dense weight** → `.dense` → `matmul`
+MLX パスは全最適化済み: fused RMSNorm (`MLXFast.rmsNorm`), fused SDPA (`MLXFast.scaledDotProductAttention`), QKV packing, Gate+Up packing, flat decode plan, 全層 lazy eval (1 eval)。
 
 ## MLXCompiler 実装規則
 

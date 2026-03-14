@@ -180,6 +180,9 @@ private func expandFusedSteps(_ steps: [FlatStep]) -> [FlatStep] {
             case .deltaNet(let norm, let dn):
                 unfused.append(.op(.norm(norm)))
                 unfused.append(.op(.deltaNet(dn)))
+            case .shortConv(let norm, let sc):
+                unfused.append(.op(.norm(norm)))
+                unfused.append(.op(.shortConv(sc)))
             case .moe(let norm, let moe):
                 unfused.append(.op(.norm(norm)))
                 unfused.append(.op(.moe(moe)))

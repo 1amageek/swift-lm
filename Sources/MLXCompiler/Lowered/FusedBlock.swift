@@ -20,6 +20,9 @@ public enum FusedSubLayer: @unchecked Sendable {
     /// Pre-norm + DeltaNet + residual add.
     case deltaNet(norm: LoweredNorm, deltaNet: LoweredDeltaNet)
 
+    /// Pre-norm + ShortConv + residual add.
+    case shortConv(norm: LoweredNorm, shortConv: LoweredShortConv)
+
     /// Pre-norm + MoE + residual add.
     case moe(norm: LoweredNorm, moe: LoweredMoE)
 
@@ -39,6 +42,8 @@ public enum FusedSubLayer: @unchecked Sendable {
             return x + mlp.apply(norm.apply(x))
         case .deltaNet(let norm, let dn):
             return x + dn.apply(norm.apply(x), caches: &state.caches)
+        case .shortConv(let norm, let sc):
+            return x + sc.apply(norm.apply(x), caches: &state.caches)
         case .moe(let norm, let moe):
             return x + moe.apply(norm.apply(x))
         }
@@ -67,6 +72,8 @@ func tryFuseResidual(_ body: [LoweredStep]) -> FusedSubLayer? {
         return .mlp(norm: norm, mlp: mlp)
     case .op(.deltaNet(let dn)):
         return .deltaNet(norm: norm, deltaNet: dn)
+    case .op(.shortConv(let sc)):
+        return .shortConv(norm: norm, shortConv: sc)
     case .op(.moe(let moe)):
         return .moe(norm: norm, moe: moe)
     default:

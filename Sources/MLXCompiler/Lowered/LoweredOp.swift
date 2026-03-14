@@ -14,6 +14,7 @@ public enum LoweredInferenceOp: @unchecked Sendable {
     case norm(LoweredNorm)
     case outputHead(LoweredOutputHead)
     case deltaNet(LoweredDeltaNet)
+    case shortConv(LoweredShortConv)
     case rope(LoweredRoPE)
     case positionalEmbedding(LoweredPositionalEmbedding)
     case linear(LoweredProjection)

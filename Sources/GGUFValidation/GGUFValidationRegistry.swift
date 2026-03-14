@@ -82,6 +82,8 @@ private extension DetectedArchitecture {
             return "moe"
         case .hybridDeltaNetAttention:
             return "hybridDeltaNetAttention"
+        case .hybridConvAttention:
+            return "hybridConvAttention"
         }
     }
 }

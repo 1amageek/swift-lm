@@ -67,6 +67,8 @@ public func primitiveSignature(from kind: OperationKind) -> OperationSignature? 
         return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     case .stateSpace:
         return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    case .shortConv:
+        return OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
     case .custom:
         return OperationSignature(operandArity: .variadic, resultArity: .variadic)
     case .residual, .parallel, .repeating, .layerStack:

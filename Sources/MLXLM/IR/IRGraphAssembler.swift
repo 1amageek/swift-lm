@@ -27,9 +27,14 @@ public struct IRGraphAssembler: Sendable {
             rootRegion = try assembleMoE(config: config, ctx: &ctx)
         case .hybridDeltaNetAttention:
             rootRegion = try assembleHybridDeltaNetAttention(config: config, ctx: &ctx)
+        case .hybridConvAttention:
+            rootRegion = try assembleHybridConvAttention(config: config, ctx: &ctx)
         }
 
-        return ModelGraph(rootRegion: rootRegion)
+        let graph = ModelGraph(rootRegion: rootRegion)
+        try GraphValidator.validate(graph)
+        try DimensionValidator.validate(graph)
+        return graph
     }
 
 }
@@ -105,6 +110,22 @@ extension IRGraphAssembler {
             (i + 1) % interval == 0
         }
     }
+
+    /// Resolve per-layer conv schedule from config.
+    ///
+    /// Uses `layerTypes` with "conv" indicating conv layers and "full_attention" indicating attention.
+    /// Returns array of booleans where `true` = conv layer, `false` = attention layer.
+    func resolveConvSchedule(config: ModelConfig) throws -> [Bool] {
+        guard let layerTypes = config.layerTypes else {
+            throw ModelGraphBuildError.missingMetadata(
+                "layerTypes is required for hybrid conv-attention model")
+        }
+        guard layerTypes.count == config.layerCount else {
+            throw ModelGraphBuildError.invalidConfig(
+                "layerTypes count (\(layerTypes.count)) != layerCount (\(config.layerCount))")
+        }
+        return layerTypes.map { $0 == "conv" }
+    }
 }
 
 // MARK: - IRGraphAssembler: Architecture Builders
@@ -167,12 +188,28 @@ private extension IRGraphAssembler {
                 operands: [inputVal])
             ops.append(op)
             decoderVal = val
+
+        case .hybridConvAttention:
+            let convSchedule = try resolveConvSchedule(config: config)
+            var layers: [Region] = []
+            for i in 0..<config.layerCount {
+                if convSchedule[i] {
+                    layers.append(try makeConvDecoderBlock(config: config, ctx: &ctx))
+                } else {
+                    layers.append(makeConvAttentionDecoderBlock(config: config, ctx: &ctx))
+                }
+            }
+            let (op, val) = ctx.makePrimitive(
+                kind: .layerStack(layers: layers),
+                operands: [inputVal])
+            ops.append(op)
+            decoderVal = val
         }
 
         // Final norm
         let normKind: OperationKind
         switch architecture {
-        case .hybridDeltaNetAttention:
+        case .hybridDeltaNetAttention, .hybridConvAttention:
             normKind = .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps))
         default:
             normKind = makeNorm(config: config)
@@ -557,6 +594,125 @@ private extension IRGraphAssembler {
             ),
             qkNorm: .rmsNorm,
             outputGate: .sigmoidPackedInQProj
+        )
+
+        let (param, paramVal) = ctx.makeParam()
+        var ops: [Operation] = []
+
+        let attnBody = makeResidualBlock(
+            normKind: .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps)),
+            bodyKind: .attention(attnAttrs),
+            ctx: &ctx
+        )
+        let (attnResidual, attnVal) = ctx.makePrimitive(
+            kind: .residual(strategy: .add, body: attnBody),
+            operands: [paramVal]
+        )
+        ops.append(attnResidual)
+
+        let mlpBody = makeResidualBlock(
+            normKind: .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps)),
+            bodyKind: .mlp(makeMLPAttrs(config: config)),
+            ctx: &ctx
+        )
+        let (mlpResidual, mlpVal) = ctx.makePrimitive(
+            kind: .residual(strategy: .add, body: mlpBody),
+            operands: [attnVal]
+        )
+        ops.append(mlpResidual)
+
+        return Region(
+            parameters: [param],
+            operations: ops,
+            results: [ValueUse(value: mlpVal)]
+        )
+    }
+
+    // MARK: Hybrid Short-Convolution / Attention
+
+    func assembleHybridConvAttention(config: ModelConfig, ctx: inout IRContext) throws -> Region {
+        var ops: [Operation] = []
+
+        let (embedOp, embedVal) = ctx.makeSource(kind: .tokenEmbedding(
+            TokenEmbeddingAttributes(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
+        ))
+        ops.append(embedOp)
+
+        // LFM2 applies RMSNorm after embedding (model.embedding_norm)
+        let (embedNormOp, embedNormVal) = ctx.makePrimitive(
+            kind: .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps)),
+            operands: [embedVal])
+        ops.append(embedNormOp)
+
+        let (postOps, resultVal) = try assemblePostEmbedding(
+            config: config, architecture: .hybridConvAttention, inputVal: embedNormVal, ctx: &ctx)
+        ops.append(contentsOf: postOps)
+
+        return Region(
+            parameters: [],
+            operations: ops,
+            results: [ValueUse(value: resultVal)]
+        )
+    }
+
+    /// Conv decoder block: RMSNorm + ShortConv residual → RMSNorm + MLP residual.
+    func makeConvDecoderBlock(config: ModelConfig, ctx: inout IRContext) throws -> Region {
+        guard let convLCache = config.convLCache else {
+            throw ModelGraphBuildError.missingMetadata("conv_L_cache is required for hybrid conv-attention model")
+        }
+
+        let scAttrs = ShortConvAttributes(
+            hiddenSize: config.hiddenSize,
+            kernelSize: convLCache
+        )
+
+        let (param, paramVal) = ctx.makeParam()
+        var ops: [Operation] = []
+
+        let scBody = makeResidualBlock(
+            normKind: .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps)),
+            bodyKind: .shortConv(scAttrs),
+            ctx: &ctx
+        )
+        let (scResidual, scVal) = ctx.makePrimitive(
+            kind: .residual(strategy: .add, body: scBody),
+            operands: [paramVal]
+        )
+        ops.append(scResidual)
+
+        let mlpBody = makeResidualBlock(
+            normKind: .rmsNorm(RMSNormAttributes(dimension: config.hiddenSize, epsilon: config.normEps)),
+            bodyKind: .mlp(makeMLPAttrs(config: config)),
+            ctx: &ctx
+        )
+        let (mlpResidual, mlpVal) = ctx.makePrimitive(
+            kind: .residual(strategy: .add, body: mlpBody),
+            operands: [scVal]
+        )
+        ops.append(mlpResidual)
+
+        return Region(
+            parameters: [param],
+            operations: ops,
+            results: [ValueUse(value: mlpVal)]
+        )
+    }
+
+    /// Attention decoder block: RMSNorm + GQA residual → RMSNorm + MLP residual.
+    func makeConvAttentionDecoderBlock(config: ModelConfig, ctx: inout IRContext) -> Region {
+        let attnAttrs = AttentionAttributes(
+            hiddenSize: config.hiddenSize,
+            headCount: config.attentionHeads,
+            kvHeadCount: config.kvHeads,
+            headDimension: config.headDim,
+            bias: config.attentionBias,
+            causal: true,
+            rope: RoPEAttributes(
+                dimension: config.ropeDimension,
+                base: config.ropeTheta,
+                scaling: config.ropeScaling
+            ),
+            qkNorm: .rmsNorm
         )
 
         let (param, paramVal) = ctx.makeParam()

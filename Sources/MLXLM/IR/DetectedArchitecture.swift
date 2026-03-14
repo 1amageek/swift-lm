@@ -18,4 +18,8 @@ public enum DetectedArchitecture: Sendable, Equatable {
     /// Hybrid DeltaNet / full-attention decoder.
     /// Has DeltaNet tensors (ssm_beta, ssm_alpha, ssm_conv1d) on some layers.
     case hybridDeltaNetAttention
+
+    /// Hybrid short-convolution / full-attention decoder (LIV convolution family).
+    /// Double-gated depthwise conv1d layers interleaved with GQA attention layers.
+    case hybridConvAttention
 }

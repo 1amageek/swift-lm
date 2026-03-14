@@ -207,6 +207,10 @@ public final class MLXExecutor {
             let input = try requireUnaryInput(inputs, op: "stateSpace")
             return try [executeStateSpace(attrs, input: input)]
 
+        case .shortConv(let attrs):
+            let input = try requireUnaryInput(inputs, op: "shortConv")
+            return try [executeShortConv(attrs, input: input)]
+
         case .rope(let attrs):
             let input = try requireUnaryInput(inputs, op: "rope")
             return [executeRoPE(attrs, input: input)]
@@ -656,6 +660,68 @@ public final class MLXExecutor {
         case .deltaNet, .gatedDeltaNet:
             return try executeDeltaNet(attrs, input: input)
         }
+    }
+
+    private func executeShortConv(
+        _ attrs: ShortConvAttributes, input: MLXArray
+    ) throws -> MLXArray {
+        let D = attrs.hiddenSize
+        let K = attrs.kernelSize
+        let B = input.dim(0)
+        let T = input.dim(1)
+
+        let inProj = try projection(field: "in_proj")
+        let outProj = try projection(field: "out_proj")
+        let convWeight = try weight(field: "conv", role: .weight)
+
+        // in_proj: [B, T, D] -> [B, T, 3D]
+        let bcx = inProj.apply(input)
+
+        // Chunk into B-gate, C-gate, x-input
+        let bGate = bcx[0..., 0..., ..<D]
+        let cGate = bcx[0..., 0..., D..<(2 * D)]
+        let xInput = bcx[0..., 0..., (2 * D)...]
+
+        // First gate: plain element-wise multiply
+        let bx = bGate * xInput  // [B, T, D]
+        let bxT = bx.transposed(0, 2, 1)  // [B, D, T]
+
+        let slot = try cacheSlot()
+        let cache = caches[slot] as! MLXRecurrentCache
+
+        let convOut: MLXArray
+
+        if let existingState = cache.convState {
+            let prefix = existingState.asType(bxT.dtype)
+            let combined = concatenated([prefix, bxT], axis: 2)
+            let totalLen = combined.dim(2)
+            cache.convState = combined[0..., 0..., (totalLen - K)...]
+
+            if T == 1 {
+                let w = convWeight.ndim == 2 ? convWeight : convWeight.squeezed(axis: 1)
+                let state = cache.convState!
+                convOut = sum(state.asType(bxT.dtype) * w, axis: 2)
+                    .expandedDimensions(axis: 1)
+            } else {
+                let w3d = convWeight.ndim == 2
+                    ? convWeight.expandedDimensions(axis: -1) : convWeight
+                let raw = conv1d(combined, w3d, stride: 1, padding: 0, groups: D)
+                let rawLen = raw.dim(1)
+                convOut = raw[0..., (rawLen - T)..., 0...]
+            }
+        } else {
+            let prefix = MLXArray.zeros([B, D, K - 1])
+            let padded = concatenated([prefix, bxT], axis: 2)
+            let w3d = convWeight.ndim == 2
+                ? convWeight.expandedDimensions(axis: -1) : convWeight
+            convOut = conv1d(padded, w3d, stride: 1, padding: 0, groups: D)
+            cache.convState = bxT[0..., 0..., (T - min(K, T))...]
+        }
+
+        // Second gate: plain element-wise multiply
+        let y = cGate * convOut
+
+        return outProj.apply(y)
     }
 
     private func executeDeltaNet(

@@ -32,12 +32,16 @@ enum WeightBindingError: Error, CustomStringConvertible {
 /// ```
 package struct MLXWeightPathBinder: WeightBinder {
 
-    package init() {}
+    let naming: WeightNamingConvention
+
+    package init(naming: WeightNamingConvention = .llamaFamily) {
+        self.naming = naming
+    }
 
     package func bind(_ raw: RawWeights, to graph: ModelGraph) throws -> BoundWeights {
         // Enumerate all expected slots from the graph
         let enumerator = ModelGraphSlotEnumerator()
-        let manifest = enumerator.enumerate(graph)
+        let manifest = enumerator.enumerate(graph, naming: naming)
 
         // Build MLX path → slot lookup
         let slotByPath: [String: ParameterSlot] = Dictionary(

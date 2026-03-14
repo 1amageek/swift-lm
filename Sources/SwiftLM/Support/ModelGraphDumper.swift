@@ -221,6 +221,9 @@ public enum ModelGraphDumper {
         case .stateSpace(let a):
             return "stateSpace(hidden=\(a.hiddenSize), heads=\(a.numHeads), dk=\(a.keyHeadDim), dv=\(a.valueHeadDim), variant=\(a.variant))"
 
+        case .shortConv(let a):
+            return "shortConv(hidden=\(a.hiddenSize), kernel=\(a.kernelSize))"
+
         case .custom(let a):
             return "custom(\(a.domain).\(a.name))"
 

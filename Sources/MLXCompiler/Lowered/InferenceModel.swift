@@ -70,6 +70,9 @@ public struct CompilationStats: Sendable, Equatable {
     /// Number of MLP layers where gating is disabled (packing not applicable).
     public var ungatedMLPCount: Int = 0
 
+    /// Number of ShortConv layers compiled.
+    public var shortConvCount: Int = 0
+
     /// Number of fused sub-layers produced during step flattening.
     public var fusedSubLayerCount: Int = 0
 
@@ -279,6 +282,8 @@ func executeOp(
         return head.apply(input)
     case .deltaNet(let dn):
         return dn.apply(input, caches: &state.caches)
+    case .shortConv(let sc):
+        return sc.apply(input, caches: &state.caches)
     case .rope(let rope):
         return rope.apply(input, offset: state.nextPosition)
     case .positionalEmbedding(let posEmb):

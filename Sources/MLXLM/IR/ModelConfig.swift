@@ -57,6 +57,9 @@ public struct ModelConfig: Sendable {
     /// Per-head value dimension (dv).
     public let ssmValueHeadDim: Int?
     public let convKernelSize: Int?
+    /// Causal cache length for short convolution (kernel_size = convLCache + 1).
+    /// Used by hybrid conv-attention architectures (LFM2 family).
+    public let convLCache: Int?
     public let partialRotaryFactor: Float?
 
     // MARK: Sliding Window
@@ -97,7 +100,8 @@ public struct ModelConfig: Sendable {
             ssmNumHeads: ssmNumHeads, ssmGroupCount: ssmGroupCount,
             ssmKeyHeadDim: ssmKeyHeadDim,
             ssmValueHeadDim: ssmValueHeadDim,
-            convKernelSize: convKernelSize, partialRotaryFactor: partialRotaryFactor,
+            convKernelSize: convKernelSize, convLCache: convLCache,
+            partialRotaryFactor: partialRotaryFactor,
             slidingWindow: slidingWindow, layerTypes: layerTypes,
             mropeAxes: axes
         )
@@ -128,6 +132,7 @@ public struct ModelConfig: Sendable {
         ssmKeyHeadDim: Int?,
         ssmValueHeadDim: Int?,
         convKernelSize: Int?,
+        convLCache: Int? = nil,
         partialRotaryFactor: Float?,
         slidingWindow: Int?,
         layerTypes: [String]? = nil,
@@ -157,6 +162,7 @@ public struct ModelConfig: Sendable {
         self.ssmKeyHeadDim = ssmKeyHeadDim
         self.ssmValueHeadDim = ssmValueHeadDim
         self.convKernelSize = convKernelSize
+        self.convLCache = convLCache
         self.partialRotaryFactor = partialRotaryFactor
         self.slidingWindow = slidingWindow
         self.layerTypes = layerTypes

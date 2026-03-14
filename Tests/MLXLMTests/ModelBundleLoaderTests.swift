@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import SwiftLM
+import MLXCompiler
 @testable import MLXLM
 
 /// Tests for ModelBundleLoader's WeightManifest → RawWeights conversion
@@ -89,6 +90,151 @@ struct ModelBundleLoaderTests {
         let assembler = IRGraphAssembler()
         let graph = try assembler.assemble(config: config, architecture: arch)
         #expect(!graph.rootRegion.operations.isEmpty)
+    }
+
+    @Test("Config → IR assembly for hybrid conv-attention (LFM2)")
+    func configToIRHybridConvAttention() throws {
+        let json = """
+        {"model_type": "lfm2", "hidden_size": 2048, "num_hidden_layers": 16,
+         "num_attention_heads": 32, "num_key_value_heads": 8,
+         "intermediate_size": 12288, "vocab_size": 65536,
+         "norm_eps": 1e-05, "conv_L_cache": 3,
+         "rope_theta": 1000000.0, "tie_embedding": true,
+         "use_qk_norm": true,
+         "layer_types": ["conv","conv","full_attention","conv","conv","full_attention",
+                         "conv","conv","full_attention","conv","full_attention",
+                         "conv","full_attention","conv","full_attention","conv"]}
+        """.data(using: .utf8)!
+
+        let decoder = HFConfigDecoder()
+        let config = try decoder.decode(from: json)
+
+        // Verify config fields
+        #expect(config.hiddenSize == 2048)
+        #expect(config.layerCount == 16)
+        #expect(config.convLCache == 3)
+        #expect(config.tiedEmbeddings == true)
+        #expect(config.attentionHeads == 32)
+        #expect(config.kvHeads == 8)
+
+        let detector = HFArchitectureDetector()
+        let arch = try detector.detect(from: json)
+        #expect(arch == .hybridConvAttention)
+
+        let assembler = IRGraphAssembler()
+        let graph = try assembler.assemble(config: config, architecture: arch)
+        #expect(!graph.rootRegion.operations.isEmpty)
+
+        // Verify structure: layerStack with 16 layers
+        let opKinds = graph.rootRegion.operations.map { $0.kind }
+        let hasEmbedding = opKinds.contains { if case .tokenEmbedding = $0 { return true }; return false }
+        let hasOutputHead = opKinds.contains { if case .outputHead = $0 { return true }; return false }
+        let hasLayerStack = opKinds.contains { if case .layerStack = $0 { return true }; return false }
+        #expect(hasEmbedding)
+        #expect(hasOutputHead)
+        #expect(hasLayerStack)
+
+        // Verify layerStack has 16 layers
+        for kind in opKinds {
+            if case .layerStack(let layers) = kind {
+                #expect(layers.count == 16)
+            }
+        }
+    }
+
+    @Test("LFM2 config fails without conv_L_cache")
+    func lfm2MissingConvLCache() throws {
+        let json = """
+        {"model_type": "lfm2", "hidden_size": 2048, "num_hidden_layers": 4,
+         "num_attention_heads": 32, "num_key_value_heads": 8,
+         "intermediate_size": 12288, "vocab_size": 65536,
+         "norm_eps": 1e-05,
+         "layer_types": ["conv","conv","full_attention","conv"]}
+        """.data(using: .utf8)!
+
+        let decoder = HFConfigDecoder()
+        let config = try decoder.decode(from: json)
+
+        let assembler = IRGraphAssembler()
+        #expect(throws: ModelGraphBuildError.self) {
+            _ = try assembler.assemble(config: config, architecture: .hybridConvAttention)
+        }
+    }
+
+    @Test("LFM2 config fails without layer_types")
+    func lfm2MissingLayerTypes() throws {
+        let json = """
+        {"model_type": "lfm2", "hidden_size": 2048, "num_hidden_layers": 4,
+         "num_attention_heads": 32, "num_key_value_heads": 8,
+         "intermediate_size": 12288, "vocab_size": 65536,
+         "norm_eps": 1e-05, "conv_L_cache": 3}
+        """.data(using: .utf8)!
+
+        let decoder = HFConfigDecoder()
+        let config = try decoder.decode(from: json)
+
+        let assembler = IRGraphAssembler()
+        #expect(throws: ModelGraphBuildError.self) {
+            _ = try assembler.assemble(config: config, architecture: .hybridConvAttention)
+        }
+    }
+
+    @Test("LFM2 weight manifest covers expected HF safetensors keys")
+    func lfm2WeightManifest() throws {
+        let json = """
+        {"model_type": "lfm2", "hidden_size": 2048, "num_hidden_layers": 16,
+         "num_attention_heads": 32, "num_key_value_heads": 8,
+         "intermediate_size": 12288, "vocab_size": 65536,
+         "norm_eps": 1e-05, "conv_L_cache": 3,
+         "rope_theta": 1000000.0, "tie_embedding": true,
+         "use_qk_norm": true,
+         "layer_types": ["conv","conv","full_attention","conv","conv","full_attention",
+                         "conv","conv","full_attention","conv","full_attention",
+                         "conv","full_attention","conv","full_attention","conv"]}
+        """.data(using: .utf8)!
+
+        let decoder = HFConfigDecoder()
+        let config = try decoder.decode(from: json)
+        let assembler = IRGraphAssembler()
+        let graph = try assembler.assemble(config: config, architecture: .hybridConvAttention)
+
+        let enumerator = ModelGraphSlotEnumerator()
+        let manifest = enumerator.enumerate(graph, naming: .lfm2Family)
+        let paths = Set(manifest.map { $0.mlxWeightPath })
+
+        // Embedding
+        #expect(paths.contains("model.embed_tokens.weight"))
+        #expect(paths.contains("model.embedding_norm.weight"))
+
+        // Final norm
+        #expect(paths.contains("model.norm.weight"))
+
+        // Conv layer 0: short conv + MLP
+        #expect(paths.contains("model.layers.0.conv.in_proj.weight"))
+        #expect(paths.contains("model.layers.0.conv.conv.weight"))
+        #expect(paths.contains("model.layers.0.conv.out_proj.weight"))
+        #expect(paths.contains("model.layers.0.operator_norm.weight"))
+        #expect(paths.contains("model.layers.0.ffn_norm.weight"))
+        #expect(paths.contains("model.layers.0.feed_forward.w1.weight"))
+        #expect(paths.contains("model.layers.0.feed_forward.w2.weight"))
+        #expect(paths.contains("model.layers.0.feed_forward.w3.weight"))
+
+        // Attention layer 2: self_attn + MLP
+        #expect(paths.contains("model.layers.2.self_attn.q_proj.weight"))
+        #expect(paths.contains("model.layers.2.self_attn.k_proj.weight"))
+        #expect(paths.contains("model.layers.2.self_attn.v_proj.weight"))
+        #expect(paths.contains("model.layers.2.self_attn.out_proj.weight"))
+        #expect(paths.contains("model.layers.2.self_attn.q_layernorm.weight"))
+        #expect(paths.contains("model.layers.2.self_attn.k_layernorm.weight"))
+        #expect(paths.contains("model.layers.2.operator_norm.weight"))
+        #expect(paths.contains("model.layers.2.ffn_norm.weight"))
+        #expect(paths.contains("model.layers.2.feed_forward.w1.weight"))
+
+        // No Llama-family naming should appear
+        #expect(!paths.contains("model.layers.0.input_layernorm.weight"))
+        #expect(!paths.contains("model.layers.0.mlp.gate_proj.weight"))
+        #expect(!paths.contains("model.layers.2.self_attn.o_proj.weight"))
+        #expect(!paths.contains("model.layers.2.self_attn.q_norm.weight"))
     }
 
     // MARK: - HFDirectoryBundle Validation

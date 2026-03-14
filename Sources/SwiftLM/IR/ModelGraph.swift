@@ -216,6 +216,9 @@ public indirect enum OperationKind: Codable, Equatable, Sendable {
     /// State-space model block (Mamba, DeltaNet, etc.).
     case stateSpace(StateSpaceAttributes)
 
+    /// Short convolution block (LFM2 family).
+    case shortConv(ShortConvAttributes)
+
     // MARK: - Structural Operations (region-bearing)
 
     /// Residual connection: output = input + f(input).
