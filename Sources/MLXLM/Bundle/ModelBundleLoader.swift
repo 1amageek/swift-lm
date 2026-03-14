@@ -88,34 +88,27 @@ public struct ModelBundleLoader: Sendable {
     ) throws -> MPSGraphLanguageModel {
         let t0 = CFAbsoluteTimeGetCurrent()
 
-        // Load safetensors weights as raw Float16 Data keyed by HF parameter name
         let manifest = try bundle.loadWeights()
         var weightData: [String: Data] = [:]
-
         for (name, array) in manifest.weights {
-            // Convert MLXArray to Float16 Data
-            let f16Array = array.asType(.float16)
-            eval(f16Array)
-            let count = f16Array.size
-            var bytes = [Float16](repeating: 0, count: count)
-            f16Array.asArray(Float16.self).withUnsafeBufferPointer { ptr in
-                bytes = Array(ptr)
-            }
-            weightData[name] = Data(bytes: &bytes, count: count * MemoryLayout<Float16>.size)
+            let f16 = array.asType(.float16)
+            eval(f16)
+            let bytes: [Float16] = f16.asArray(Float16.self)
+            weightData[name] = bytes.withUnsafeBytes { Data($0) }
         }
 
-        let engineConfig = MPSGraphInferenceEngine.Config(
-            hiddenSize: config.hiddenSize,
-            headCount: config.attentionHeads,
-            kvHeadCount: config.kvHeads,
-            headDim: config.hiddenSize / config.attentionHeads,
-            intermediateSize: config.intermediateSize,
-            layerCount: config.layerCount,
-            vocabSize: config.vocabSize)
+        let engine = try MPSGraphInferenceEngine(
+            config: .init(
+                hiddenSize: config.hiddenSize,
+                headCount: config.attentionHeads,
+                kvHeadCount: config.kvHeads,
+                headDim: config.hiddenSize / config.attentionHeads,
+                intermediateSize: config.intermediateSize,
+                layerCount: config.layerCount,
+                vocabSize: config.vocabSize),
+            weights: weightData)
 
-        let engine = try MPSGraphInferenceEngine(config: engineConfig, weights: weightData)
-        print("[ModelBundleLoader] MPSGraph compiled: D=\(config.hiddenSize) L=\(config.layerCount) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
-
+        print("[ModelBundleLoader] MPSGraph: D=\(config.hiddenSize) L=\(config.layerCount) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
         return MPSGraphLanguageModel(engine: engine)
     }
 
