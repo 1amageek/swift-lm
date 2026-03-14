@@ -28,7 +28,9 @@ public final class MPSGraphLanguageModel: Module, LanguageModel, @unchecked Send
     public func callAsFunction(
         _ input: LMInput.Text, cache: [KVCache]?, state: LMOutput.State?
     ) -> LMOutput {
-        let newTokens: [Int32] = input.tokens.flattened().asArray(Int32.self)
+        let flat = input.tokens.flattened()
+        eval(flat)
+        let newTokens: [Int32] = flat.asArray(Int32.self)
 
         let allTokens: [Int32]
         if let history = cache?.first as? TokenHistoryCache {

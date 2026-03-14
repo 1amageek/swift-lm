@@ -69,22 +69,15 @@ public final class MPSGraphInferenceEngine: @unchecked Sendable {
     }
 
     /// Forward pass: token IDs → logits.
-    ///
-    /// Minimizes copies: input uses contiguous buffer pointer directly,
-    /// output reads GPU results into a pre-sized buffer.
     public func callAsFunction(_ tokenIDs: [Int32]) -> MLXArray {
         let T = tokenIDs.count
         let mpsDevice = MPSGraphDevice(mtlDevice: device)
 
-        // Input: [Int32] → MPSGraphTensorData (single copy via Data)
-        let inputData = tokenIDs.withUnsafeBytes { rawBuffer in
-            MPSGraphTensorData(
-                device: mpsDevice,
-                data: Data(bytesNoCopy: UnsafeMutableRawPointer(mutating: rawBuffer.baseAddress!),
-                           count: rawBuffer.count, deallocator: .none),
-                shape: [1, T as NSNumber],
-                dataType: .int32)
-        }
+        // Input: copy token IDs into Data (safe across scope boundaries)
+        let inputBytes = tokenIDs.withUnsafeBytes { Data($0) }
+        let inputData = MPSGraphTensorData(
+            device: mpsDevice, data: inputBytes,
+            shape: [1, T as NSNumber], dataType: .int32)
 
         let results = graph.run(
             with: commandQueue,
@@ -92,15 +85,13 @@ public final class MPSGraphInferenceEngine: @unchecked Sendable {
             targetTensors: [outputTensor],
             targetOperations: nil)
 
-        // Output: MPSNDArray → [Float16] → MLXArray (2 copies unavoidable across GPU frameworks)
+        // Output: read GPU result directly into MLXArray
         let result = results[outputTensor]!
         let shape = result.shape.map { $0.intValue }
         let count = shape.reduce(1, *)
-        let buffer = UnsafeMutableBufferPointer<Float16>.allocate(capacity: count)
-        result.mpsndarray().readBytes(buffer.baseAddress!, strideBytes: nil)
-        let mlxArray = MLXArray(Array(buffer), shape)
-        buffer.deallocate()
-        return mlxArray
+        var buffer = [Float16](repeating: 0, count: count)
+        result.mpsndarray().readBytes(&buffer, strideBytes: nil)
+        return MLXArray(buffer, shape)
     }
 
     // MARK: - Graph Construction
