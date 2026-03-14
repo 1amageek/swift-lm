@@ -42,19 +42,10 @@ public struct ModelBundleLoader: Sendable {
         let architecture = try bundle.architecture()
         print("[ModelBundleLoader] config: hiddenSize=\(config.hiddenSize) layers=\(config.layerCount) arch=\(architecture) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 2. Compile model — MPSGraph for standard transformers, MLX for hybrid
-        let model: any LanguageModel
-        switch architecture {
-        case .transformer, .parallelAttentionMLP:
-            do {
-                model = try loadMPSGraph(config: config, bundle: bundle)
-            } catch {
-                print("[ModelBundleLoader] MPSGraph failed (\(error.localizedDescription)), falling back to MLX")
-                model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
-            }
-        case .moe, .hybridDeltaNetAttention, .hybridConvAttention:
-            model = try loadMLX(config: config, architecture: architecture, bundle: bundle)
-        }
+        // 2. Compile model
+        let manifest = try bundle.loadWeights()
+        let model: any LanguageModel = try loadMLX(
+            config: config, architecture: architecture, manifest: manifest)
 
         // 4. Create tokenizer
         t0 = CFAbsoluteTimeGetCurrent()
@@ -83,53 +74,21 @@ public struct ModelBundleLoader: Sendable {
 
     // MARK: - MPSGraph Loading
 
-    private func loadMPSGraph(
-        config: ModelConfig, bundle: any ModelBundle
-    ) throws -> MPSGraphLanguageModel {
-        let t0 = CFAbsoluteTimeGetCurrent()
-
-        let manifest = try bundle.loadWeights()
-        var weightData: [String: Data] = [:]
-        for (name, array) in manifest.weights {
-            let f16 = array.asType(.float16)
-            eval(f16)
-            // Single copy: MLXArray GPU buffer → [Float16] → Data
-            weightData[name] = f16.asArray(Float16.self).withUnsafeBytes { Data($0) }
-        }
-
-        let engine = try MPSGraphInferenceEngine(
-            config: .init(
-                hiddenSize: config.hiddenSize,
-                headCount: config.attentionHeads,
-                kvHeadCount: config.kvHeads,
-                headDim: config.hiddenSize / config.attentionHeads,
-                intermediateSize: config.intermediateSize,
-                layerCount: config.layerCount,
-                vocabSize: config.vocabSize),
-            weights: weightData)
-
-        print("[ModelBundleLoader] MPSGraph: D=\(config.hiddenSize) L=\(config.layerCount) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
-        return MPSGraphLanguageModel(engine: engine)
-    }
-
     // MARK: - MLX Loading
 
     private func loadMLX(
         config: ModelConfig,
         architecture: DetectedArchitecture,
-        bundle: any ModelBundle
+        manifest: WeightManifest
     ) throws -> CompiledLanguageModel {
-        // 2. Assemble IR graph
         var t0 = CFAbsoluteTimeGetCurrent()
         let assembler = IRGraphAssembler()
         let graph = try assembler.assemble(config: config, architecture: architecture)
         print("[ModelBundleLoader] IR assembled: \(graph.rootRegion.operations.count) ops [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 3. Load weights and convert to RawWeights
         t0 = CFAbsoluteTimeGetCurrent()
-        let manifest = try bundle.loadWeights()
         let rawWeights = convertToRawWeights(manifest: manifest)
-        print("[ModelBundleLoader] weights loaded: \(manifest.weights.count) tensors [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
+        print("[ModelBundleLoader] weights: \(manifest.weights.count) tensors [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
         // 4. Sanitize, bind, and compile
         t0 = CFAbsoluteTimeGetCurrent()
