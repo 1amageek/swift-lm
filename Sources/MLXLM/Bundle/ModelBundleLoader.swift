@@ -116,7 +116,7 @@ public struct ModelBundleLoader: Sendable {
         // MPSGraph backend: build graph → compile → wrap
         // TODO: Full MPSGraph integration with weight loading
         // For now, falls back to MLX path until MPSGraph LanguageModel adapter is complete
-        throw MPSGraphEngineError.graphNotBuilt
+        throw MPSGraphInferenceEngine.Error.noMetalDevice
     }
 
     // MARK: - MLX Loading (existing path)
