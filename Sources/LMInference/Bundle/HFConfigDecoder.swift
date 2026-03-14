@@ -77,6 +77,10 @@ public struct HFConfigDecoder: Sendable {
         // MoE
         let expertCount = optionalInt(textConfig, "num_local_experts")
         let expertsPerToken = optionalInt(textConfig, "num_experts_per_tok")
+        let moeIntermediateSize = optionalInt(textConfig, "moe_intermediate_size")
+
+        // Dense/MoE layer boundary
+        let numDenseLayers = optionalInt(textConfig, "num_dense_layers") ?? 0
 
         // QK norm (Cohere-style parallel attention)
         let qkNorm = optionalBool(textConfig, "use_qk_norm") ?? false
@@ -130,6 +134,7 @@ public struct HFConfigDecoder: Sendable {
             tiedEmbeddings: tiedEmbeddings,
             expertCount: expertCount,
             expertsPerToken: expertsPerToken,
+            moeIntermediateSize: moeIntermediateSize,
             qkNorm: qkNorm,
             fullAttentionInterval: fullAttentionInterval,
             ssmNumHeads: ssmNumHeads,
@@ -141,6 +146,7 @@ public struct HFConfigDecoder: Sendable {
             partialRotaryFactor: ropeConfig.partialRotaryFactor,
             slidingWindow: slidingWindow,
             layerTypes: layerTypes,
+            numDenseLayers: numDenseLayers,
             mropeAxes: mropeAxes
         )
     }

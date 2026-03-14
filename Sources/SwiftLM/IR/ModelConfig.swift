@@ -1,5 +1,3 @@
-import SwiftLM
-
 /// All configuration values needed for graph construction.
 ///
 /// Format-agnostic container populated from HuggingFace config.json.
@@ -40,6 +38,9 @@ public struct ModelConfig: Sendable {
 
     public let expertCount: Int?
     public let expertsPerToken: Int?
+    /// Per-expert intermediate size (when different from `intermediateSize`).
+    /// Used by LFM2 MoE variants where expert FFN width differs from dense FFN width.
+    public let moeIntermediateSize: Int?
 
     // MARK: Shared-Norm Parallel Attention/MLP (optional)
 
@@ -73,6 +74,12 @@ public struct ModelConfig: Sendable {
     /// When present, takes precedence over `fullAttentionInterval`.
     public let layerTypes: [String]?
 
+    // MARK: Dense/MoE Layer Boundary
+
+    /// Number of leading layers that use dense MLP instead of MoE.
+    /// Only meaningful when `expertCount != nil`. Defaults to 0.
+    public let numDenseLayers: Int
+
     // MARK: M-RoPE (VLM only)
 
     /// Multi-axis RoPE configuration for VLM. Nil for text-only models.
@@ -95,6 +102,7 @@ public struct ModelConfig: Sendable {
             ropeTheta: ropeTheta, ropeDimension: ropeDimension,
             ropeScaling: ropeScaling, tiedEmbeddings: tiedEmbeddings,
             expertCount: expertCount, expertsPerToken: expertsPerToken,
+            moeIntermediateSize: moeIntermediateSize,
             qkNorm: qkNorm,
             fullAttentionInterval: fullAttentionInterval,
             ssmNumHeads: ssmNumHeads, ssmGroupCount: ssmGroupCount,
@@ -103,6 +111,7 @@ public struct ModelConfig: Sendable {
             convKernelSize: convKernelSize, convLCache: convLCache,
             partialRotaryFactor: partialRotaryFactor,
             slidingWindow: slidingWindow, layerTypes: layerTypes,
+            numDenseLayers: numDenseLayers,
             mropeAxes: axes
         )
     }
@@ -125,6 +134,7 @@ public struct ModelConfig: Sendable {
         tiedEmbeddings: Bool,
         expertCount: Int?,
         expertsPerToken: Int?,
+        moeIntermediateSize: Int? = nil,
         qkNorm: Bool,
         fullAttentionInterval: Int?,
         ssmNumHeads: Int?,
@@ -136,6 +146,7 @@ public struct ModelConfig: Sendable {
         partialRotaryFactor: Float?,
         slidingWindow: Int?,
         layerTypes: [String]? = nil,
+        numDenseLayers: Int = 0,
         mropeAxes: MRoPEAxes? = nil
     ) {
         self.hiddenSize = hiddenSize
@@ -155,6 +166,7 @@ public struct ModelConfig: Sendable {
         self.tiedEmbeddings = tiedEmbeddings
         self.expertCount = expertCount
         self.expertsPerToken = expertsPerToken
+        self.moeIntermediateSize = moeIntermediateSize
         self.qkNorm = qkNorm
         self.fullAttentionInterval = fullAttentionInterval
         self.ssmNumHeads = ssmNumHeads
@@ -166,6 +178,7 @@ public struct ModelConfig: Sendable {
         self.partialRotaryFactor = partialRotaryFactor
         self.slidingWindow = slidingWindow
         self.layerTypes = layerTypes
+        self.numDenseLayers = numDenseLayers
         self.mropeAxes = mropeAxes
     }
 }

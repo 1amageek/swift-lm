@@ -10,13 +10,14 @@ import MetalPerformanceShadersGraph
 /// HF bundles flow through:
 ///
 /// ```
-/// bundle.configuration()  → ModelConfig
-/// bundle.architecture()   → DetectedArchitecture
-/// IRGraphAssembler.assemble() → ModelGraph
-/// bundle.loadWeights()    → WeightManifest → RawWeights
-/// bind + compile          → MLXInferenceModel
-/// bundle.tokenizer()      → Tokenizer
-/// bundle.chatTemplate()   → ChatTemplateRenderer
+/// bundle.configuration()    → ModelConfig
+/// bundle.rawConfigData()    → Data → model_type + raw JSON
+/// ModelRegistry.resolve()   → ModelGraph + WeightNameMapper
+/// mapper.manifest(for:)     → [SlotManifestEntry]
+/// bundle.loadWeights()      → WeightManifest → RawWeights
+/// bind + compile            → MLXInferenceModel
+/// bundle.tokenizer()        → Tokenizer
+/// bundle.chatTemplate()     → ChatTemplateRenderer
 /// → ModelContext
 /// ```
 public struct ModelBundleLoader: Sendable {
@@ -37,35 +38,41 @@ public struct ModelBundleLoader: Sendable {
     ) throws -> ModelContext {
         let loadStart = CFAbsoluteTimeGetCurrent()
 
-        // 1. Extract config and detect architecture
+        // 1. Extract config and resolve model via registry
         var t0 = CFAbsoluteTimeGetCurrent()
         let config = try bundle.configuration()
-        let architecture = try bundle.architecture()
-        print("[ModelBundleLoader] config: hiddenSize=\(config.hiddenSize) layers=\(config.layerCount) arch=\(architecture) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
+        let configData = try bundle.rawConfigData()
+        let modelType = try HFConfigDecoder().modelType(from: configData)
+        guard let rawConfig = try JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
+            throw ModelBundleLoaderError.invalidConfig
+        }
+        let registry = ModelRegistry()
+        let resolved = try registry.resolve(
+            modelType: modelType, config: config, rawConfig: rawConfig)
+        let irGraph = resolved.graph
+        let weightNameMapper = resolved.weightNameMapper
+        print("[ModelBundleLoader] config: hiddenSize=\(config.hiddenSize) layers=\(config.layerCount) model_type=\(modelType) [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t0))s]")
 
-        // 2. Assemble IR + load weights
+        // 2. Load and bind weights
         var t1 = CFAbsoluteTimeGetCurrent()
-        let assembler = IRGraphAssembler()
-        let irGraph = try assembler.assemble(config: config, architecture: architecture)
         print("[ModelBundleLoader] IR: \(irGraph.rootRegion.operations.count) ops [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
 
         t1 = CFAbsoluteTimeGetCurrent()
-        let manifest = try bundle.loadWeights()
-        let rawWeights = convertToRawWeights(manifest: manifest)
+        let weightManifest = try bundle.loadWeights()
+        let rawWeights = convertToRawWeights(manifest: weightManifest)
         let sanitized = WeightSanitizer.filterRotaryEmbeddings(rawWeights.tensors)
-        let naming: WeightNamingConvention = architecture == .hybridConvAttention
-            ? .lfm2Family : .llamaFamily
-        let boundWeights = try MLXWeightPathBinder(naming: naming)
+        let slotManifest = weightNameMapper.manifest(for: irGraph)
+        let boundWeights = try MLXWeightPathBinder(manifest: slotManifest)
             .bind(RawWeights(tensors: sanitized), to: irGraph)
-        print("[ModelBundleLoader] weights: \(manifest.weights.count) tensors [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
+        print("[ModelBundleLoader] weights: \(weightManifest.weights.count) tensors [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
 
-        // 3. Compile — MPSGraph for dense transformers, MLX for everything else
+        // 3. Compile — MPSGraph for dense transformers, MLX for hybrid/recurrent
         t1 = CFAbsoluteTimeGetCurrent()
         let model: any LanguageModel
-        let isQuantized = manifest.quantizationInfo.values.contains { $0.bits <= 8 }
+        let isQuantized = weightManifest.quantizationInfo.values.contains { $0.bits <= 8 }
+        let requiresMLX = graphRequiresMLX(irGraph)
 
-        switch architecture {
-        case .transformer where !isQuantized, .parallelAttentionMLP where !isQuantized:
+        if !requiresMLX && !isQuantized {
             do {
                 let compiled = try MPSGraphInferenceCompiler().compile(graph: irGraph, weights: boundWeights)
                 model = MPSGraphLanguageModel(compiled: compiled)
@@ -76,7 +83,7 @@ public struct ModelBundleLoader: Sendable {
                 model = MLXLanguageModel(lowered: lowered)
                 print("[ModelBundleLoader] MLX compiled [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
             }
-        default:
+        } else {
             let lowered = try MLXInferenceCompiler().compile(graph: irGraph, weights: boundWeights)
             model = MLXLanguageModel(lowered: lowered)
             print("[ModelBundleLoader] MLX compiled [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
@@ -107,7 +114,7 @@ public struct ModelBundleLoader: Sendable {
         )
     }
 
-    // MARK: - Private
+    // MARK: - Convenience
 
     /// Load a compiled model and wrap in a `ModelContainer`.
     ///
@@ -144,7 +151,50 @@ public struct ModelBundleLoader: Sendable {
         return try load(bundle: bundle, configOverride: configOverride)
     }
 
-    // MARK: - Private
+    // MARK: - Backend Selection
+
+    /// Check if the model graph contains operations that require MLX backend.
+    ///
+    /// MPSGraph supports transformer/MoE operations. State-space (DeltaNet) and
+    /// short convolution (LFM2) operations require the MLX backend.
+    private func graphRequiresMLX(_ graph: ModelGraph) -> Bool {
+        containsOp(in: graph.rootRegion) { kind in
+            switch kind {
+            case .stateSpace: return true
+            case .shortConv: return true
+            default: return false
+            }
+        }
+    }
+
+    /// Recursively walk a region looking for operations matching a predicate.
+    private func containsOp(
+        in region: Region,
+        matching predicate: (OperationKind) -> Bool
+    ) -> Bool {
+        for op in region.operations {
+            if predicate(op.kind) { return true }
+            switch op.kind {
+            case .residual(_, let body):
+                if containsOp(in: body, matching: predicate) { return true }
+            case .repeating(_, let body):
+                if containsOp(in: body, matching: predicate) { return true }
+            case .layerStack(let layers):
+                for layer in layers {
+                    if containsOp(in: layer, matching: predicate) { return true }
+                }
+            case .parallel(_, let branches):
+                for branch in branches {
+                    if containsOp(in: branch, matching: predicate) { return true }
+                }
+            default:
+                break
+            }
+        }
+        return false
+    }
+
+    // MARK: - Weight Conversion
 
     /// Convert a `WeightManifest` to `RawWeights` for the compiled path.
     ///
@@ -321,11 +371,14 @@ public struct ModelConfigurationOverride: Sendable {
 /// Errors specific to `ModelBundleLoader`.
 public enum ModelBundleLoaderError: Error, CustomStringConvertible {
     case unknownFormat(repo: String)
+    case invalidConfig
 
     public var description: String {
         switch self {
         case .unknownFormat(let repo):
             return "Cannot determine model format for repository '\(repo)'. No safetensors files found."
+        case .invalidConfig:
+            return "Failed to parse config.json as JSON dictionary."
         }
     }
 }

@@ -1,4 +1,6 @@
+import Foundation
 @preconcurrency import MLX
+import SwiftLM
 
 // MARK: - ModelBundle
 
@@ -13,8 +15,8 @@ public protocol ModelBundle: Sendable {
     /// Extract model configuration from the bundle.
     func configuration() throws -> ModelConfig
 
-    /// Detect architecture from bundle contents.
-    func architecture() throws -> DetectedArchitecture
+    /// Raw config.json data for model_type extraction and registry lookup.
+    func rawConfigData() throws -> Data
 
     /// Load weights as a flat dictionary with optional quantization metadata.
     ///

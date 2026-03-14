@@ -12,7 +12,7 @@
 /// These checks catch misconfigurations that `GraphValidator` (structural
 /// arity) cannot detect — e.g., a residual body whose norm dimension
 /// doesn't match the attention hidden size, or a stateSpace block where
-/// `numHeads * valueHeadDim != hiddenSize`.
+/// `groupCount > numHeads`.
 public enum DimensionValidator {
 
     /// Validate dimensional consistency of a model graph.
@@ -79,13 +79,9 @@ private func validateAttentionInvariants(
     try requirePositive("attention.kvHeadCount", attrs.kvHeadCount, key: key)
     try requirePositive("attention.headDimension", attrs.headDimension, key: key)
 
-    // Q projection output must reconstruct hidden size for residual compatibility
-    if attrs.headCount * attrs.headDimension != attrs.hiddenSize {
-        throw DimensionValidationError.attributeInvariant(
-            message: "headCount(\(attrs.headCount)) * headDimension(\(attrs.headDimension)) = \(attrs.headCount * attrs.headDimension) != hiddenSize(\(attrs.hiddenSize))",
-            operationKey: key
-        )
-    }
+    // Output projection is [headCount * headDimension] → [hiddenSize] matmul.
+    // Some architectures (e.g. Qwen3.5-4B: headCount=16, headDim=256, hiddenSize=2560)
+    // use a rectangular output projection, so headCount * headDimension != hiddenSize is valid.
 
     // GQA: kvHeadCount must divide headCount evenly
     if attrs.kvHeadCount > attrs.headCount {
@@ -117,19 +113,14 @@ private func validateStateSpaceInvariants(
     try requirePositive("stateSpace.keyHeadDim", attrs.keyHeadDim, key: key)
     try requirePositive("stateSpace.valueHeadDim", attrs.valueHeadDim, key: key)
 
-    // DeltaNet: output projection is numHeads * valueHeadDim → hiddenSize (matmul),
-    // so the product must equal hiddenSize for residual compatibility.
-    // Mamba uses a different architecture where state dimension is independent.
-    let isDeltaNet = attrs.variant.contains("deltanet") || attrs.variant.contains("delta_net")
-    if isDeltaNet && attrs.numHeads * attrs.valueHeadDim != attrs.hiddenSize {
-        throw DimensionValidationError.attributeInvariant(
-            message: "numHeads(\(attrs.numHeads)) * valueHeadDim(\(attrs.valueHeadDim)) = \(attrs.numHeads * attrs.valueHeadDim) != hiddenSize(\(attrs.hiddenSize))",
-            operationKey: key
-        )
-    }
+    // DeltaNet: output projection is numHeads * valueHeadDim → hiddenSize (matmul).
+    // Asymmetric variants (e.g. Qwen3.5-4B: numHeads=32, valueHeadDim=128, hiddenSize=2560)
+    // use a rectangular output projection, so numHeads * valueHeadDim != hiddenSize is valid.
+    // No invariant between numHeads * valueHeadDim and hiddenSize is enforced.
 
     // DeltaNet: groupCount is the key/query head count, expanded to match numHeads.
     // groupCount must divide numHeads evenly for clean expansion.
+    let isDeltaNet = attrs.variant.contains("deltanet") || attrs.variant.contains("delta_net")
     if isDeltaNet {
         if attrs.groupCount > attrs.numHeads {
             throw DimensionValidationError.attributeInvariant(

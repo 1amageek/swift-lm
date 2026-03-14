@@ -29,6 +29,7 @@ let package = Package(
             name: "LMInference",
             dependencies: [
                 "LMCompiler",
+                "ModelDeclarations",
                 .product(name: "Jinja", package: "swift-jinja"),
                 .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "Tokenizers", package: "swift-transformers"),

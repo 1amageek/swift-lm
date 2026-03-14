@@ -49,19 +49,17 @@ struct AttributeInvariantTests {
 
     // MARK: Attention
 
-    @Test("Attention: headCount * headDimension must equal hiddenSize")
-    func attentionHeadDimProduct() {
+    @Test("Attention: headCount * headDimension != hiddenSize is valid (rectangular output projection)")
+    func attentionAsymmetricHeadDimProduct() throws {
         let graph = graphWith(embeddingSize: 64, operation: .attention(
             AttentionAttributes(
                 hiddenSize: 64,
                 headCount: 4,
                 kvHeadCount: 4,
-                headDimension: 32  // 4 * 32 = 128 != 64
+                headDimension: 32  // 4 * 32 = 128 != 64 — valid
             )
         ))
-        #expect(throws: DimensionValidationError.self) {
-            try DimensionValidator.validate(graph)
-        }
+        try DimensionValidator.validate(graph)
     }
 
     @Test("Attention: kvHeadCount must not exceed headCount")
@@ -155,20 +153,18 @@ struct AttributeInvariantTests {
 
     // MARK: StateSpace
 
-    @Test("StateSpace: numHeads * valueHeadDim must equal hiddenSize")
-    func stateSpaceValueDimProduct() {
+    @Test("StateSpace: asymmetric DeltaNet (numHeads * valueHeadDim != hiddenSize) is valid")
+    func stateSpaceAsymmetricValueDimProduct() throws {
         let graph = graphWith(embeddingSize: 64, operation: .stateSpace(
             StateSpaceAttributes(
                 hiddenSize: 64,
                 numHeads: 4,
                 keyHeadDim: 16,
-                valueHeadDim: 32,  // 4 * 32 = 128 != 64
+                valueHeadDim: 32,  // 4 * 32 = 128 != 64 — valid for asymmetric DeltaNet
                 variant: "deltanet"
             )
         ))
-        #expect(throws: DimensionValidationError.self) {
-            try DimensionValidator.validate(graph)
-        }
+        try DimensionValidator.validate(graph)
     }
 
     @Test("StateSpace: groupCount must not exceed numHeads")
@@ -506,23 +502,21 @@ struct RealArchitectureDimensionTests {
         try DimensionValidator.validate(graph)
     }
 
-    @Test("DimensionValidator catches cross-architecture dimension bug")
-    func dimensionBugDetection() throws {
-        // Simulate the MLXExecutorPerformanceTests bug: stateSpace where
-        // numHeads * valueHeadDim != hiddenSize
+    @Test("DeltaNet with numHeads * valueHeadDim != hiddenSize is valid (rectangular output projection)")
+    func asymmetricDeltaNetOutputProjection() throws {
+        // Asymmetric DeltaNet: output projection is [numHeads * valueHeadDim] → [hiddenSize] matmul.
+        // The two dimensions need not be equal.
         let graph = graphWith(embeddingSize: 4, operation: .stateSpace(
             StateSpaceAttributes(
                 hiddenSize: 4,
                 numHeads: 1,
                 keyHeadDim: 2,
-                valueHeadDim: 2,  // 1 * 2 = 2 != 4
+                valueHeadDim: 2,  // 1 * 2 = 2 != 4 — valid
                 variant: "deltanet"
             )
         ))
 
-        #expect(throws: DimensionValidationError.self) {
-            try DimensionValidator.validate(graph)
-        }
+        try DimensionValidator.validate(graph)
     }
 
     @Test("Realistic DeltaNet dimensions (Qwen3.5 0.8B style) pass")
@@ -556,8 +550,9 @@ struct RealArchitectureDimensionTests {
 
     @Test("Realistic asymmetric DeltaNet dimensions (Qwen3.5 4B style) pass")
     func realisticAsymmetricDeltaNetDimensions() throws {
-        // numHeads=32, groupCount=16, dk=128, dv=128, hiddenSize=4096
-        let hiddenSize = 32 * 128
+        // Qwen3.5-4B: numHeads=32, groupCount=16, dk=128, dv=128, hiddenSize=2560
+        // numHeads * valueHeadDim = 4096 != hiddenSize = 2560 (rectangular output projection)
+        let hiddenSize = 2560
         let model = Group {
             TokenEmbedding(vocabSize: 32000, embeddingSize: hiddenSize)
             Residual {

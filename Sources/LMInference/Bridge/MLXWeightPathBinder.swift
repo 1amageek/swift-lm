@@ -23,41 +23,40 @@ enum WeightBindingError: Error, CustomStringConvertible {
 /// Binds MLX-path-keyed weight tensors to semantic ParameterSlots.
 ///
 /// Accepts `RawWeights` keyed by MLX weight paths (e.g., "model.layers.0.self_attn.q_proj.weight")
-/// and maps them to `ParameterSlot`s using `ModelGraphSlotEnumerator`.
+/// and maps them to `ParameterSlot`s using a pre-built slot manifest.
 ///
 /// Usage:
 /// ```swift
-/// let bound = try MLXWeightPathBinder().bind(rawWeights, to: graph)
+/// let manifest = mapper.manifest(for: graph)
+/// let bound = try MLXWeightPathBinder(manifest: manifest).bind(rawWeights, to: graph)
 /// let store = try InferenceWeightStore(boundWeights: bound)
 /// ```
 package struct MLXWeightPathBinder: WeightBinder {
 
-    let naming: WeightNamingConvention
+    let manifest: [SlotManifestEntry]
 
-    package init(naming: WeightNamingConvention = .llamaFamily) {
-        self.naming = naming
+    package init(manifest: [SlotManifestEntry]) {
+        self.manifest = manifest
     }
 
     package func bind(_ raw: RawWeights, to graph: ModelGraph) throws -> BoundWeights {
-        // Enumerate all expected slots from the graph
-        let enumerator = ModelGraphSlotEnumerator()
-        let manifest = enumerator.enumerate(graph, naming: naming)
+        // Build MLX path → slot lookup, allowing multiple slots per path (weight sharing)
+        var slotsByPath: [String: [ParameterSlot]] = [:]
+        for entry in manifest {
+            slotsByPath[entry.mlxWeightPath, default: []].append(entry.slot)
+        }
 
-        // Build MLX path → slot lookup
-        let slotByPath: [String: ParameterSlot] = Dictionary(
-            manifest.map { ($0.mlxWeightPath, $0.slot) },
-            uniquingKeysWith: { first, _ in first }
-        )
-
-        // Map each raw tensor to its slot
+        // Map each raw tensor to its slot(s)
         var result: [ParameterSlot: TensorData] = [:]
         for (mlxPath, tensor) in raw.tensors {
-            guard let slot = slotByPath[mlxPath] else {
+            guard let slots = slotsByPath[mlxPath] else {
                 // Skip unmapped tensors (e.g., LoRA weights, quantization metadata)
                 // The caller can validate completeness separately
                 continue
             }
-            result[slot] = tensor
+            for slot in slots {
+                result[slot] = tensor
+            }
         }
 
         return BoundWeights(tensors: result)

@@ -607,7 +607,7 @@ struct CompiledPathBinderTests {
 
         let rawWeights = RawWeights(tensors: tensors)
 
-        let binder = MLXWeightPathBinder()
+        let binder = MLXWeightPathBinder(manifest: manifest)
         let boundWeights = try binder.bind(rawWeights, to: graph)
 
         let compiled = try MLXInferenceCompiler().compile(graph: graph, weights: boundWeights)

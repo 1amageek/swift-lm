@@ -79,16 +79,17 @@ struct HFBundleDiagnosticTests {
         #expect(config.mropeAxes?.interleaved == true)
     }
 
-    // MARK: - Step 2: Architecture Detection
+    // MARK: - Step 2: Model Type Detection
 
-    @Test("HFDirectoryBundle: detect Qwen3.5-4B architecture")
-    func detectArchitecture() throws {
+    @Test("HFDirectoryBundle: detect Qwen3.5-4B model type")
+    func detectModelType() throws {
         let dir = try requireModel(at: Self.qwen35_4B_dir)
         let bundle = try HFDirectoryBundle(directory: dir)
-        let arch = try bundle.architecture()
+        let configData = try bundle.rawConfigData()
+        let modelType = try HFConfigDecoder().modelType(from: configData)
 
-        print("[HFBundle] detected architecture: \(arch)")
-        #expect(arch == .hybridDeltaNetAttention)
+        print("[HFBundle] detected model_type: \(modelType)")
+        #expect(modelType == "qwen3_5")
     }
 
     // MARK: - Step 3: Weight Loading
@@ -201,19 +202,23 @@ struct HFBundleDiagnosticTests {
         let dir = try requireModel(at: Self.qwen35_4B_dir)
         let bundle = try HFDirectoryBundle(directory: dir)
 
-        // Step A: Config + Architecture
+        // Step A: Config + Registry resolve
         let t0 = CFAbsoluteTimeGetCurrent()
         let config = try bundle.configuration()
-        let arch = try bundle.architecture()
+        let configData = try bundle.rawConfigData()
+        let modelType = try HFConfigDecoder().modelType(from: configData)
+        guard let rawConfig = try JSONSerialization.jsonObject(with: configData) as? [String: Any] else {
+            throw SkipInfo("Failed to parse config.json")
+        }
+        let resolved = try ModelRegistry().resolve(
+            modelType: modelType, config: config, rawConfig: rawConfig)
+        let graph = resolved.graph
         let configTime = CFAbsoluteTimeGetCurrent() - t0
-        print("[HFBundle] config + arch: \(String(format: "%.3f", configTime))s")
+        print("[HFBundle] config + resolve: \(String(format: "%.3f", configTime))s")
 
-        // Step B: Assemble IR
+        // Step B: Verify IR
         let t1 = CFAbsoluteTimeGetCurrent()
-        let assembler = IRGraphAssembler()
-        let graph = try assembler.assemble(config: config, architecture: arch)
-        let irTime = CFAbsoluteTimeGetCurrent() - t1
-        print("[HFBundle] IR assembled: \(graph.rootRegion.operations.count) ops [\(String(format: "%.3f", irTime))s]")
+        print("[HFBundle] IR assembled: \(graph.rootRegion.operations.count) ops [\(String(format: "%.3f", CFAbsoluteTimeGetCurrent() - t1))s]")
         #expect(!graph.rootRegion.operations.isEmpty)
 
         // Step C: Load weights

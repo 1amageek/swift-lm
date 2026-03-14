@@ -198,16 +198,13 @@ struct ModelBundleLoaderTests {
         let assembler = IRGraphAssembler()
         let graph = try assembler.assemble(config: config, architecture: .hybridConvAttention)
 
-        let enumerator = ModelGraphSlotEnumerator()
-        let manifest = enumerator.enumerate(graph, naming: .lfm2Family)
+        let mapper = LFM2FamilyWeightNameMapper()
+        let manifest = mapper.manifest(for: graph)
         let paths = Set(manifest.map { $0.mlxWeightPath })
 
-        // Embedding
+        // Embedding + shared norm (embedding_norm is used for both post-embed and final norm)
         #expect(paths.contains("model.embed_tokens.weight"))
         #expect(paths.contains("model.embedding_norm.weight"))
-
-        // Final norm
-        #expect(paths.contains("model.norm.weight"))
 
         // Conv layer 0: short conv + MLP
         #expect(paths.contains("model.layers.0.conv.in_proj.weight"))

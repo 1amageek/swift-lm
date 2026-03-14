@@ -112,30 +112,37 @@ xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS' \
 ```
 HF ディレクトリ (config.json + *.safetensors + tokenizer.json)
      │
+     ├── model_type 抽出
+     │
      ▼
-ModelBundleLoader (LMInference)
-  ├── HFConfigDecoder: config.json → ModelConfig
-  ├── HFArchitectureDetector: model_type → DetectedArchitecture
-  ├── IRGraphAssembler: (ModelConfig, DetectedArchitecture) → ModelGraph (IR)
-  │
-  ├── [MPSGraph path]
-  │   └── MPSGraphInferenceCompiler → MPSGraphInferenceModel
-  │       → MPSGraphLanguageModel
-  │
-  └── [MLX path]
-      ├── HFDirectoryBundle: safetensors → WeightManifest → RawWeights
-      ├── MLXWeightPathBinder: RawWeights → BoundWeights
-      └── MLXInferenceCompiler: (ModelGraph, BoundWeights) → MLXInferenceModel
-          → MLXLanguageModel
-           │
-           ▼
-     ModelContainer → TokenIterator → generate()
+ModelRegistry.resolve(modelType, config)
+     │
+     ├── Known ("qwen3_5") → Qwen35(config).makeModelGraph()    ← 検証済み
+     ├── Known ("lfm2")    → LFM2(config).makeModelGraph()      ← 検証済み
+     ├── Known ("llama")   → Transformer(config).makeModelGraph()
+     │
+     └── Unknown           → AnyModel(config).makeModelGraph()   ← ベストエフォート
+     │
+     ▼
+ModelGraph (IR) + WeightNameMapper
+     │
+     ├── [MPSGraph path]
+     │   └── MPSGraphInferenceCompiler → MPSGraphInferenceModel → MPSGraphLanguageModel
+     │
+     └── [MLX path]
+         ├── WeightNameMapper.manifest(graph) → [SlotManifestEntry]
+         ├── MLXWeightPathBinder(manifest).bind(rawWeights) → BoundWeights
+         └── MLXInferenceCompiler → MLXInferenceModel → MLXLanguageModel
+              │
+              ▼
+        ModelContainer → TokenIterator → generate()
 ```
 
 ### なぜ HF ディレクトリ駆動か
 
 - **config.json が正規ソース** — 完全なメタデータ。GGUF metadata のような converter 依存の不完全コピーではない
-- **モデル固有型が不要** — config.json の `model_type` と構造情報がアーキテクチャの完全な記述。新アーキテクチャ対応は `HFConfigDecoder` + `IRGraphAssembler` のパターン追加で完結する
+- **Known model は ModelComponent で保証** — config.json の `model_type` で検証済み ModelComponent を選択。config.json → Model.Config → makeModelGraph() で IR を構築
+- **Unknown model は AnyModel でベストエフォート** — 既存コンポーネントの組み合わせで可能な限り動作。動作保証なし
 - **消費者は何も知らなくてよい** — HuggingFace repo ID を渡すだけ。`CompiledModelEntry` や `ModelComponent` の指定は不要
 - **mlx-community の事前量子化モデル** — safetensors に MLX ネイティブ形式で格納済み。GGUF 量子化パッキングコード（270KB+）が不要
 - **コンパイル時カーネル選択** — 重みのストレージ型を見て `quantizedMatmul` or `matmul` を静的に確定。実行時の型判定が不要

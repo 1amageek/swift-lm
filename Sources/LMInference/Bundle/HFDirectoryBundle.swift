@@ -34,9 +34,8 @@ public struct HFDirectoryBundle: ModelBundle {
         return try decoder.decode(from: configData)
     }
 
-    public func architecture() throws -> DetectedArchitecture {
-        let detector = HFArchitectureDetector()
-        return try detector.detect(from: configData)
+    public func rawConfigData() throws -> Data {
+        configData
     }
 
     public func loadWeights() throws -> WeightManifest {

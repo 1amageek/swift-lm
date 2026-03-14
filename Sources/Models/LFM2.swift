@@ -7,17 +7,17 @@ import SwiftLM
 /// Conv layers use depthwise causal Conv1d with double gating (B*x, C*conv_out).
 /// Attention layers use GQA with QK RMSNorm and RoPE.
 ///
-/// The layer pattern is defined as an array of `LayerSection`s, each
-/// specifying a run of identical groups (conv×N + optional attention).
-/// This supports arbitrary patterns across all model sizes.
+/// The layer pattern is derived from `ModelConfig.layerTypes`, which provides
+/// a flat array of layer type strings (e.g., ["conv", "conv", "full_attention", ...]).
 ///
 /// MoE variants (8B-A1B, 24B-A2B) replace dense MLP with mixture-of-experts
 /// in all layers beyond `numDenseLayers`.
 ///
-/// ```swift
-/// let lfm2 = LFM2(config: .lfm25_1_2B)
-/// let graph = try lfm2.makeModelGraph()
-/// ```
+/// Accepts `ModelConfig` directly. Required fields:
+/// - `layerTypes` (per-layer type schedule)
+/// - `convLCache` (causal cache length for depthwise conv)
+///
+/// Call `LFM2.validate(_:)` before constructing to ensure all required fields are present.
 ///
 /// Reference: LiquidAI LFM2 / LFM2.5
 public struct LFM2: ModelComponent {
@@ -41,133 +41,6 @@ public struct LFM2: ModelComponent {
         }
     }
 
-    /// Architecture configuration for LFM2 / LFM2.5 models.
-    public struct Config: Sendable {
-
-        // MARK: - Core Dimensions
-
-        public let hiddenSize: Int
-        public let hiddenLayers: Int
-        public let intermediateSize: Int
-        public let vocabularySize: Int
-        public let normEps: Float
-
-        // MARK: - Attention
-
-        public let attentionHeads: Int
-        public let kvHeads: Int
-
-        // MARK: - RoPE
-
-        public let ropeTheta: Float
-
-        // MARK: - Short Convolution
-
-        /// Causal cache length for depthwise conv (kernel_size = convLCache + 1).
-        public let convLCache: Int
-
-        // MARK: - Layer Pattern
-
-        /// Ordered sections defining the conv/attention pattern.
-        public let sections: [LayerSection]
-
-        // MARK: - MoE (optional)
-
-        public let moe: MoEConfig?
-
-        /// Number of leading layers that use dense MLP instead of MoE.
-        /// Only relevant when `moe != nil`. Defaults to 0.
-        public let numDenseLayers: Int
-
-        // MARK: - Output
-
-        public let tieWordEmbeddings: Bool
-
-        // MARK: - Computed
-
-        public var resolvedHeadDim: Int { hiddenSize / attentionHeads }
-        public var convKernelSize: Int { convLCache + 1 }
-        public var isMoE: Bool { moe != nil }
-
-        /// Expands sections into a flat list of layer descriptors,
-        /// applying `numDenseLayers` to determine dense MLP vs MoE per layer.
-        public var layerDescriptors: [LFM2.LayerDescriptor] {
-            var result: [LFM2.LayerDescriptor] = []
-            for section in sections {
-                for _ in 0..<section.groupCount {
-                    for _ in 0..<section.convsPerGroup {
-                        result.append(LayerDescriptor(
-                            isConvolution: true,
-                            useMoE: moe != nil && result.count >= numDenseLayers
-                        ))
-                    }
-                    if section.hasAttention {
-                        result.append(LayerDescriptor(
-                            isConvolution: false,
-                            useMoE: moe != nil && result.count >= numDenseLayers
-                        ))
-                    }
-                }
-            }
-            return result
-        }
-
-        public init(
-            hiddenSize: Int,
-            hiddenLayers: Int,
-            intermediateSize: Int,
-            vocabularySize: Int,
-            normEps: Float = 1e-5,
-            attentionHeads: Int,
-            kvHeads: Int,
-            ropeTheta: Float = 1_000_000.0,
-            convLCache: Int = 3,
-            sections: [LayerSection],
-            moe: MoEConfig? = nil,
-            numDenseLayers: Int = 0,
-            tieWordEmbeddings: Bool = true
-        ) {
-            let total = sections.reduce(0) { $0 + $1.layerCount }
-            precondition(
-                total == hiddenLayers,
-                "Section pattern (\(total)) must match hiddenLayers (\(hiddenLayers))"
-            )
-            self.hiddenSize = hiddenSize
-            self.hiddenLayers = hiddenLayers
-            self.intermediateSize = intermediateSize
-            self.vocabularySize = vocabularySize
-            self.normEps = normEps
-            self.attentionHeads = attentionHeads
-            self.kvHeads = kvHeads
-            self.ropeTheta = ropeTheta
-            self.convLCache = convLCache
-            self.sections = sections
-            self.moe = moe
-            self.numDenseLayers = numDenseLayers
-            self.tieWordEmbeddings = tieWordEmbeddings
-        }
-    }
-
-    /// MoE sub-configuration for LFM2 MoE variants.
-    public struct MoEConfig: Sendable {
-        public let expertCount: Int
-        public let expertsPerToken: Int
-        public let moeIntermediateSize: Int
-        public let expertBias: Bool
-
-        public init(
-            expertCount: Int,
-            expertsPerToken: Int,
-            moeIntermediateSize: Int,
-            expertBias: Bool = true
-        ) {
-            self.expertCount = expertCount
-            self.expertsPerToken = expertsPerToken
-            self.moeIntermediateSize = moeIntermediateSize
-            self.expertBias = expertBias
-        }
-    }
-
     /// Per-layer descriptor expanded from sections and `numDenseLayers`.
     ///
     /// Each entry carries the layer type (conv vs attention) and whether
@@ -187,30 +60,157 @@ public struct LFM2: ModelComponent {
         }
     }
 
-    public let config: Config
+    public let config: ModelConfig
 
-    public init(config: Config) {
+    /// Precomputed sections derived from `config.layerTypes`.
+    private let sections: [LayerSection]
+
+    public init(config: ModelConfig) throws {
         self.config = config
+        guard let layerTypes = config.layerTypes else {
+            throw ModelGraphBuildError.missingMetadata("layer_types required for LFM2")
+        }
+        guard layerTypes.count == config.layerCount else {
+            throw ModelGraphBuildError.invalidConfig(
+                "layer_types count (\(layerTypes.count)) != num_hidden_layers (\(config.layerCount))")
+        }
+        self.sections = try LFM2.buildSections(from: layerTypes)
+    }
+
+    /// Validate that config has all required fields for LFM2.
+    ///
+    /// Call this before constructing an `LFM2` instance to get clear error messages
+    /// for missing required fields.
+    public static func validate(_ config: ModelConfig) throws {
+        guard config.layerTypes != nil else {
+            throw ModelGraphBuildError.missingMetadata("layer_types required for LFM2")
+        }
+        guard config.convLCache != nil else {
+            throw ModelGraphBuildError.missingMetadata("conv_L_cache required for LFM2")
+        }
+    }
+
+    // MARK: - Computed Helpers
+
+    /// Causal cache length (kernel_size = convLCache + 1).
+    private var convLCache: Int {
+        config.convLCache ?? 3
+    }
+
+    /// Head dimension derived from hiddenSize / attentionHeads.
+    private var resolvedHeadDim: Int {
+        config.hiddenSize / config.attentionHeads
+    }
+
+    /// Whether this model uses MoE.
+    private var isMoE: Bool {
+        config.expertCount != nil
+    }
+
+    /// Expand sections into a flat list of layer descriptors.
+    private var layerDescriptors: [LayerDescriptor] {
+        var result: [LayerDescriptor] = []
+        for section in sections {
+            for _ in 0..<section.groupCount {
+                for _ in 0..<section.convsPerGroup {
+                    result.append(LayerDescriptor(
+                        isConvolution: true,
+                        useMoE: isMoE && result.count >= config.numDenseLayers
+                    ))
+                }
+                if section.hasAttention {
+                    result.append(LayerDescriptor(
+                        isConvolution: false,
+                        useMoE: isMoE && result.count >= config.numDenseLayers
+                    ))
+                }
+            }
+        }
+        return result
     }
 
     @ModelComponentBuilder
     public var body: some ModelComponent {
-        TokenEmbedding(vocabSize: config.vocabularySize, embeddingSize: config.hiddenSize)
+        TokenEmbedding(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
 
-        ForEach(config.layerDescriptors) { layer in
+        ForEach(layerDescriptors) { layer in
             if layer.isConvolution {
-                LFM2ConvDecoderLayer(config: config, useMoE: layer.useMoE)
+                LFM2ConvDecoderLayer(config: config, convLCache: convLCache, useMoE: layer.useMoE)
             } else {
-                LFM2AttnDecoderLayer(config: config, useMoE: layer.useMoE)
+                LFM2AttnDecoderLayer(config: config, resolvedHeadDim: resolvedHeadDim, useMoE: layer.useMoE)
             }
         }
 
         RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
         OutputHead(
             inputSize: config.hiddenSize,
-            vocabSize: config.vocabularySize,
-            tiedToEmbedding: config.tieWordEmbeddings
+            vocabSize: config.vocabSize,
+            tiedToEmbedding: config.tiedEmbeddings
         )
+    }
+
+    // MARK: - Section Builder
+
+    /// Convert flat layer_types array to LFM2.LayerSection pattern.
+    ///
+    /// Groups consecutive layers into sections where each section is:
+    /// (conv x convsPerGroup + attention?) x groupCount
+    public static func buildSections(from layerTypes: [String]) throws -> [LayerSection] {
+        var sections: [LayerSection] = []
+        var i = 0
+
+        while i < layerTypes.count {
+            // Count consecutive conv layers
+            var convCount = 0
+            let groupStart = i
+            while i < layerTypes.count && layerTypes[i] == "conv" {
+                convCount += 1
+                i += 1
+            }
+
+            // Check if followed by attention
+            let hasAttention = i < layerTypes.count && layerTypes[i] == "full_attention"
+            if hasAttention { i += 1 }
+
+            if convCount == 0 && !hasAttention {
+                throw ModelGraphBuildError.invalidConfig(
+                    "Unexpected layer_type '\(layerTypes[groupStart])' at index \(groupStart)")
+            }
+
+            // Try to find repeating groups with the same pattern
+            let patternLength = convCount + (hasAttention ? 1 : 0)
+            var groupCount = 1
+
+            while i + patternLength <= layerTypes.count {
+                var matches = true
+                var j = 0
+                while j < convCount && (i + j) < layerTypes.count {
+                    if layerTypes[i + j] != "conv" { matches = false; break }
+                    j += 1
+                }
+                if matches && hasAttention {
+                    if (i + j) >= layerTypes.count || layerTypes[i + j] != "full_attention" {
+                        matches = false
+                    }
+                }
+                if j < convCount { matches = false }
+
+                if matches {
+                    groupCount += 1
+                    i += patternLength
+                } else {
+                    break
+                }
+            }
+
+            sections.append(LayerSection(
+                groupCount: groupCount,
+                convsPerGroup: convCount,
+                hasAttention: hasAttention
+            ))
+        }
+
+        return sections
     }
 }
 
@@ -222,7 +222,8 @@ public struct LFM2: ModelComponent {
 /// in_proj(D -> 3D) -> chunk(B, C, x) -> B*x -> depthwise_conv1d -> C*conv_out -> out_proj
 struct LFM2ConvDecoderLayer: ModelComponent {
 
-    let config: LFM2.Config
+    let config: ModelConfig
+    let convLCache: Int
     let useMoE: Bool
 
     @ModelComponentBuilder
@@ -232,20 +233,20 @@ struct LFM2ConvDecoderLayer: ModelComponent {
             StateSpace(
                 hiddenSize: config.hiddenSize,
                 numHeads: 1,
-                keyHeadDim: config.convLCache,
-                valueHeadDim: config.convLCache,
+                keyHeadDim: convLCache,
+                valueHeadDim: convLCache,
                 variant: "short_conv"
             )
         }
         Residual {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
-            if useMoE, let moe = config.moe {
+            if useMoE, let expertCount = config.expertCount, let expertsPerToken = config.expertsPerToken {
                 MoE(
-                    expertCount: moe.expertCount,
-                    expertsPerToken: moe.expertsPerToken,
+                    expertCount: expertCount,
+                    expertsPerToken: expertsPerToken,
                     expertInputSize: config.hiddenSize,
-                    expertIntermediateSize: moe.moeIntermediateSize,
-                    expertBias: moe.expertBias
+                    expertIntermediateSize: config.moeIntermediateSize ?? config.intermediateSize,
+                    expertBias: config.mlpBias
                 )
             } else {
                 MLP(inputSize: config.hiddenSize, intermediateSize: config.intermediateSize)
@@ -257,7 +258,8 @@ struct LFM2ConvDecoderLayer: ModelComponent {
 /// Attention decoder layer: RMSNorm + GQA residual, then RMSNorm + FFN residual.
 struct LFM2AttnDecoderLayer: ModelComponent {
 
-    let config: LFM2.Config
+    let config: ModelConfig
+    let resolvedHeadDim: Int
     let useMoE: Bool
 
     @ModelComponentBuilder
@@ -269,7 +271,7 @@ struct LFM2AttnDecoderLayer: ModelComponent {
                 headCount: config.attentionHeads,
                 kvHeadCount: config.kvHeads,
                 rope: RoPEAttributes(
-                    dimension: config.resolvedHeadDim,
+                    dimension: resolvedHeadDim,
                     base: config.ropeTheta
                 ),
                 qkNorm: .rmsNorm
@@ -277,113 +279,17 @@ struct LFM2AttnDecoderLayer: ModelComponent {
         }
         Residual {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
-            if useMoE, let moe = config.moe {
+            if useMoE, let expertCount = config.expertCount, let expertsPerToken = config.expertsPerToken {
                 MoE(
-                    expertCount: moe.expertCount,
-                    expertsPerToken: moe.expertsPerToken,
+                    expertCount: expertCount,
+                    expertsPerToken: expertsPerToken,
                     expertInputSize: config.hiddenSize,
-                    expertIntermediateSize: moe.moeIntermediateSize,
-                    expertBias: moe.expertBias
+                    expertIntermediateSize: config.moeIntermediateSize ?? config.intermediateSize,
+                    expertBias: config.mlpBias
                 )
             } else {
                 MLP(inputSize: config.hiddenSize, intermediateSize: config.intermediateSize)
             }
         }
     }
-}
-
-// MARK: - Preset Configurations
-
-extension LFM2.Config {
-
-    /// LFM2 350M (text backbone of LFM2-VL-450M)
-    ///
-    /// Pattern: (conv×2 + attn)×3, (conv + attn)×3, conv×1 = 16 layers
-    public static let lfm2_350M = LFM2.Config(
-        hiddenSize: 1024,
-        hiddenLayers: 16,
-        intermediateSize: 6656,
-        vocabularySize: 65536,
-        attentionHeads: 16,
-        kvHeads: 8,
-        sections: [
-            .init(groupCount: 3, convsPerGroup: 2),
-            .init(groupCount: 3, convsPerGroup: 1),
-            .init(groupCount: 1, convsPerGroup: 1, hasAttention: false),
-        ]
-    )
-
-    /// LFM 2.5 1.2B
-    ///
-    /// Pattern: (conv×2 + attn)×3, (conv + attn)×3, conv×1 = 16 layers
-    public static let lfm25_1_2B = LFM2.Config(
-        hiddenSize: 2048,
-        hiddenLayers: 16,
-        intermediateSize: 12288,
-        vocabularySize: 65536,
-        attentionHeads: 32,
-        kvHeads: 8,
-        sections: [
-            .init(groupCount: 3, convsPerGroup: 2),
-            .init(groupCount: 3, convsPerGroup: 1),
-            .init(groupCount: 1, convsPerGroup: 1, hasAttention: false),
-        ]
-    )
-
-    /// LFM2 2.6B
-    ///
-    /// Pattern: (conv×2 + attn)×2, (conv×3 + attn)×4, (conv×2 + attn)×2, conv×2 = 30 layers
-    public static let lfm2_2_6B = LFM2.Config(
-        hiddenSize: 2048,
-        hiddenLayers: 30,
-        intermediateSize: 10752,
-        vocabularySize: 65536,
-        attentionHeads: 32,
-        kvHeads: 8,
-        sections: [
-            .init(groupCount: 2, convsPerGroup: 2),
-            .init(groupCount: 4, convsPerGroup: 3),
-            .init(groupCount: 2, convsPerGroup: 2),
-            .init(groupCount: 1, convsPerGroup: 2, hasAttention: false),
-        ]
-    )
-
-    /// LFM2 8B-A1B (MoE: 32 experts, 4 active per token)
-    ///
-    /// Pattern: (conv×2 + attn)×1, (conv×3 + attn)×4, (conv×2 + attn)×1, conv×2 = 24 layers
-    public static let lfm2_8B_A1B = LFM2.Config(
-        hiddenSize: 2048,
-        hiddenLayers: 24,
-        intermediateSize: 7168,
-        vocabularySize: 65536,
-        attentionHeads: 32,
-        kvHeads: 8,
-        sections: [
-            .init(groupCount: 1, convsPerGroup: 2),
-            .init(groupCount: 4, convsPerGroup: 3),
-            .init(groupCount: 1, convsPerGroup: 2),
-            .init(groupCount: 1, convsPerGroup: 2, hasAttention: false),
-        ],
-        moe: .init(expertCount: 32, expertsPerToken: 4, moeIntermediateSize: 1792),
-        numDenseLayers: 2
-    )
-
-    /// LFM2 24B-A2B (MoE: 64 experts, 4 active per token)
-    ///
-    /// Pattern: (conv×2 + attn)×1, (conv×3 + attn)×9, conv×1 = 40 layers
-    public static let lfm2_24B_A2B = LFM2.Config(
-        hiddenSize: 2048,
-        hiddenLayers: 40,
-        intermediateSize: 11776,
-        vocabularySize: 65536,
-        attentionHeads: 32,
-        kvHeads: 8,
-        sections: [
-            .init(groupCount: 1, convsPerGroup: 2),
-            .init(groupCount: 9, convsPerGroup: 3),
-            .init(groupCount: 1, convsPerGroup: 1, hasAttention: false),
-        ],
-        moe: .init(expertCount: 64, expertsPerToken: 4, moeIntermediateSize: 1536),
-        numDenseLayers: 2
-    )
 }

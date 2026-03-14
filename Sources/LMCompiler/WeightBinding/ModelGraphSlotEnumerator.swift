@@ -163,9 +163,11 @@ private extension ModelGraphSlotEnumerator {
                 let mlxPath: String
                 switch namingScope {
                 case .root:
-                    if context.naming == .lfm2Family && context.rootNormIndex == 0 {
+                    switch context.naming {
+                    case .lfm2Family:
+                        // LFM2 shares embedding_norm for both post-embedding and final norm
                         mlxPath = "model.embedding_norm.weight"
-                    } else {
+                    case .llamaFamily:
                         mlxPath = "model.norm.weight"
                     }
                     context.rootNormIndex += 1
@@ -216,25 +218,27 @@ private extension ModelGraphSlotEnumerator {
                 guard case .layer(let idx) = namingScope else { continue }
                 let attnPrefix = "model.layers.\(idx).self_attn"
 
-                // Projection field names differ by convention
-                let projFields: [String]
+                // IR slot uses canonical names; HF path uses convention-specific names
+                let projFields: [(irField: String, hfField: String)]
                 switch context.naming {
                 case .llamaFamily:
-                    projFields = ["q_proj", "k_proj", "v_proj", "o_proj"]
+                    projFields = [("q_proj", "q_proj"), ("k_proj", "k_proj"),
+                                  ("v_proj", "v_proj"), ("o_proj", "o_proj")]
                 case .lfm2Family:
-                    projFields = ["q_proj", "k_proj", "v_proj", "out_proj"]
+                    projFields = [("q_proj", "q_proj"), ("k_proj", "k_proj"),
+                                  ("v_proj", "v_proj"), ("o_proj", "out_proj")]
                 }
 
-                for field in projFields {
-                    let fieldPath = path.appending(.field(field))
+                for (irField, hfField) in projFields {
+                    let fieldPath = path.appending(.field(irField))
                     entries.append(SlotManifestEntry(
                         slot: ParameterSlot(path: fieldPath, role: .weight),
-                        mlxWeightPath: "\(attnPrefix).\(field).weight"
+                        mlxWeightPath: "\(attnPrefix).\(hfField).weight"
                     ))
                     if attrs.bias {
                         entries.append(SlotManifestEntry(
                             slot: ParameterSlot(path: fieldPath, role: .bias),
-                            mlxWeightPath: "\(attnPrefix).\(field).bias"
+                            mlxWeightPath: "\(attnPrefix).\(hfField).bias"
                         ))
                     }
                 }
