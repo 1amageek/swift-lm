@@ -54,18 +54,16 @@ LMInference
 
 ### Inference Backends
 
-MPSGraph is the default backend. MLX is used as fallback for hybrid architectures.
+MPSGraph and MLX are independent backends. Each can be selected explicitly.
 
-| Backend | Target Architectures | Advantage |
-|---|---|---|
-| **MPSGraph** (default) | transformer, parallelAttentionMLP, MoE | MPSGraph fused execution (1.6x faster) |
-| **MLX** (fallback) | hybridDeltaNet, hybridConvAttention, all | Dynamic shapes, LoRA, quantization |
+| Backend | Advantage |
+|---|---|
+| **MPSGraph** | MPSGraph fused execution, compiled graph plan |
+| **MLX** | Dynamic shapes, LoRA, quantization, custom kernels |
 
 ```swift
-// Auto-selects backend (default: MPSGraph)
-let container = try await ModelBundleLoader().load(repo: "...", backend: .auto)
-
-// Force MLX backend
+// Select backend explicitly
+let container = try await ModelBundleLoader().load(repo: "...", backend: .mpsgraph)
 let container = try await ModelBundleLoader().load(repo: "...", backend: .mlx)
 ```
 
@@ -80,10 +78,10 @@ ModelBundleLoader
   ├── HFArchitectureDetector: model_type → DetectedArchitecture
   ├── IRGraphAssembler: (ModelConfig, DetectedArchitecture) → ModelGraph (IR)
   │
-  ├── [MPSGraph path — default]
+  ├── [MPSGraph path]
   │   └── MPSGraphInferenceCompiler → MPSGraphInferenceModel → MPSGraphLanguageModel
   │
-  └── [MLX path — fallback]
+  └── [MLX path]
       ├── HFDirectoryBundle: safetensors → WeightManifest → RawWeights
       ├── MLXWeightPathBinder: RawWeights → BoundWeights
       └── MLXInferenceCompiler → MLXInferenceModel → MLXLanguageModel
@@ -106,7 +104,7 @@ ModelBundleLoader
 ## Features
 
 - **HF-first loading** — config.json + safetensors + tokenizer.json is all you need
-- **Dual backends** — MPSGraph (default, 1.6x faster) with MLX fallback
+- **Dual backends** — MPSGraph and MLX as independent inference backends
 - **Chat template** — Jinja2 evaluation via [swift-jinja](https://github.com/huggingface/swift-jinja), no hand-written formatters
 - **Streaming generation** — `AsyncStream<Generation>` with token-by-token output
 - **Tool calling** — JSON and XML tool call format detection

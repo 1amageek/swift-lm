@@ -12,20 +12,15 @@ swift-lm は Apple Silicon 上での高速 LLM 推論パッケージ。[AnyFound
 
 ### 推論バックエンド
 
-**MPSGraph がデフォルト**（transformer / parallelAttentionMLP / MoE）。MLX は hybrid モデル（DeltaNet / ShortConv）のフォールバック。
+MPSGraph と MLX は**独立したバックエンド**。それぞれ個別に選択可能。
 
 ```
-ModelBundleLoader(backend: .auto)
-  ├── .mpsgraph (default): MPSGraphInferenceCompiler → MPSGraphInferenceModel
-  │   → MPSGraph グラフコンパイラ。全層を fused 実行計画に。MLX の 1.62x 高速
-  └── .mlx (fallback): MLXInferenceCompiler → MLXInferenceModel
+ModelBundleLoader(backend:)
+  ├── .mpsgraph: MPSGraphInferenceCompiler → MPSGraphInferenceModel
+  │   → MPSGraph グラフコンパイラ。全層を fused 実行計画に
+  └── .mlx: MLXInferenceCompiler → MLXInferenceModel
       → fused RMSNorm, fused SDPA, QKV packing, flat decode plan。全最適化済み
 ```
-
-ベンチマーク根拠（M4 Max, D=896, 24L, 全層 1 実行）:
-- MLX: 8.04ms (0.335ms/layer) — lazy eval + fused kernels
-- MPSGraph: 4.97ms (0.207ms/layer) — MPSGraph compiled plan
-- 詳細: `reports/full-model-coreml-vs-mlx.md`
 
 ## Build & Test
 
@@ -123,11 +118,11 @@ ModelBundleLoader (LMInference)
   ├── HFArchitectureDetector: model_type → DetectedArchitecture
   ├── IRGraphAssembler: (ModelConfig, DetectedArchitecture) → ModelGraph (IR)
   │
-  ├── [MPSGraph path — default for transformer/MoE]
+  ├── [MPSGraph path]
   │   └── MPSGraphInferenceCompiler → MPSGraphInferenceModel
   │       → MPSGraphLanguageModel
   │
-  └── [MLX path — fallback for hybrid/recurrent]
+  └── [MLX path]
       ├── HFDirectoryBundle: safetensors → WeightManifest → RawWeights
       ├── MLXWeightPathBinder: RawWeights → BoundWeights
       └── MLXInferenceCompiler: (ModelGraph, BoundWeights) → MLXInferenceModel
@@ -145,7 +140,6 @@ ModelBundleLoader (LMInference)
 - **mlx-community の事前量子化モデル** — safetensors に MLX ネイティブ形式で格納済み。GGUF 量子化パッキングコード（270KB+）が不要
 - **コンパイル時カーネル選択** — 重みのストレージ型を見て `quantizedMatmul` or `matmul` を静的に確定。実行時の型判定が不要
 - **IR と実行の分離** — モデル構造（ModelGraph IR）とランタイム（LMCompiler）が独立。バックエンド追加がモデル定義に影響しない
-- **MPSGraph がデフォルト** — MPSGraph のグラフコンパイラが Metal op-at-a-time より 1.6x 高速（全層 1 実行のベンチマークで実証済み）
 
 ### SwiftLM の役割
 
@@ -273,9 +267,9 @@ LMCompiler (depends: SwiftLM) ─────┤
   └── MPSGraphInferenceCompiler    │
                                    │
 LMInference (depends: SwiftLM, LMCompiler)
-  ├── ModelBundleLoader: HF config → IR → backend selection
-  │     ├── MPSGraph path: MPSGraphInferenceCompiler → MPSGraphLanguageModel
-  │     └── MLX path: MLXInferenceCompiler → MLXLanguageModel
+  ├── ModelBundleLoader: HF config → IR → backend
+  │     ├── .mpsgraph: MPSGraphInferenceCompiler → MPSGraphLanguageModel
+  │     └── .mlx: MLXInferenceCompiler → MLXLanguageModel
   └── ※ ModelDeclarations には依存しない
 ```
 
@@ -304,15 +298,17 @@ LMInference (depends: SwiftLM, LMCompiler)
 
 ### 推論バックエンドの使い分け
 
-| バックエンド | 対象アーキテクチャ | 利点 | 制約 |
-|---|---|---|---|
-| **MPSGraph** (default) | transformer, parallelAttentionMLP, MoE | MPSGraph fused execution (1.6x) | Pure Swift、Python 不要 |
-| **MLX** (fallback) | hybridDeltaNet, hybridConvAttention, 全て | 動的 shape、LoRA、量子化、常時利用可 | op-at-a-time dispatch |
+MPSGraph と MLX は独立したバックエンド。消費者が明示的に選択する。
+
+| バックエンド | 利点 | 制約 |
+|---|---|---|
+| **MPSGraph** | MPSGraph fused execution, compiled graph plan | Pure Swift、Python 不要 |
+| **MLX** | 動的 shape、LoRA、量子化、custom kernels | op-at-a-time dispatch |
 
 ```swift
 // 使い方
-let container = try await ModelBundleLoader().load(repo: "...", backend: .auto)  // default: MPSGraph
-let container = try await ModelBundleLoader().load(repo: "...", backend: .mlx)   // force MLX
+let container = try await ModelBundleLoader().load(repo: "...", backend: .mpsgraph)
+let container = try await ModelBundleLoader().load(repo: "...", backend: .mlx)
 ```
 
 AnyFoundationModels が `MLXFoundationModels` 経由で消費する。公開インターフェースは `ModelContainer`。消費者が指定するのは HuggingFace repo ID のみ。
@@ -396,7 +392,7 @@ llama.cpp の `llama_batch` と同じ方式。text decoder に対して token ID
 
 ## Weight Loading Flow
 
-### MPSGraph パス（デフォルト）
+### MPSGraph パス
 
 ```
 HF ディレクトリ (config.json + *.safetensors)
@@ -408,7 +404,7 @@ ModelBundleLoader → IR assembly → MPSGraphInferenceCompiler
 MPSGraphInferenceModel → MPSGraphLanguageModel
 ```
 
-### MLX パス（フォールバック）
+### MLX パス
 
 ```
 HF ディレクトリ (*.safetensors)
