@@ -39,9 +39,12 @@ public struct MPSGraphInferenceCompiler: Sendable {
 
         // Phase 2: Compile — walk IR, build MPSGraph ops
         let input = mpsGraph.placeholder(shape: [1, -1], dataType: .int32, name: "token_ids")
+        // Causal mask placeholder: [1, 1, T, T] additive mask (0 for valid, -1e4 for future)
+        // For T=1 decode, caller feeds all-zeros. For T>1, caller builds causal mask.
+        let maskPh = mpsGraph.placeholder(shape: [1, 1, -1, -1], dataType: .float16, name: "causal_mask")
 
         var context = CompilationContext(
-            graph: mpsGraph, store: store, embeddingTensor: nil)
+            graph: mpsGraph, store: store, embeddingTensor: nil, maskPlaceholder: maskPh)
 
         let output = try compileRegion(
             modelGraph.rootRegion,
@@ -51,7 +54,10 @@ public struct MPSGraphInferenceCompiler: Sendable {
 
         return MPSGraphInferenceModel(
             graph: mpsGraph, device: device, commandQueue: queue,
-            inputPlaceholder: input, outputTensor: output,
+            inputPlaceholder: input, maskPlaceholder: maskPh,
+            ropeCosPh: context.ropeCosPh, ropeSinPh: context.ropeSinPh,
+            ropeHeadDim: context.ropeHeadDim,
+            outputTensor: output,
             metadata: InferenceMetadata(
                 cacheSlotCount: scanResult.cacheDescriptors.count,
                 cacheDescriptors: scanResult.cacheDescriptors,
@@ -63,10 +69,14 @@ public struct MPSGraphInferenceCompiler: Sendable {
     private struct CompilationContext {
         let graph: MPSGraph
         let store: InferenceWeightStore
-        /// Token embedding variable — stored for tied output head reuse.
         var embeddingTensor: MPSGraphTensor?
-        /// RoPE frequency table — built once, shared across layers.
-        var ropeFreqs: MPSGraphTensor?
+        /// Causal mask placeholder [1, 1, T, T] — shared across layers.
+        var maskPlaceholder: MPSGraphTensor?
+        /// RoPE cos/sin placeholders [1, 1, T, hd/2] — shared across layers.
+        var ropeCosPh: MPSGraphTensor?
+        var ropeSinPh: MPSGraphTensor?
+        /// Head dim for RoPE table shape.
+        var ropeHeadDim: Int = 0
     }
 
     // MARK: - Region Walk
@@ -201,12 +211,10 @@ public struct MPSGraphInferenceCompiler: Sendable {
         // MARK: RoPE (standalone)
 
         case .rope(let attrs):
-            let freqs = ensureRoPEFreqs(attrs: attrs, context: &context)
-            let heads = input.shape?[1].intValue ?? 1
+            let (cosPh, sinPh) = ensureRoPEPlaceholders(headDim: attrs.dimension, context: &context)
             return MPSGraphOps.applyRoPE(
-                g, input: input, frequencies: freqs,
-                heads: heads, headDim: attrs.dimension,
-                name: "\(path)")
+                g, input: input, cosTable: cosPh, sinTable: sinPh,
+                headDim: attrs.dimension, name: "\(path)")
 
         // MARK: Positional Embedding
 
@@ -297,12 +305,12 @@ public struct MPSGraphInferenceCompiler: Sendable {
             heads: KVH, headDim: hd, name: "\(n).v")
 
         // RoPE
-        if let rope = attrs.rope {
-            let freqs = ensureRoPEFreqs(attrs: rope, context: &context)
-            q = MPSGraphOps.applyRoPE(g, input: q, frequencies: freqs,
-                                       heads: H, headDim: hd, name: "\(n).q")
-            k = MPSGraphOps.applyRoPE(g, input: k, frequencies: freqs,
-                                       heads: KVH, headDim: hd, name: "\(n).k")
+        if attrs.rope != nil {
+            let (cosPh, sinPh) = ensureRoPEPlaceholders(headDim: hd, context: &context)
+            q = MPSGraphOps.applyRoPE(g, input: q, cosTable: cosPh, sinTable: sinPh,
+                                       headDim: hd, name: "\(n).q")
+            k = MPSGraphOps.applyRoPE(g, input: k, cosTable: cosPh, sinTable: sinPh,
+                                       headDim: hd, name: "\(n).k")
         }
 
         // GQA head repeat
@@ -310,9 +318,10 @@ public struct MPSGraphInferenceCompiler: Sendable {
         let kAttn = MPSGraphOps.repeatKVHeads(g, input: k, repeatFactor: repeatFactor, name: "\(n).k")
         let vAttn = MPSGraphOps.repeatKVHeads(g, input: v, repeatFactor: repeatFactor, name: "\(n).v")
 
-        // Causal SDPA
-        let attn = MPSGraphOps.causalScaledDotProductAttention(
-            g, query: q, key: kAttn, value: vAttn, headDim: hd, name: n)
+        // SDPA with causal mask from context
+        let attn = MPSGraphOps.scaledDotProductAttention(
+            g, query: q, key: kAttn, value: vAttn,
+            mask: context.maskPlaceholder, headDim: hd, name: n)
 
         let flat = MPSGraphOps.fromHeads(g, input: attn, totalDim: H * hd, name: n)
         return MPSGraphOps.linear(g, input: flat, weight: oW, name: "\(n).o")
@@ -358,14 +367,19 @@ public struct MPSGraphInferenceCompiler: Sendable {
         g.multiplication(x, g.sigmoid(with: x, name: "\(name).sig"), name: "\(name).silu")
     }
 
-    private func ensureRoPEFreqs(
-        attrs: RoPEAttributes, context: inout CompilationContext
-    ) -> MPSGraphTensor {
-        if let existing = context.ropeFreqs { return existing }
-        let freqs = MPSGraphOps.buildRoPEFrequencies(
-            context.graph, headDim: attrs.dimension, theta: attrs.base)
-        context.ropeFreqs = freqs
-        return freqs
+    private func ensureRoPEPlaceholders(
+        headDim: Int, context: inout CompilationContext
+    ) -> (cos: MPSGraphTensor, sin: MPSGraphTensor) {
+        if let c = context.ropeCosPh, let s = context.ropeSinPh { return (c, s) }
+        let halfDim = headDim / 2
+        let cosPh = context.graph.placeholder(
+            shape: [1, 1, -1, halfDim as NSNumber], dataType: .float16, name: "rope_cos")
+        let sinPh = context.graph.placeholder(
+            shape: [1, 1, -1, halfDim as NSNumber], dataType: .float16, name: "rope_sin")
+        context.ropeCosPh = cosPh
+        context.ropeSinPh = sinPh
+        context.ropeHeadDim = headDim
+        return (cosPh, sinPh)
     }
 
     // MARK: - Weight Resolution

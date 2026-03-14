@@ -5,37 +5,66 @@ import MetalPerformanceShadersGraph
 
 /// Compiled MPSGraph model ready for inference.
 ///
-/// Contains the full transformer graph (all layers) as a single MPSGraph
-/// with kernel fusion and memory aliasing. Each `forward()` call executes
-/// the entire model in one dispatch.
+/// Causal mask and RoPE tables are generated at call time and passed as inputs,
+/// avoiding MPSGraph MLIR issues with dynamic coordinate ops.
 public struct MPSGraphInferenceModel: @unchecked Sendable {
 
     let graph: MPSGraph
     let device: MTLDevice
     let commandQueue: MTLCommandQueue
     let inputPlaceholder: MPSGraphTensor
+    let maskPlaceholder: MPSGraphTensor
+    let ropeCosPh: MPSGraphTensor?
+    let ropeSinPh: MPSGraphTensor?
+    let ropeHeadDim: Int
     let outputTensor: MPSGraphTensor
 
-    /// Model metadata (cache descriptors, tied head info).
     public let metadata: InferenceMetadata
 
+    /// RoPE theta — needed to build cos/sin tables at call time.
+    /// Defaults to 500000 if not configured.
+    public var ropeTheta: Float = 500000.0
+
     /// Forward pass: token IDs → logits.
-    ///
-    /// Processes the full token sequence through all layers.
-    /// - Parameter tokenIDs: Int32 token IDs.
-    /// - Returns: Logits as MLXArray [1, T, vocab].
     public func forward(_ tokenIDs: [Int32]) -> MLXArray {
         let T = tokenIDs.count
-        let inputBytes = tokenIDs.withUnsafeBytes { Data($0) }
-        let inputData = MPSGraphTensorData(
-            device: MPSGraphDevice(mtlDevice: device), data: inputBytes,
-            shape: [1, T as NSNumber], dataType: .int32)
+        let mpsDevice = MPSGraphDevice(mtlDevice: device)
+
+        // Input tokens
+        let inputData = tokenIDs.withUnsafeBytes { ptr in
+            MPSGraphTensorData(device: mpsDevice, data: Data(ptr),
+                                shape: [1, T as NSNumber], dataType: .int32)
+        }
+
+        // Causal mask [1, 1, T, T]
+        let maskBytes = T == 1
+            ? [Float16](repeating: 0, count: 1).withUnsafeBytes { Data($0) }
+            : MPSGraphOps.buildCausalMask(seqLen: T)
+        let maskData = MPSGraphTensorData(
+            device: mpsDevice, data: maskBytes,
+            shape: [1, 1, T as NSNumber, T as NSNumber], dataType: .float16)
+
+        var feeds: [MPSGraphTensor: MPSGraphTensorData] = [
+            inputPlaceholder: inputData,
+            maskPlaceholder: maskData,
+        ]
+
+        // RoPE cos/sin tables [1, 1, T, hd/2]
+        if let cosPh = ropeCosPh, let sinPh = ropeSinPh, ropeHeadDim > 0 {
+            let halfDim = ropeHeadDim / 2
+            let (cosData, sinData) = MPSGraphOps.buildRoPETables(
+                seqLen: T, headDim: ropeHeadDim, theta: ropeTheta)
+            feeds[cosPh] = MPSGraphTensorData(
+                device: mpsDevice, data: cosData,
+                shape: [1, 1, T as NSNumber, halfDim as NSNumber], dataType: .float16)
+            feeds[sinPh] = MPSGraphTensorData(
+                device: mpsDevice, data: sinData,
+                shape: [1, 1, T as NSNumber, halfDim as NSNumber], dataType: .float16)
+        }
 
         let results = graph.run(
-            with: commandQueue,
-            feeds: [inputPlaceholder: inputData],
-            targetTensors: [outputTensor],
-            targetOperations: nil)
+            with: commandQueue, feeds: feeds,
+            targetTensors: [outputTensor], targetOperations: nil)
 
         let result = results[outputTensor]!
         let shape = result.shape.map { $0.intValue }
