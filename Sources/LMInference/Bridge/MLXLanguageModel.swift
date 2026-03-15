@@ -303,7 +303,7 @@ class MLXLanguageModel: Module, LanguageModel, @unchecked Sendable {
             compiledCache.inferenceState = newState
             return LMOutput(logits: logits)
         } else {
-            // Decode — single token via optimized lowered path
+            // Decode — single token via lowered path
             //
             // For VLM: generate sequential M-RoPE position IDs if not provided.
             let positionIds: MLXArray?
