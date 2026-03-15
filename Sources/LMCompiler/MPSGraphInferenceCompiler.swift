@@ -382,20 +382,47 @@ public struct MPSGraphInferenceCompiler: Sendable {
         let padded = g.concatTensors([zeroPad, bx], dimension: 1, name: "\(n).pad")
 
         // Shifted sum: for each kernel tap k, slice padded[k..k+T] * weight[k]
-        var convOut: MPSGraphTensor?
-        for k in 0..<K {
-            // weight slice: convW[D, K] → column k → [1, 1, D] for broadcast
-            let wk = g.sliceTensor(convWSq, dimension: 1, start: k, length: 1, name: "\(n).w\(k)")
-            // Padded input shifted: padded[:, k:k+T, :] — length T from position k
-            let shifted = g.sliceTensor(padded, dimension: 1, start: k, length: -1, name: "\(n).sh\(k)")
-            let term = g.multiplication(shifted, wk, name: "\(n).t\(k)")
-            if let acc = convOut {
-                convOut = g.addition(acc, term, name: "\(n).sum\(k)")
-            } else {
-                convOut = term
-            }
-        }
-        let convResult = convOut!
+        // padded shape: [1, K-1+T, D]. Output length: T.
+        // MPSGraph cannot handle length=-1 (MLIR crash). Since this is a static graph,
+        // we express the output length as: padded_len - (K-1) = T.
+        // For each k: shifted = padded[:, k:k+T, :], length = padded_len - (K-1)
+        // Since padded_len = K-1+T, output length = T. But T is dynamic (placeholder).
+        //
+        // Solution: use stridedSlice with end = padded_len - (K-1-k) instead of explicit length.
+        // Or equivalently: for k in 0..<K, shifted[k] = padded[:, k:-(K-1-k), :] when k<K-1,
+        // and shifted[K-1] = padded[:, K-1:, :].
+        //
+        // MPSGraph approach: slice from start=k, length = we compute from shape.
+        // Use gatherND or just do element-wise with proper indexing.
+        //
+        // Simplest correct approach for fixed K: unroll K dot products.
+        // padded[:, k, :] * weight[:, k] for each position, then sum.
+        // Since K is small (3-4), this is efficient.
+        //
+        // For the full sequence: conv[t, d] = sum_{k=0}^{K-1} padded[t+k, d] * weight[d, k]
+        // We need T outputs. padded has K-1+T timesteps.
+        //
+        // With MPSGraph sliceTensor: start=k, length=T works if T is known.
+        // But T comes from the input placeholder which is dynamic shape [-1].
+        //
+        // Alternative: use MPSGraph convolution2D with [1, T+K-1, D, 1] input
+        // and [1, K, D, 1] weight with groups=D.
+        //
+        // Depthwise conv via conv2d: reshape [1, T, D] → [1, T, D, 1] (NHWC)
+        // Weight [D, K] → [D, 1, K, 1] (OIHW format for groups=D depthwise)
+        let bx4d = g.reshape(bx, shape: [1, -1, D as NSNumber, 1], name: "\(n).bx4d")
+        let convW4d = g.reshape(convWSq, shape: [D as NSNumber, 1, K as NSNumber, 1], name: "\(n).cw4d")
+
+        let convDesc = MPSGraphConvolution2DOpDescriptor(
+            strideInX: 1, strideInY: 1,
+            dilationRateInX: 1, dilationRateInY: 1,
+            groups: D,
+            paddingLeft: 0, paddingRight: 0,
+            paddingTop: K - 1, paddingBottom: 0,
+            paddingStyle: .explicit,
+            dataLayout: .NHWC, weightsLayout: .OIHW)!
+        let conv4d = g.convolution2D(bx4d, weights: convW4d, descriptor: convDesc, name: "\(n).conv2d")
+        let convResult = g.reshape(conv4d, shape: [1, -1, D as NSNumber], name: "\(n).conv3d")
 
         // Second gate: C * conv_out
         let y = g.multiplication(cGate, convResult, name: "\(n).Cy")

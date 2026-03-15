@@ -155,15 +155,12 @@ public struct ModelBundleLoader: Sendable {
 
     /// Check if the model graph contains operations that require MLX backend.
     ///
-    /// MPSGraph supports transformer and MoE operations.
-    /// State-space (DeltaNet) and ShortConv operations require MLX because
-    /// MPSGraph's MLIR compiler cannot handle dynamic-length slice operations
-    /// needed for causal convolution with variable sequence length.
+    /// MPSGraph supports transformer, MoE, and ShortConv operations (1 dispatch).
+    /// State-space (DeltaNet) requires MLX (recurrent state incompatible with static graph).
     private func graphRequiresMLX(_ graph: ModelGraph) -> Bool {
         containsOp(in: graph.rootRegion) { kind in
             switch kind {
             case .stateSpace: return true
-            case .shortConv: return true
             default: return false
             }
         }
