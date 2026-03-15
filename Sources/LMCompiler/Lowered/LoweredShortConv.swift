@@ -1,4 +1,5 @@
 @preconcurrency import MLX
+import MLXFast
 import SwiftLM
 
 /// Lowered short convolution module for LFM2 family with compile-time kernel selection.
@@ -30,9 +31,12 @@ public struct LoweredShortConv: @unchecked Sendable {
     /// Output projection (D -> D) with compile-time resolved kernel.
     public let outProj: LoweredProjection
 
-    /// Depthwise conv1d weight in MLX layout: [D, K, 1] (C_out, kernel, C_in/groups).
+    /// Depthwise conv1d weight: [D, K] for SSM conv kernel (squeezed from [D, 1, K]).
     public let convWeight: MLXArray
 
+    /// SSM conv Metal kernel — specialized dot product for short convolution.
+    /// Much faster than generic conv1d for small kernel sizes (K=3..4).
+    private let ssmConvKernel: MLXFast.MLXFastKernel
 
     /// Short convolution attributes (hiddenSize, kernelSize).
     public let attrs: ShortConvAttributes
@@ -49,14 +53,48 @@ public struct LoweredShortConv: @unchecked Sendable {
     ) {
         self.inProj = inProj
         self.outProj = outProj
-        // Pre-compute weight layout at compile time (not per-token).
+
+        // Pre-compute weight layout at compile time.
         // Raw weight from safetensors: [D, 1, K]
-        // MLX conv1d (channels-last) expects: [C_out, K, C_in/groups] = [D, K, 1]
+        // SSM conv kernel uses [D, K] — squeezed for direct dot product.
         if rawWeight.ndim == 3 {
-            self.convWeight = rawWeight.transposed(0, 2, 1)  // [D, K, 1]
+            self.convWeight = rawWeight.squeezed(axis: 1)  // [D, K]
         } else {
-            self.convWeight = rawWeight.expandedDimensions(axis: -1)  // [D, K, 1]
+            self.convWeight = rawWeight  // already [D, K]
         }
+
+        // Create SSM conv Metal kernel — llama.cpp-style dot product per channel.
+        // Input: padded [B, K+T-1, D] (channels-last), Weight: [D, K]
+        // Output: [B, T, D] where each output[b,t,d] = sum_{k=0}^{K-1} input[b,t+k,d] * weight[d,k]
+        self.ssmConvKernel = MLXFast.metalKernel(
+            name: "ssm_conv",
+            inputNames: ["input", "weight"],
+            outputNames: ["output"],
+            source: """
+                // SSM conv: depthwise causal convolution as dot product per channel.
+                // grid: (D, T, B)
+                uint d = thread_position_in_grid.x;  // channel index
+                uint t = thread_position_in_grid.y;  // output token index
+                uint b = thread_position_in_grid.z;  // batch index
+
+                uint D = output_shape[2];  // hidden size
+                uint T = output_shape[1];  // output sequence length
+                uint K = weight_shape[1];  // kernel size
+
+                float sum = 0.0f;
+                for (uint k = 0; k < K; k++) {
+                    // input[b, t + k, d] * weight[d, k]
+                    uint in_idx = b * input_strides[0] + (t + k) * input_strides[1] + d;
+                    uint w_idx = d * weight_strides[0] + k;
+                    sum += float(input[in_idx]) * float(weight[w_idx]);
+                }
+
+                uint out_idx = b * output_strides[0] + t * output_strides[1] + d;
+                output[out_idx] = sum;
+            """,
+            ensureRowContiguous: true
+        )
+
         self.attrs = attrs
         self.cacheSlotIndex = cacheSlotIndex
     }
@@ -102,8 +140,15 @@ public struct LoweredShortConv: @unchecked Sendable {
         // For decode (T=1): start = 1, for prefill: start = T.
         let newConvState = bx[0..., x.dim(1)..., 0...]
 
-        // Depthwise causal conv1d
-        let convOut = conv1d(bx, convWeight, stride: 1, padding: 0, groups: D)
+        // SSM conv via custom Metal kernel — replaces generic conv1d(groups: D)
+        let T = x.dim(1)
+        let convOut = ssmConvKernel(
+            [bx, convWeight],
+            grid: (D, T, B),
+            threadGroup: (min(D, 256), 1, 1),
+            outputShapes: [[B, T, D]],
+            outputDTypes: [bx.dtype]
+        )[0]
 
         // Store updated cache
         caches[cacheSlotIndex] = .recurrent(LoweredRecurrentCache(
