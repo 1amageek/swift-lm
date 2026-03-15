@@ -127,13 +127,15 @@ public struct LoweredShortConv: @unchecked Sendable {
             .store(variable: "y", output: 0),
             .cacheShift(output: 1, stateInput: 1, newVal: "bx", kernelSize: K),
         ]
+        let kernelName = "fused_shortconv_decode_k\(K)_d\(D)"
         self.fusedDecodeKernel = FusedKernel(
-            name: "fused_shortconv_decode_k\(K)_d\(D)",
+            name: kernelName,
             ops: fusedOps,
             inputNames: ["bcx", "state", "weight"],
             outputNames: ["out", "new_state"],
             templateParams: FusedKernel.TemplateParams(hiddenSize: D, kernelSize: K)
         )
+        print("[LMCompiler] fused kernel generated: \(kernelName) (6 ops → 1 dispatch)")
     }
 
     /// Apply short convolution with external cache state.

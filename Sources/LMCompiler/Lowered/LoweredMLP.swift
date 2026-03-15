@@ -92,12 +92,14 @@ public struct LoweredMLP: @unchecked Sendable {
         case .relu: name = "fused_relu_gate"
         }
 
-        return FusedKernel(
+        let kernel = FusedKernel(
             name: name,
             ops: ops,
             inputNames: ["gate", "up"],
             outputNames: ["out"]
         )
+        print("[LMCompiler] fused kernel generated: \(name) (2 ops → 1 dispatch)")
+        return kernel
     }
 
     /// Apply the MLP: `output = downProj(activation(gateProj(x)) * upProj(x))`.
