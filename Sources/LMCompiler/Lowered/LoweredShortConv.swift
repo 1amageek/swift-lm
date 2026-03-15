@@ -93,10 +93,12 @@ public struct LoweredShortConv: @unchecked Sendable {
                 uint L_in = (uint)input_shape[1];
                 uint in_base = b * L_in * HIDDEN_D;
 
-                float sum = 0.0f;
+                // Accumulate in T (matches input/output dtype: bfloat16 or float32).
+                // DType template param ensures correct type throughout.
+                DType sum = DType(0);
                 for (uint k = 0; k < (uint)CONV_K; k++) {
-                    sum += (float)input[in_base + (t + k) * HIDDEN_D + d]
-                         * (float)weight[d * CONV_K + k];
+                    sum += DType(input[in_base + (t + k) * HIDDEN_D + d])
+                         * DType(weight[d * CONV_K + k]);
                 }
 
                 // output: [B, T, D] row-contiguous. T = L_in - CONV_K + 1.
@@ -155,7 +157,7 @@ public struct LoweredShortConv: @unchecked Sendable {
         let T = x.dim(1)
         let convOut = ssmConvKernel(
             [bx, convWeight],
-            template: [("CONV_K", K), ("HIDDEN_D", D)],
+            template: [("CONV_K", K), ("HIDDEN_D", D), ("DType", bx.dtype)],
             grid: (D, T, B),
             threadGroup: (min(D, 256), 1, 1),
             outputShapes: [[B, T, D]],
