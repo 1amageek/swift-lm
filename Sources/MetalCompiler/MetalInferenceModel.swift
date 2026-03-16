@@ -166,33 +166,6 @@ public struct MetalInferenceModel: @unchecked Sendable {
                    min(decodeKV.values.length, prefillKV.values.length))
         }
 
-        // Warm up conv_state by replaying last kernelSize tokens through decode
-        if let convState = self.plan.buffers.convState, self.plan.buffers.convStateKernelSize > 0 {
-            let ks = self.plan.buffers.convStateKernelSize
-            let warmupCount = min(ks, seqLen)
-            memset(convState.contents(), 0, convState.length)
-
-            for i in 0..<warmupCount {
-                let replayPosition = seqLen - warmupCount + i
-                let b = self.plan.buffers
-                b.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(replayPosition)
-                b.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tokens[replayPosition]
-                guard let cb = commandQueue.makeCommandBuffer(),
-                      let enc = cb.makeComputeCommandEncoder() else { break }
-                encodeSteps(enc)
-                enc.endEncoding()
-                cb.commit()
-                cb.waitUntilCompleted()
-            }
-
-            // Restore hidden from prefill (warm-up decode overwrote it)
-            if lastTokenOffset + prefillHiddenStride <= prefill.buffers.hidden.length {
-                let src = (prefill.buffers.hidden.contents() + lastTokenOffset).bindMemory(to: Float.self, capacity: decodeHiddenSize)
-                let dst = self.plan.buffers.hidden.contents().bindMemory(to: Float16.self, capacity: decodeHiddenSize)
-                for i in 0..<decodeHiddenSize { dst[i] = Float16(src[i]) }
-            }
-        }
-
         let totalTime = CFAbsoluteTimeGetCurrent() - prefillStart
         print("[MetalInference] prefill: \(seqLen) tokens, \(dispatchCount) dispatches [\(String(format: "%.3f", totalTime))s] \(String(format: "%.0f", Double(seqLen) / totalTime)) tok/s")
         position += seqLen

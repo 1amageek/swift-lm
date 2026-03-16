@@ -313,11 +313,7 @@ public struct MetalInferenceCompiler: Sendable {
         var routingState = BufferRoutingState()
 
         for entry in fusedEntries {
-            // Conv1d with conv_state uses a different kernel
             var resolvedKernelName = kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore)
-            if case .compute(let op) = entry.kind, op is Conv1dOperation, bufferSet.convState != nil {
-                resolvedKernelName = "conv_state_update"
-            }
             guard let pipeline = pipelineCache[resolvedKernelName] else {
                 throw MetalCompilerError.kernelNotFound(resolvedKernelName)
             }
@@ -1751,46 +1747,26 @@ public struct MetalInferenceCompiler: Sendable {
                 ]
             )
 
-        // MARK: Conv1d (temporal depthwise conv with conv_state)
-        // Uses conv_state_update kernel: shifts state, appends in_proj output, convolves.
-        // conv_state persists across decode steps for causal temporal convolution.
+        // MARK: Conv1d (depthwise conv for ShortConv)
+        // in_proj [3*hiddenSize] is treated as [kernelSize × hiddenSize] — the temporal
+        // window is encoded within the single-token projection, not across tokens.
         case .compute(let operation) where operation is Conv1dOperation:
             let convOp = operation as! Conv1dOperation
             let (weightBuffer, weightOffset) = resolveWeight(role: "conv_weight")
             let slotBytes = slotDimension * elementSize
             routingState.lastOutputIsHidden = false
             routingState.projectionIndex = 0
-
-            if let convState = bufferSet.convState {
-                // Use conv_state_update: temporal conv with state
-                let convLayerOffset = kvCacheIndex > 0 ? 0 : routingState.convLayerIndex * bufferSet.convStateKernelSize * bufferSet.convStateDimension * elementSize
-                routingState.convLayerIndex += 1
-                return (
-                    buffers: [
-                        (0, convState, convLayerOffset),           // conv state (in-place update)
-                        (1, bufferSet.scratch, 1 * slotBytes),    // new input (first `dimension` of in_proj)
-                        (2, weightBuffer, weightOffset),           // conv weight
-                        (3, bufferSet.scratch, 0),                 // conv output
-                    ],
-                    bytes: [
-                        uint32Binding(4, UInt32(convOp.dimension)),
-                        uint32Binding(5, UInt32(convOp.kernelSize)),
-                    ]
-                )
-            } else {
-                // Fallback: no conv state (original behavior)
-                return (
-                    buffers: [
-                        (0, bufferSet.scratch, 1 * slotBytes),
-                        (1, weightBuffer, weightOffset),
-                        (2, bufferSet.scratch, 0),
-                    ],
-                    bytes: [
-                        uint32Binding(3, UInt32(convOp.dimension)),
-                        uint32Binding(4, UInt32(convOp.kernelSize)),
-                    ]
-                )
-            }
+            return (
+                buffers: [
+                    (0, bufferSet.scratch, 1 * slotBytes),   // input from in_proj (slot 1)
+                    (1, weightBuffer, weightOffset),          // conv weight
+                    (2, bufferSet.scratch, 0),                // output to slot 0
+                ],
+                bytes: [
+                    uint32Binding(3, UInt32(convOp.dimension)),
+                    uint32Binding(4, UInt32(convOp.kernelSize)),
+                ]
+            )
 
         // MARK: Default (unsupported compute operations)
         default:
