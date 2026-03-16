@@ -121,7 +121,7 @@ struct LiveModelDiagnosticTests {
     /// Config matching the ACTUAL LFM2.5-1.2B-Thinking config.json on disk.
     static func makeConfig() -> ModelConfig {
         ModelConfig(
-            hiddenSize: 2048, layerCount: 16, intermediateSize: 12288,
+            hiddenSize: 2048, layerCount: 16, intermediateSize: 8192,
             vocabSize: 65536, attentionHeads: 32, kvHeads: 8, headDim: 64,
             attentionBias: false, mlpBias: false, normEps: 1e-5,
             normKind: .rmsNorm, ropeTheta: 1000000.0, ropeDimension: 64,
@@ -313,10 +313,10 @@ struct LiveModelDiagnosticTests {
 
         let compiler = MetalInferenceCompiler()
         let decodePlan = try compiler.compile(
-            graph: resolved, hiddenSize: 2048, intermediateSize: 12288,
+            graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
             vocabSize: 65536, stafWeightStore: store, device: device)
         let prefillPlan = try compiler.compilePrefill(
-            graph: resolved, hiddenSize: 2048, intermediateSize: 12288,
+            graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
             vocabSize: 65536, maximumSequenceLength: 4096,
             stafWeightStore: store, device: device)
 

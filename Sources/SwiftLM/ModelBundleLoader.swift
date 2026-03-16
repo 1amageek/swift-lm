@@ -239,7 +239,12 @@ struct HFConfigDecoder {
         guard let layerCount = json["num_hidden_layers"] as? Int else {
             throw ModelBundleLoaderError.invalidConfig("Missing num_hidden_layers")
         }
-        let intermediateSize = json["intermediate_size"] as? Int ?? hiddenSize * 4
+        // SwiGLU models: config intermediate_size is the "theoretical" size.
+        // Actual gate_proj/up_proj weight shape is [intermediate_size * 2/3, hidden_size].
+        // We need the ACTUAL weight dimension, not the config value.
+        let rawIntermediateSize = json["intermediate_size"] as? Int ?? hiddenSize * 4
+        let useSwiGLU = json["block_use_swiglu"] as? Bool ?? true
+        let intermediateSize = useSwiGLU ? (rawIntermediateSize * 2 / 3) : rawIntermediateSize
         guard let vocabSize = json["vocab_size"] as? Int else {
             throw ModelBundleLoaderError.invalidConfig("Missing vocab_size")
         }

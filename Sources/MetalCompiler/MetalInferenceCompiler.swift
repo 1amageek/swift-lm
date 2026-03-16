@@ -1840,9 +1840,11 @@ public struct MetalInferenceCompiler: Sendable {
 
     /// Get or compile the Metal library. Cached in memory after first compilation.
     private static func getOrCompileLibrary(device: MTLDevice) throws -> MTLLibrary {
-        if let cached = libraryCache.get() {
-            return cached
-        }
+        // Disable library cache to ensure fresh compilation with current options.
+        // TODO: re-enable cache after fastMath investigation is complete.
+        // if let cached = libraryCache.get() {
+        //     return cached
+        // }
 
         let compileOptions = MTLCompileOptions()
         compileOptions.fastMathEnabled = false

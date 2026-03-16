@@ -186,7 +186,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 let hs = (0..<min(4, hiddenSize)).map { hp[$0] }
                 let ss = (0..<min(4, hiddenSize)).map { sp[$0] }
                 var extra = ""
-                if stepIndex >= 10 && stepIndex <= 13 {
+                if stepIndex >= 0 && stepIndex <= 13 {
                     // Scan each scratch slot separately
                     let f32Size = MemoryLayout<Float>.size
                     let slotBytes = prefill.buffers.scratch.length / 4  // 4 slots
@@ -205,7 +205,21 @@ public struct MetalInferenceModel: @unchecked Sendable {
                             extra += " slot\(slot)(NaN=\(nanC) inf=\(infC) maxAbs=\(maxA) first=\(firstBad))"
                         }
                     }
-                    if extra.isEmpty { extra = " allSlots(clean)" }
+                    // Also scan hidden per-position
+                let hiddenF32Count = prefill.buffers.hidden.length / MemoryLayout<Float>.size
+                var hMaxAbs: Float = 0; var hWorstPos = -1; var hNaNCount = 0
+                for pos in 0..<seqLen {
+                    var posMax: Float = 0; var posNaN = false
+                    for d in 0..<hiddenSize {
+                        let v = hp[pos * hiddenSize + d]
+                        if v.isNaN { posNaN = true; hNaNCount += 1 }
+                        let a = abs(v); if a.isFinite && a > posMax { posMax = a }
+                    }
+                    if posMax > hMaxAbs { hMaxAbs = posMax; hWorstPos = pos }
+                }
+                extra += " hidden(maxAbs=\(hMaxAbs) worstPos=\(hWorstPos) hNaN=\(hNaNCount))"
+
+                if extra.isEmpty { extra = " allClean" }
                 }
                 print("[Prefill step \(stepIndex)] (\(modeStr)) [\(kernelLabel)] hidden=\(hs) hNaN=\(hasNaN) scratch=\(ss) sNaN=\(scratchNaN)\(extra)")
             }
