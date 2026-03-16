@@ -74,6 +74,25 @@ public struct MetalInferenceModel: @unchecked Sendable {
         cb.commit()
         cb.waitUntilCompleted()
         if let error = cb.error { print("[MetalInference] GPU error: \(error)") }
+
+        // Diagnostic: first 3 decode steps
+        if position < 989 {
+            let hp = b.hidden.contents().bindMemory(to: Float16.self, capacity: 4)
+            let hs = (0..<4).map { Float(hp[$0]) }
+            let hNaN = (0..<min(b.hidden.length / 2, 2048)).contains {
+                b.hidden.contents().bindMemory(to: Float16.self, capacity: $0 + 1)[$0].isNaN
+            }
+            let sp = b.scratch.contents().bindMemory(to: Float16.self, capacity: 4)
+            let ss = (0..<4).map { Float(sp[$0]) }
+            let lp = b.logits.contents().bindMemory(to: Float16.self, capacity: 8)
+            let ls = (0..<8).map { Float(lp[$0]) }
+            let logitsNaN = (0..<min(b.logits.length / 2, 1024)).contains {
+                b.logits.contents().bindMemory(to: Float16.self, capacity: $0 + 1)[$0].isNaN
+            }
+            let tokenOut = b.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+            print("[Decode pos=\(position)] tokenIn=\(tokenID) hidden=\(hs) hNaN=\(hNaN) scratch=\(ss) logits=\(ls) lNaN=\(logitsNaN) tokenOut=\(tokenOut)")
+        }
+
         position += 1
         return b.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
     }
