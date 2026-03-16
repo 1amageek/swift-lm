@@ -15,7 +15,7 @@ import OrderedCollections
 @Suite("Live Model Diagnostic")
 struct LiveModelDiagnosticTests {
 
-    static let stafPath = "/Users/1amageek/Library/Containers/team.stamp.JARDIS.ml/Data/Documents/huggingface/models/LiquidAI/LFM2.5-1.2B-Thinking/model.staf"
+    static let stafPath = "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf"
 
     @Test("Single command buffer prefill with real STAF (matches app behavior)")
     func liveModelSingleCommandBuffer() throws {
@@ -237,9 +237,9 @@ struct LiveModelDiagnosticTests {
                 // Dump weight data at this step's weight binding
                 for (idx, buf, off) in step.bufferBindings {
                     if buf.length > 100_000_000 {  // STAF weight buffer is large
-                        let wp = (buf.contents() + off).bindMemory(to: UInt16.self, capacity: 8)
-                        let wSample = (0..<8).map { String(format: "0x%04x", wp[$0]) }
-                        let wFloat = (0..<8).map { Float(Float16(bitPattern: wp[$0])) }
+                        let wp = (buf.contents() + off).bindMemory(to: BFloat16.self, capacity: 8)
+                        let wSample = (0..<8).map { String(format: "0x%04x", wp[$0].bitPattern) }
+                        let wFloat = (0..<8).map { wp[$0].floatValue }
                         print("[Proj dump] weight bind[\(idx)] raw=\(wSample) asF16=\(wFloat)")
                         // Check for NaN in weights
                         let wSize = min(buf.length - off, 50_000_000) / 2
@@ -269,7 +269,7 @@ struct LiveModelDiagnosticTests {
         }
     }
 
-    static let modelDir = "/Users/1amageek/Library/Containers/team.stamp.JARDIS.ml/Data/Documents/huggingface/models/LiquidAI/LFM2.5-1.2B-Thinking"
+    static let modelDir = "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
 
     @Test("Run prefill via MetalInferenceModel with REAL tokens from tokenizer")
     func prefillViaInferenceModel() async throws {

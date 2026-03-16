@@ -412,6 +412,10 @@ public struct STAFConverter: Sendable {
             }
             return tensorData
 
+        case .bf16RowMajor:
+            // BF16 data stored as-is — gemv_bf16 kernel reads BF16 natively
+            return tensorData
+
         case .q4Group64ScaleF16, .q4Group128ScaleF16:
             return try repackMLXQuantized(
                 entry: entry, weightData: tensorData,
@@ -548,18 +552,15 @@ public struct STAFConverter: Sendable {
     }
 
     private func convertBFloat16ToFloat16(_ data: Data) -> Data {
-        let count = data.count / 2
-        var output = Data(count: count * 2)
+        let count = data.count / MemoryLayout<BFloat16>.size
+        var output = Data(count: count * MemoryLayout<Float16>.size)
 
         data.withUnsafeBytes { source in
             output.withUnsafeMutableBytes { destination in
-                let bf16 = source.bindMemory(to: UInt16.self)
+                let bf16 = source.bindMemory(to: BFloat16.self)
                 let fp16 = destination.bindMemory(to: Float16.self)
                 for i in 0..<count {
-                    // BF16 → Float32 → Float16
-                    let f32Bits = UInt32(bf16[i]) << 16
-                    let f32 = Float(bitPattern: f32Bits)
-                    fp16[i] = Float16(f32)
+                    fp16[i] = bf16[i].float16Value
                 }
             }
         }

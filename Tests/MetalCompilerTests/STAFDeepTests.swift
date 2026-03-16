@@ -525,14 +525,13 @@ struct STAFDeepTests {
         defer { cleanup(tempDirectory) }
 
         // BF16 identity-like matrix: 2×4
-        // Row 0: [1, 0, 0, 0] in BF16
-        // Row 1: [0, 0, 1, 0] in BF16
+        // Row 0: [1, 0, 0, 0]
+        // Row 1: [0, 0, 1, 0]
         let outputDimension = 2
         let inputDimension = 4
-        // BF16 representations: 1.0=0x3F80, 0.0=0x0000
-        var bf16Weights: [UInt16] = [
-            0x3F80, 0x0000, 0x0000, 0x0000,  // [1, 0, 0, 0]
-            0x0000, 0x0000, 0x3F80, 0x0000,  // [0, 0, 1, 0]
+        var bf16Weights: [BFloat16] = [
+            .one, .zero, .zero, .zero,  // [1, 0, 0, 0]
+            .zero, .zero, .one, .zero,  // [0, 0, 1, 0]
         ]
 
         let safetensorsURL = tempDirectory.appendingPathComponent("model.safetensors")
@@ -540,7 +539,7 @@ struct STAFDeepTests {
             tensors: [
                 TestTensor(name: "test.weight", dtype: "BF16",
                            shape: [outputDimension, inputDimension],
-                           data: Data(bytes: &bf16Weights, count: bf16Weights.count * 2))
+                           data: Data(bytes: &bf16Weights, count: bf16Weights.count * MemoryLayout<BFloat16>.size))
             ],
             to: safetensorsURL)
 
@@ -618,7 +617,7 @@ struct STAFDeepTests {
         // FP16 dense
         var fp16Values: [Float16] = Array(repeating: Float16(1.0), count: 8)
         // BF16 dense
-        var bf16Values: [UInt16] = Array(repeating: 0x3F80, count: 8)
+        var bf16Values: [BFloat16] = Array(repeating: .one, count: 8)
         // FP32 dense (converted to FP16)
         var fp32Values: [Float] = Array(repeating: 1.0, count: 8)
         // Q4 G64: needs packedDim=8 (64 elements) and companion scales/biases

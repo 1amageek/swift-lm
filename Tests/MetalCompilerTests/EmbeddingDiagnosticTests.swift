@@ -20,20 +20,17 @@ struct EmbeddingDiagnosticTests {
         let vocabSize = 100
 
         // Create BF16 embedding table with known values
-        // BF16(1.0) = 0x3F80, BF16(2.0) = 0x4000, BF16(0.5) = 0x3F00
-        var bf16Table: [UInt16] = (0..<vocabSize * embeddingDimension).map { i in
+        var bf16Table: [BFloat16] = (0..<vocabSize * embeddingDimension).map { i in
             // Each token has a unique value: token_id * 0.01 + dim * 0.001
             let tokenID = i / embeddingDimension
             let dim = i % embeddingDimension
             let value = Float(tokenID) * 0.01 + Float(dim) * 0.001
-            // Convert to BF16: float32 → truncate lower 16 bits
-            let f32Bits = value.bitPattern
-            return UInt16(f32Bits >> 16)
+            return BFloat16(value)
         }
 
         let tableBuffer = device.makeBuffer(
             bytes: &bf16Table,
-            length: bf16Table.count * 2,
+            length: bf16Table.count * MemoryLayout<BFloat16>.size,
             options: .storageModeShared)!
 
         let options = MTLCompileOptions()
@@ -131,18 +128,17 @@ struct EmbeddingDiagnosticTests {
         let vocabSize = 10
         let seqLen = 5
 
-        // BF16 embedding: token i → all dims = BF16(float(i + 1))
-        var bf16Table = [UInt16](repeating: 0, count: vocabSize * embeddingDimension)
+        // BF16 embedding: token i → all dims = BFloat16(float(i + 1))
+        var bf16Table = [BFloat16](repeating: .zero, count: vocabSize * embeddingDimension)
         for tokenID in 0..<vocabSize {
-            let value = Float(tokenID + 1)
-            let bf16 = UInt16(value.bitPattern >> 16)
+            let bf16 = BFloat16(Float(tokenID + 1))
             for dim in 0..<embeddingDimension {
                 bf16Table[tokenID * embeddingDimension + dim] = bf16
             }
         }
 
         let tableBuffer = device.makeBuffer(
-            bytes: &bf16Table, length: bf16Table.count * 2, options: .storageModeShared)!
+            bytes: &bf16Table, length: bf16Table.count * MemoryLayout<BFloat16>.size, options: .storageModeShared)!
 
         // Input tokens: [0, 1, 2, 3, 4]
         var tokenIDs: [Int32] = [0, 1, 2, 3, 4]
@@ -220,10 +216,9 @@ struct EmbeddingDiagnosticTests {
             bytes: &input, length: input.count * 2, options: .storageModeShared)!
 
         // BF16 weight: all 1.0
-        let bf16One = UInt16(Float(1.0).bitPattern >> 16)
-        var bf16Weight = [UInt16](repeating: bf16One, count: dimension)
+        var bf16Weight = [BFloat16](repeating: .one, count: dimension)
         let weightBuffer = device.makeBuffer(
-            bytes: &bf16Weight, length: dimension * 2, options: .storageModeShared)!
+            bytes: &bf16Weight, length: dimension * MemoryLayout<BFloat16>.size, options: .storageModeShared)!
 
         let outputBuffer = device.makeBuffer(
             length: seqLen * dimension * 2, options: .storageModeShared)!

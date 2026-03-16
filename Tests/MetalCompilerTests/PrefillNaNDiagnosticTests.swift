@@ -378,15 +378,15 @@ private func createBF16Weights(
     // Helper: create BF16 tensor with small random-ish values
     func bf16Tensor(name: String, shape: [Int]) {
         let count = shape.reduce(1, *)
-        var data = [UInt16](repeating: 0, count: count)
+        var data = [BFloat16](repeating: .zero, count: count)
         for i in 0..<count {
             // Small values around 0.01 to avoid overflow
             let value = Float(((i * 7 + 13) % 100)) * 0.001 - 0.05
-            data[i] = UInt16(value.bitPattern >> 16)
+            data[i] = BFloat16(value)
         }
         tensors.append(TestTensor(
             name: name, dtype: "BF16", shape: shape,
-            data: Data(bytes: &data, count: count * 2)))
+            data: Data(bytes: &data, count: count * MemoryLayout<BFloat16>.size)))
     }
 
     // Embedding
@@ -423,14 +423,14 @@ private func createBF16WeightsWithConv(
 
     func bf16Tensor(name: String, shape: [Int]) {
         let count = shape.reduce(1, *)
-        var data = [UInt16](repeating: 0, count: count)
+        var data = [BFloat16](repeating: .zero, count: count)
         for i in 0..<count {
             let value = Float(((i * 7 + 13) % 100)) * 0.001 - 0.05
-            data[i] = UInt16(value.bitPattern >> 16)
+            data[i] = BFloat16(value)
         }
         tensors.append(TestTensor(
             name: name, dtype: "BF16", shape: shape,
-            data: Data(bytes: &data, count: count * 2)))
+            data: Data(bytes: &data, count: count * MemoryLayout<BFloat16>.size)))
     }
 
     bf16Tensor(name: "model.embed_tokens.weight", shape: [vocabSize, hiddenSize])

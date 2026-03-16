@@ -80,8 +80,8 @@ struct STAFRoundtripTests {
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        // BF16: 1.0 = 0x3F80, 2.0 = 0x4000, -1.0 = 0xBF80
-        let bf16Values: [UInt16] = [0x3F80, 0x4000, 0xBF80, 0x4040]
+        // BF16: 1.0, 2.0, -1.0, 3.0
+        let bf16Values: [BFloat16] = [1.0, 2.0, -1.0, 3.0]
         let elementCount = bf16Values.count
         var bf16Data = bf16Values
 
@@ -89,7 +89,7 @@ struct STAFRoundtripTests {
         try writeSafetensors(
             tensors: [
                 TestTensor(name: "test.weight", dtype: "BF16", shape: [1, elementCount], data: Data(
-                    bytes: &bf16Data, count: elementCount * 2))
+                    bytes: &bf16Data, count: elementCount * MemoryLayout<BFloat16>.size))
             ],
             to: safetensorsURL)
 
@@ -108,14 +108,14 @@ struct STAFRoundtripTests {
 
         // BF16 data should be preserved as-is (raw bytes)
         let bufferPointer = store.buffer.contents() + entry.bufferOffset
-        let loadedUInt16 = UnsafeBufferPointer(
-            start: bufferPointer.bindMemory(to: UInt16.self, capacity: elementCount),
+        let loaded = UnsafeBufferPointer(
+            start: bufferPointer.bindMemory(to: BFloat16.self, capacity: elementCount),
             count: elementCount)
 
         for i in 0..<elementCount {
             #expect(
-                loadedUInt16[i] == bf16Values[i],
-                "BF16 mismatch at index \(i): loaded=0x\(String(loadedUInt16[i], radix: 16)) expected=0x\(String(bf16Values[i], radix: 16))")
+                loaded[i] == bf16Values[i],
+                "BF16 mismatch at index \(i): loaded=\(loaded[i]) expected=\(bf16Values[i])")
         }
     }
 

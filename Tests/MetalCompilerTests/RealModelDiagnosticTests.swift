@@ -214,15 +214,15 @@ private func createRealScaleWeights(
 
     func bf16Tensor(name: String, shape: [Int]) {
         let count = shape.reduce(1, *)
-        var data = [UInt16](repeating: 0, count: count)
+        var data = [BFloat16](repeating: .zero, count: count)
         // Small values to avoid overflow: ~0.01 scale
         for i in 0..<count {
             let value = Float(((i * 7 + 13) % 200)) * 0.0001 - 0.01
-            data[i] = UInt16(value.bitPattern >> 16)
+            data[i] = BFloat16(value)
         }
         tensors.append(TestTensor(
             name: name, dtype: "BF16", shape: shape,
-            data: Data(bytes: &data, count: count * 2)))
+            data: Data(bytes: &data, count: count * MemoryLayout<BFloat16>.size)))
     }
 
     // Embedding
