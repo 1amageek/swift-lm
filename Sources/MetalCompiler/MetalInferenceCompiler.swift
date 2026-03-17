@@ -2134,14 +2134,15 @@ public struct MetalInferenceCompiler: Sendable {
             var bufferBindings: [(index: Int, buffer: MTLBuffer, offset: Int)] = []
             var bytesBindings: [(index: Int, value: [UInt8])] = []
 
-            // Each fragment gets its own data and weight buffer binding
-            // Data slots: Q is at slot 1, K is at slot 2 (from projections before)
-            for (i, frag) in batch.fragments.enumerated() {
-                let scratchSlotIndex = routingState.projectionIndex - batch.fragments.count + i + 1
-                bufferBindings.append((i, bufferSet.scratch, max(0, scratchSlotIndex) * slotBytes))
+            // Data slots: in-place fragments operate on consecutive projection outputs.
+            // First batched fragment → slot 1 (first projection output),
+            // second → slot 2, etc.
+            for i in 0..<batch.fragments.count {
+                let scratchSlotIndex = 1 + i
+                bufferBindings.append((i, bufferSet.scratch, scratchSlotIndex * slotBytes))
             }
 
-            // Weight bindings
+            // Weight bindings: resolve from each fragment's weightSlots
             for (i, frag) in batch.fragments.enumerated() {
                 if let weightSlot = frag.weightSlots.first {
                     let role = weightSlot.field ?? "weight"
@@ -2150,7 +2151,8 @@ public struct MetalInferenceCompiler: Sendable {
                 }
             }
 
-            // Constants: count per fragment, headDimension, epsilon
+            // Constants: head count per fragment, then shared headDimension and epsilon.
+            // All derived from fragment properties — no type checks.
             let bytesStart = 2 * batch.fragments.count
             for (i, frag) in batch.fragments.enumerated() {
                 if case .perHead(let headCount) = frag.dispatchDimension {
@@ -2158,10 +2160,17 @@ public struct MetalInferenceCompiler: Sendable {
                 }
             }
 
-            // headDimension and epsilon from first fragment
-            if let firstQKNorm = batch.fragments.first as? QKNormFragment {
-                bytesBindings.append(uint32Binding(bytesStart + batch.fragments.count, UInt32(firstQKNorm.headDimension)))
-                bytesBindings.append(floatBinding(bytesStart + batch.fragments.count + 1, firstQKNorm.epsilon))
+            // Extract headDimension from dispatchDimension + weight slot count.
+            // For per-head fragments: total elements / headCount = headDimension.
+            if case .perHead(let totalHeads) = batch.dispatchDimension,
+               let firstFrag = batch.fragments.first,
+               case .perHead(let firstHeadCount) = firstFrag.dispatchDimension {
+                // headDimension: infer from hiddenSize / headCount of first fragment.
+                // For QK norm: q_proj output = headCount * headDimension.
+                let headDimension = hiddenSize / firstHeadCount
+                bytesBindings.append(uint32Binding(bytesStart + batch.fragments.count, UInt32(headDimension)))
+                let epsilon = batch.fragments.first?.normEpsilon ?? 1e-6
+                bytesBindings.append(floatBinding(bytesStart + batch.fragments.count + 1, epsilon))
             }
 
             return (buffers: bufferBindings, bytes: bytesBindings)

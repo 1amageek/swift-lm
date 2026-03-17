@@ -165,14 +165,11 @@ public struct MetalInferenceModel: @unchecked Sendable {
             // Prefill hidden is shared — CPU-accessible for F32→F16 conversion.
             // Write F16 values to a temp shared buffer, then blit to private decode hidden.
             if self.plan.buffers.hidden.storageMode == .private {
-                // Convert F32→F16 into the prefill tokenOut area (reuse as temp, small enough)
-                // Actually use a proper temp: prefill's tokenOut is only 4 bytes.
-                // Instead, write F16 values into the beginning of prefill's hidden buffer
-                // (which is shared and large enough), then blit from there.
+                // Convert F32→F16 and blit to private decode hidden.
+                // Use prefill scratch buffer as staging (shared, large enough).
                 let src = (prefill.buffers.hidden.contents() + lastTokenOffset)
                     .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
-                // Write F16 at offset 0 of prefill hidden (reuse as staging area)
-                let staging = prefill.buffers.hidden.contents()
+                let staging = prefill.buffers.scratch.contents()
                     .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
                 for i in 0..<decodeHiddenSize {
                     staging[i] = Float16(src[i])
@@ -180,7 +177,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 // Blit from staging (shared) to decode hidden (private)
                 if let blitCB = commandQueue.makeCommandBuffer(),
                    let blit = blitCB.makeBlitCommandEncoder() {
-                    blit.copy(from: prefill.buffers.hidden, sourceOffset: 0,
+                    blit.copy(from: prefill.buffers.scratch, sourceOffset: 0,
                               to: self.plan.buffers.hidden, destinationOffset: 0,
                               size: decodeHiddenSize * MemoryLayout<Float16>.size)
                     blit.endEncoding()

@@ -35,6 +35,10 @@ public protocol PrimitiveMetalKernelFragment: MetalKernelFragment where Fragment
     /// The optimizer uses this to determine batchability.
     var isInPlace: Bool { get }
 
+    /// Epsilon value for normalization-type fragments.
+    /// nil for fragments that don't perform normalization.
+    var normEpsilon: Float? { get }
+
     /// Generate the composable MSL computation body for this fragment.
     ///
     /// Fusable fragments return a body using standardized variable names
@@ -71,6 +75,7 @@ extension PrimitiveMetalKernelFragment {
     public var weightSlots: [MetalWeightSlot] { [] }
     public var cacheSlots: [MetalCacheSlot] { [] }
     public var isInPlace: Bool { false }
+    public var normEpsilon: Float? { nil }
     public func kernelBody(bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String? { nil }
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
         fatalError("Fragment \(type(of: self)) must implement either kernelBody() or kernelSource()")
@@ -91,6 +96,7 @@ public struct Reduction: PrimitiveMetalKernelFragment {
     }
 
     public var isFusable: Bool { true }
+    public var normEpsilon: Float? { epsilon }
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: dimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: nil, role: .weight)] }
 }
@@ -239,6 +245,7 @@ public struct QKNormFragment: PrimitiveMetalKernelFragment {
 
     public var isFusable: Bool { true }
     public var isInPlace: Bool { true }
+    public var normEpsilon: Float? { epsilon }
     public var dispatchDimension: MetalDispatchDimension { .perHead(headCount: headCount) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: weightRole, role: .weight)] }
 }
