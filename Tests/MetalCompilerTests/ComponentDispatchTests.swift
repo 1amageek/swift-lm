@@ -50,7 +50,8 @@ struct ComponentDispatchTests {
             return
         }
         if let body = fragment as? any _FragmentBodyAccessor {
-            body._visitBody { child in visitFragmentTree(child, visitor: visitor) }
+            let ctx = KernelContext(bufferPrecision: .float16, weightFormat: .float16)
+            body._visitBody(context: ctx) { child in visitFragmentTree(child, visitor: visitor) }
         }
     }
 
@@ -140,7 +141,7 @@ struct ComponentDispatchTests {
     @Test("TokenEmbedding produces GatherFragment with correct dimension")
     func tokenEmbeddingDimension() {
         let emb = TokenEmbeddingAttributes(vocabSize: 65536, embeddingSize: 2048)
-        let frag = emb.fragment
+        let frag = emb.fragment(context: KernelContext(bufferPrecision: .float16, weightFormat: .float16))
         #expect(frag.embeddingDimension == 2048)
         #expect(frag.vocabularySize == 65536)
     }
@@ -170,7 +171,7 @@ struct ComponentDispatchTests {
     @Test("RMSNorm fragment has correct dimension")
     func rmsNormDimension() {
         let norm = RMSNormAttributes(dimension: 2048, epsilon: 1e-5)
-        let frag = norm.fragment
+        let frag = norm.fragment(context: KernelContext(bufferPrecision: .float16, weightFormat: .float16))
         #expect(frag.dimension == 2048)
         #expect(frag.epsilon == 1e-5)
         #expect(frag.isFusable == true)

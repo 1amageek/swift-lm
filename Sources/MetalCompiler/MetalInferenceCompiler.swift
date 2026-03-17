@@ -208,7 +208,7 @@ public struct MetalInferenceCompiler: Sendable {
         var routingState = BufferRoutingState()
 
         for entry in fusedEntries {
-            let resolvedKernelName = kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore)
+            let resolvedKernelName = kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore, kernelContext: kernelContext)
             guard let pipeline = pipelineCache[resolvedKernelName] else {
                 throw MetalCompilerError.kernelNotFound(resolvedKernelName)
             }
@@ -1397,87 +1397,6 @@ public struct MetalInferenceCompiler: Sendable {
 
     // MARK: - Fragment Tree Walk
 
-    /// Recursively walk a MetalKernelFragment tree and emit dispatch entries.
-    ///
-    /// - Primitive fragments (Reduction, LinearFragment, etc.) → emit as .fragment or .projection
-    /// - TupleFragment → walk each child in order
-    /// - OptionalFragment → walk content if present
-    /// - ConditionalFragment → walk the active branch
-    private func emitFragmentTree(
-        _ fragment: any MetalKernelFragment,
-        bindings: [ParameterBinding],
-        layerIndex: Int?,
-        context: inout WalkContext
-    ) {
-        // Primitive fragment → emit dispatch entry
-        if let primitive = fragment as? any PrimitiveMetalKernelFragment {
-            // LinearFragment → .projection (for GEMV/GEMM dispatch)
-            if let linear = primitive as? LinearFragment {
-                let projection = MetalProjection(
-                    field: linear.field,
-                    inputDimension: linear.inputDimension,
-                    outputDimension: linear.outputDimension)
-                // isOutput is resolved later by marking the last projection
-                context.emit(.projection(projection), parameterBindings: bindings, layerIndex: layerIndex)
-            }
-            // FlashAttentionFragment → register KV cache slot + emit .fragment
-            else if let flash = primitive as? FlashAttentionFragment {
-                context.cacheSlots.append(CacheSlotInfo(
-                    kvHeadCount: flash.kvHeadCount,
-                    headDimension: flash.headDimension))
-                context.emit(.fragment(primitive), parameterBindings: bindings, layerIndex: layerIndex)
-            }
-            // Other primitives → emit .fragment
-            else {
-                context.emit(.fragment(primitive), parameterBindings: bindings, layerIndex: layerIndex)
-            }
-            return
-        }
-
-        // Walk composite fragments by type-casting
-        walkCompositeFragment(fragment, bindings: bindings, layerIndex: layerIndex, context: &context)
-    }
-
-    /// Walk composite (non-primitive) fragment types.
-    private func walkCompositeFragment(
-        _ fragment: any MetalKernelFragment,
-        bindings: [ParameterBinding],
-        layerIndex: Int?,
-        context: inout WalkContext
-    ) {
-        // TupleFragment — use parameter pack iteration
-        if let _ = fragment as? any _TupleFragmentProtocol {
-            (fragment as! any _TupleFragmentProtocol)._visitChildren { child in
-                emitFragmentTree(child, bindings: bindings, layerIndex: layerIndex, context: &context)
-            }
-            return
-        }
-
-        // OptionalFragment
-        if let opt = fragment as? any _OptionalFragmentProtocol {
-            opt._visitContent { child in
-                emitFragmentTree(child, bindings: bindings, layerIndex: layerIndex, context: &context)
-            }
-            return
-        }
-
-        // ConditionalFragment
-        if let cond = fragment as? any _ConditionalFragmentProtocol {
-            cond._visitActive { child in
-                emitFragmentTree(child, bindings: bindings, layerIndex: layerIndex, context: &context)
-            }
-            return
-        }
-
-        // Generic composite: recurse into the fragment's body.
-        // Uses type-erased access to avoid associated type constraints.
-        if let bodyAccessor = fragment as? any _FragmentBodyAccessor {
-            bodyAccessor._visitBody { child in
-                emitFragmentTree(child, bindings: bindings, layerIndex: layerIndex, context: &context)
-            }
-        }
-    }
-
     // MARK: - Primitive Collection (for optimizer)
 
     /// Collect all primitives from a fragment tree without emitting.
@@ -1618,87 +1537,47 @@ public struct MetalInferenceCompiler: Sendable {
     // MARK: - Kernel Name Resolution
 
     /// Map a DispatchKind to the MSL kernel function name.
+    /// Map a DispatchKind to the MSL kernel function name.
     ///
-    /// For projections, the kernel depends on the weight's quantization format.
-    /// The STAF weight store is consulted to determine whether to use float16
-    /// GEMV or a quantized variant (gemv_q4_g64, gemv_q8_g32, etc.).
+    /// Uses KernelContext for weight format resolution — no STAF lookups.
+    /// Projection kernels still use STAF for per-tensor quantization format
+    /// (e.g., gemv_q4_g64 for quantized models).
     private func kernelName(
         for kind: DispatchKind,
         entry: DispatchEntry,
-        stafWeightStore: STAFWeightStore?
+        stafWeightStore: STAFWeightStore?,
+        kernelContext: KernelContext
     ) -> String {
+        let isBF16 = kernelContext.weightFormat == .bfloat16
+        let bf16Suffix = isBF16 ? "_bf16" : ""
+
         switch kind {
         case .projection(let projection, _):
-            // Look up the weight's quantization format from STAF
+            // Projection uses per-tensor format from STAF (supports mixed quantization)
             if let binding = entry.parameterBindings.first(where: { $0.role == projection.field }),
                let staf = stafWeightStore,
                let tensorInfo = staf.tensor(for: binding.tensorName) {
                 return tensorInfo.format.gemvKernelName
             }
-            return "gemv"  // fallback to float16
-        case .fusedCopyNorm:
-            let isBF16 = entry.parameterBindings.contains { binding in
-                guard let staf = stafWeightStore,
-                      let info = staf.tensor(for: binding.tensorName) else { return false }
-                return info.format.schemeIdentifier == .bf16RowMajor
-            }
-            return isBF16 ? "fused_copy_rms_norm_bf16" : "fused_copy_rms_norm"
-        case .fusedResidualAddCopyNorm:
-            let isBF16 = entry.parameterBindings.contains { binding in
-                guard let staf = stafWeightStore,
-                      let info = staf.tensor(for: binding.tensorName) else { return false }
-                return info.format.schemeIdentifier == .bf16RowMajor
-            }
-            return isBF16 ? "fused_residual_add_copy_rms_norm_bf16" : "fused_residual_add_copy_rms_norm"
+            return "gemv"
         case .fragment(let frag):
-            // Fragment-driven: kernel name derived from fragment type + weight format
-            // TODO: implement dynamic name resolution from fragment parameters
-            return resolveFragmentKernelName(frag, entry: entry, stafWeightStore: stafWeightStore)
+            return frag.kernelName(context: kernelContext)
+        case .fusedCopyNorm:
+            return "fused_copy_rms_norm" + bf16Suffix
+        case .fusedResidualAddCopyNorm:
+            return "fused_residual_add_copy_rms_norm" + bf16Suffix
         case .fusedResidualAddNorm:
-            let isBF16 = entry.parameterBindings.contains { binding in
-                guard let staf = stafWeightStore,
-                      let info = staf.tensor(for: binding.tensorName) else { return false }
-                return info.format.schemeIdentifier == .bf16RowMajor
-            }
-            return isBF16 ? "fused_residual_add_rms_norm_bf16" : "fused_residual_add_rms_norm"
+            return "fused_residual_add_rms_norm" + bf16Suffix
         case .batchedProjection(let batched):
-            if let binding = entry.parameterBindings.first(where: { $0.role == batched.projections[0].field }),
-               let staf = stafWeightStore,
-               let info = staf.tensor(for: binding.tensorName) {
-                let base = info.format.gemvKernelName
-                let suffix = base.hasSuffix("_bf16") ? "_bf16" : ""
-                return "batched_gemv\(batched.projections.count)\(suffix)"
-            }
-            return "batched_gemv\(batched.projections.count)"
+            return "batched_gemv\(batched.projections.count)" + bf16Suffix
         case .batchedFragment(let batch):
-            // Kernel name from first fragment + batch count
-            let firstFrag = batch.fragments[0]
-            let baseName = resolveFragmentKernelName(firstFrag, entry: entry, stafWeightStore: stafWeightStore)
+            let baseName = batch.fragments[0].kernelName(context: kernelContext)
             return "batched_\(baseName)_\(batch.fragments.count)"
         case .structuralCopy:
             return "copy_buffer"
         case .structuralAdd:
             return "residual_add"
         }
-    }
-
-    /// Derive kernel name from a primitive fragment and its context.
-    /// Derive kernel name from fragment protocol — no concrete type checks.
-    private func resolveFragmentKernelName(
-        _ fragment: any PrimitiveMetalKernelFragment,
-        kernelContext: KernelContext
-    ) -> String {
-        fragment.kernelName(context: kernelContext)
-    }
-
-    /// Legacy overload for call sites that still pass entry/stafWeightStore.
-    private func resolveFragmentKernelName(
-        _ fragment: any PrimitiveMetalKernelFragment,
-        entry: DispatchEntry,
-        stafWeightStore: STAFWeightStore?
-    ) -> String {
-        let wf = resolveModelWeightFormat(stafWeightStore)
-        return fragment.kernelName(context: KernelContext(bufferPrecision: .float16, weightFormat: wf))
     }
 
     /// Get the dispatch dimension for grid/threadgroup calculation.
@@ -2293,7 +2172,8 @@ public struct MetalInferenceCompiler: Sendable {
 
             case .fragment(let frag):
                 let weightFormat = resolveWeightFormat(forFragment: frag, entry: entry, stafWeightStore: stafWeightStore)
-                name = resolveFragmentKernelName(frag, entry: entry, stafWeightStore: stafWeightStore)
+                let fragCtx = KernelContext(bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+                name = frag.kernelName(context: fragCtx)
                 let kernelName = resolveKernelNameForPrecision(baseName: name, bufferPrecision: bufferPrecision)
                 if generatedNames.insert(kernelName).inserted {
                     if let src = MetalSourceGenerator.generateForFragment(frag, name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat) {
@@ -2402,7 +2282,8 @@ public struct MetalInferenceCompiler: Sendable {
 
             case .batchedFragment(let batch):
                 if bufferPrecision == .float16 {
-                    let kernelName = self.kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore)
+                    let ctx = KernelContext(bufferPrecision: bufferPrecision, weightFormat: resolveModelWeightFormat(stafWeightStore))
+                    let kernelName = self.kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore, kernelContext: ctx)
                     if generatedNames.insert(kernelName).inserted {
                         let weightFormat = resolveWeightFormat(role: "q_layernorm", entry: entry, stafWeightStore: stafWeightStore)
                         if batch.fragments.count == 2, case .perHead = batch.dispatchDimension {
@@ -2462,7 +2343,7 @@ public struct MetalInferenceCompiler: Sendable {
         case "argmax": return "argmax_f32"
         case "rope": return "rope_seq_f32"
         case "qk_rms_norm", "qk_rms_norm_bf16": return "qk_rms_norm_seq_f32"
-        case "conv_state_update": return "conv1d_causal_seq_f32"
+        case "conv_state_update", "conv_state_update_bf16": return "conv1d_causal_seq_f32"
         case "flash_attn_decode": return "flash_attn_decode_f32"
         default: return baseName
         }

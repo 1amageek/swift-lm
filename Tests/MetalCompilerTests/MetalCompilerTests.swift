@@ -10,7 +10,7 @@ struct FragmentProtocolTests {
     @Test
     func embeddingFragmentIsGather() {
         let a = TokenEmbeddingAttributes(vocabSize: 32000, embeddingSize: 2048)
-        let frag = a.fragment
+        let frag = a.fragment(context: KernelContext(bufferPrecision: .float16, weightFormat: .float16))
         #expect(frag is GatherFragment)
         if case .gather(let count) = frag.dispatchDimension {
             #expect(count == 2048)
@@ -20,7 +20,7 @@ struct FragmentProtocolTests {
     @Test
     func rmsNormFragmentIsReduction() {
         let a = RMSNormAttributes(dimension: 2048, epsilon: 1e-5)
-        let frag = a.fragment
+        let frag = a.fragment(context: KernelContext(bufferPrecision: .float16, weightFormat: .float16))
         #expect(frag is Reduction)
         if case .reduction(let dim) = frag.dispatchDimension {
             #expect(dim == 2048)
