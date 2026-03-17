@@ -128,7 +128,7 @@ struct LiveModelDiagnosticTests {
             ropeScaling: nil, tiedEmbeddings: true,
             expertCount: nil, expertsPerToken: nil, qkNorm: true,
             fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil, convKernelSize: 3,
+            ssmValueHeadDim: nil, convKernelSize: 3, convLCache: 3,
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",

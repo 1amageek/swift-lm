@@ -8,8 +8,10 @@ public protocol QuantizationFormat: Sendable {
     var schemeIdentifier: QuantizationSchemeIdentifier { get }
     /// MSL block struct name (e.g., "BlockQ4Affine").
     var blockStructName: String { get }
-    /// GEMV kernel function name for this format.
+    /// GEMV kernel function name for this format (decode, single token).
     var gemvKernelName: String { get }
+    /// GEMM kernel function name for this format (prefill, sequence).
+    func gemmKernelName(bufferPrecision: BufferPrecision) -> String
     /// Number of weights per block.
     var weightsPerBlock: Int { get }
     /// Byte size of one block.
@@ -26,6 +28,9 @@ public struct Float16Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .fp16RowMajor }
     public var blockStructName: String { "" }
     public var gemvKernelName: String { "gemv" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_f32s" : "gemm"
+    }
     public var weightsPerBlock: Int { 1 }
     public var bytesPerBlock: Int { 2 }
     public var bits: Int { 16 }
@@ -38,6 +43,9 @@ public struct BFloat16Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .bf16RowMajor }
     public var blockStructName: String { "" }
     public var gemvKernelName: String { "gemv_bf16" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_bf16_f32s" : "gemm_bf16"
+    }
     public var weightsPerBlock: Int { 1 }
     public var bytesPerBlock: Int { 2 }
     public var bits: Int { 16 }
@@ -64,6 +72,9 @@ public struct AffineQ4Group64Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .q4Group64ScaleF16 }
     public var blockStructName: String { "BlockQ4Affine64" }
     public var gemvKernelName: String { "gemv_q4_g64" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q4_g64_f32s" : "gemm_q4_g64"
+    }
     public var weightsPerBlock: Int { 64 }
     public var bytesPerBlock: Int { 4 + 32 }  // scale(2) + zero(2) + 64*4bit/8
     public var bits: Int { 4 }
@@ -85,6 +96,9 @@ public struct AffineQ4Group128Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .q4Group128ScaleF16 }
     public var blockStructName: String { "BlockQ4Affine128" }
     public var gemvKernelName: String { "gemv_q4_g128" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q4_g128_f32s" : "gemm_q4_g128"
+    }
     public var weightsPerBlock: Int { 128 }
     public var bytesPerBlock: Int { 4 + 64 }
     public var bits: Int { 4 }
@@ -99,6 +113,9 @@ public struct AffineQ8Group32Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .q8Group32ScaleF16 }
     public var blockStructName: String { "BlockQ8Affine32" }
     public var gemvKernelName: String { "gemv_q8_g32" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q8_g32_f32s" : "gemm_q8_g32"
+    }
     public var weightsPerBlock: Int { 32 }
     public var bytesPerBlock: Int { 4 + 32 }  // scale(2) + zero(2) + 32 bytes
     public var bits: Int { 8 }
@@ -111,6 +128,9 @@ public struct AffineQ8Group64Format: QuantizationFormat {
     public var schemeIdentifier: QuantizationSchemeIdentifier { .q8Group64ScaleF16 }
     public var blockStructName: String { "BlockQ8Affine64" }
     public var gemvKernelName: String { "gemv_q8_g64" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q8_g64_f32s" : "gemm_q8_g64"
+    }
     public var weightsPerBlock: Int { 64 }
     public var bytesPerBlock: Int { 4 + 64 }
     public var bits: Int { 8 }

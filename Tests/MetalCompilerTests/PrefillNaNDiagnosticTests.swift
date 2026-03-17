@@ -237,7 +237,7 @@ struct PrefillNaNDiagnosticTests {
             ropeScaling: nil, tiedEmbeddings: true,
             expertCount: nil, expertsPerToken: nil, qkNorm: false,
             fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil, convKernelSize: convKernelSize,
+            ssmValueHeadDim: nil, convKernelSize: convKernelSize, convLCache: convKernelSize,
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv"]
         )

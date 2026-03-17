@@ -57,7 +57,7 @@ struct RealModelDiagnosticTests {
             ropeScaling: nil, tiedEmbeddings: false,
             expertCount: nil, expertsPerToken: nil, qkNorm: true,
             fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil, convKernelSize: convKernelSize,
+            ssmValueHeadDim: nil, convKernelSize: convKernelSize, convLCache: convKernelSize,
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv", "attention"]
         )
