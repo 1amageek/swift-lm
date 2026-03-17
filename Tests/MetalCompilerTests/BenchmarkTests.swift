@@ -74,6 +74,34 @@ struct BenchmarkTests {
         print("[Benchmark] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
     }
 
+    // MARK: - Aggressive Optimizer Benchmark
+
+    @Test("Aggressive optimizer: decode throughput")
+    func aggressiveDecodeBenchmark() throws {
+        let (model, _) = try setupOrSkip(optimizer: AggressiveOptimizer())
+        var inferenceModel = model
+
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        var currentToken = inferenceModel.prefill(tokens: promptTokens)
+
+        // Warm-up
+        for _ in 0..<3 {
+            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
+        }
+
+        let decodeSteps = 50
+        let start = CFAbsoluteTimeGetCurrent()
+        for _ in 0..<decodeSteps {
+            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
+        }
+        let elapsed = CFAbsoluteTimeGetCurrent() - start
+
+        let tokPerSec = Double(decodeSteps) / elapsed
+        let msPerToken = elapsed / Double(decodeSteps) * 1000
+        print("[Benchmark/aggressive] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
+        print("[Benchmark/aggressive] dispatches: \(inferenceModel.plan.fusedEntryCount) (from \(inferenceModel.plan.unfusedEntryCount))")
+    }
+
     // MARK: - End-to-End Benchmark
 
     @Test("End-to-end: prefill + decode with memory diagnostics")
@@ -207,7 +235,9 @@ struct BenchmarkTests {
 
     // MARK: - Setup
 
-    private func setupOrSkip() throws -> (MetalInferenceModel, STAFWeightStore) {
+    private func setupOrSkip(
+        optimizer: (any DispatchOptimizer)? = nil
+    ) throws -> (MetalInferenceModel, STAFWeightStore) {
         guard let device = MTLCreateSystemDefaultDevice() else { throw BenchError.noDevice }
 
         let stafURL = URL(fileURLWithPath: Self.stafPath)
@@ -239,7 +269,7 @@ struct BenchmarkTests {
         let graph = try LFM2(config: config).makeModelGraph()
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
-        let compiler = MetalInferenceCompiler()
+        let compiler = MetalInferenceCompiler(optimizer: optimizer)
         let decodePlan = try compiler.compile(
             graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
             vocabSize: 65536, stafWeightStore: store, device: device)

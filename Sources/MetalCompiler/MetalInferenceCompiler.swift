@@ -1129,6 +1129,97 @@ public struct MetalInferenceCompiler: Sendable {
             }
             return steps
 
+        // MARK: Batched Projection → decompose into individual GEMMs
+        case .batchedProjection(let batched):
+            var steps: [MetalPrefillStep] = []
+            for (i, proj) in batched.projections.enumerated() {
+                let singleProjection = MetalProjection(
+                    field: proj.field,
+                    inputDimension: proj.inputDimension,
+                    outputDimension: proj.outputDimension)
+                let singleEntry = DispatchEntry(
+                    index: entry.index + i,
+                    kind: .projection(singleProjection, isOutput: false),
+                    parameterBindings: entry.parameterBindings,
+                    layerIndex: entry.layerIndex)
+                let projSteps = try buildPrefillSteps(
+                    entry: singleEntry,
+                    buffers: buffers,
+                    stafWeightStore: stafWeightStore,
+                    hiddenSize: hiddenSize,
+                    intermediateSize: intermediateSize,
+                    slotDimension: slotDimension,
+                    vocabSize: vocabSize,
+                    maximumSequenceLength: maximumSequenceLength,
+                    scratchElementSize: scratchElementSize,
+                    kvCacheIndex: &kvCacheIndex,
+                    routingState: &routingState,
+                    pipelineCache: pipelineCache,
+                    device: device)
+                steps.append(contentsOf: projSteps)
+            }
+            return steps
+
+        // MARK: Batched Fragment → decompose into individual per-head dispatches
+        case .batchedFragment(let batch):
+            var steps: [MetalPrefillStep] = []
+            for (i, frag) in batch.fragments.enumerated() {
+                let singleEntry = DispatchEntry(
+                    index: entry.index + i,
+                    kind: .fragment(frag),
+                    parameterBindings: entry.parameterBindings,
+                    layerIndex: entry.layerIndex)
+                let fragSteps = try buildPrefillSteps(
+                    entry: singleEntry,
+                    buffers: buffers,
+                    stafWeightStore: stafWeightStore,
+                    hiddenSize: hiddenSize,
+                    intermediateSize: intermediateSize,
+                    slotDimension: slotDimension,
+                    vocabSize: vocabSize,
+                    maximumSequenceLength: maximumSequenceLength,
+                    scratchElementSize: scratchElementSize,
+                    kvCacheIndex: &kvCacheIndex,
+                    routingState: &routingState,
+                    pipelineCache: pipelineCache,
+                    device: device)
+                steps.append(contentsOf: fragSteps)
+            }
+            return steps
+
+        // MARK: Fused Residual Add + Norm → decompose into add + norm
+        case .fusedResidualAddNorm(let fusedOp):
+            // Decompose into structuralAdd + Reduction for prefill
+            let addEntry = DispatchEntry(
+                index: entry.index,
+                kind: .structuralAdd(dimension: fusedOp.dimension),
+                parameterBindings: [],
+                layerIndex: entry.layerIndex)
+            let normEntry = DispatchEntry(
+                index: entry.index + 1,
+                kind: .fragment(Reduction(dimension: fusedOp.dimension, epsilon: fusedOp.epsilon)),
+                parameterBindings: entry.parameterBindings,
+                layerIndex: entry.layerIndex)
+            var steps: [MetalPrefillStep] = []
+            for decomposed in [addEntry, normEntry] {
+                let s = try buildPrefillSteps(
+                    entry: decomposed,
+                    buffers: buffers,
+                    stafWeightStore: stafWeightStore,
+                    hiddenSize: hiddenSize,
+                    intermediateSize: intermediateSize,
+                    slotDimension: slotDimension,
+                    vocabSize: vocabSize,
+                    maximumSequenceLength: maximumSequenceLength,
+                    scratchElementSize: scratchElementSize,
+                    kvCacheIndex: &kvCacheIndex,
+                    routingState: &routingState,
+                    pipelineCache: pipelineCache,
+                    device: device)
+                steps.append(contentsOf: s)
+            }
+            return steps
+
         // MARK: Default — skip unsupported ops in prefill
         default:
             return []
@@ -2302,8 +2393,9 @@ public struct MetalInferenceCompiler: Sendable {
                     }
                 } else {
                     // Prefill: decompose into individual QKNorm steps (handled by buildPrefillSteps)
+                    // buildPrefillSteps uses "qk_rms_norm_seq_f32" regardless of weight format
                     let weightFormat = resolveWeightFormat(role: "q_layernorm", entry: entry, stafWeightStore: stafWeightStore)
-                    let normName = weightFormat == .bfloat16 ? "qk_rms_norm_seq_f32_bf16" : "qk_rms_norm_seq_f32"
+                    let normName = "qk_rms_norm_seq_f32"
                     if generatedNames.insert(normName).inserted {
                         sources.append(MetalSourceGenerator.generateQKNormSeq(
                             name: normName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
