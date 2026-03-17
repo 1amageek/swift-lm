@@ -20,7 +20,8 @@ for await generation in container.generate(input: try container.prepare(input: U
 
 ```
 LMIR (IR — no dependencies)
-    │  ModelGraph, OperationKind, ParameterBinding, OperationAttributes
+    │  ModelGraph, OperationAttributes, ParameterBinding
+    │  Pure data types. No Metal. No backend awareness.
     │
     ├── LMArchitecture (DSL + Validation — re-exports LMIR)
     │   ├── ModelComponent protocol + @ModelComponentBuilder
@@ -30,10 +31,10 @@ LMIR (IR — no dependencies)
     ├── ModelDeclarations (depends: LMArchitecture)
     │   └── Transformer, Qwen35, LFM2, Cohere
     │
-    ├── MetalCompiler (depends: LMIR only)
-    │   ├── MetalKernelFragment protocol + fragment tree
-    │   ├── MetalSourceGenerator (on-demand MSL generation)
-    │   ├── MetalInferenceCompiler (IR walk → fusion → dispatch plan)
+    ├── MetalCompiler (depends: LMIR only — not LMArchitecture)
+    │   ├── PrimitiveMetalKernelFragment protocol
+    │   ├── DispatchOptimizer protocol (pluggable graph optimization)
+    │   ├── MetalInferenceCompiler (IR walk → optimize → dispatch plan)
     │   ├── MetalInferenceModel (decode/prefill execution)
     │   └── STAF (weight format, parameter resolution)
     │
@@ -43,32 +44,175 @@ LMIR (IR — no dependencies)
         └── UserInput, ChatMessage, GenerateParameters
 ```
 
+### Module Dependency Direction
+
+```
+LMIR  ←──  LMArchitecture  ←──  ModelDeclarations
+  │                                     │
+  └──────  MetalCompiler                │
+                │                       │
+                └───────  SwiftLM  ─────┘
+```
+
+`LMArchitecture` and `MetalCompiler` never depend on each other. Both depend on `LMIR`. This separation allows multiple backends to coexist without modification.
+
+## Design Principles
+
+### IR and Backend Separation
+
+LMIR describes **connections only**. Computation is opaque — stored as `any OperationAttributes`. Backends extend these types to add execution behavior:
+
+```swift
+// LMIR — backend-independent
+public struct AttentionAttributes: OperationAttributes {
+    let hiddenSize: Int, headCount: Int, kvHeadCount: Int, ...
+}
+
+// MetalCompiler — extends IR type with Metal execution
+extension AttentionAttributes: MetalKernelFragment {
+    func fragment(context: KernelContext) -> some MetalKernelFragment { ... }
+}
+```
+
+New backends extend the same IR types independently:
+
+```swift
+// Future TPUCompiler — no changes to LMIR or MetalCompiler
+extension AttentionAttributes: TPUKernelFragment { ... }
+```
+
+### Fragment Declares, Compiler Dispatches
+
+Each fragment owns its complete execution specification through protocol methods. The compiler never checks concrete fragment types — it dispatches through the protocol:
+
+| Responsibility | Protocol Method | Owner |
+|---|---|---|
+| Kernel name | `kernelName(context:)` | Fragment |
+| MSL source | `kernelSource(name:bufferPrecision:weightFormat:)` | Fragment |
+| Decode buffer layout | `decodeBindings(context:)` | Fragment |
+| Prefill step building | `prefillSteps(context:)` | Fragment |
+| Dispatch optimization | `DispatchOptimizer.optimizeFragment()` | Optimizer |
+
+The compiler is a thin dispatcher that reads protocol properties and calls protocol methods. Adding a new fragment never requires modifying the compiler.
+
+### Pluggable Graph Optimization
+
+The `DispatchOptimizer` protocol separates optimization strategy from compilation:
+
+```swift
+let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+```
+
+| Optimizer | Dispatch Count | Strategy |
+|---|---|---|
+| `NoOptimizer` | 242 | No optimization (baseline) |
+| `StandardOptimizer` | 179 | Norm fusion only |
+| `AggressiveOptimizer` | 144 | + Projection batching + per-head batching |
+
+Optimization runs during the IR walk (collect → optimize → emit), not as a post-hoc pass on a flat list. This preserves structural information from the IR.
+
+### Context-Aware Fragment Tree
+
+Fragment tree evaluation receives `KernelContext` (buffer precision + weight format), enabling fragments to make context-dependent decisions:
+
+```swift
+func fragment(context: KernelContext) -> some MetalKernelFragment {
+    // Can vary tree structure based on context
+    LinearFragment(field: "q_proj", ...)
+    LinearFragment(field: "k_proj", ...)
+    // ...
+}
+```
+
+## Adding a New Component
+
+### Step 1: IR Attributes (LMIR)
+
+Define the operation's parameters as a backend-independent data type:
+
+```swift
+public struct NewOpAttributes: OperationAttributes, Sendable {
+    public let dimension: Int
+    public let epsilon: Float
+}
+```
+
+### Step 2: Model Component (LMArchitecture)
+
+Create the DSL component that builds IR:
+
+```swift
+public struct NewOp: ModelComponent {
+    let dimension: Int
+    let epsilon: Float
+
+    public var body: some ModelComponent {
+        Primitive(NewOpAttributes(dimension: dimension, epsilon: epsilon))
+    }
+}
+```
+
+### Step 3: Metal Fragment (MetalCompiler/Fragments/)
+
+Extend the IR attributes with Metal execution — this is the bridge:
+
+```swift
+// Fragments/NewOpFragment.swift
+extension NewOpAttributes: MetalKernelFragment, _FragmentBodyAccessor {
+    @MetalKernelFragmentBuilder
+    public func fragment(context: KernelContext) -> some MetalKernelFragment {
+        NewOpPrimitiveFragment(dimension: dimension, epsilon: epsilon)
+    }
+    public var isFusable: Bool { false }
+    public func _visitBody(context: KernelContext, _ visitor: (any MetalKernelFragment) -> Void) {
+        visitor(fragment(context: context))
+    }
+}
+```
+
+### Step 4: Primitive Fragment (MetalCompiler/Fragments/Primitives/)
+
+Define the leaf dispatch unit with all 4 protocol methods:
+
+```swift
+// Fragments/Primitives/NewOpPrimitiveFragment.swift
+public struct NewOpPrimitiveFragment: PrimitiveMetalKernelFragment {
+    public let dimension: Int
+    public let epsilon: Float
+
+    public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: dimension) }
+    public var isFusable: Bool { true }
+
+    public func kernelName(context: KernelContext) -> String {
+        context.bufferPrecision == .float32 ? "new_op_f32" : "new_op"
+    }
+
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateNewOp(name: name, ...)
+    }
+
+    public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
+        FragmentBindings(
+            buffers: [(0, context.bufferSet.hidden, 0), ...],
+            bytes: [uint32Binding(1, UInt32(dimension))],
+            outputIsHidden: true)
+    }
+
+    public func prefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
+        // Build MetalPrefillStep with grid/threadgroup for sequence processing
+    }
+}
+```
+
+### What You Don't Need to Modify
+
+- **MetalInferenceCompiler** — dispatches through protocol, no type checks
+- **DispatchOptimizer** — detects optimization opportunities from properties
+- **Other fragments** — completely independent
+
 ## Metal Backend
 
 All inference runs on direct Metal compute — no MLX, no MPSGraph.
-
-### Fragment-Driven Kernel Generation
-
-Each `ModelComponent` has a corresponding `MetalKernelFragment`, declaring its Metal execution as a compositional tree:
-
-```
-LMArchitecture/Components/          MetalCompiler/Fragments/
-├── Attention.swift            ↔    ├── AttentionFragment.swift
-├── MLP.swift                  ↔    ├── MLPFragment.swift
-├── Norm.swift                 ↔    ├── NormFragment.swift
-├── ShortConv.swift            ↔    ├── ShortConvFragment.swift
-├── TokenEmbedding.swift       ↔    ├── TokenEmbeddingFragment.swift
-├── OutputHead.swift           ↔    ├── OutputHeadFragment.swift
-└── ...                        ↔    └── ...
-```
-
-The compiler walks the fragment tree to:
-1. Emit dispatch entries from primitive fragments (Reduction, Linear, FlashAttention, ...)
-2. Fuse adjacent fragments (residualAdd + copy + RMSNorm → single kernel)
-3. Generate MSL kernel source on-demand from fragment parameters + weight format + buffer precision
-4. Compile into MTLLibrary → dispatch plan
-
-No hardcoded kernel variants. dtype/precision is determined by the compiler from STAF weight format and execution phase.
 
 ### Precision
 
