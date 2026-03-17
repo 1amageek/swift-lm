@@ -303,7 +303,59 @@ public struct MetalSourceGenerator: Sendable {
         }
     }
 
-    /// Generate MSL source for a GEMM kernel (prefill projection).
+    /// Generate MSL source for a GEMM kernel using Metal Performance Primitives matmul2d.
+    ///
+    /// Uses Apple's optimized AMX paths via `mpp::tensor_ops::matmul2d`.
+    /// Requires Metal language version 4.0.
+    /// Buffer layout matches the naive GEMM: input[seqLen×inputDim], weight[outputDim×inputDim], output[seqLen×outputDim].
+    public static func generateMPPGEMM(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        // MPP tensor type for weight: bfloat for BF16, half for FP16
+        let tensorWeightType = weightFormat == .bfloat16 ? "bfloat" : bt
+
+        return """
+        #include <metal_stdlib>
+        #include <metal_tensor>
+        #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
+        using namespace metal;
+
+        kernel void \(name)(
+            device \(bt)* input              [[buffer(0)]],
+            device \(tensorWeightType)* weight [[buffer(1)]],
+            device \(bt)* output             [[buffer(2)]],
+            constant uint& inputDimension    [[buffer(3)]],
+            constant uint& outputDimension   [[buffer(4)]],
+            constant uint& sequenceLength    [[buffer(5)]],
+            uint2 tgid [[threadgroup_position_in_grid]]
+        ) {
+            using namespace mpp::tensor_ops;
+
+            auto A = tensor<device \(bt), dextents<int32_t, 2>, tensor_inline>(
+                input, dextents<int32_t, 2>(inputDimension, sequenceLength));
+            auto B = tensor<device \(tensorWeightType), dextents<int32_t, 2>, tensor_inline>(
+                weight, dextents<int32_t, 2>(inputDimension, outputDimension));
+            auto C = tensor<device \(bt), dextents<int32_t, 2>, tensor_inline>(
+                output, dextents<int32_t, 2>(outputDimension, sequenceLength));
+
+            constexpr auto desc = matmul2d_descriptor(
+                64, 32, dynamic_length_v<int>,
+                false, true, false,
+                matmul2d_descriptor::mode::multiply);
+            matmul2d<desc, execution_simdgroups<4>> op;
+
+            auto mA = A.slice(0, tgid.y * 64);
+            auto mB = B.slice(0, tgid.x * 32);
+            auto mC = C.slice(tgid.x * 32, tgid.y * 64);
+            op.run(mA, mB, mC);
+        }
+        """
+    }
+
+    /// Generate MSL source for a GEMM kernel (prefill projection, naive fallback).
     public static func generateGEMM(
         name: String,
         bufferPrecision: BufferPrecision,
@@ -345,6 +397,9 @@ public struct MetalSourceGenerator: Sendable {
     }
 
     /// Generate MSL source for a GEMV kernel (decode projection, single token).
+    ///
+    /// Optimization: input vector cached in threadgroup memory for reuse across rows.
+    /// 4 simdgroups per threadgroup = 4 rows sharing one input load.
     public static func generateGEMV(
         name: String,
         bufferPrecision: BufferPrecision,

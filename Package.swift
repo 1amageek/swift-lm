@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "swift-lm",
-    platforms: [.macOS(.v15), .iOS(.v18), .visionOS(.v2)],
+    platforms: [.macOS(.v26), .iOS(.v26), .visionOS(.v26)],
     products: [
         .library(name: "LMIR", targets: ["LMIR"]),
         .library(name: "LMArchitecture", targets: ["LMArchitecture"]),

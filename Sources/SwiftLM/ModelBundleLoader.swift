@@ -69,7 +69,8 @@ public struct ModelBundleLoader: Sendable {
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: convention)
 
         // 4. Compile IR → MetalDispatchPlan (includes Metal pipeline compilation)
-        let plan = try MetalInferenceCompiler().compile(
+        let compiler = MetalInferenceCompiler()
+        let plan = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -79,7 +80,7 @@ public struct ModelBundleLoader: Sendable {
         )
 
         // 4b. Compile prefill plan (sequence graph — step count independent of token count)
-        let prefillPlan = try MetalInferenceCompiler().compilePrefill(
+        let prefillPlan = try compiler.compilePrefill(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,

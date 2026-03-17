@@ -17,6 +17,7 @@ public struct MetalInferenceCompiler: Sendable {
     /// The optimization strategy used for dispatch entry generation.
     public let optimizer: any DispatchOptimizer
 
+
     public init(optimizer: (any DispatchOptimizer)? = nil) {
         self.optimizer = optimizer ?? StandardOptimizer()
     }
@@ -143,17 +144,9 @@ public struct MetalInferenceCompiler: Sendable {
 
         // Phase 3: Compile only the kernels needed by this model's dispatch entries
         // Decode uses F16 buffers (single token, no accumulation)
-        let library = try compileLibrary(
+        var (pipelineCache, _) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: stafWeightStore,
             bufferPrecision: .float16, device: device)
-
-        // Build pipeline cache: kernelName → MTLComputePipelineState
-        var pipelineCache: [String: MTLComputePipelineState] = [:]
-        for name in library.functionNames {
-            if let function = library.makeFunction(name: name) {
-                pipelineCache[name] = try device.makeComputePipelineState(function: function)
-            }
-        }
 
         // Phase 4: Allocate buffers
         //
@@ -338,19 +331,10 @@ public struct MetalInferenceCompiler: Sendable {
         let fusedEntries = optimizer.optimizeGraph(walkContext.entries)
 
         // Compile only the kernels needed by this model's prefill dispatch entries
-        let library = try compileLibrary(
+        // For prefill (F32), attempts Metal 4 MPP GEMM with fallback to naive GEMM.
+        let (pipelineCache, prefillUsesMPP) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: stafWeightStore,
             bufferPrecision: .float32, device: device)
-        var pipelineCache: [String: MTLComputePipelineState] = [:]
-        for name in library.functionNames {
-            if let function = library.makeFunction(name: name) {
-                let descriptor = MTLComputePipelineDescriptor()
-                descriptor.computeFunction = function
-                descriptor.label = name
-                let pipeline = try device.makeComputePipelineState(descriptor: descriptor, options: [], reflection: nil)
-                pipelineCache[name] = pipeline
-            }
-        }
 
         // Compute maximum non-output projection dimension for scratch slot sizing.
         // Only non-output projections write to scratch slots.
@@ -459,6 +443,7 @@ public struct MetalInferenceCompiler: Sendable {
                 vocabSize: resolvedVocabSize,
                 maximumSequenceLength: maxSeq,
                 scratchElementSize: f32ElementSize,
+                usesMPP: prefillUsesMPP,
                 kvCacheIndex: &kvCacheIndex,
                 routingState: &routingState,
                 pipelineCache: pipelineCache,
@@ -489,6 +474,7 @@ public struct MetalInferenceCompiler: Sendable {
         vocabSize: Int,
         maximumSequenceLength: Int,
         scratchElementSize: Int,  // 4 for float32 scratch
+        usesMPP: Bool = false,
         kvCacheIndex: inout Int,
         routingState: inout BufferRoutingState,
         pipelineCache: [String: MTLComputePipelineState],
@@ -923,16 +909,35 @@ public struct MetalInferenceCompiler: Sendable {
             }
             routingState.projectionIndex += 1
 
-            let gridHeight = mode == .lastToken ? 1 : maximumSequenceLength
             var perPositionStrides: [Int: Int] = [:]
             if mode == .lastToken {
                 perPositionStrides[0] = projection.inputDimension * scratchElementSize
             }
 
+            // MPP matmul2d uses tile 64(M)×32(N) with 4 simdgroups.
+            // Grid: (outputDim/32, seqLen/64, 1). Kernel handles edge tiles internally.
+            // Naive GEMM: (outputDim/2, seqLen, 1) with 2 simdgroups.
+            let gridSize: MTLSize
+            let threadgroupSize: MTLSize
+            if usesMPP && mode == .batch {
+                let simdWidth = pipeline.threadExecutionWidth
+                gridSize = MTLSize(
+                    width: (projection.outputDimension + 31) / 32,
+                    height: (maximumSequenceLength + 63) / 64,
+                    depth: 1)
+                threadgroupSize = MTLSize(width: simdWidth * 4, height: 1, depth: 1)
+            } else if mode == .lastToken {
+                gridSize = MTLSize(width: config.grid.width, height: 1, depth: 1)
+                threadgroupSize = config.threadgroup
+            } else {
+                gridSize = MTLSize(width: config.grid.width, height: maximumSequenceLength, depth: 1)
+                threadgroupSize = config.threadgroup
+            }
+
             return [MetalPrefillStep(
                 pipeline: pipeline,
-                gridSize: MTLSize(width: config.grid.width, height: gridHeight, depth: 1),
-                threadgroupSize: config.threadgroup,
+                gridSize: gridSize,
+                threadgroupSize: threadgroupSize,
                 bufferBindings: [
                     (0, inputBuffer, inputOffset),
                     (1, weightBuffer, weightOffset),
@@ -943,10 +948,12 @@ public struct MetalInferenceCompiler: Sendable {
                     uint32Binding(4, UInt32(projection.outputDimension)),
                     uint32Binding(5, seqLenValue),
                 ],
-                threadgroupMemoryLength: config.sharedMemoryBytes,
+                threadgroupMemoryLength: (usesMPP && mode == .batch) ? 0 : config.sharedMemoryBytes,
                 sync: .bufferBarrier,
                 mode: mode,
-                sequenceLengthBindingIndex: mode == .batch ? 5 : nil,
+                // MPP GEMM: grid is in tiles, not raw seqLen. Disable runtime grid adjustment.
+                // The kernel reads seqLen from buffer(5) for tensor extents and handles edge tiles.
+                sequenceLengthBindingIndex: (usesMPP && mode == .batch) ? nil : (mode == .batch ? 5 : nil),
                 positionBufferIndex: nil,
                 perPositionStrides: perPositionStrides
             )]
@@ -1774,18 +1781,24 @@ public struct MetalInferenceCompiler: Sendable {
     // MARK: - Metal Library Cache
 
 
-    /// Compile a Metal library containing only the kernels needed by the given dispatch entries.
+    /// Compile Metal libraries and build a pipeline cache for the given dispatch entries.
     ///
     /// Kernel source is generated on-demand from fragment parameters + STAF weight format.
     /// No hardcoded catalog — only the kernels actually used are compiled.
-    private func compileLibrary(
+    /// For prefill (F32), attempts Metal 4 MPP GEMM with fallback to naive GEMM.
+    private func compilePipelineCache(
         entries: [DispatchEntry],
         stafWeightStore: STAFWeightStore?,
         bufferPrecision: MetalSourceGenerator.BufferPrecision,
         device: MTLDevice
-    ) throws -> MTLLibrary {
+    ) throws -> (pipelines: [String: MTLComputePipelineState], usesMPP: Bool) {
+        var detectedMPP = false
         var sources: [String] = [MetalSourceGenerator.commonHeader]
         var generatedNames: Set<String> = []
+
+        // Metal 4 MPP GEMM: compiled separately with Metal 4 language version
+        var mppGEMMNames: Set<String> = []
+        var mppGEMMWeightFormat: MetalSourceGenerator.WeightFormat = .float16
 
         // Collect flash_attn helper (shared by F16/F32 variants)
         var needsFlashAttnHelper = false
@@ -1801,6 +1814,10 @@ public struct MetalInferenceCompiler: Sendable {
                 if generatedNames.insert(isSeq ? name.replacingOccurrences(of: "gemv", with: "gemm") + (bufferPrecision == .float32 ? "_f32s" : "") : name).inserted {
                     if isSeq {
                         let gemmName = weightFormat == .bfloat16 ? "gemm_bf16_f32s" : "gemm_f32s"
+                        // MPP GEMM compiled separately in Metal 4 library (see below)
+                        mppGEMMNames.insert(gemmName)
+                        mppGEMMWeightFormat = weightFormat
+                        // Also generate fallback for non-Metal4
                         sources.append(MetalSourceGenerator.generateGEMM(name: gemmName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
                     } else {
                         sources.append(MetalSourceGenerator.generateGEMV(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
@@ -1947,7 +1964,48 @@ public struct MetalInferenceCompiler: Sendable {
         let compileOptions = MTLCompileOptions()
         compileOptions.fastMathEnabled = false
         compileOptions.languageVersion = .version3_0
-        return try device.makeLibrary(source: sources.joined(separator: "\n\n"), options: compileOptions)
+        let library = try device.makeLibrary(source: sources.joined(separator: "\n\n"), options: compileOptions)
+
+        // Build base pipeline cache from Metal 3 library
+        var pipelineCache: [String: MTLComputePipelineState] = [:]
+        for name in library.functionNames {
+            if let function = library.makeFunction(name: name) {
+                let descriptor = MTLComputePipelineDescriptor()
+                descriptor.computeFunction = function
+                descriptor.label = name
+                pipelineCache[name] = try device.makeComputePipelineState(
+                    descriptor: descriptor, options: [], reflection: nil)
+            }
+        }
+
+        // Compile Metal 4 MPP GEMM kernels as a separate library.
+        // MPP requires Metal 4.0 language version and MetalPerformancePrimitives framework headers.
+        // If Metal 4 compilation fails (older OS/GPU), the Metal 3 fallback GEMM is already in cache.
+        if !mppGEMMNames.isEmpty {
+            var mppSources: [String] = []
+            for name in mppGEMMNames {
+                mppSources.append(MetalSourceGenerator.generateMPPGEMM(
+                    name: name, bufferPrecision: bufferPrecision, weightFormat: mppGEMMWeightFormat))
+            }
+            let mppOptions = MTLCompileOptions()
+            mppOptions.languageVersion = .version4_0
+            do {
+                let mppLibrary = try device.makeLibrary(
+                    source: mppSources.joined(separator: "\n\n"), options: mppOptions)
+                detectedMPP = true
+                for name in mppLibrary.functionNames {
+                    if let function = mppLibrary.makeFunction(name: name) {
+                        let descriptor = MTLComputePipelineDescriptor()
+                        descriptor.computeFunction = function
+                        descriptor.label = name
+                        pipelineCache[name] = try device.makeComputePipelineState(
+                            descriptor: descriptor, options: [], reflection: nil)
+                    }
+                }
+            } catch { /* Metal 4 MPP unavailable — using Metal 3 fallback GEMM */ }
+        }
+
+        return (pipelineCache, detectedMPP)
     }
 
     /// Determine weight format from STAF for a given role.
