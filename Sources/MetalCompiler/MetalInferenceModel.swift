@@ -154,17 +154,48 @@ public struct MetalInferenceModel: @unchecked Sendable {
             return -1
         }
 
-        // Transfer hidden: convert last token from prefill F32 to decode F16
+        // Transfer hidden: F32→F16 conversion via GPU blit
+        // Decode hidden is storageModePrivate — cannot use CPU .contents().
+        // Use a GPU blit to copy the last token from prefill (F32, shared) → decode (F16, private).
         let decodeHiddenSize = self.plan.buffers.hidden.length / MemoryLayout<Float16>.size
         let prefillHiddenStride = decodeHiddenSize * MemoryLayout<Float32>.size
         let lastTokenOffset = (seqLen - 1) * prefillHiddenStride
+
         if lastTokenOffset + prefillHiddenStride <= prefill.buffers.hidden.length {
-            let src = (prefill.buffers.hidden.contents() + lastTokenOffset)
-                .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
-            let dst = self.plan.buffers.hidden.contents()
-                .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
-            for i in 0..<decodeHiddenSize {
-                dst[i] = Float16(src[i])
+            // Prefill hidden is shared — CPU-accessible for F32→F16 conversion.
+            // Write F16 values to a temp shared buffer, then blit to private decode hidden.
+            if self.plan.buffers.hidden.storageMode == .private {
+                // Convert F32→F16 into the prefill tokenOut area (reuse as temp, small enough)
+                // Actually use a proper temp: prefill's tokenOut is only 4 bytes.
+                // Instead, write F16 values into the beginning of prefill's hidden buffer
+                // (which is shared and large enough), then blit from there.
+                let src = (prefill.buffers.hidden.contents() + lastTokenOffset)
+                    .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
+                // Write F16 at offset 0 of prefill hidden (reuse as staging area)
+                let staging = prefill.buffers.hidden.contents()
+                    .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
+                for i in 0..<decodeHiddenSize {
+                    staging[i] = Float16(src[i])
+                }
+                // Blit from staging (shared) to decode hidden (private)
+                if let blitCB = commandQueue.makeCommandBuffer(),
+                   let blit = blitCB.makeBlitCommandEncoder() {
+                    blit.copy(from: prefill.buffers.hidden, sourceOffset: 0,
+                              to: self.plan.buffers.hidden, destinationOffset: 0,
+                              size: decodeHiddenSize * MemoryLayout<Float16>.size)
+                    blit.endEncoding()
+                    blitCB.commit()
+                    blitCB.waitUntilCompleted()
+                }
+            } else {
+                // Shared mode — direct CPU copy (test path)
+                let src = (prefill.buffers.hidden.contents() + lastTokenOffset)
+                    .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
+                let dst = self.plan.buffers.hidden.contents()
+                    .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
+                for i in 0..<decodeHiddenSize {
+                    dst[i] = Float16(src[i])
+                }
             }
         }
 
@@ -172,22 +203,35 @@ public struct MetalInferenceModel: @unchecked Sendable {
         if let prefillKV = prefill.buffers.kvCache,
            let decodeKV = self.plan.buffers.kvCache,
            prefillKV.keys !== decodeKV.keys {
-            memcpy(decodeKV.keys.contents(), prefillKV.keys.contents(),
-                   min(decodeKV.keys.length, prefillKV.keys.length))
-            memcpy(decodeKV.values.contents(), prefillKV.values.contents(),
-                   min(decodeKV.values.length, prefillKV.values.length))
+            if let blitCB = commandQueue.makeCommandBuffer(),
+               let blit = blitCB.makeBlitCommandEncoder() {
+                blit.copy(from: prefillKV.keys, sourceOffset: 0,
+                          to: decodeKV.keys, destinationOffset: 0,
+                          size: min(decodeKV.keys.length, prefillKV.keys.length))
+                blit.copy(from: prefillKV.values, sourceOffset: 0,
+                          to: decodeKV.values, destinationOffset: 0,
+                          size: min(decodeKV.values.length, prefillKV.values.length))
+                blit.endEncoding()
+                blitCB.commit()
+                blitCB.waitUntilCompleted()
+            }
         }
 
         // Copy conv_state (skip if shared — same buffer used by both prefill and decode)
         if let prefillConvState = prefill.buffers.convState,
            let decodeConvState = self.plan.buffers.convState,
            prefillConvState !== decodeConvState {
-            memcpy(decodeConvState.contents(), prefillConvState.contents(),
-                   min(decodeConvState.length, prefillConvState.length))
+            if let blitCB = commandQueue.makeCommandBuffer(),
+               let blit = blitCB.makeBlitCommandEncoder() {
+                blit.copy(from: prefillConvState, sourceOffset: 0,
+                          to: decodeConvState, destinationOffset: 0,
+                          size: min(decodeConvState.length, prefillConvState.length))
+                blit.endEncoding()
+                blitCB.commit()
+                blitCB.waitUntilCompleted()
+            }
         }
 
-        let totalTime = CFAbsoluteTimeGetCurrent() - prefillStart
-        _ = dispatchCount
         position += seqLen
 
         // Return the first predicted token (argmax of prefill logits)
