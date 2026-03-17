@@ -190,6 +190,19 @@ struct BenchmarkTests {
         print("[Benchmark] compilation:")
         print("  decode plan: \(decodePlan.fusedEntryCount) dispatches, \(String(format: "%.0f", compileTime * 1000))ms")
         print("  prefill plan: \(prefillPlan.stepCount) steps, \(String(format: "%.0f", prefillCompileTime * 1000))ms")
+
+        // Optimizer comparison: count dispatch entries with each strategy
+        let optimizers: [any DispatchOptimizer] = [
+            NoOptimizer(),
+            StandardOptimizer(),
+            AggressiveOptimizer(),
+        ]
+        print("\n[Benchmark] optimizer comparison:")
+        for opt in optimizers {
+            let comp = MetalInferenceCompiler(optimizer: opt)
+            let report = comp.analyzeOptimization(graph: resolved, hiddenSize: 2048)
+            report.printReport()
+        }
     }
 
     // MARK: - Setup

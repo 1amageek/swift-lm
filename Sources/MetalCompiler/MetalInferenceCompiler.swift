@@ -21,6 +21,46 @@ public struct MetalInferenceCompiler: Sendable {
         self.optimizer = optimizer ?? StandardOptimizer()
     }
 
+    /// Analyze optimization without Metal compilation.
+    /// Returns a report comparing unfused vs optimized dispatch counts.
+    public func analyzeOptimization(
+        graph: ModelGraph,
+        hiddenSize: Int
+    ) -> OptimizationReport {
+        var walkContext = WalkContext()
+        walkRegion(
+            graph.rootRegion,
+            pathComponents: [],
+            layerIndex: nil,
+            hiddenSize: hiddenSize,
+            context: &walkContext
+        )
+        let unfusedCount = walkContext.entries.count
+        let optimized = optimizer.optimizeGraph(walkContext.entries)
+
+        // Count patterns
+        var patterns: [String: (count: Int, saved: Int)] = [:]
+        for entry in optimized {
+            let name: String
+            switch entry.kind {
+            case .fusedCopyNorm: name = "fusedCopyNorm"
+            case .fusedResidualAddCopyNorm: name = "fusedResidualAddCopyNorm"
+            case .fusedResidualAddNorm: name = "fusedResidualAddNorm"
+            case .batchedProjection(let b): name = "batchedProjection(\(b.projections.count)-way)"
+            case .batchedFragment(let b): name = "batchedFragment(\(b.fragments.count)-way)"
+            default: continue
+            }
+            patterns[name, default: (0, 0)].count += 1
+        }
+
+        return OptimizationReport(
+            optimizerName: optimizer.name,
+            unfusedCount: unfusedCount,
+            optimizedCount: optimized.count,
+            patterns: patterns.map { .init(name: $0.key, count: $0.value.count, savedDispatches: 0) }
+        )
+    }
+
     public func compile(
         graph: ModelGraph,
         hiddenSize: Int,
@@ -1144,6 +1184,35 @@ public struct MetalInferenceCompiler: Sendable {
                 parameterBindings: parameterBindings, layerIndex: layerIndex))
             nextIndex += 1
         }
+
+        /// Emit an optimizer result entry.
+        mutating func emitOptimized(_ entry: OptimizedEntry) {
+            switch entry {
+            case .single(let p):
+                // LinearFragment → .projection, others → .fragment
+                if let linear = p.fragment as? LinearFragment {
+                    let projection = MetalProjection(
+                        field: linear.field,
+                        inputDimension: linear.inputDimension,
+                        outputDimension: linear.outputDimension)
+                    emit(.projection(projection),
+                         parameterBindings: p.parameterBindings,
+                         layerIndex: p.layerIndex)
+                } else {
+                    emit(.fragment(p.fragment),
+                         parameterBindings: p.parameterBindings,
+                         layerIndex: p.layerIndex)
+                }
+            case .batchedProjection(let batched, let bindings, let layer):
+                emit(.batchedProjection(batched),
+                     parameterBindings: bindings,
+                     layerIndex: layer)
+            case .batchedFragment(let batched, let bindings, let layer):
+                emit(.batchedFragment(batched),
+                     parameterBindings: bindings,
+                     layerIndex: layer)
+            }
+        }
     }
 
     struct CacheSlotInfo {
@@ -1206,10 +1275,16 @@ public struct MetalInferenceCompiler: Sendable {
                     bindings = operation.parameterBindings
                 }
 
-                // Fragment-driven path: walk the MetalKernelFragment tree
+                // Fragment-driven path: collect → optimize → emit
                 guard let fragment = attributes as? (any MetalKernelFragment) else { continue }
+                var primitives: [CollectedPrimitive] = []
+                collectPrimitives(fragment, bindings: bindings, layerIndex: layerIndex,
+                                  primitives: &primitives, context: &context)
+                let optimized = optimizer.optimizeFragment(primitives)
                 let startIndex = context.entries.count
-                emitFragmentTree(fragment, bindings: bindings, layerIndex: layerIndex, context: &context)
+                for entry in optimized {
+                    context.emitOptimized(entry)
+                }
                 markLastProjectionAsOutput(entries: &context.entries, from: startIndex)
             }
         }
@@ -1294,6 +1369,63 @@ public struct MetalInferenceCompiler: Sendable {
         if let bodyAccessor = fragment as? any _FragmentBodyAccessor {
             bodyAccessor._visitBody { child in
                 emitFragmentTree(child, bindings: bindings, layerIndex: layerIndex, context: &context)
+            }
+        }
+    }
+
+    // MARK: - Primitive Collection (for optimizer)
+
+    /// Collect all primitives from a fragment tree without emitting.
+    ///
+    /// Similar to `emitFragmentTree()` but appends to an array instead of emitting.
+    /// FlashAttentionFragment still registers KV cache slots in the context.
+    private func collectPrimitives(
+        _ fragment: any MetalKernelFragment,
+        bindings: [ParameterBinding],
+        layerIndex: Int?,
+        primitives: inout [CollectedPrimitive],
+        context: inout WalkContext
+    ) {
+        if let primitive = fragment as? any PrimitiveMetalKernelFragment {
+            // Register KV cache slot for FlashAttention (side effect needed by compiler)
+            if let flash = primitive as? FlashAttentionFragment {
+                context.cacheSlots.append(CacheSlotInfo(
+                    kvHeadCount: flash.kvHeadCount,
+                    headDimension: flash.headDimension))
+            }
+            primitives.append(CollectedPrimitive(
+                fragment: primitive,
+                parameterBindings: bindings,
+                layerIndex: layerIndex))
+            return
+        }
+
+        // Walk composite fragments recursively
+        if let tuple = fragment as? any _TupleFragmentProtocol {
+            tuple._visitChildren { child in
+                collectPrimitives(child, bindings: bindings, layerIndex: layerIndex,
+                                  primitives: &primitives, context: &context)
+            }
+            return
+        }
+        if let opt = fragment as? any _OptionalFragmentProtocol {
+            opt._visitContent { child in
+                collectPrimitives(child, bindings: bindings, layerIndex: layerIndex,
+                                  primitives: &primitives, context: &context)
+            }
+            return
+        }
+        if let cond = fragment as? any _ConditionalFragmentProtocol {
+            cond._visitActive { child in
+                collectPrimitives(child, bindings: bindings, layerIndex: layerIndex,
+                                  primitives: &primitives, context: &context)
+            }
+            return
+        }
+        if let bodyAccessor = fragment as? any _FragmentBodyAccessor {
+            bodyAccessor._visitBody { child in
+                collectPrimitives(child, bindings: bindings, layerIndex: layerIndex,
+                                  primitives: &primitives, context: &context)
             }
         }
     }
