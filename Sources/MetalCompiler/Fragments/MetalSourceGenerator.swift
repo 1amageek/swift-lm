@@ -655,6 +655,235 @@ public struct MetalSourceGenerator: Sendable {
         """
     }
 
+    // MARK: - Fused Residual Add + RMS Norm (no copy)
+
+    /// Generate fused residual add + RMS norm kernel (no copy to residual).
+    /// Used at model end where no next residual block follows.
+    public static func generateFusedResidualAddRMSNorm(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device \(bt)* hidden             [[buffer(0)]],
+            device const \(bt)* residual     [[buffer(1)]],
+            device const \(wt)* weight       [[buffer(2)]],
+            device \(bt)* output             [[buffer(3)]],
+            constant uint& dimension         [[buffer(4)]],
+            constant float& epsilon          [[buffer(5)]],
+            uint tid                         [[thread_index_in_threadgroup]],
+            uint threadgroupSize             [[threads_per_threadgroup]]
+        ) {
+            // Residual add: hidden += residual (no copy to residual buffer)
+            for (uint i = tid; i < dimension; i += threadgroupSize) {
+                hidden[i] = \(bt)(float(hidden[i]) + float(residual[i]));
+            }
+            threadgroup_barrier(mem_flags::mem_device);
+
+            // RMSNorm hidden → output
+            float sumSquared = 0.0f;
+            for (uint i = tid; i < dimension; i += threadgroupSize) {
+                float v = float(hidden[i]);
+                sumSquared += v * v;
+            }
+            sumSquared = simd_sum(sumSquared);
+
+            threadgroup float shared[32];
+            if (tid % SIMD_WIDTH == 0) shared[tid / SIMD_WIDTH] = sumSquared;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float total = 0.0f;
+                for (uint s = 0; s < (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH; s++) total += shared[s];
+                shared[0] = rsqrt(total / float(dimension) + epsilon);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float scale = shared[0];
+            for (uint i = tid; i < dimension; i += threadgroupSize) {
+                output[i] = \(bt)(float(hidden[i]) * scale * \(readWeight("weight[i]")));
+            }
+        }
+        """
+    }
+
+    // MARK: - Batched GEMV
+
+    /// Generate batched GEMV kernel for 2 projections sharing the same input.
+    public static func generateBatchedGEMV2(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input          [[buffer(0)]],
+            device const \(wt)* weight0        [[buffer(1)]],
+            device const \(wt)* weight1        [[buffer(2)]],
+            device \(bt)* output0              [[buffer(3)]],
+            device \(bt)* output1              [[buffer(4)]],
+            constant uint& inputDimension      [[buffer(5)]],
+            constant uint& outputDim0          [[buffer(6)]],
+            constant uint& outputDim1          [[buffer(7)]],
+            uint2 gid                          [[threadgroup_position_in_grid]],
+            uint tiisg                         [[thread_index_in_simdgroup]],
+            uint sgitg                         [[simdgroup_index_in_threadgroup]]
+        ) {
+            const uint rowsPerThreadgroup = 2;
+            const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
+            const uint totalRows = outputDim0 + outputDim1;
+            if (globalRow >= totalRows) return;
+
+            const bool isSecond = (globalRow >= outputDim0);
+            const uint localRow = isSecond ? (globalRow - outputDim0) : globalRow;
+            device const \(wt)* weight = isSecond ? weight1 : weight0;
+            device \(bt)* output = isSecond ? output1 : output0;
+
+            float sum = 0.0f;
+            device const \(wt)* weightRow = weight + localRow * inputDimension;
+            for (uint j = tiisg; j < inputDimension; j += SIMD_WIDTH) {
+                sum += \(readWeight("weightRow[j]")) * float(input[j]);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                output[localRow] = \(bt)(sum);
+            }
+        }
+        """
+    }
+
+    /// Generate batched GEMV kernel for 3 projections sharing the same input.
+    public static func generateBatchedGEMV3(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input          [[buffer(0)]],
+            device const \(wt)* weight0        [[buffer(1)]],
+            device const \(wt)* weight1        [[buffer(2)]],
+            device const \(wt)* weight2        [[buffer(3)]],
+            device \(bt)* output0              [[buffer(4)]],
+            device \(bt)* output1              [[buffer(5)]],
+            device \(bt)* output2              [[buffer(6)]],
+            constant uint& inputDimension      [[buffer(7)]],
+            constant uint& outputDim0          [[buffer(8)]],
+            constant uint& outputDim1          [[buffer(9)]],
+            constant uint& outputDim2          [[buffer(10)]],
+            uint2 gid                          [[threadgroup_position_in_grid]],
+            uint tiisg                         [[thread_index_in_simdgroup]],
+            uint sgitg                         [[simdgroup_index_in_threadgroup]]
+        ) {
+            const uint rowsPerThreadgroup = 2;
+            const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
+            const uint totalRows = outputDim0 + outputDim1 + outputDim2;
+            if (globalRow >= totalRows) return;
+
+            device const \(wt)* weight;
+            device \(bt)* output;
+            uint localRow;
+            if (globalRow < outputDim0) {
+                weight = weight0; output = output0; localRow = globalRow;
+            } else if (globalRow < outputDim0 + outputDim1) {
+                weight = weight1; output = output1; localRow = globalRow - outputDim0;
+            } else {
+                weight = weight2; output = output2; localRow = globalRow - outputDim0 - outputDim1;
+            }
+
+            float sum = 0.0f;
+            device const \(wt)* weightRow = weight + localRow * inputDimension;
+            for (uint j = tiisg; j < inputDimension; j += SIMD_WIDTH) {
+                sum += \(readWeight("weightRow[j]")) * float(input[j]);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                output[localRow] = \(bt)(sum);
+            }
+        }
+        """
+    }
+
+    // MARK: - Batched Per-Head Fragment
+
+    /// Generate batched per-head kernel for 2 independent in-place operations.
+    /// Routes threadgroups to the correct data/weight buffers based on head index.
+    public static func generateBatchedPerHead2(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device \(bt)* data0            [[buffer(0)]],
+            device \(bt)* data1            [[buffer(1)]],
+            device const \(wt)* weight0    [[buffer(2)]],
+            device const \(wt)* weight1    [[buffer(3)]],
+            constant uint& count0          [[buffer(4)]],
+            constant uint& count1          [[buffer(5)]],
+            constant uint& headDim         [[buffer(6)]],
+            constant float& epsilon        [[buffer(7)]],
+            uint headIndex                 [[threadgroup_position_in_grid]],
+            uint tid                       [[thread_index_in_threadgroup]],
+            uint threadgroupSize           [[threads_per_threadgroup]]
+        ) {
+            // Route: threadgroups [0..count0) → data0/weight0, [count0..count0+count1) → data1/weight1
+            device \(bt)* data;
+            device const \(wt)* weight;
+            uint localHead;
+            if (headIndex < count0) {
+                data = data0; weight = weight0; localHead = headIndex;
+            } else {
+                data = data1; weight = weight1; localHead = headIndex - count0;
+                if (localHead >= count1) return;
+            }
+            uint offset = localHead * headDim;
+
+            // Per-head RMS norm (in-place)
+            float sumSq = 0.0f;
+            for (uint i = tid; i < headDim; i += threadgroupSize) {
+                float v = float(data[offset + i]);
+                sumSq += v * v;
+            }
+            sumSq = simd_sum(sumSq);
+
+            threadgroup float shared[32];
+            if (tid % SIMD_WIDTH == 0) shared[tid / SIMD_WIDTH] = sumSq;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float total = 0.0f;
+                uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                for (uint i = 0; i < sgCount; i++) total += shared[i];
+                shared[0] = rsqrt(total / float(headDim) + epsilon);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float scale = shared[0];
+            for (uint i = tid; i < headDim; i += threadgroupSize) {
+                data[offset + i] = \(bt)(float(data[offset + i]) * scale * \(readWeight("weight[i]")));
+            }
+        }
+        """
+    }
+
     // MARK: - QK Norm
 
     /// Generate QK RMSNorm (per-head normalization for Q/K projections).

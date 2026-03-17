@@ -1992,6 +1992,104 @@ public struct MetalInferenceCompiler: Sendable {
             print("[Compiler] WARNING: unhandled fragment in buffer routing")
             return (buffers: [], bytes: [])
 
+        // MARK: Fused Residual Add + RMS Norm (no copy)
+        case .fusedResidualAddNorm(let fusedOperation):
+            let (weightBuffer, weightOffset) = resolveWeight(role: "scale")
+            routingState.lastOutputIsHidden = false
+            routingState.projectionIndex = 0
+            return (
+                buffers: [
+                    (0, bufferSet.hidden, 0),
+                    (1, bufferSet.residual, 0),
+                    (2, weightBuffer, weightOffset),
+                    (3, bufferSet.scratch, 0),
+                ],
+                bytes: [
+                    uint32Binding(4, UInt32(fusedOperation.dimension)),
+                    floatBinding(5, fusedOperation.epsilon),
+                ]
+            )
+
+        // MARK: Batched Projection
+        case .batchedProjection(let batched):
+            let inputBuffer: MTLBuffer
+            let inputOffset: Int
+            if routingState.lastOutputIsHidden {
+                inputBuffer = bufferSet.hidden
+                inputOffset = 0
+            } else {
+                inputBuffer = bufferSet.scratch
+                inputOffset = 0
+            }
+
+            let count = batched.projections.count
+            var bufferBindings: [(index: Int, buffer: MTLBuffer, offset: Int)] = [
+                (0, inputBuffer, inputOffset),
+            ]
+            var bytesBindings: [(index: Int, value: [UInt8])] = []
+
+            // Bind weights: indices 1..<1+count
+            for (i, proj) in batched.projections.enumerated() {
+                let (weightBuf, weightOff) = resolveWeight(role: proj.field)
+                bufferBindings.append((1 + i, weightBuf, weightOff))
+            }
+
+            // Bind outputs: indices 1+count..<1+2*count
+            for i in 0..<count {
+                let scratchSlot = routingState.projectionIndex + 1
+                let outputOffset = scratchSlot * slotDimension * elementSize
+                bufferBindings.append((1 + count + i, bufferSet.scratch, outputOffset))
+                routingState.projectionIndex += 1
+            }
+
+            // Bytes: inputDimension, then each outputDimension
+            let bytesStart = 1 + 2 * count
+            bytesBindings.append(uint32Binding(bytesStart, UInt32(batched.inputDimension)))
+            for (i, proj) in batched.projections.enumerated() {
+                bytesBindings.append(uint32Binding(bytesStart + 1 + i, UInt32(proj.outputDimension)))
+            }
+
+            routingState.lastOutputIsHidden = false
+            return (buffers: bufferBindings, bytes: bytesBindings)
+
+        // MARK: Batched Fragment (per-head)
+        case .batchedFragment(let batch):
+            let slotBytes = slotDimension * elementSize
+            var bufferBindings: [(index: Int, buffer: MTLBuffer, offset: Int)] = []
+            var bytesBindings: [(index: Int, value: [UInt8])] = []
+
+            // Each fragment gets its own data and weight buffer binding
+            // Data slots: Q is at slot 1, K is at slot 2 (from projections before)
+            for (i, frag) in batch.fragments.enumerated() {
+                let scratchSlotIndex = routingState.projectionIndex - batch.fragments.count + i + 1
+                bufferBindings.append((i, bufferSet.scratch, max(0, scratchSlotIndex) * slotBytes))
+            }
+
+            // Weight bindings
+            for (i, frag) in batch.fragments.enumerated() {
+                if let weightSlot = frag.weightSlots.first {
+                    let role = weightSlot.field ?? "weight"
+                    let (weightBuffer, weightOffset) = resolveWeight(role: role)
+                    bufferBindings.append((batch.fragments.count + i, weightBuffer, weightOffset))
+                }
+            }
+
+            // Constants: count per fragment, headDimension, epsilon
+            let bytesStart = 2 * batch.fragments.count
+            for (i, frag) in batch.fragments.enumerated() {
+                if case .perHead(let headCount) = frag.dispatchDimension {
+                    bytesBindings.append(uint32Binding(bytesStart + i, UInt32(headCount)))
+                }
+            }
+
+            // headDimension and epsilon from first fragment
+            if let firstQKNorm = batch.fragments.first as? QKNormFragment {
+                bytesBindings.append(uint32Binding(bytesStart + batch.fragments.count, UInt32(firstQKNorm.headDimension)))
+                bytesBindings.append(floatBinding(bytesStart + batch.fragments.count + 1, firstQKNorm.epsilon))
+            }
+
+            return (buffers: bufferBindings, bytes: bytesBindings)
+
         // MARK: Default
         default:
             print("[Compiler] WARNING: unhandled operation in buffer routing")
@@ -2155,16 +2253,62 @@ public struct MetalInferenceCompiler: Sendable {
                 }
 
             case .fusedResidualAddNorm(_):
-                // TODO: generate fused residual add + rms norm kernel
-                break
+                let weightFormat = resolveWeightFormat(role: "scale", entry: entry, stafWeightStore: stafWeightStore)
+                let kernelName = weightFormat == .bfloat16 ? "fused_residual_add_rms_norm_bf16" : "fused_residual_add_rms_norm"
+                if bufferPrecision == .float16 {
+                    if generatedNames.insert(kernelName).inserted {
+                        sources.append(MetalSourceGenerator.generateFusedResidualAddRMSNorm(
+                            name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                    }
+                }
+                // Prefill: decomposed into add + norm steps by buildPrefillSteps.
+                // Individual kernels (residual_add_seq, rms_norm_seq) are generated
+                // by their own dispatch entries — no additional generation needed here.
 
-            case .batchedProjection(_):
-                // TODO: generate batched GEMV kernel
-                break
+            case .batchedProjection(let batched):
+                let count = batched.projections.count
+                let weightFormat = resolveWeightFormat(
+                    role: batched.projections[0].field, entry: entry, stafWeightStore: stafWeightStore)
+                if bufferPrecision == .float16 {
+                    let suffix = weightFormat == .bfloat16 ? "_bf16" : ""
+                    let kernelName = "batched_gemv\(count)\(suffix)"
+                    if generatedNames.insert(kernelName).inserted {
+                        if count == 2 {
+                            sources.append(MetalSourceGenerator.generateBatchedGEMV2(
+                                name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                        } else {
+                            sources.append(MetalSourceGenerator.generateBatchedGEMV3(
+                                name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                        }
+                    }
+                } else {
+                    // Prefill: decompose into individual GEMMs (handled by buildPrefillSteps)
+                    let gemmName = weightFormat == .bfloat16 ? "gemm_bf16_f32s" : "gemm_f32s"
+                    if generatedNames.insert(gemmName).inserted {
+                        sources.append(MetalSourceGenerator.generateGEMM(
+                            name: gemmName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                    }
+                }
 
-            case .batchedFragment(_):
-                // TODO: generate batched fragment kernel from kernelBody()
-                break
+            case .batchedFragment(let batch):
+                if bufferPrecision == .float16 {
+                    let kernelName = self.kernelName(for: entry.kind, entry: entry, stafWeightStore: stafWeightStore)
+                    if generatedNames.insert(kernelName).inserted {
+                        let weightFormat = resolveWeightFormat(role: "q_layernorm", entry: entry, stafWeightStore: stafWeightStore)
+                        if batch.fragments.count == 2, case .perHead = batch.dispatchDimension {
+                            sources.append(MetalSourceGenerator.generateBatchedPerHead2(
+                                name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                        }
+                    }
+                } else {
+                    // Prefill: decompose into individual QKNorm steps (handled by buildPrefillSteps)
+                    let weightFormat = resolveWeightFormat(role: "q_layernorm", entry: entry, stafWeightStore: stafWeightStore)
+                    let normName = weightFormat == .bfloat16 ? "qk_rms_norm_seq_f32_bf16" : "qk_rms_norm_seq_f32"
+                    if generatedNames.insert(normName).inserted {
+                        sources.append(MetalSourceGenerator.generateQKNormSeq(
+                            name: normName, bufferPrecision: bufferPrecision, weightFormat: weightFormat))
+                    }
+                }
             }
         }
 
