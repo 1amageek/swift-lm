@@ -129,45 +129,7 @@ public struct MetalSourceGenerator: Sendable {
 
     // MARK: - Fragment-Driven Generation
 
-    /// Generate MSL for a primitive fragment with the given precision and weight format.
-    /// Returns nil if the fragment type is not recognized.
-    public static func generateForFragment(
-        _ fragment: any PrimitiveMetalKernelFragment,
-        name: String,
-        bufferPrecision: BufferPrecision,
-        weightFormat: WeightFormat
-    ) -> String? {
-        let isSeq = bufferPrecision == .float32  // F32 = prefill = sequence
 
-        switch fragment {
-        case is Reduction:
-            return generateReduction(name: name, dimension: 0, epsilon: 0,
-                                     bufferPrecision: bufferPrecision, weightFormat: weightFormat, isSequence: isSeq)
-        case is ElementwiseFragment:
-            return generateSwiGLU(name: name, bufferPrecision: bufferPrecision, isSequence: isSeq)
-        case is GatherFragment:
-            return generateEmbeddingLookup(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat, isSequence: isSeq)
-        case is ArgmaxFragment:
-            return generateArgmax(name: name, bufferPrecision: bufferPrecision)
-        case is FlashAttentionFragment:
-            return generateFlashAttentionKernel(name: name, bufferPrecision: bufferPrecision)
-        case is RoPEFragment:
-            return isSeq ? generateRoPESeq(name: name, bufferPrecision: bufferPrecision)
-                         : generateRoPE(name: name, bufferPrecision: bufferPrecision)
-        case is QKNormFragment:
-            return isSeq ? generateQKNormSeq(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
-                         : generateQKNorm(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
-        case is Conv1dFragment:
-            return isSeq ? generateConv1dCausalSeq(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
-                         : generateConvStateUpdate(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
-        case is SSMRecurrenceFragment:
-            return ssmRecurrenceSource
-        case is SigmoidGateFragment:
-            return generateSigmoidGate(name: name, bufferPrecision: bufferPrecision)
-        default:
-            return nil
-        }
-    }
 
     // MARK: - Common Header
 

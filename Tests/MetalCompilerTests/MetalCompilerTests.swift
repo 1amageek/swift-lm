@@ -172,10 +172,10 @@ struct KernelCompletenessTests {
             SigmoidGateFragment(dimension: 128),
         ]
         for frag in fragments {
-            let src = MetalSourceGenerator.generateForFragment(
-                frag, name: "test_\(type(of: frag))",
+            let src = frag.kernelSource(
+                name: "test_\(type(of: frag))",
                 bufferPrecision: .float16, weightFormat: .bfloat16)
-            #expect(src != nil, "Failed to generate kernel for \(type(of: frag))")
+            #expect(!src.isEmpty, "Failed to generate kernel for \(type(of: frag))")
         }
     }
 

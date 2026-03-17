@@ -26,6 +26,12 @@ public struct RoPEFragment: PrimitiveMetalKernelFragment {
         .perHead(headCount: max(headCount, kvHeadCount))
     }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        bufferPrecision == .float32
+            ? MetalSourceGenerator.generateRoPESeq(name: name, bufferPrecision: bufferPrecision)
+            : MetalSourceGenerator.generateRoPE(name: name, bufferPrecision: bufferPrecision)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let slotBytes = context.slotDimension * context.elementSize
         return FragmentBindings(

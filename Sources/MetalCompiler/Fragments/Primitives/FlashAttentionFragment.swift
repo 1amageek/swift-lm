@@ -28,6 +28,10 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         [MetalCacheSlot(name: "kv_cache", kind: .kv, kvHeadCount: kvHeadCount, headDimension: headDimension)]
     }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateFlashAttentionKernel(name: name, bufferPrecision: bufferPrecision)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let scale: Float = 1.0 / Float(headDimension).squareRoot()
         let slotBytes = context.slotDimension * context.elementSize

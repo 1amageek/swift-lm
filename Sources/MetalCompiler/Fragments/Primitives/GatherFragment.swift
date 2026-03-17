@@ -21,6 +21,10 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .gather(count: embeddingDimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: nil, role: .weight)] }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateEmbeddingLookup(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat, isSequence: bufferPrecision == .float32)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let (weightBuffer, weightOffset) = context.resolveWeight("embedding_table")
         return FragmentBindings(

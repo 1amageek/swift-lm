@@ -24,6 +24,12 @@ public struct QKNormFragment: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .perHead(headCount: headCount) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: weightRole, role: .weight)] }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        bufferPrecision == .float32
+            ? MetalSourceGenerator.generateQKNormSeq(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+            : MetalSourceGenerator.generateQKNorm(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let slotBytes = context.slotDimension * context.elementSize
         let scratchSlotIndex = weightRole == "q_layernorm" ? 1 : 2

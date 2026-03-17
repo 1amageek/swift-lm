@@ -12,6 +12,10 @@ public struct SigmoidGateFragment: PrimitiveMetalKernelFragment {
     public func kernelName(context: KernelContext) -> String { "sigmoid_gate" }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateSigmoidGate(name: name, bufferPrecision: bufferPrecision)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let slotBytes = context.slotDimension * context.elementSize
         return FragmentBindings(

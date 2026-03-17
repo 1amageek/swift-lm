@@ -1309,10 +1309,10 @@ public struct MetalInferenceCompiler: Sendable {
                 let fragCtx = KernelContext(bufferPrecision: bufferPrecision, weightFormat: weightFormat)
                 let kernelName = frag.kernelName(context: fragCtx)
                 if generatedNames.insert(kernelName).inserted {
-                    if let src = MetalSourceGenerator.generateForFragment(frag, name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat) {
-                        if !frag.cacheSlots.filter({ $0.kind == .kv }).isEmpty { needsFlashAttnHelper = true }
-                        sources.append(src)
-                    }
+                    // Fragment provides its own MSL source — no type switch needed
+                    let src = frag.kernelSource(name: kernelName, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+                    if !frag.cacheSlots.filter({ $0.kind == .kv }).isEmpty { needsFlashAttnHelper = true }
+                    sources.append(src)
                 }
                 // Conv cache fragments in prefill also need extract_conv_state kernel
                 if frag.cacheSlots.contains(where: { $0.kind == .conv }) && bufferPrecision == .float32 {

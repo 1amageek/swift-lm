@@ -19,6 +19,12 @@ public struct Conv1dFragment: PrimitiveMetalKernelFragment {
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: "conv_weight", role: .weight)] }
     public var cacheSlots: [MetalCacheSlot] { [MetalCacheSlot(name: "conv_cache", kind: .conv, temporalSize: kernelSize)] }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        bufferPrecision == .float32
+            ? MetalSourceGenerator.generateConv1dCausalSeq(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+            : MetalSourceGenerator.generateConvStateUpdate(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let (weightBuffer, weightOffset) = context.resolveWeight("conv_weight")
         let slotBytes = context.slotDimension * context.elementSize

@@ -14,6 +14,10 @@ public struct ArgmaxFragment: PrimitiveMetalKernelFragment {
     }
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: vocabularySize) }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateArgmax(name: name, bufferPrecision: bufferPrecision)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         return FragmentBindings(
             buffers: [

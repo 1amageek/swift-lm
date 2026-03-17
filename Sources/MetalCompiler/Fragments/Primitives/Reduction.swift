@@ -23,6 +23,11 @@ public struct Reduction: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: dimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: nil, role: .weight)] }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateReduction(name: name, dimension: 0, epsilon: 0,
+            bufferPrecision: bufferPrecision, weightFormat: weightFormat, isSequence: bufferPrecision == .float32)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let (weightBuffer, weightOffset) = context.resolveWeight("scale")
         return FragmentBindings(

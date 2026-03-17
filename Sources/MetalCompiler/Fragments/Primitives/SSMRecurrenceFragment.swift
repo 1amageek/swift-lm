@@ -14,6 +14,10 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
     public func kernelName(context: KernelContext) -> String { "ssm_recurrence" }
     public var dispatchDimension: MetalDispatchDimension { .perHead(headCount: headCount) }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.ssmRecurrenceSource
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         fatalError("[Compiler] SSMRecurrenceFragment decode bindings not yet implemented")
     }

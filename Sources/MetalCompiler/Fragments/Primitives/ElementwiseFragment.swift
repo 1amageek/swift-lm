@@ -27,6 +27,10 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: count) }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        MetalSourceGenerator.generateSwiGLU(name: name, bufferPrecision: bufferPrecision, isSequence: bufferPrecision == .float32)
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         let slotBytes = context.slotDimension * context.elementSize
         return FragmentBindings(
