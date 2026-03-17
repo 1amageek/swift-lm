@@ -14,6 +14,10 @@ public struct QuantizeKVFragment: PrimitiveMetalKernelFragment {
     public func kernelName(context: KernelContext) -> String { "quantize_kv" }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: totalElements / groupSize) }
 
+    public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
+        fatalError("[Compiler] QuantizeKVFragment kernel source not yet implemented")
+    }
+
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
         fatalError("[Compiler] QuantizeKVFragment decode bindings not yet implemented")
     }
