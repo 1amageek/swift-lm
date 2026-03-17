@@ -26,14 +26,12 @@ public struct AggressiveOptimizer: DispatchOptimizer {
             // Only batch non-output projections. The last projection in the
             // composite is likely the output projection (o_proj, down_proj) and
             // must remain as .projection for markLastProjectionAsOutput().
-            if case .gemv(_, let inputDim) = primitives[i].fragment.dispatchDimension,
-               let linear = primitives[i].fragment as? LinearFragment {
+            if case .gemv(let outputDim, let inputDim) = primitives[i].fragment.dispatchDimension {
                 var batch: [CollectedPrimitive] = [primitives[i]]
                 var j = i + 1
                 while j < primitives.count,
                       case .gemv(_, let nextInputDim) = primitives[j].fragment.dispatchDimension,
-                      nextInputDim == inputDim,
-                      primitives[j].fragment is LinearFragment {
+                      nextInputDim == inputDim {
                     // Stop before the last projection in the composite —
                     // it might be the output projection.
                     let isLastProjection = !primitives[(j+1)...].contains {
@@ -47,11 +45,14 @@ public struct AggressiveOptimizer: DispatchOptimizer {
 
                 if batch.count >= 2 {
                     let projections = batch.map { p in
-                        let l = p.fragment as! LinearFragment
+                        guard case .gemv(let outDim, let inDim) = p.fragment.dispatchDimension else {
+                            fatalError("Expected .gemv dispatchDimension in batched projection")
+                        }
+                        let field = p.fragment.weightSlots.first?.field ?? "weight"
                         return BatchedProjection.Entry(
-                            field: l.field,
-                            inputDimension: l.inputDimension,
-                            outputDimension: l.outputDimension)
+                            field: field,
+                            inputDimension: inDim,
+                            outputDimension: outDim)
                     }
                     let mergedBindings = batch.flatMap { $0.parameterBindings }
                     result.append(.batchedProjection(

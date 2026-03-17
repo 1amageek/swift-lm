@@ -642,12 +642,13 @@ public struct MetalInferenceCompiler: Sendable {
         mutating func emitOptimized(_ entry: OptimizedEntry) {
             switch entry {
             case .single(let p):
-                // LinearFragment → .projection, others → .fragment
-                if let linear = p.fragment as? LinearFragment {
+                // .gemv dispatch dimension → .projection, others → .fragment
+                if case .gemv(let outputDim, let inputDim) = p.fragment.dispatchDimension {
+                    let field = p.fragment.weightSlots.first?.field ?? "weight"
                     let projection = MetalProjection(
-                        field: linear.field,
-                        inputDimension: linear.inputDimension,
-                        outputDimension: linear.outputDimension)
+                        field: field,
+                        inputDimension: inputDim,
+                        outputDimension: outputDim)
                     emit(.projection(projection),
                          parameterBindings: p.parameterBindings,
                          layerIndex: p.layerIndex)
@@ -1473,13 +1474,4 @@ public struct MetalInferenceCompiler: Sendable {
         return ((value + multiple - 1) / multiple) * multiple
     }
 
-    private func uint32Binding(_ index: Int, _ value: UInt32) -> (index: Int, value: [UInt8]) {
-        var v = value
-        return (index, withUnsafeBytes(of: &v) { Array($0) })
-    }
-
-    private func floatBinding(_ index: Int, _ value: Float) -> (index: Int, value: [UInt8]) {
-        var v = value
-        return (index, withUnsafeBytes(of: &v) { Array($0) })
-    }
 }
