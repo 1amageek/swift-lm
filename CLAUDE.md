@@ -41,7 +41,7 @@ LMIR (IR モジュール — backend 非依存)
 
 ### IR と Backend の分離
 
-**LMIR は接続だけを記述する。計算の中身は opaque。**
+**LMIR は接続と構造だけを記述する。計算の中身は opaque。**
 
 ```swift
 // LMIR — 接続のみ
@@ -52,161 +52,194 @@ struct Operation {
 }
 
 // 構造操作 — IR が知る唯一のもの
-enum StructuralKind {
-    case residual(strategy, body: Region)
-    case parallel(merge, branches: [Region])
-    case repeating(count, body: Region)
-    case conditional(condition, then: Region, else: Region)
+enum OperationKind {
+    case primitive(any OperationAttributes)     // 計算ノード (opaque)
+    case residual(strategy, body: Region)       // copy → body → add
+    case parallel(merge, branches: [Region])    // 並列分岐
+    case repeating(count, body: Region)         // N 回繰り返し
+    case conditional(condition, then, else)     // compile-time 分岐
 }
 ```
 
-Backend (MetalCompiler, 将来の TPUCompiler) が attributes の型を判定して実行方法を決める:
+### IR Graph の構造
+
+IR は Region と Operation のネスト構造。ModelComponent DSL が宣言的に構築し、SemanticNormalizer が正規化する。
 
 ```
-LMIR (接続)           MetalCompiler              TPUCompiler
-Operation             MetalComponent protocol    TPUComponent protocol
-  .attrs (opaque) ──▶  attrs as? AttentionAttrs   attrs as? AttentionAttrs
-                       → flash_attn kernel         → tpu_attn_op
-                       attrs as? MLPAttrs          attrs as? MLPAttrs
-                       → gemv + swiglu              → tpu_mlp_op
-
-StructuralKind        compiler が walk
-  .residual   ───────▶  copy → body → add
-  .parallel   ───────▶  barrier なし (concurrent)
-  .repeating  ───────▶  unroll
-  .conditional ──────▶  compile-time 分岐
+ModelGraph.rootRegion:
+  Region [
+    Operation(.primitive(TokenEmbeddingAttributes))
+    Operation(.repeating(count: 16, body:
+      Region [
+        Operation(.residual(body:
+          Region [
+            Operation(.primitive(RMSNormAttributes))        // operator_norm
+            Operation(.primitive(AttentionAttributes))      // or ShortConvAttributes
+          ]))
+        Operation(.residual(body:
+          Region [
+            Operation(.primitive(RMSNormAttributes))        // ffn_norm
+            Operation(.primitive(MLPAttributes))
+          ]))
+      ]))
+    Operation(.primitive(RMSNormAttributes))                // final norm
+    Operation(.primitive(OutputHeadAttributes))
+  ]
 ```
 
-IR は OperationKind enum を持たない。`any OperationAttributes` として opaque に保持する。新しい計算を追加しても IR の変更は不要。
+構造操作 (residual, repeating, conditional) は compiler が walk 時に処理する。primitive 操作の attributes は MetalKernelFragment として Metal backend に橋渡しされる。
 
-### MetalComponent Protocol — 責務の分離
+### MetalKernelFragment — SwiftUI 風 fragment tree
 
-MetalComponent は **Metal backend 側のプロトコル** (MetalCompiler モジュール内)。IR (LMIR) には属さない。LMIR の Attributes 型を MetalCompiler 内で extension して準拠させる。
-
-**核心原則: MetalComponent は「何の計算が必要か」を宣言する。Compiler は「どう実行するか」を決定する。**
-
-この2つを混同しない:
-- **計算の宣言** (MetalComponent の責務): 「GEMV が必要」「reduction(dim: D) が必要」「flashAttention(heads: H) が必要」
-- **実行の決定** (Compiler の責務): kernel source、dispatch config、fusion、buffer routing
+**OperationAttributes → MetalKernelFragment** : IR の各計算ノードを Metal kernel の組み合わせに展開する。
 
 ```swift
-// MetalCompiler モジュール内
-protocol MetalComponent {
-    var projections: [MetalProjection] { get }       // "GEMV が必要" の宣言
-    var computeOps: [MetalComputeOp] { get }         // "この非 GEMV 計算が必要" の宣言
-    var weightSlots: [MetalWeightSlot] { get }       // weight 名 (variant)
-    var cacheSlots: [MetalCacheSlot] { get }         // cache 宣言
-}
-
-// 計算種別の宣言 — MetalComponent が返す
-// compiler はこれを読んで kernel 選択・dispatch config 計算を行う
-enum MetalComputeOp {
-    case reduction(dim: Int)                          // norm, argmax
-    case elementwise(count: Int)                      // activation, add, copy
-    case flashAttention(numHeads: Int, headDim: Int)  // SDPA + KV cache
-    case gather(count: Int)                           // embedding lookup
-    case conv1d(dim: Int, kernelSize: Int)            // depthwise conv
-    case recurrence(numHeads: Int, dk: Int, dv: Int)  // SSM state update
-}
-
-// Attributes 型への準拠は MetalCompiler 内の extension で行う
-extension AttentionAttributes: MetalComponent { ... }
-extension MLPAttributes: MetalComponent { ... }
-```
-
-#### 禁止: Compiler 内部に計算種別を持つ
-
-```swift
-// ✗ WRONG — compiler が計算種別を決め打ちしている
-// 新しい MetalComponent を追加するたびに compiler の enum も変更が必要
-enum KernelKind {  // compiler 内部
-    case reduction(dim: Int)
-    case gemv(...)
-}
-func primitiveKernelKind(for entry: KernelEntry) -> KernelKind { ... }
-
-// ✓ CORRECT — compiler は MetalComponent から計算種別を読み取る
-// 新しい MetalComponent を追加しても compiler の変更は不要
-let ops = metalComponent.computeOps
-for op in ops {
-    let config = computeDispatchConfig(op: op, pipeline: pipeline)
-    ...
+// MetalCompiler モジュール内で extension
+extension AttentionAttributes: MetalKernelFragment {
+    @MetalKernelFragmentBuilder
+    func fragment(context: KernelContext) -> some MetalKernelFragment {
+        LinearFragment(field: "q_proj", ...)     // Q 射影
+        LinearFragment(field: "k_proj", ...)     // K 射影
+        LinearFragment(field: "v_proj", ...)     // V 射影
+        if qkNorm != nil {
+            QKNormFragment(headCount: headCount, ...)
+            QKNormFragment(headCount: kvHeadCount, ...)
+        }
+        if let rope = rope {
+            RoPEFragment(...)
+        }
+        FlashAttentionFragment(...)              // attention 本体
+        LinearFragment(field: "o_proj", ...)     // 出力射影
+    }
 }
 ```
 
-### Compiler の役割
-
-Compiler は MetalComponent の宣言を読んで実行方法を決定する:
+Fragment tree のレイヤー:
 
 ```
-IR Graph walk:
-
-  operation を見る → metalComponent を取得
-    → projections から GEMV dispatch を生成
-    → computeOps から非 GEMV dispatch を生成
-    → graph の接続 (sequential/parallel/residual) に従って繋ぐ
-
-  graph 構造だけで dispatch 列が決まる:
-
-    residual {                      → copy(hidden → residual_buf)
-      rmsNorm                       → norm(hidden → scratch)
-      parallel {                    → barrier なし (独立)
-        linear(q_proj)              → gemv(scratch → scratch_q)
-        linear(k_proj)              → gemv(scratch → scratch_k)
-        linear(v_proj)              → gemv(scratch → scratch_v)
-      }
-      flash_attn                    → flash_attn(Q,K,V,cache → scratch)
-      linear(o_proj)                → gemv(scratch → hidden)
-    }                               → add(hidden, residual_buf → hidden)
-
-  新しい計算を追加しても compiler は変更不要。
-  MetalComponent 準拠を追加するだけ。
+MetalKernelFragment (protocol)
+├── PrimitiveMetalKernelFragment    // 1 kernel に対応する leaf
+│   ├── Reduction                   // RMSNorm, LayerNorm
+│   ├── LinearFragment              // GEMV/GEMM 射影
+│   ├── ElementwiseFragment         // SwiGLU, sigmoid gate
+│   ├── FlashAttentionFragment      // QKV attention + KV cache
+│   ├── Conv1dFragment              // temporal conv + conv_state
+│   ├── RoPEFragment                // rotary position encoding
+│   ├── QKNormFragment              // per-head RMS norm
+│   ├── GatherFragment              // embedding lookup
+│   └── ArgmaxFragment              // argmax for token selection
+│
+├── TupleFragment                   // 複数 fragment の直列結合
+├── OptionalFragment                // 条件付き fragment
+└── ConditionalFragment             // if-else 分岐
 ```
 
-### Kernel Source — MetalComponent が fragment を持ち、Compiler が合成する
+### Compiler の IR walk → dispatch plan 生成
 
-**MetalComponent は primitive な kernel fragment (計算の本体) を提供する。Compiler が dtype 変換・buffer routing・fusion を行い、最終的な kernel source を合成する。**
+#### Phase 1: IR walk (walkRegion)
 
-#### 禁止: kernel variant のハードコーディング
+compiler は IR Graph を再帰的に walk し、dispatch entries を生成する。
 
-```swift
-// ✗ WRONG — dtype × precision × operation の組み合わせを手書きする
-// 新しい dtype や operation を追加するたびに N×M×K の variant が必要
-static let gemvSource = "kernel void gemv(...half*...)"
-static let gemvBF16Source = "kernel void gemv_bf16(...uint16_t*...)"
-static let gemmBF16F32SSource = "kernel void gemm_bf16_f32s(...float*...uint16_t*...float*...)"
-// ... 同じ計算を何十回も書き直す
+```
+walkRegion(region):
+  for operation in region.operations:
+    switch operation.kind:
 
-// ✓ CORRECT — fragment は計算の本体のみ。dtype・precision は compiler が制御
-// MetalComponent が提供する fragment:
-//   float compute_rms_norm(float input, float weight, float rms) {
-//       return input * rms * weight;
-//   }
-// Compiler が以下を合成:
-//   1. buffer の型宣言 (half*, float*, uint16_t*)
-//   2. weight の読み取り変換 (bf16_to_float, そのまま, dequantize)
-//   3. output の書き込み変換 (half(), そのまま)
-//   4. fusion (隣接 fragment の結合)
+    case .primitive(attributes):
+      fragment = attributes as? MetalKernelFragment
+      primitives = collectPrimitives(fragment)    // tree を flatten
+      optimized = optimizer.optimizeFragment(primitives)
+      for entry in optimized: emit(entry)
+      markLastProjectionAsOutput()                // o_proj, down_proj → isOutput
+
+    case .residual(body):
+      emit(.structuralCopy)     // hidden → residual buffer
+      walkRegion(body)          // body の entries を再帰生成
+      emit(.structuralAdd)      // hidden += residual
+
+    case .repeating(count, body):
+      for i in 0..<count:
+        walkRegion(body, layerIndex: i)
+
+    case .conditional(condition, then, else):
+      walkRegion(selectedBody)  // compile-time 分岐
 ```
 
-#### なぜ fragment + 合成が必要か
+#### Phase 2: Graph-level optimization
 
-1. **dtype の組み合わせ爆発を防ぐ**: weight は BF16/FP16/Q4/Q8、buffer は F16/F32 — 手書きでは N×M variant が必要。Compiler が自動生成すれば fragment は 1 つ
-2. **fusion を自動化できる**: 隣接する fragment を結合して中間 buffer の read/write を消す。手書き fused kernel は不要
-3. **新しい operation の追加が容易**: fragment を 1 つ書けば、全 dtype・precision の組み合わせが自動的に使える
-4. **BF16 誤読のような不整合を構造的に防ぐ**: weight dtype の解釈は compiler が一元管理。個別 kernel で `half*` と `uint16_t*` を間違えることがない
+StandardOptimizer が隣接 entries をパターンマッチで fusion:
 
-#### BFloat16 の特性と Compiler の責務
+```
+structuralAdd + structuralCopy + Reduction → fusedResidualAddCopyNorm
+structuralCopy + Reduction                → fusedCopyNorm
+```
 
-BFloat16 は Float32 の上位 16 bit。`UInt32(bf16) << 16` で情報損失なく Float32 に戻る (exponent 8 bit が同一)。Float16 とは exponent 幅が違う (5 vs 8) ため、BF16 raw bits を Float16 として読むと値が完全に壊れる。
+#### Phase 3: Prefill dispatch plan 生成 (buildPrefillSteps)
 
-- **Compiler の責務**: weight の QuantizationFormat を見て、読み取りコードを生成する
-  - BF16: `bf16_to_float(raw_uint16)` = `as_type<float>(uint32(raw) << 16)`
-  - FP16: `float(half_value)` — そのまま
-  - Q4/Q8: dequantize block → float
-- **MetalComponent の責務**: 計算の本体 (float in → float out) のみ。dtype を知らない
+dispatch entries → MetalPrefillStep (実行可能な GPU dispatch 列) に変換。
 
-Grid/threadgroup は compiler が `pipeline.maxTotalThreadsPerThreadgroup` と `threadExecutionWidth` から計算。固定値を焼き込まない。
+```
+buildPrefillSteps(entry):
+  switch entry.kind:
+
+  case .projection(proj, isOutput):
+    input  = lastOutputIsHidden ? hidden : scratch
+    output = isOutput ? hidden : scratch[projectionIndex + 1]
+    projectionIndex += 1
+    // ⚠ isOutput でない projection は lastOutputIsHidden を変更しない
+    //   → 並列射影 (gate+up, Q+K+V) が同じ入力を読めるようにする
+
+  case .fragment(frag):
+    steps = frag.prefillSteps(context)
+    lastOutputIsHidden = result.outputIsHidden
+    if result.resetsProjectionIndex: projectionIndex = 0
+
+  case .structuralCopy:
+    copy hidden → residual
+    projectionIndex = 0
+
+  case .structuralAdd:
+    hidden = hidden + residual
+    lastOutputIsHidden = true
+
+  case .fusedResidualAddCopyNorm:
+    decompose → [structuralAdd, structuralCopy, Reduction]
+    再帰的に buildPrefillSteps
+```
+
+#### Buffer routing state
+
+Compiler は routing state を通じて各 step のバッファ割り当てを決定:
+
+```
+struct BufferRoutingState {
+    lastOutputIsHidden: Bool     // true: 次の入力は hidden, false: scratch
+    projectionIndex: Int         // scratch slot の番号 (slot = projectionIndex + 1)
+}
+```
+
+**重要**: 非出力 projection (gate, up, Q, K, V) は `lastOutputIsHidden` を変更しない。これにより並列射影が同一入力 (RMSNorm 出力) を読める。
+
+#### Scratch buffer slot layout
+
+```
+scratch buffer:
+  slot 0: RMSNorm 出力 → conv1d 出力 → SwiGLU 出力 → attention 出力
+  slot 1: 1st projection 出力 (in_proj / gate_proj / q_proj)
+  slot 2: 2nd projection 出力 (up_proj / k_proj)
+  slot 3: 3rd projection 出力 (v_proj)
+
+  slot stride = slotDimension × maxSequenceLength × sizeof(float)
+  slotDimension = max(hiddenSize, intermediateSize, maxProjectionOutputDimension)
+```
+
+#### Dispatch mode (prefill)
+
+| Mode | 動作 | 用途 |
+|------|------|------|
+| `.batch` | 全 position を 1 dispatch で処理。grid.height = seqLen | GEMM, RMSNorm, SwiGLU, conv1d |
+| `.perPosition` | position ごとに dispatch + barrier | flash_attn (KV cache 依存) |
+| `.lastToken` | 最終 position のみ dispatch | output head GEMM, argmax |
 
 ### Prefill と Decode の precision 分離
 
@@ -215,43 +248,6 @@ Grid/threadgroup は compiler が `pipeline.maxTotalThreadsPerThreadgroup` と `
 - **F32↔F16 変換**: prefill→decode の転送時に **1 箇所で独立して** 行う。計算 kernel 内で混在させない
 - **KV cache**: F16 (prefill/decode 共通)。flash_attn kernel 内で F32→F16 変換して書き込む
 - **conv_state**: F16 (decode format)。extract kernel 内で F32→F16 変換して書き込む
-
-### Op Fusion — llama.cpp パターンマッチ方式
-
-**fusion の本質は dispatch 数削減ではなく、中間バッファの device memory read/write を消すこと。**
-
-llama.cpp と同じパターンマッチ方式で fusion を検出する:
-
-#### Fusion 判定条件 (llama.cpp `ggml_can_fuse_ext` 準拠)
-
-```
-1. 中間ノードの use count == 1 (他の consumer がいない)
-2. 次ノードの入力が前ノードの出力
-3. 前後ノードの shape が同一
-4. 型が contiguous
-```
-
-**use count == 1 が fusion の本質的条件。** 出力が 1 箇所にしか消費されないなら、中間 buffer への書き出しを省略して register に保持できる。
-
-#### Fusion 対象パターン
-
-```
-1. rmsNorm + mul (weight)           → kernel_rms_norm_mul
-2. rmsNorm + mul + add (residual)   → kernel_rms_norm_mul_add
-3. silu(gate) * up                  → kernel_swiglu (既に 1 kernel)
-4. residualAdd + rmsNorm            → kernel_residual_norm
-```
-
-GEMV / SDPA / conv1d / recurrence は fuse しない (最適化済み dedicated kernel)。
-
-#### Compiler の fusion pass
-
-```
-Phase 1: IR walk → MetalComponent.computeOps を読んで dispatch 列を生成
-Phase 2: Fusion pass — 隣接する dispatch を pattern match で fuse
-Phase 3: Fused dispatch の kernel source を選択 (compiler が持つ fused variant)
-Phase 4: Pipeline 生成 + dispatch config 計算
-```
 
 ### STAF (SafeTensor Accelerated Format)
 

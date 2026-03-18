@@ -298,6 +298,49 @@ struct ReferenceComparisonTests {
                 "Prefill logits argmax: Metal=\(metalArgmax.index) Python=\(refArgmax.index)")
     }
 
+    @Test("Prefill argmax matches Python for all sequence lengths 5-11")
+    func prefillArgmaxSweep() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { throw SetupError.noDevice }
+        let stafURL = URL(fileURLWithPath: Self.stafPath)
+        guard FileManager.default.fileExists(atPath: stafURL.path) else { throw SetupError.noSTAF }
+        let store = try STAFLoader().load(at: stafURL, device: device)
+        let config = ModelConfig(
+            hiddenSize: 2048, layerCount: 16, intermediateSize: 8192,
+            vocabSize: 65536, attentionHeads: 32, kvHeads: 8, headDim: 64,
+            attentionBias: false, mlpBias: false, normEps: 1e-5,
+            normKind: .rmsNorm, ropeTheta: 1000000.0, ropeDimension: 64,
+            ropeScaling: nil, tiedEmbeddings: true,
+            expertCount: nil, expertsPerToken: nil, qkNorm: true,
+            fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil, convKernelSize: nil, convLCache: 3,
+            partialRotaryFactor: nil, slidingWindow: nil,
+            layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
+                         "conv", "conv", "full_attention", "conv", "full_attention", "conv",
+                         "full_attention", "conv", "full_attention", "conv"])
+        let graph = try LFM2(config: config).makeModelGraph()
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
+        let pyArgmax: [Int: Int] = [5: 2, 6: 2, 7: 49049, 8: 2, 9: 2, 10: 2, 11: 64400]
+        let full: [Int32] = [1, 1, 6, 6423, 708, 6928, 7, 708, 6, 64015, 708]
+
+        var allMatch = true
+        for n in 5...11 {
+            let compiler = MetalInferenceCompiler()
+            let decode = try compiler.compile(graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
+                                              vocabSize: 65536, stafWeightStore: store, device: device)
+            let prefill = try compiler.compilePrefill(graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
+                                                     vocabSize: 65536, maximumSequenceLength: 64,
+                                                     stafWeightStore: store, device: device)
+            var model = try MetalInferenceModel(plan: decode, device: device)
+            model.prefillPlan = prefill
+            let first = model.prefill(tokens: Array(full.prefix(n)))
+            let expected = pyArgmax[n] ?? -1
+            let match = Int(first) == expected
+            if !match { allMatch = false }
+            print("[sweep] len=\(n) metal=\(first) python=\(expected) \(match ? "✓" : "✗")")
+        }
+        #expect(allMatch, "Some sequence lengths produced wrong argmax")
+    }
+
     // MARK: - Graph and Dispatch Dump
 
     @Test("Dump IR graph and dispatch entries for LFM2")

@@ -89,6 +89,16 @@ public struct MetalInferenceModel: @unchecked Sendable {
             for token in tokens { lastOutput = decodeSync(tokenID: token) }
             return lastOutput
         }
+
+        // Use sequence-parallel prefill for short prompts (verified correct for ≤8 tokens).
+        // Longer prompts fall back to sequential decode to avoid a known
+        // cross-threadgroup KV cache visibility issue in perPosition flash attention.
+        // TODO: Replace with a proper batch flash attention kernel.
+        if tokens.count > 8 {
+            var lastOutput: Int32 = -1
+            for token in tokens { lastOutput = decodeSync(tokenID: token) }
+            return lastOutput
+        }
         guard !tokens.isEmpty else { return -1 }
         guard tokens.count <= prefill.maximumSequenceLength else { return -1 }
 

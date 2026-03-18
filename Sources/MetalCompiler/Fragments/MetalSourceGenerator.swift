@@ -1264,8 +1264,9 @@ public struct MetalSourceGenerator: Sendable {
             const uint kvHeadIndex = headIndex * kvHeadCount / headCount;
 
             // --- Step 1: Append new K/V to cache ---
-            const bool isWriter = (headIndex == kvHeadIndex * headCount / kvHeadCount);
-            if (isWriter) {
+            // All heads in a GQA group write the same K/V (idempotent).
+            // Eliminates cross-threadgroup race for perPosition prefill dispatch.
+            {
                 const uint kvIn = kvHeadIndex * headDim;
 
                 uint kWriteByteOffset;
