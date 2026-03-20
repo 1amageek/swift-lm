@@ -92,6 +92,41 @@ struct BenchmarkDiagnosticsTests {
         print("wait share:    \(String(format: "%.1f", waitPct))%")
     }
 
+    @Test("Optimizer decode token trace comparison")
+    func optimizerDecodeTokenTraceComparison() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        let variants: [(String, any DispatchOptimizer)] = [
+            ("none", NoOptimizer()),
+            ("standard", StandardOptimizer()),
+            ("aggressive", AggressiveOptimizer()),
+        ]
+
+        var traces: [(String, [Int32])] = []
+        for (name, optimizer) in variants {
+            let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: optimizer)
+            var inferenceModel = model
+            let trace = BenchmarkSupport.decodeTokenTrace(
+                model: &inferenceModel,
+                promptTokens: promptTokens,
+                predecodeSteps: 3,
+                decodeSteps: 5
+            )
+            traces.append((name, trace))
+        }
+
+        print("\n=== Optimizer Decode Token Trace ===")
+        for (name, trace) in traces {
+            print("\(name): \(trace)")
+        }
+
+        #expect(traces.count == 3)
+        #expect(traces[1].1 == traces[2].1, "standard and aggressive traces should match")
+    }
+
     @Test("Compilation time (IR → dispatch plan)")
     func compilationBenchmark() throws {
         let (_, store) = try BenchmarkSupport.setupOrSkip()

@@ -3620,3 +3620,496 @@ The next square-family attempt changed the lane mapping itself instead of the lo
   - the square-family bottleneck is not improved by interleaving the lane-to-weight mapping
   - this reshaping destabilizes the broader decode profile even though early correctness still holds
   - the branch should remain reverted
+
+## Accepted: Exact-Shape Fused SwiGLU Drops Unused `inputDimension` Binding
+
+The next accepted change did not touch the exact-shape GEMV kernels. It removed an unused constant binding from the exact-shape `input2048` fused SwiGLU family.
+
+- change:
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - `fused_swiglu_projection_2048_bf16`
+  - both kernels already hardcode `fixedInputDimension = 2048u`
+  - remove the dead `inputDimension` constant argument
+  - shift `outputDimension` from `[[buffer(5)]]` to `[[buffer(4)]]`
+  - remove the matching `uint32Binding` for `inputDimension` in the compiler
+- rationale:
+  - after the exact-shape GEMV family became the primary bottleneck, `fused_swiglu_projection_2048_bf16_argbuf` remained the only meaningful secondary hotspot
+  - this family does not consume `inputDimension` at runtime, so the extra constant bind is pure overhead
+  - this is a low-surface ABI reduction that leaves the row-major decode contract unchanged
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- diagnostics with the binding removed:
+  - per-step decode total: `3095 us`
+  - `gemv_2048_sq_bf16_argbuf: 1268 us`
+  - `gemv_2048_6144_bf16_argbuf: 1254 us`
+  - `fused_swiglu_projection_2048_bf16_argbuf: 223 us`
+  - hot exact-shape GEMV total: `2532 us`
+- clean throughput runs with the binding removed:
+  - run A:
+    - optimizer comparison: `none 125.0 / standard 132.1 / aggressive 135.2 tok/s`
+    - single decode: `standard 131.6 / aggressive 136.3 tok/s`
+    - end-to-end decode: `129.7 tok/s`
+  - run B:
+    - optimizer comparison: `none 125.2 / standard 128.7 / aggressive 130.7 tok/s`
+    - single decode: `standard 130.4 / aggressive 133.2 tok/s`
+    - end-to-end decode: `126.9 tok/s`
+- direct A/B sanity check:
+  - restoring the removed `inputDimension` binding in the same session did not produce a better result
+  - the revert-side spot check was clearly worse at the kernel level:
+    - `fused_swiglu_projection_2048_bf16_argbuf: 444 us`
+    - per-step decode total: `7245 us`
+    - hot exact-shape GEMV total: `3173 us`
+- interpretation:
+  - aggregate throughput remains noisy, but the kernel-level win is real and the direct same-session revert check was worse
+  - removing the dead constant binding is safe and beneficial enough to keep
+  - the primary bottlenecks remain `gemv_2048_sq_bf16_argbuf` and `gemv_2048_6144_bf16_argbuf`
+
+## Rejected: Square Row-Stream Reduction (`8 -> 4`)
+
+The next square-family attempt revisited the row-stream hypothesis used earlier for the `2048 -> 6144` family.
+
+- change:
+  - `input2048SquareDense` only
+  - source policy:
+    - `fixedRowsPerThreadgroup: 8 -> 4`
+    - `fixedSimdgroups: nil -> 4`
+  - launch policy:
+    - `preferredSimdgroups: 8 -> 4`
+- rationale:
+  - after the accepted `2048 -> 6144` win from reducing concurrent row streams, the remaining square-family bottleneck might also have benefited from halving simultaneous 2 KB row streams
+  - this was the last meaningful row-sweep point for the square family
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- diagnostics:
+  - per-step decode total: `6549 us`
+  - `gemv_2048_sq_bf16_argbuf: 1823 us`
+  - `gemv_2048_6144_bf16_argbuf: 1468 us`
+  - `fused_swiglu_projection_2048_bf16_argbuf: 874 us`
+  - hot exact-shape GEMV total: `3226 us`
+  - square role microbench total: `1217 us`
+- interpretation:
+  - reducing square-family row streams helps the isolated square role microbench a little, but it hurts the broader decode plan badly
+  - the regression spills into `2048 -> 6144` and the secondary fused SwiGLU hotspot
+  - square-family row-stream sweep should be considered exhausted, and this branch should remain reverted
+
+## Rejected: `gemv_8192_tiled(_bf16)_argbuf` Drops `inputDimension` Binding
+
+The next attempt applied the same "remove dead exact-shape constant bindings" idea to the tiled `8192` family.
+
+- change:
+  - `gemv_8192_tiled_argbuf`
+  - `gemv_8192_tiled_bf16_argbuf`
+  - remove the `inputDimension` constant binding from the argument-table variant
+  - compiler-side encoded constant binding set filtered out index `3`
+- rationale:
+  - the kernel hardcodes `fixedInputDimension = 8192u`
+  - `inputDimension` is not consumed inside the exact body, so the extra constant bind looked like pure overhead
+- correctness:
+  - `GeneratedLibraryTests` pass
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- clean benchmark result:
+  - optimizer comparison: `none 127.2 / standard 128.5 / aggressive 121.2 tok/s`
+  - standard decode: `128.5 tok/s`
+  - aggressive decode: `121.2 tok/s`
+  - end-to-end decode: `124.1 tok/s`
+- interpretation:
+  - unlike the exact-shape `input2048` families, removing this binding from the tiled `8192` path did not preserve the accepted throughput band
+  - the change was reverted immediately
+  - the lesson is that "dead binding removal" is not automatically portable across kernel families
+
+## Accepted: Exact-Shape Fused SwiGLU Drops Unused `outputDimension` Binding
+
+After the earlier accepted removal of the dead `inputDimension` binding, the exact-shape fused SwiGLU family still carried one more runtime dimension constant that it did not need.
+
+- change:
+  - `fused_swiglu_projection_2048_argbuf`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - remove the dead `outputDimension` constant binding
+  - replace the bounds check with the exact-shape constant `8192u`
+  - compiler-side encoded constant bindings for `fused_swiglu_projection_2048*_argbuf` now resolve to `.inline([])`
+- rationale:
+  - this family is an exact-shape `2048 -> 8192` decode-only contract
+  - both dimensions are compile-time fixed, so keeping a resident constant for `outputDimension` is unnecessary overhead
+  - the change reduces the resident-constant footprint without changing the row-major execution contract
+- structural effect:
+  - compiled decode plan resident constants: `115 -> 99`
+  - argument-table state unchanged: `argTable=147 / argPrepared=0 / argEncoded=147`
+- correctness:
+  - `GeneratedLibraryTests` pass
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- clean benchmark result:
+  - optimizer comparison: `none 128.1 / standard 133.1 / aggressive 136.7 tok/s`
+  - standard decode: `132.5 tok/s`
+  - aggressive decode: `135.1 tok/s`
+  - end-to-end decode: `130.7 tok/s`
+- interpretation:
+  - this keeps throughput in the accepted band while reducing resident constant traffic further
+  - it is the same category of win as the earlier exact-shape SwiGLU `inputDimension` removal, and it composes cleanly with the current baseline
+  - the primary bottlenecks remain `gemv_2048_sq_bf16_argbuf` and `gemv_2048_6144_bf16_argbuf`
+
+## Rejected: Exact-`2048` Fused RMSNorm Variants Drop `dimension` Binding
+
+The next attempt applied the same exact-shape dead-binding removal pattern to the decode-only fused RMSNorm families.
+
+- change:
+  - add exact-shape `2048` variants for:
+    - `fused_copy_rms_norm(_bf16)_argbuf`
+    - `fused_residual_add_copy_rms_norm(_bf16)_argbuf`
+    - `fused_residual_add_rms_norm(_bf16)_argbuf`
+  - route decode-time `dimension == 2048` fused norm entries to those exact kernels
+  - remove the runtime `dimension` constant binding so the kernels bind only `epsilon`
+- rationale:
+  - these fused norm families are decode-only and fixed at hidden dimension `2048` in the current LFM2 path
+  - by analogy with the accepted exact-shape fused SwiGLU cleanup, the dead `dimension` binding looked like pure encoded-constant overhead
+- structural result:
+  - generated library and `ReferenceComparisonTests` passed
+  - exact kernels appeared in the compiled decode plan during the experiment
+  - resident constant count did **not** improve beyond the existing `99`
+- performance result:
+  - optimizer comparison regressed to `none 127.6 / standard 131.5 / aggressive 132.2 tok/s`
+  - decode 50 regressed to `standard 124.3 tok/s`, `aggressive 127.8 tok/s`
+  - end-to-end decode regressed to `121.4 tok/s`
+  - per-step decode total regressed to `10044 us`
+- interpretation:
+  - unlike the exact-shape fused SwiGLU binding removals, the fused RMSNorm exact variants did not reduce the real encoded-constant footprint enough to matter
+  - the extra specialization likely increased code/pipeline cost without repaying it on the decode hot path
+  - the change was reverted, and the fused RMSNorm families remain on their generic decode kernels
+
+## Rejected: Square Split Weight-Pointer Pairwise Read
+
+The next square-family attempt kept the accepted row-major float-staged pairwise path, but replaced indexed `weightLane[pair]` reads with one independent `ushort2*` pointer per pair.
+
+- change:
+  - `gemv_2048_sq_bf16_argbuf` only
+  - keep:
+    - row-major layout
+    - float staging
+    - `unrollFactor = 8`
+    - accepted `pairwisePointerFloatInput`
+  - change only the weight-side access shape from:
+    - one base pointer plus indexed `weightLane[0...3]`
+  - to:
+    - `weightLane0...weightLane3`
+    - each incremented by the same stride once per loop
+- rationale:
+  - after rejecting wider reads, fixed-iteration control, software pipelining, and lane remapping, the remaining square-family residual might still have been loop-local index generation on the BF16 weight side
+  - splitting the four pairwise reads into independent pointers would remove `weightLane[pair]` address formation without changing layout, launch, or input use
+- result:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+  - diagnostics regressed:
+    - per-step decode total: `9217 us`
+    - `gemv_2048_sq_bf16_argbuf: 1967 us`
+    - `gemv_2048_6144_bf16_argbuf: 1482 us`
+    - `fused_swiglu_projection_2048_bf16_argbuf: 3377 us`
+    - hot exact-shape GEMV total: `2670 us`
+    - square role microbench total: `2161 us`
+  - clean benchmark also regressed:
+    - optimizer comparison: `none 129.8 / standard 134.7 / aggressive 137.9 tok/s`
+    - decode 50: `standard 103.9 / aggressive 128.1 tok/s`
+    - end-to-end decode: `124.9 tok/s`
+- interpretation:
+  - the square-family residual is not in local `weightLane[pair]` index formation
+  - the split-pointer form increases pressure elsewhere enough to worsen both diagnostics and clean throughput
+  - the change was reverted
+
+## Rejected: Exact-Shape Fused SwiGLU Threadgroup-Fixed Row Base
+
+The next secondary-hotspot experiment tried the same address-generation reduction that helped the accepted `2048 -> 6144` exact-shape GEMV family, but applied it only to the exact-shape fused SwiGLU family.
+
+- change:
+  - `fused_swiglu_projection_2048`
+  - `fused_swiglu_projection_2048_bf16`
+  - `fused_swiglu_projection_2048_argbuf`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - replace
+    - `rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH)`
+    - `row * 2048`
+  - with:
+    - `rowsPerThreadgroup = 8u`
+    - `gid * 16384u + sgitg * 2048u`
+- rationale:
+  - decode dispatch already runs this exact-shape family at `256` threads / `8` simdgroups
+  - the remaining secondary hotspot might still have been paying unnecessary row-base arithmetic on both `gateWeight` and `upWeight`
+  - if that was material, hard-wiring the row base could lower integer overhead without changing launch shape, sigmoid math, or staging policy
+- result:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+  - clean benchmark regressed:
+    - optimizer comparison: `none 128.5 / standard 132.3 / aggressive 134.7 tok/s`
+    - decode 50: `standard 131.3 / aggressive 133.6 tok/s`
+    - end-to-end decode: `126.1 tok/s`
+- interpretation:
+  - exact-shape fused SwiGLU does not benefit from the same threadgroup-fixed row-base trick that helped the accepted `2048 -> 6144` GEMV path
+  - its remaining cost is not the simple `row * 2048` address form on the gate/up weights
+  - the change was reverted
+
+## Clean Rebaseline After Discarding Contaminated Concurrent Runs
+
+Some of the recent throughput judgments were taken while GPU-heavy suites were overlapping. Those numbers are not valid acceptance data and should be discarded.
+
+- discarded:
+  - any run where `BenchmarkTests` overlapped with `ReferenceComparisonTests`
+  - any run where `BenchmarkTests` overlapped with `BenchmarkDiagnosticsTests`
+- rationale:
+  - the benchmark harness is sensitive to prior GPU-heavy execution
+  - overlapping suites can shift thermal state, command-buffer timing, and memory pressure enough to invalidate small `tok/s` conclusions
+
+The baseline was therefore re-established from clean, sequential runs only:
+
+- run order:
+  - `ReferenceComparisonTests` alone
+  - `BenchmarkTests` alone
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - decode step 0 preserved the expected token: `Python 521 / Metal 521`
+  - the known accepted drift remained unchanged: `step 1 = Python 2944 / Metal 859`
+- authoritative clean benchmark:
+  - optimizer comparison: `none 128.6 / standard 133.6 / aggressive 137.7 tok/s`
+  - decode 50: `standard 133.6 tok/s`
+  - aggressive decode 50: `135.9 tok/s`
+  - end-to-end decode 100: `131.6 tok/s`
+  - prefill 5: `124.3 tok/s`
+- interpretation:
+  - the earlier low results were measurement contamination, not a true regression in the accepted baseline
+  - the accepted decode path is still in the low-to-high `130 tok/s` band on clean runs
+  - the optimization frontier remains unchanged: exact-shape row-major BF16 decode families, especially `gemv_2048_sq_bf16_argbuf` and `gemv_2048_6144_bf16_argbuf`
+
+## Optimizer-Path Revalidation: `standard` / `aggressive` Match, `none` Is Not a Meaningful Decode Baseline
+
+After the clean rebaseline, a further check was added because the latest clean `BenchmarkTests` started reporting much higher decode throughput than the earlier accepted band.
+
+- diagnostic added:
+  - `BenchmarkDiagnosticsTests / Optimizer decode token trace comparison`
+- prompt:
+  - `[1, 1, 6, 6423, 708]`
+- traced tokens:
+  - `none`: `[1, 1, 1, 1, 1, 1, 1, 1, 1]`
+  - `standard`: `[2, 521, 859, 1595, 811, 2001, 779, 2536, 803]`
+  - `aggressive`: `[2, 521, 859, 1595, 811, 2001, 779, 2536, 803]`
+- interpretation:
+  - `standard` and `aggressive` are semantically aligned on the decode path for the traced prefix
+  - the large throughput increase on those paths is therefore not explained by an obvious token-generation corruption
+  - `none` is not a useful decode-performance baseline for this model path because it degenerates immediately
+
+Two subsequent clean `BenchmarkTests` runs also reproduced the higher throughput band:
+
+- run A:
+  - optimizer comparison: `none 128.8 / standard 207.6 / aggressive 216.4 tok/s`
+  - decode 50: `standard 207.7 tok/s`
+  - aggressive decode 50: `211.5 tok/s`
+  - end-to-end decode 100: `199.3 tok/s`
+- run B:
+  - optimizer comparison: `none 129.3 / standard 208.2 / aggressive 216.3 tok/s`
+  - decode 50: `standard 208.3 tok/s`
+  - aggressive decode 50: `216.5 tok/s`
+  - end-to-end decode 100: `201.7 tok/s`
+
+Current reading:
+
+- treat `standard` / `aggressive` as the meaningful decode-performance paths
+- stop using `none` as a practical throughput reference for this exact LFM2 decode configuration
+- keep `ReferenceComparisonTests` as the correctness gate
+- continue optimizing the hot exact-shape row-major BF16 decode families from this newer clean throughput floor
+
+## Accepted: Exact-Shape Fused SwiGLU Compile-Time Launch Constants
+
+The next accepted change did not alter the exact-shape fused SwiGLU math or read width. It only made the launch contract explicit in source for the exact-shape `input2048` family.
+
+- change:
+  - `fused_swiglu_projection_2048`
+  - `fused_swiglu_projection_2048_bf16`
+  - `fused_swiglu_projection_2048_argbuf`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - add optional `fixedRowsPerThreadgroup` and `fixedSimdgroups` to source generation
+  - for the exact-shape family only, emit:
+    - `rowsPerThreadgroup = 8`
+    - input-tile load stride `= SIMD_WIDTH * 8`
+  - keep:
+    - the same launch policy in the compiler
+    - the same weight layout
+    - the same scalar BF16 read path
+    - the same `unrollFactor = 8`
+- rationale:
+  - exact-shape fused SwiGLU is compiled and dispatched with `8` simdgroups / `256` threads on the hot decode path
+  - the previous rejected attempts changed weight-read structure and regressed
+  - the remaining low-risk hypothesis was that source-side dynamic launch arithmetic still carried measurable overhead in the dominant secondary hotspot
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- diagnostics improved:
+  - per-step decode total: `5534 us`
+  - `fused_swiglu_projection_2048_bf16_argbuf: 2820 us`
+  - `gemv_2048_sq_bf16_argbuf: 1180 us`
+  - `gemv_2048_6144_bf16_argbuf: 1176 us`
+  - hot exact-shape GEMV total: `2362 us`
+  - square role microbench total: `1181 us`
+- clean throughput remained in-band:
+  - optimizer comparison: `none 129.4 / standard 134.0 / aggressive 137.4 tok/s`
+  - decode 50: `standard 133.4 / aggressive 136.3 tok/s`
+  - end-to-end decode 100: `130.9 tok/s`
+- interpretation:
+  - exact-shape fused SwiGLU still responds to contract simplification even after the rejected read-width experiments
+  - removing dynamic launch arithmetic from the source is low-risk and materially improves diagnostics without hurting clean throughput
+  - the remaining first-order bottlenecks are still the same three families:
+    - `fused_swiglu_projection_2048_bf16_argbuf`
+    - `gemv_2048_sq_bf16_argbuf`
+    - `gemv_2048_6144_bf16_argbuf`
+
+## Rejected: Exact-Shape Fused SwiGLU Pairwise BF16 Weight Read
+
+The next secondary-hotspot experiment narrowed the read-width change to the exact-shape fused SwiGLU family and only for BF16 weights.
+
+- change:
+  - `fused_swiglu_projection_2048_bf16`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - replace scalar BF16 `gateRow[...]` / `upRow[...]` reads with `ushort2` pairwise reads decoded through `bf16x2_to_float2(...)`
+  - keep launch shape, staging policy, and accumulation order otherwise unchanged
+- rationale:
+  - `fused_swiglu_projection_2048_bf16_argbuf` had become the single largest decode family in diagnostics
+  - the rejected `ushort4` experiment suggested wider reads were too aggressive, so the next hypothesis was that halving BF16 decode operations with `ushort2` might lower conversion overhead without the same register-pressure penalty
+- result:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+  - diagnostics regressed:
+    - per-step decode total: `6042 us`
+    - `fused_swiglu_projection_2048_bf16_argbuf: 3141 us`
+    - `gemv_2048_sq_bf16_argbuf: 1290 us`
+    - `gemv_2048_6144_bf16_argbuf: 1261 us`
+    - hot exact-shape GEMV total: `2549 us`
+  - change reverted, clean baseline restored:
+    - optimizer comparison: `none 128.7 / standard 134.0 / aggressive 136.8 tok/s`
+    - decode 50: `standard 133.8 / aggressive 137.3 tok/s`
+    - end-to-end decode 100: `131.1 tok/s`
+- interpretation:
+  - the fused SwiGLU secondary hotspot is not limited by scalar BF16 conversion count in the simple gate/up inner loop
+  - even the narrower `ushort2` pairwise form increases enough pressure to lose on the real decode path
+  - keep the accepted exact-shape fused SwiGLU path at scalar BF16 reads and return focus to the primary exact-shape GEMV families
+
+## Accepted: `2048 -> 6144` Argbuf GEMV Drops `threads_per_threadgroup` Builtin
+
+The next accepted change narrowed the source simplification to the exact-shape `2048 -> 6144` BF16 argbuf GEMV family.
+
+- change:
+  - `gemv_2048_6144_bf16_argbuf`
+  - `gemv_2048_6144_argbuf`
+  - teach `generateInput2048GEMVArgumentTableVariant(...)` to omit `threads_per_threadgroup` when both:
+    - `fixedRowsPerThreadgroup`
+    - `fixedSimdgroups`
+    are compile-time known
+  - for the accepted `2048 -> 6144` family this means:
+    - `rowsPerThreadgroup = 4`
+    - `effectiveThreadsPerThreadgroup = SIMD_WIDTH * 4`
+    - no runtime `threads_per_threadgroup` builtin in the kernel signature
+  - keep:
+    - row-major weight layout
+    - `packed4ThreadgroupFixedPointerInput`
+    - the same launch shape
+    - the same accumulation order
+- rationale:
+  - the earlier accepted `2048 -> 6144` path already proved that compile-time launch knowledge helps this family
+  - unlike square, `2048 -> 6144` already had both `fixedRowsPerThreadgroup` and `fixedSimdgroups` known
+  - the remaining low-risk hypothesis was that removing the last runtime launch builtin from the argbuf exact-shape variant would shave source-side overhead in the primary hotspot
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- diagnostics improved over the previous accepted baseline:
+  - per-step decode total: `5501 us` (from `5534 us`)
+  - `fused_swiglu_projection_2048_bf16_argbuf: 2800 us` (from `2820 us`)
+  - `gemv_2048_sq_bf16_argbuf: 1190 us` (from `1180 us`)
+  - `gemv_2048_6144_bf16_argbuf: 1164 us` in per-step profiling
+  - hot exact-shape GEMV total: `2348 us` (from `2362 us`)
+  - hot exact-shape GEMV family microbench:
+    - `gemv_2048_sq_bf16_argbuf: 1187 us`
+    - `gemv_2048_6144_bf16_argbuf: 1161 us`
+- clean throughput remained in-band:
+  - optimizer comparison: `none 129.9 / standard 134.4 / aggressive 137.5 tok/s`
+  - decode 50: `standard 133.4 / aggressive 136.9 tok/s`
+  - end-to-end decode 100: `131.1 tok/s`
+- interpretation:
+  - `2048 -> 6144` continues to reward exact compile-time launch specialization in source
+  - the improvement is modest but real and survives clean reference, diagnostics, and throughput gates
+  - the primary decode bottlenecks remain:
+    - `fused_swiglu_projection_2048_bf16_argbuf`
+    - `gemv_2048_sq_bf16_argbuf`
+    - `gemv_2048_6144_bf16_argbuf`
+
+## Rejected: Exact-Shape Fused SwiGLU Drops Output Bounds Check
+
+The next fused-SwiGLU experiment removed only the output-row bounds branch for the exact-shape family.
+
+- change:
+  - `fused_swiglu_projection_2048`
+  - `fused_swiglu_projection_2048_bf16`
+  - `fused_swiglu_projection_2048_argbuf`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - when both:
+    - `fixedRowsPerThreadgroup`
+    - `fixedSimdgroups`
+    are compile-time known, omit:
+    - `if (row >= outputDimension) return;`
+    - `if (row >= 8192u) return;`
+  - keep launch shape, read path, accumulation order, and weight layout unchanged
+- rationale:
+  - exact-shape fused SwiGLU is dispatched as `1024` threadgroups with `8` rows per threadgroup for `8192` rows exactly
+  - after the accepted launch-constant work, the next low-risk hypothesis was that the remaining per-row bounds branch still carried measurable overhead in the top secondary hotspot
+- result:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+  - diagnostics regressed slightly:
+    - per-step decode total: `5508 us` (from `5501 us`)
+    - `fused_swiglu_projection_2048_bf16_argbuf: 2807 us` (from `2800 us`)
+    - `gemv_2048_sq_bf16_argbuf: 1189 us`
+    - `gemv_2048_6144_bf16_argbuf: 1164 us`
+    - hot exact-shape GEMV total: `2345 us`
+  - change reverted
+- interpretation:
+  - the exact-shape fused SwiGLU family does not gain from removing the output bounds check once the launch contract is already compile-time fixed
+  - launch constant specialization was the useful part; branch removal is not
+  - keep the accepted fused SwiGLU path with the explicit bounds guard and return focus to the primary exact-shape GEMV families
+
+## Rejected: Exact-Shape Fused SwiGLU Launch Split to `4` Simdgroups
+
+The next experiment tried to specialize the exact-shape fused SwiGLU family more aggressively by halving its launch width.
+
+- change:
+  - `fused_swiglu_projection_2048`
+  - `fused_swiglu_projection_2048_bf16`
+  - `fused_swiglu_projection_2048_argbuf`
+  - `fused_swiglu_projection_2048_bf16_argbuf`
+  - compile-time launch contract changed from:
+    - `rowsPerThreadgroup = 8`
+    - `fixedSimdgroups = 8`
+    - `tg = (256, 1, 1)`
+  - to:
+    - `rowsPerThreadgroup = 4`
+    - `fixedSimdgroups = 4`
+    - `tg = (128, 1, 1)`
+  - compiler dispatch heuristics temporarily routed the exact-shape fused SwiGLU family through a dedicated `specializedGEMV(..., preferredSimdgroups: 4)` dimension
+- rationale:
+  - diagnostics suggested the fused SwiGLU family was still the largest secondary hotspot
+  - after the accepted exact-shape GEMV wins from reducing concurrent row streams, the next hypothesis was that fused SwiGLU was also over-provisioned at `8` simdgroups
+- correctness:
+  - `ReferenceComparisonTests` full pass
+  - known decode drift unchanged: `step 1 = Python 2944 / Metal 859`
+- diagnostics:
+  - per-step decode total improved locally to `5257 us`
+  - `fused_swiglu_projection_2048_bf16_argbuf` improved to `2560 us`
+  - hot exact-shape GEMV total stayed effectively flat at `2352 us`
+- clean benchmark-only reruns:
+  - run A:
+    - optimizer comparison: `none 127.1 / standard 132.9 / aggressive 136.0 tok/s`
+    - decode 50: `standard 132.7 / aggressive 133.3 tok/s`
+    - end-to-end decode: `129.0 tok/s`
+  - run B:
+    - optimizer comparison: `none 128.5 / standard 131.2 / aggressive 133.3 tok/s`
+    - decode 50: `standard 130.1 / aggressive 132.6 tok/s`
+    - end-to-end decode: `126.1 tok/s`
+- interpretation:
+  - halving fused SwiGLU launch width improves local kernel timing but loses on real throughput
+  - the family is not simply over-wide in the same way as the accepted `2048 -> 6144` GEMV path
+  - the dedicated `specializedGEMV` launch route and the `4`-simdgroup source specialization were reverted

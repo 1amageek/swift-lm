@@ -122,10 +122,10 @@ public struct MetalSourceGenerator: Sendable {
         sources.append(generateBatchedPerHead2ArgumentTableVariant(name: "batched_qk_rms_norm_bf16_2_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16))
         sources.append(generateFusedSwiGLUProjection(name: "fused_swiglu_projection", bufferPrecision: decode, weightFormat: .float16))
         sources.append(generateFusedSwiGLUProjection(name: "fused_swiglu_projection_bf16", bufferPrecision: decode, weightFormat: .bfloat16))
-        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048", bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048_bf16", bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048", bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048_bf16", bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
         sources.append(generateQKNorm(name: "qk_rms_norm", bufferPrecision: decode, weightFormat: .float16))
         sources.append(generateQKNorm(name: "qk_rms_norm_bf16", bufferPrecision: decode, weightFormat: .bfloat16))
         sources.append(generateQKNormArgumentTableVariant(name: "qk_rms_norm_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16))
@@ -693,6 +693,8 @@ public struct MetalSourceGenerator: Sendable {
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
         let effectiveUnroll = max(1, unrollFactor)
         let effectiveThreadsPerThreadgroup = fixedSimdgroups.map { "SIMD_WIDTH * \($0)u" } ?? "threadsPerThreadgroup"
+        let rowsPerThreadgroupExpr = fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)"
+        let requiresThreadsPerThreadgroupBuiltin = fixedSimdgroups == nil || fixedRowsPerThreadgroup == nil
         let inputStructName = "\(name)_args"
         let usesPairwiseWeightRead =
             (bf16ArgumentReadPolicy == .pairwise ||
@@ -776,11 +778,10 @@ public struct MetalSourceGenerator: Sendable {
             uint gid                                  [[threadgroup_position_in_grid]],
             uint tid                                  [[thread_index_in_threadgroup]],
             uint tiisg                                [[thread_index_in_simdgroup]],
-            uint sgitg                                [[simdgroup_index_in_threadgroup]],
-            uint threadsPerThreadgroup                [[threads_per_threadgroup]]
+            uint sgitg                                [[simdgroup_index_in_threadgroup]]\(requiresThreadsPerThreadgroupBuiltin ? ",\n            uint threadsPerThreadgroup                [[threads_per_threadgroup]]" : "")
         ) {
             const uint stagedInputElements = 2048u;
-            const uint rowsPerThreadgroup = \(fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)");
+            const uint rowsPerThreadgroup = \(rowsPerThreadgroupExpr);
             const uint row = gid * rowsPerThreadgroup + sgitg;
             if (row >= \(fixedOutputDimension)u) return;
 
@@ -972,7 +973,6 @@ public struct MetalSourceGenerator: Sendable {
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
         fixedOutputDimension: Int? = nil,
-        includesDimensionBindings: Bool = true,
         tileElements: Int = 1_024,
         unrollFactor: Int = 4
     ) -> String {
@@ -995,7 +995,8 @@ public struct MetalSourceGenerator: Sendable {
 
         kernel void \(name)(
             constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
-            \(includesDimensionBindings ? "constant uint& inputDimension             [[buffer(3)]],\n            constant uint& outputDimension            [[buffer(4)]]," : "")
+            constant uint& inputDimension             [[buffer(3)]],
+            constant uint& outputDimension            [[buffer(4)]],
             uint gid                                  [[threadgroup_position_in_grid]],
             uint tid                                  [[thread_index_in_threadgroup]],
             uint tiisg                                [[thread_index_in_simdgroup]],
@@ -1865,6 +1866,8 @@ public struct MetalSourceGenerator: Sendable {
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
         stagesInputAsFloat: Bool = true,
+        fixedRowsPerThreadgroup: Int? = nil,
+        fixedSimdgroups: Int? = nil,
         unrollFactor: Int = 4
     ) -> String {
         let bt = bufferPrecision.metalType
@@ -1873,6 +1876,8 @@ public struct MetalSourceGenerator: Sendable {
         let stagedInputRead = stagesInputAsFloat ? "" : "float"
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
         let effectiveUnroll = max(1, unrollFactor)
+        let effectiveThreadsPerThreadgroupExpr = fixedSimdgroups.map { "SIMD_WIDTH * \($0)u" } ?? "threadsPerThreadgroup"
+        let rowsPerThreadgroupExpr = fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)"
         let gateAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
                 return "gateSum += \(readWeight("gateRow[0]")) * \(stagedInputRead)(inputLane[0]);"
@@ -1903,12 +1908,12 @@ public struct MetalSourceGenerator: Sendable {
             uint threadsPerThreadgroup         [[threads_per_threadgroup]]
         ) {
             const uint fixedInputDimension = 2048u;
-            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint rowsPerThreadgroup = \(rowsPerThreadgroupExpr);
             const uint row = gid * rowsPerThreadgroup + sgitg;
             if (row >= outputDimension) return;
 
             threadgroup \(stagedInputType) inputTile[fixedInputDimension];
-            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+            for (uint j = tid; j < fixedInputDimension; j += \(effectiveThreadsPerThreadgroupExpr)) {
                 inputTile[j] = \(stagesInputAsFloat ? "float(input[j])" : "input[j]");
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1941,6 +1946,8 @@ public struct MetalSourceGenerator: Sendable {
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
         stagesInputAsFloat: Bool = true,
+        fixedRowsPerThreadgroup: Int? = nil,
+        fixedSimdgroups: Int? = nil,
         unrollFactor: Int = 4
     ) -> String {
         let bt = bufferPrecision.metalType
@@ -1950,6 +1957,8 @@ public struct MetalSourceGenerator: Sendable {
         let stagedInputStore = stagesInputAsFloat ? "inputTile[j] = float(args.input[j]);" : "inputTile[j] = args.input[j];"
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
         let effectiveUnroll = max(1, unrollFactor)
+        let effectiveThreadsPerThreadgroupExpr = fixedSimdgroups.map { "SIMD_WIDTH * \($0)u" } ?? "threadsPerThreadgroup"
+        let rowsPerThreadgroupExpr = fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)"
         let inputStructName = "\(name)_args"
         let gateAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
@@ -1974,8 +1983,6 @@ public struct MetalSourceGenerator: Sendable {
 
         kernel void \(name)(
             constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
-            constant uint& inputDimension             [[buffer(4)]],
-            constant uint& outputDimension            [[buffer(5)]],
             uint gid                                  [[threadgroup_position_in_grid]],
             uint tid                                  [[thread_index_in_threadgroup]],
             uint tiisg                                [[thread_index_in_simdgroup]],
@@ -1983,12 +1990,12 @@ public struct MetalSourceGenerator: Sendable {
             uint threadsPerThreadgroup                [[threads_per_threadgroup]]
         ) {
             const uint fixedInputDimension = 2048u;
-            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint rowsPerThreadgroup = \(rowsPerThreadgroupExpr);
             const uint row = gid * rowsPerThreadgroup + sgitg;
-            if (row >= outputDimension) return;
+            if (row >= 8192u) return;
 
             threadgroup \(stagedInputType) inputTile[fixedInputDimension];
-            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+            for (uint j = tid; j < fixedInputDimension; j += \(effectiveThreadsPerThreadgroupExpr)) {
                 \(stagedInputStore)
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);

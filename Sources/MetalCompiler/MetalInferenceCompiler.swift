@@ -1053,6 +1053,7 @@ public struct MetalInferenceCompiler: Sendable {
                                     fixedOutputDimension: sourcePolicy.fixedOutputDimension,
                                     includesDimensionBindings: false,
                                     fixedRowsPerThreadgroup: sourcePolicy.fixedRowsPerThreadgroup,
+                                    fixedSimdgroups: sourcePolicy.fixedSimdgroups,
                                     stagesInputAsFloat: sourcePolicy.stagesInputAsFloat,
                                     weightLayoutPolicy: sourcePolicy.weightLayoutPolicy,
                                     bf16ArgumentReadPolicy: sourcePolicy.bf16ArgumentReadPolicy,
@@ -1086,6 +1087,7 @@ public struct MetalInferenceCompiler: Sendable {
                                     fixedOutputDimension: sourcePolicy.fixedOutputDimension,
                                     includesDimensionBindings: false,
                                     fixedRowsPerThreadgroup: sourcePolicy.fixedRowsPerThreadgroup,
+                                    fixedSimdgroups: sourcePolicy.fixedSimdgroups,
                                     stagesInputAsFloat: sourcePolicy.stagesInputAsFloat,
                                     weightLayoutPolicy: sourcePolicy.weightLayoutPolicy,
                                     bf16ArgumentReadPolicy: sourcePolicy.bf16ArgumentReadPolicy,
@@ -1351,6 +1353,8 @@ public struct MetalInferenceCompiler: Sendable {
                                     name: kernelName,
                                     bufferPrecision: bufferPrecision,
                                     weightFormat: weightFormat,
+                                    fixedRowsPerThreadgroup: 8,
+                                    fixedSimdgroups: 8,
                                     unrollFactor: 8))
                                 let argumentKernelName = MetalInferenceCompiler.argumentTableVariantKernelName(for: kernelName)
                                 if generatedNames.insert(argumentKernelName).inserted {
@@ -1360,6 +1364,8 @@ public struct MetalInferenceCompiler: Sendable {
                                         bufferPrecision: bufferPrecision,
                                         weightFormat: weightFormat,
                                         stagesInputAsFloat: false,
+                                        fixedRowsPerThreadgroup: 8,
+                                        fixedSimdgroups: 8,
                                         unrollFactor: 8))
                                 }
                             } else {
@@ -2534,6 +2540,9 @@ public struct MetalInferenceCompiler: Sendable {
         ) && variantKernelName.hasSuffix("_argbuf") {
             return .inline([])
         }
+        if variantKernelName.hasPrefix("fused_swiglu_projection_2048") && variantKernelName.hasSuffix("_argbuf") {
+            return .inline([])
+        }
         return bindings
     }
 
@@ -2654,11 +2663,11 @@ public struct MetalInferenceCompiler: Sendable {
             }
         case [0, 1, 2, 3]:
             switch kernelName {
-            case "fused_copy_rms_norm", "fused_copy_rms_norm_bf16":
+            case let name where name.hasPrefix("fused_copy_rms_norm"):
                 return argumentTableVariantKernelName(for: kernelName)
-            case "fused_residual_add_copy_rms_norm", "fused_residual_add_copy_rms_norm_bf16":
+            case let name where name.hasPrefix("fused_residual_add_copy_rms_norm"):
                 return argumentTableVariantKernelName(for: kernelName)
-            case "fused_residual_add_rms_norm", "fused_residual_add_rms_norm_bf16":
+            case let name where name.hasPrefix("fused_residual_add_rms_norm"):
                 return argumentTableVariantKernelName(for: kernelName)
             case "fused_swiglu_projection_2048", "fused_swiglu_projection_2048_bf16":
                 return argumentTableVariantKernelName(for: kernelName)
@@ -3655,6 +3664,10 @@ public struct MetalInferenceCompiler: Sendable {
             case .fusedSwiGLUProjection(let fusedOperation):
                 let (gateWeightBuffer, gateWeightOffset) = weightResolver.resolve(role: fusedOperation.gateField)
                 let (upWeightBuffer, upWeightOffset) = weightResolver.resolve(role: fusedOperation.upField)
+                let family = FusedSwiGLUProjectionFamily.resolve(
+                    inputDimension: fusedOperation.inputDimension,
+                    outputDimension: fusedOperation.outputDimension
+                )
 
                 let inputBuffer: MTLBuffer
                 let inputOffset: Int
@@ -3669,6 +3682,18 @@ public struct MetalInferenceCompiler: Sendable {
                 routingState.lastOutputIsHidden = false
                 routingState.currentInputOffset = slotDimension * elementSize
                 routingState.projectionIndex = 0
+                let bytes: [(index: Int, value: [UInt8])]
+                switch family {
+                case .generic:
+                    bytes = [
+                        uint32Binding(4, UInt32(fusedOperation.inputDimension)),
+                        uint32Binding(5, UInt32(fusedOperation.outputDimension)),
+                    ]
+                case .input2048Dense:
+                    bytes = [
+                        uint32Binding(4, UInt32(fusedOperation.outputDimension)),
+                    ]
+                }
 
                 return (
                     buffers: [
@@ -3677,10 +3702,7 @@ public struct MetalInferenceCompiler: Sendable {
                         (2, upWeightBuffer, upWeightOffset),
                         (3, bufferSet.scratch, slotDimension * elementSize),
                     ],
-                    bytes: [
-                        uint32Binding(4, UInt32(fusedOperation.inputDimension)),
-                        uint32Binding(5, UInt32(fusedOperation.outputDimension)),
-                    ]
+                    bytes: bytes
                 )
 
             // MARK: Flash Attention Decode

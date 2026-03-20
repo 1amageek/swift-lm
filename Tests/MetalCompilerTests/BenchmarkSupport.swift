@@ -353,6 +353,26 @@ enum BenchmarkSupport {
         return breakdown.averaged(over: iterations)
     }
 
+    static func decodeTokenTrace(
+        model: inout MetalInferenceModel,
+        promptTokens: [Int32],
+        predecodeSteps: Int = 0,
+        decodeSteps: Int
+    ) -> [Int32] {
+        var trace: [Int32] = []
+        var currentToken = model.prefill(tokens: promptTokens)
+        trace.append(currentToken)
+        for _ in 0..<predecodeSteps {
+            currentToken = model.decodeSync(tokenID: currentToken)
+            trace.append(currentToken)
+        }
+        for _ in 0..<decodeSteps {
+            currentToken = model.decodeSync(tokenID: currentToken)
+            trace.append(currentToken)
+        }
+        return trace
+    }
+
     enum BenchError: Error {
         case noDevice
         case noModel
