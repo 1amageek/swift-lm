@@ -385,6 +385,8 @@ public struct MetalInferenceCompiler: Sendable {
                 kind = "fusedResidualAddCopyNorm(dim=\(f.dimension), eps=\(f.epsilon))"
             case .fusedResidualAddNorm(let f):
                 kind = "fusedResidualAddNorm(dim=\(f.dimension), eps=\(f.epsilon))"
+            case .fusedOutputProjectionResidualAddCopyNorm(let fused):
+                kind = "fusedOutputProjectionResidualAddCopyNorm(field=\(fused.field), in=\(fused.inputDimension), out=\(fused.outputDimension), eps=\(fused.epsilon))"
             case .fusedSwiGLUProjection(let f):
                 kind = "fusedSwiGLUProjection(gate=\(f.gateField), up=\(f.upField), in=\(f.inputDimension), out=\(f.outputDimension))"
             case .batchedProjection(let b):
@@ -417,6 +419,8 @@ public struct MetalInferenceCompiler: Sendable {
                     name = "fusedResidualAddCopyNorm"
                 case .fusedResidualAddNorm:
                     name = "fusedResidualAddNorm"
+                case .fusedOutputProjectionResidualAddCopyNorm:
+                    name = "fusedOutputProjectionResidualAddCopyNorm"
                 case .fusedSwiGLUProjection:
                     name = "fusedSwiGLUProjection"
                 case .batchedProjection(let batched):
@@ -435,6 +439,139 @@ public struct MetalInferenceCompiler: Sendable {
                 optimizedCount: optimizedEntries.count,
                 patterns: patterns.map { .init(name: $0.key, count: $0.value.count, savedDispatches: 0) }
             )
+        }
+    }
+
+    private struct TailFusionOpportunityReportBuilder {
+        private struct OutputTailKey: Hashable {
+            let projectionKernelFamily: String
+            let projectionField: String
+            let inputDimension: Int
+            let outputDimension: Int
+            let trailingKind: String
+        }
+
+        private struct GraphTailKey: Hashable {
+            let label: String
+        }
+
+        func makeReport(entries: [DispatchEntry]) -> DispatchTailFusionReport {
+            var outputProjectionDispatches = 0
+            var opportunities: [DispatchTailFusionReport.Opportunity] = []
+            var outputTailOpportunities: [OutputTailKey: Int] = [:]
+            var graphTailOpportunities: [GraphTailKey: Int] = [:]
+
+            for index in entries.indices {
+                guard case .projection(let projection, let isOutput) = entries[index].kind, isOutput else {
+                    continue
+                }
+                outputProjectionDispatches += 1
+                guard index + 1 < entries.count else { continue }
+
+                let trailingKind: String?
+                switch entries[index + 1].kind {
+                case .fusedResidualAddCopyNorm:
+                    trailingKind = "fusedResidualAddCopyNorm"
+                case .fusedResidualAddNorm:
+                    trailingKind = "fusedResidualAddNorm"
+                default:
+                    trailingKind = nil
+                }
+                guard let trailingKind else { continue }
+
+                let family = DecodeProjectionShapeFamily.resolve(
+                    outputDimension: projection.outputDimension,
+                    inputDimension: projection.inputDimension
+                )
+                let key = OutputTailKey(
+                    projectionKernelFamily: family.kernelBaseName,
+                    projectionField: projection.field,
+                    inputDimension: projection.inputDimension,
+                    outputDimension: projection.outputDimension,
+                    trailingKind: trailingKind
+                )
+                outputTailOpportunities[key, default: 0] += 1
+            }
+
+            for index in entries.indices {
+                if index + 2 < entries.count,
+                   case .structuralAdd = entries[index].kind,
+                   case .structuralCopy = entries[index + 1].kind,
+                   isFusableReduction(entries[index + 2]) {
+                    graphTailOpportunities[GraphTailKey(label: "structuralAdd+structuralCopy+reduction"), default: 0] += 1
+                }
+
+                if index + 1 < entries.count,
+                   case .structuralCopy = entries[index].kind,
+                   isFusableReduction(entries[index + 1]) {
+                    graphTailOpportunities[GraphTailKey(label: "structuralCopy+reduction"), default: 0] += 1
+                }
+
+                if index + 1 < entries.count,
+                   case .structuralAdd = entries[index].kind,
+                   isFusableReduction(entries[index + 1]) {
+                    graphTailOpportunities[GraphTailKey(label: "structuralAdd+reduction"), default: 0] += 1
+                }
+            }
+
+            opportunities.append(contentsOf: outputTailOpportunities
+                .map { key, count in
+                    let isFeasible = key.projectionKernelFamily == "gemv_2048_sq"
+                        && key.inputDimension == 2_048
+                        && key.outputDimension == 2_048
+                        && key.trailingKind == "fusedResidualAddCopyNorm"
+                    return DispatchTailFusionReport.Opportunity(
+                        category: "output-tail",
+                        label: "\(key.projectionField) -> \(key.trailingKind)",
+                        projectionKernelFamily: key.projectionKernelFamily,
+                        projectionInputDimension: key.inputDimension,
+                        projectionOutputDimension: key.outputDimension,
+                        isFeasibleInCurrentExecutionModel: isFeasible,
+                        infeasibilityReason: isFeasible
+                            ? nil
+                            : "projection emits multiple threadgroups before global norm reduction",
+                        count: count,
+                        potentialDispatchSavings: count
+                    )
+                })
+
+            opportunities.append(contentsOf: graphTailOpportunities
+                .map { key, count in
+                    DispatchTailFusionReport.Opportunity(
+                        category: "graph-tail",
+                        label: key.label,
+                        isFeasibleInCurrentExecutionModel: true,
+                        infeasibilityReason: nil,
+                        count: count,
+                        potentialDispatchSavings: count
+                    )
+                })
+
+            let sorted = opportunities.sorted { lhs, rhs in
+                if lhs.isFeasibleInCurrentExecutionModel != rhs.isFeasibleInCurrentExecutionModel {
+                    return lhs.isFeasibleInCurrentExecutionModel && !rhs.isFeasibleInCurrentExecutionModel
+                }
+                if lhs.potentialDispatchSavings != rhs.potentialDispatchSavings {
+                    return lhs.potentialDispatchSavings > rhs.potentialDispatchSavings
+                }
+                if lhs.category != rhs.category {
+                    return lhs.category < rhs.category
+                }
+                return lhs.label < rhs.label
+            }
+
+            return DispatchTailFusionReport(
+                totalDispatches: entries.count,
+                outputProjectionDispatches: outputProjectionDispatches,
+                opportunities: sorted
+            )
+        }
+
+        private func isFusableReduction(_ entry: DispatchEntry) -> Bool {
+            guard case .fragment(let fragment) = entry.kind else { return false }
+            guard fragment.isFusable else { return false }
+            guard case .reduction = fragment.dispatchDimension else { return false }
+            return fragment.normEpsilon != nil
         }
     }
 
@@ -1338,6 +1475,30 @@ public struct MetalInferenceCompiler: Sendable {
                         }
                     }
 
+                case .fusedOutputProjectionResidualAddCopyNorm(let fused):
+                    let projectionWeightFormat = weightFormatResolver.resolve(role: fused.field, entry: entry)
+                    let normWeightFormat = weightFormatResolver.resolve(role: "scale", entry: entry)
+                    guard projectionWeightFormat == normWeightFormat, bufferPrecision != .float32 else {
+                        break
+                    }
+                    let kernelName = projectionWeightFormat == .bfloat16
+                        ? "fused_gemv_2048_sq_residual_add_copy_rms_norm_bf16"
+                        : "fused_gemv_2048_sq_residual_add_copy_rms_norm"
+                    if generatedNames.insert(kernelName).inserted {
+                        sources.append(MetalSourceGenerator.generateFusedOutputProjectionResidualAddCopyRMSNorm(
+                            name: kernelName,
+                            bufferPrecision: bufferPrecision,
+                            weightFormat: projectionWeightFormat))
+                        let argumentKernelName = MetalInferenceCompiler.argumentTableVariantKernelName(for: kernelName)
+                        if generatedNames.insert(argumentKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateFusedOutputProjectionResidualAddCopyRMSNormArgumentTableVariant(
+                                name: argumentKernelName,
+                                argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: projectionWeightFormat))
+                        }
+                    }
+
                 case .fusedSwiGLUProjection(let fused):
                     let weightFormat = weightFormatResolver.resolve(role: fused.gateField, entry: entry)
                     if bufferPrecision != .float32 {
@@ -1363,7 +1524,7 @@ public struct MetalInferenceCompiler: Sendable {
                                         argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
                                         bufferPrecision: bufferPrecision,
                                         weightFormat: weightFormat,
-                                        stagesInputAsFloat: false,
+                                        stagesInputAsFloat: true,
                                         fixedRowsPerThreadgroup: 8,
                                         fixedSimdgroups: 8,
                                         unrollFactor: 8))
@@ -1985,6 +2146,30 @@ public struct MetalInferenceCompiler: Sendable {
             optimizedEntries: optimization.fusedEntries)
     }
 
+    public func analyzeTailFusionOpportunities(
+        graph: ModelGraph,
+        hiddenSize: Int,
+        intermediateSize: Int = 0,
+        vocabSize: Int = 0,
+        stafWeightStore: STAFWeightStore? = nil,
+        device: MTLDevice
+    ) -> DispatchTailFusionReport {
+        let context = makeCompileContext(
+            graph: graph,
+            hiddenSize: hiddenSize,
+            intermediateSize: intermediateSize,
+            vocabSize: vocabSize,
+            stafWeightStore: stafWeightStore,
+            device: device
+        )
+        let optimization = optimizedEntries(
+            using: context,
+            kernelContext: context.decodeKernelContext
+        )
+        let reportBuilder = TailFusionOpportunityReportBuilder()
+        return reportBuilder.makeReport(entries: optimization.fusedEntries)
+    }
+
     public func analyzeDecodeProjectionCosts(
         graph: ModelGraph,
         hiddenSize: Int,
@@ -2573,6 +2758,10 @@ public struct MetalInferenceCompiler: Sendable {
             return MetalBufferAccesses(
                 readBuffers: bindings(in: [0, 1, 2]),
                 writeBuffers: bindings(in: [3]))
+        case .fusedOutputProjectionResidualAddCopyNorm:
+            return MetalBufferAccesses(
+                readBuffers: bindings(in: [0, 1, 2, 3]),
+                writeBuffers: bindings(in: [2, 4, 5]))
         case .structuralCopy:
             return MetalBufferAccesses(
                 readBuffers: bindings(in: [0]),
@@ -2681,6 +2870,13 @@ public struct MetalInferenceCompiler: Sendable {
         case [0, 1, 2, 3, 4]:
             switch kernelName {
             case "batched_gemv2", "batched_gemv2_bf16":
+                return argumentTableVariantKernelName(for: kernelName)
+            default:
+                return nil
+            }
+        case [0, 1, 2, 3, 4, 5]:
+            switch kernelName {
+            case let name where name.hasPrefix("fused_gemv_2048_sq_residual_add_copy_rms_norm"):
                 return argumentTableVariantKernelName(for: kernelName)
             default:
                 return nil
@@ -2919,6 +3115,37 @@ public struct MetalInferenceCompiler: Sendable {
 
                 routingState.lastOutputIsHidden = false
                 routingState.projectionIndex = 0
+                return steps
+
+            case .fusedOutputProjectionResidualAddCopyNorm(let fusedOp):
+                let projectionEntry = DispatchEntry(
+                    index: entry.index,
+                    kind: .projection(
+                        MetalProjection(
+                            field: fusedOp.field,
+                            inputDimension: fusedOp.inputDimension,
+                            outputDimension: fusedOp.outputDimension
+                        ),
+                        isOutput: true
+                    ),
+                    parameterBindings: entry.parameterBindings,
+                    layerIndex: entry.layerIndex)
+                let normEntry = DispatchEntry(
+                    index: entry.index + 1,
+                    kind: .fusedResidualAddCopyNorm(
+                        FusedResidualAddCopyNorm(
+                            dimension: fusedOp.outputDimension,
+                            epsilon: fusedOp.epsilon
+                        )
+                    ),
+                    parameterBindings: entry.parameterBindings,
+                    layerIndex: entry.layerIndex)
+
+                var steps: [MetalPrefillStep] = []
+                for decomposed in [projectionEntry, normEntry] {
+                    let built = try buildSteps(for: decomposed)
+                    steps.append(contentsOf: built)
+                }
                 return steps
 
         // MARK: Projection → GEMM (sequence matrix multiply)
@@ -3475,6 +3702,11 @@ public struct MetalInferenceCompiler: Sendable {
             return "fused_residual_add_copy_rms_norm" + bf16Suffix
         case .fusedResidualAddNorm:
             return "fused_residual_add_rms_norm" + bf16Suffix
+        case .fusedOutputProjectionResidualAddCopyNorm(let fused):
+            if fused.inputDimension == 2_048 && fused.outputDimension == 2_048 {
+                return "fused_gemv_2048_sq_residual_add_copy_rms_norm" + bf16Suffix
+            }
+            return "fused_gemv_output_projection_residual_add_copy_rms_norm" + bf16Suffix
         case .fusedSwiGLUProjection(let fused):
             let weightFormat = weightFormatResolver.resolve(role: fused.gateField, entry: entry)
             let family = FusedSwiGLUProjectionFamily.resolve(
@@ -3510,6 +3742,8 @@ public struct MetalInferenceCompiler: Sendable {
             return .elementwise(count: dimension)
         case .fusedResidualAddNorm(let fused):
             return .reduction(dimension: fused.dimension)
+        case .fusedOutputProjectionResidualAddCopyNorm:
+            return .reduction(dimension: 256)
         case .fusedSwiGLUProjection(let fused):
             return .gemv(outputDimension: fused.outputDimension, inputDimension: fused.inputDimension)
         case .batchedProjection(let batched):
@@ -3608,6 +3842,37 @@ public struct MetalInferenceCompiler: Sendable {
             // MARK: Fused Residual Add + Copy + RMS Norm
             case .fusedResidualAddCopyNorm(let fusedOperation):
                 return fusedNormBindings(dimension: fusedOperation.dimension, epsilon: fusedOperation.epsilon)
+
+            case .fusedOutputProjectionResidualAddCopyNorm(let fusedOperation):
+                let (projectionWeightBuffer, projectionWeightOffset) = weightResolver.resolve(role: fusedOperation.field)
+                let (normWeightBuffer, normWeightOffset) = weightResolver.resolve(role: "scale")
+                let inputBuffer: MTLBuffer
+                let inputOffset: Int
+                if routingState.lastOutputIsHidden {
+                    inputBuffer = bufferSet.hidden
+                    inputOffset = 0
+                } else {
+                    inputBuffer = bufferSet.scratch
+                    inputOffset = routingState.currentInputOffset
+                }
+
+                routingState.lastOutputIsHidden = false
+                routingState.currentInputOffset = 0
+                routingState.projectionIndex = 0
+
+                return (
+                    buffers: [
+                        (0, inputBuffer, inputOffset),
+                        (1, projectionWeightBuffer, projectionWeightOffset),
+                        (2, bufferSet.residual, 0),
+                        (3, normWeightBuffer, normWeightOffset),
+                        (4, bufferSet.hidden, 0),
+                        (5, bufferSet.scratch, 0),
+                    ],
+                    bytes: [
+                        floatBinding(6, fusedOperation.epsilon),
+                    ]
+                )
 
             // MARK: GEMV Projection
             case .projection(let projection, let isOutput):

@@ -157,6 +157,19 @@ public struct MetalInferenceModel: @unchecked Sendable {
         }
     }
 
+    private mutating func decodeSequencePipelined(tokens: [Int32]) -> Int32 {
+        guard let firstToken = tokens.first else { return -1 }
+        if hasPendingResult {
+            _ = flush()
+        }
+
+        _ = decode(tokenID: firstToken)
+        for token in tokens.dropFirst() {
+            _ = decode(tokenID: token)
+        }
+        return flush()
+    }
+
     // MARK: - Prefill
 
     /// Prefill the KV cache with prompt tokens and return the first predicted token.
@@ -166,9 +179,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
     @discardableResult
     public mutating func prefill(tokens: [Int32]) -> Int32 {
         guard let prefill = prefillPlan else {
-            var lastOutput: Int32 = -1
-            for token in tokens { lastOutput = decodeSync(tokenID: token) }
-            return lastOutput
+            return decodeSequencePipelined(tokens: tokens)
         }
 
         // Use sequence-parallel prefill for short prompts (verified correct for ≤8 tokens).
@@ -176,9 +187,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         // cross-threadgroup KV cache visibility issue in perPosition flash attention.
         // TODO: Replace with a proper batch flash attention kernel.
         if tokens.count > 8 {
-            var lastOutput: Int32 = -1
-            for token in tokens { lastOutput = decodeSync(tokenID: token) }
-            return lastOutput
+            return decodeSequencePipelined(tokens: tokens)
         }
         guard !tokens.isEmpty else { return -1 }
         guard tokens.count <= prefill.maximumSequenceLength else { return -1 }

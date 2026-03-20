@@ -253,6 +253,31 @@ public struct FusedResidualAddNorm: Sendable {
     }
 }
 
+/// Fused operation: exact-shape output projection + residualAdd + copy + RMSNorm.
+///
+/// This is intended for decode-only output tails where the projection shape is
+/// specialized enough to let one threadgroup compute the full hidden vector,
+/// then immediately perform the residual add/copy + norm without a second
+/// dispatch.
+public struct FusedOutputProjectionResidualAddCopyNorm: Sendable {
+    public let field: String
+    public let inputDimension: Int
+    public let outputDimension: Int
+    public let epsilon: Float
+
+    public init(
+        field: String,
+        inputDimension: Int,
+        outputDimension: Int,
+        epsilon: Float
+    ) {
+        self.field = field
+        self.inputDimension = inputDimension
+        self.outputDimension = outputDimension
+        self.epsilon = epsilon
+    }
+}
+
 /// Fused operation: gate_proj + up_proj + SwiGLU → single decode dispatch.
 ///
 /// This avoids materializing the two MLP branch projections into separate

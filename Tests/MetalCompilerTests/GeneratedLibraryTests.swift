@@ -296,4 +296,93 @@ struct GeneratedLibraryTests {
         #expect(hot6144.weightBytesPerStep > hot6144.inputBytesPerStep)
         #expect(hotSquare.weightBytesPerStep > hotSquare.inputBytesPerStep)
     }
+
+    @Test("Tail fusion opportunity report distinguishes feasible and infeasible output tails")
+    func tailFusionOpportunityReportHighlightsOutputProjectionTails() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let stafURL = URL(fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf")
+        guard FileManager.default.fileExists(atPath: stafURL.path) else { return }
+
+        let store = try STAFLoader().load(at: stafURL, device: device)
+        let config = ModelConfig(
+            hiddenSize: 2048, layerCount: 16, intermediateSize: 8192,
+            vocabSize: 65536, attentionHeads: 32, kvHeads: 8, headDim: 64,
+            attentionBias: false, mlpBias: false, normEps: 1e-5,
+            normKind: .rmsNorm, ropeTheta: 1000000.0, ropeDimension: 64,
+            ropeScaling: nil, tiedEmbeddings: true,
+            expertCount: nil, expertsPerToken: nil, qkNorm: true,
+            fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil, convKernelSize: nil, convLCache: 3,
+            partialRotaryFactor: nil, slidingWindow: nil,
+            layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
+                         "conv", "conv", "full_attention", "conv", "full_attention", "conv",
+                         "full_attention", "conv", "full_attention", "conv"])
+        let graph = try LFM2(config: config).makeModelGraph()
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
+        let compiler = MetalInferenceCompiler(optimizer: StandardOptimizer())
+        let report = compiler.analyzeTailFusionOpportunities(
+            graph: resolved,
+            hiddenSize: 2048,
+            intermediateSize: 8192,
+            vocabSize: 65536,
+            stafWeightStore: store,
+            device: device
+        )
+
+        print(report.formatted())
+
+        #expect(report.totalDispatches > 0)
+        #expect(report.outputProjectionDispatches > 0)
+        #expect(report.totalPotentialDispatchSavings > 0)
+        #expect(report.feasiblePotentialDispatchSavings > 0)
+        #expect(report.opportunities.contains(where: { $0.label.contains("fusedResidualAddCopyNorm") }))
+        #expect(report.opportunities.contains(where: { $0.projectionKernelFamily == "gemv_2048_sq" }))
+        #expect(report.opportunities.contains(where: { $0.projectionKernelFamily == "gemv_8192_tiled" }))
+        #expect(report.opportunities.contains(where: {
+            $0.projectionKernelFamily == "gemv_2048_sq" && $0.isFeasibleInCurrentExecutionModel
+        }))
+        #expect(report.opportunities.contains(where: {
+            $0.projectionKernelFamily == "gemv_8192_tiled" && !$0.isFeasibleInCurrentExecutionModel
+        }))
+    }
+
+    @Test("Aggressive optimizer still leaves feasible exact output tails")
+    func aggressiveOptimizerStillLeavesFeasibleExactOutputTails() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let stafURL = URL(fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf")
+        guard FileManager.default.fileExists(atPath: stafURL.path) else { return }
+
+        let store = try STAFLoader().load(at: stafURL, device: device)
+        let config = ModelConfig(
+            hiddenSize: 2048, layerCount: 16, intermediateSize: 8192,
+            vocabSize: 65536, attentionHeads: 32, kvHeads: 8, headDim: 64,
+            attentionBias: false, mlpBias: false, normEps: 1e-5,
+            normKind: .rmsNorm, ropeTheta: 1000000.0, ropeDimension: 64,
+            ropeScaling: nil, tiedEmbeddings: true,
+            expertCount: nil, expertsPerToken: nil, qkNorm: true,
+            fullAttentionInterval: nil, ssmNumHeads: nil, ssmKeyHeadDim: nil,
+            ssmValueHeadDim: nil, convKernelSize: nil, convLCache: 3,
+            partialRotaryFactor: nil, slidingWindow: nil,
+            layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
+                         "conv", "conv", "full_attention", "conv", "full_attention", "conv",
+                         "full_attention", "conv", "full_attention", "conv"])
+        let graph = try LFM2(config: config).makeModelGraph()
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
+
+        let aggressiveReport = MetalInferenceCompiler(optimizer: AggressiveOptimizer()).analyzeTailFusionOpportunities(
+            graph: resolved,
+            hiddenSize: 2048,
+            intermediateSize: 8192,
+            vocabSize: 65536,
+            stafWeightStore: store,
+            device: device
+        )
+
+        #expect(aggressiveReport.feasiblePotentialDispatchSavings > 0)
+        #expect(aggressiveReport.opportunities.contains(where: {
+            $0.projectionKernelFamily == "gemv_2048_sq" && $0.isFeasibleInCurrentExecutionModel
+        }))
+    }
 }

@@ -557,6 +557,7 @@ public enum DispatchKind: Sendable {
     case fusedCopyNorm(FusedCopyNorm)
     case fusedResidualAddCopyNorm(FusedResidualAddCopyNorm)
     case fusedResidualAddNorm(FusedResidualAddNorm)
+    case fusedOutputProjectionResidualAddCopyNorm(FusedOutputProjectionResidualAddCopyNorm)
     case fusedSwiGLUProjection(FusedSwiGLUProjection)
     case batchedProjection(BatchedProjection)
     case batchedFragment(BatchedFragment)

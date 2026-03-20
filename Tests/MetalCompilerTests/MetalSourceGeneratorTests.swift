@@ -70,6 +70,37 @@ struct MetalSourceGeneratorTests {
         }
     }
 
+    @Test("Generated fused output projection tail compiles for both weight formats")
+    func fusedOutputProjectionTailCompiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let formats: [(MetalSourceGenerator.WeightFormat, String)] = [
+            (.float16, "fp16"), (.bfloat16, "bf16")
+        ]
+
+        for (format, label) in formats {
+            let name = "fused_output_projection_tail_\(label)"
+            let argbufName = "\(name)_argbuf"
+            let source = MetalSourceGenerator.commonHeader + "\n\n"
+                + MetalSourceGenerator.generateFusedOutputProjectionResidualAddCopyRMSNorm(
+                    name: name,
+                    bufferPrecision: .float16,
+                    weightFormat: format)
+                + "\n\n"
+                + MetalSourceGenerator.generateFusedOutputProjectionResidualAddCopyRMSNormArgumentTableVariant(
+                    name: argbufName,
+                    argumentBufferIndex: 30,
+                    bufferPrecision: .float16,
+                    weightFormat: format)
+
+            let options = MTLCompileOptions()
+            options.languageVersion = .version4_0
+            let library = try device.makeLibrary(source: source, options: options)
+            #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
+            #expect(library.makeFunction(name: argbufName) != nil, "Failed to compile \(argbufName)")
+        }
+    }
+
     @Test("Generated GEMM compiles for all weight formats")
     func gemmCompiles() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }

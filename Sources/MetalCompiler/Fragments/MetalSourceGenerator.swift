@@ -122,10 +122,10 @@ public struct MetalSourceGenerator: Sendable {
         sources.append(generateBatchedPerHead2ArgumentTableVariant(name: "batched_qk_rms_norm_bf16_2_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16))
         sources.append(generateFusedSwiGLUProjection(name: "fused_swiglu_projection", bufferPrecision: decode, weightFormat: .float16))
         sources.append(generateFusedSwiGLUProjection(name: "fused_swiglu_projection_bf16", bufferPrecision: decode, weightFormat: .bfloat16))
-        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048", bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048_bf16", bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
-        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: false, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048", bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: true, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjection(name: "fused_swiglu_projection_2048_bf16", bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: true, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16, stagesInputAsFloat: true, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
+        sources.append(generateInput2048FusedSwiGLUProjectionArgumentTableVariant(name: "fused_swiglu_projection_2048_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16, stagesInputAsFloat: true, fixedRowsPerThreadgroup: 8, fixedSimdgroups: 8, unrollFactor: 8))
         sources.append(generateQKNorm(name: "qk_rms_norm", bufferPrecision: decode, weightFormat: .float16))
         sources.append(generateQKNorm(name: "qk_rms_norm_bf16", bufferPrecision: decode, weightFormat: .bfloat16))
         sources.append(generateQKNormArgumentTableVariant(name: "qk_rms_norm_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16))
@@ -831,6 +831,168 @@ public struct MetalSourceGenerator: Sendable {
             sum = simd_sum(sum);
             if (tiisg == 0) {
                 args.output[row] = \(bt)(sum);
+            }
+        }
+        """
+    }
+
+    public static func generateFusedOutputProjectionResidualAddCopyRMSNorm(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input            [[buffer(0)]],
+            device const \(wt)* projectionWeight [[buffer(1)]],
+            device \(bt)* residual               [[buffer(2)]],
+            device const \(wt)* normWeight       [[buffer(3)]],
+            device \(bt)* hidden                 [[buffer(4)]],
+            device \(bt)* scratch                [[buffer(5)]],
+            constant float& epsilon              [[buffer(6)]],
+            uint tid                             [[thread_index_in_threadgroup]],
+            uint tiisg                           [[thread_index_in_simdgroup]],
+            uint sgitg                           [[simdgroup_index_in_threadgroup]],
+            uint threadgroupSize                 [[threads_per_threadgroup]]
+        ) {
+            const uint fixedDimension = 2048u;
+
+            threadgroup float inputTile[fixedDimension];
+            threadgroup float projectedTile[fixedDimension];
+
+            for (uint j = tid; j < fixedDimension; j += threadgroupSize) {
+                inputTile[j] = float(input[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint row = tid; row < fixedDimension; row += threadgroupSize) {
+                device const \(wt)* weightRow = projectionWeight + row * fixedDimension;
+                float sum = 0.0f;
+                for (uint j = 0; j < fixedDimension; j += 4) {
+                    sum += \(readWeight("weightRow[j]")) * inputTile[j];
+                    sum += \(readWeight("weightRow[j + 1]")) * inputTile[j + 1];
+                    sum += \(readWeight("weightRow[j + 2]")) * inputTile[j + 2];
+                    sum += \(readWeight("weightRow[j + 3]")) * inputTile[j + 3];
+                }
+                projectedTile[row] = sum + float(residual[row]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sumSquared = 0.0f;
+            for (uint i = tid; i < fixedDimension; i += threadgroupSize) {
+                float h = projectedTile[i];
+                sumSquared += h * h;
+            }
+            sumSquared = simd_sum(sumSquared);
+
+            threadgroup float shared[32];
+            if (tid % SIMD_WIDTH == 0) shared[tid / SIMD_WIDTH] = sumSquared;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                const uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                float total = tiisg < sgCount ? shared[tiisg] : 0.0f;
+                total = simd_sum(total);
+                if (tiisg == 0) {
+                    shared[0] = rsqrt(total / float(fixedDimension) + epsilon);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float scale = shared[0];
+            for (uint row = tid; row < fixedDimension; row += threadgroupSize) {
+                float h = projectedTile[row];
+                hidden[row] = \(bt)(h);
+                residual[row] = \(bt)(h);
+                scratch[row] = \(bt)(h * scale * \(readWeight("normWeight[row]")));
+            }
+        }
+        """
+    }
+
+    public static func generateFusedOutputProjectionResidualAddCopyRMSNormArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const \(bt)* input [[id(0)]];
+            device const \(wt)* projectionWeight [[id(1)]];
+            device \(bt)* residual [[id(2)]];
+            device const \(wt)* normWeight [[id(3)]];
+            device \(bt)* hidden [[id(4)]];
+            device \(bt)* scratch [[id(5)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant float& epsilon                   [[buffer(6)]],
+            uint tid                                  [[thread_index_in_threadgroup]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint threadgroupSize                      [[threads_per_threadgroup]]
+        ) {
+            const uint fixedDimension = 2048u;
+
+            threadgroup float inputTile[fixedDimension];
+            threadgroup float projectedTile[fixedDimension];
+
+            for (uint j = tid; j < fixedDimension; j += threadgroupSize) {
+                inputTile[j] = float(args.input[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            for (uint row = tid; row < fixedDimension; row += threadgroupSize) {
+                device const \(wt)* weightRow = args.projectionWeight + row * fixedDimension;
+                float sum = 0.0f;
+                for (uint j = 0; j < fixedDimension; j += 4) {
+                    sum += \(readWeight("weightRow[j]")) * inputTile[j];
+                    sum += \(readWeight("weightRow[j + 1]")) * inputTile[j + 1];
+                    sum += \(readWeight("weightRow[j + 2]")) * inputTile[j + 2];
+                    sum += \(readWeight("weightRow[j + 3]")) * inputTile[j + 3];
+                }
+                projectedTile[row] = sum + float(args.residual[row]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sumSquared = 0.0f;
+            for (uint i = tid; i < fixedDimension; i += threadgroupSize) {
+                float h = projectedTile[i];
+                sumSquared += h * h;
+            }
+            sumSquared = simd_sum(sumSquared);
+
+            threadgroup float shared[32];
+            if (tid % SIMD_WIDTH == 0) shared[tid / SIMD_WIDTH] = sumSquared;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (sgitg == 0) {
+                const uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                float total = tiisg < sgCount ? shared[tiisg] : 0.0f;
+                total = simd_sum(total);
+                if (tiisg == 0) {
+                    shared[0] = rsqrt(total / float(fixedDimension) + epsilon);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float scale = shared[0];
+            for (uint row = tid; row < fixedDimension; row += threadgroupSize) {
+                float h = projectedTile[row];
+                args.hidden[row] = \(bt)(h);
+                args.residual[row] = \(bt)(h);
+                args.scratch[row] = \(bt)(h * scale * \(readWeight("args.normWeight[row]")));
             }
         }
         """
@@ -1878,19 +2040,22 @@ public struct MetalSourceGenerator: Sendable {
         let effectiveUnroll = max(1, unrollFactor)
         let effectiveThreadsPerThreadgroupExpr = fixedSimdgroups.map { "SIMD_WIDTH * \($0)u" } ?? "threadsPerThreadgroup"
         let rowsPerThreadgroupExpr = fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)"
+        let inputValuePrefetch = (0..<effectiveUnroll).map { lane in
+            "float x\(lane) = \(stagedInputRead)(inputLane[\(lane)]);"
+        }.joined(separator: "\n")
         let gateAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
-                return "gateSum += \(readWeight("gateRow[0]")) * \(stagedInputRead)(inputLane[0]);"
+                return "gateSum += \(readWeight("gateRow[0]")) * x0;"
             }
             let offset = "\(lane)"
-            return "gateSum += \(readWeight("gateRow[\(offset)]")) * \(stagedInputRead)(inputLane[\(offset)]);"
+            return "gateSum += \(readWeight("gateRow[\(offset)]")) * x\(offset);"
         }.joined(separator: "\n")
         let upAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
-                return "upSum += \(readWeight("upRow[0]")) * \(stagedInputRead)(inputLane[0]);"
+                return "upSum += \(readWeight("upRow[0]")) * x0;"
             }
             let offset = "\(lane)"
-            return "upSum += \(readWeight("upRow[\(offset)]")) * \(stagedInputRead)(inputLane[\(offset)]);"
+            return "upSum += \(readWeight("upRow[\(offset)]")) * x\(offset);"
         }.joined(separator: "\n")
 
         return """
@@ -1924,6 +2089,7 @@ public struct MetalSourceGenerator: Sendable {
             device const \(wt)* upRow = upWeight + row * fixedInputDimension + tiisg * \(effectiveUnroll);
             threadgroup const \(stagedInputType)* inputLane = inputTile + tiisg * \(effectiveUnroll);
             for (uint j = tiisg * \(effectiveUnroll); j < fixedInputDimension; j += SIMD_WIDTH * \(effectiveUnroll)) {
+                \(inputValuePrefetch)
                 \(gateAccumulate)
                 \(upAccumulate)
                 gateRow += SIMD_WIDTH * \(effectiveUnroll);
@@ -1960,17 +2126,20 @@ public struct MetalSourceGenerator: Sendable {
         let effectiveThreadsPerThreadgroupExpr = fixedSimdgroups.map { "SIMD_WIDTH * \($0)u" } ?? "threadsPerThreadgroup"
         let rowsPerThreadgroupExpr = fixedRowsPerThreadgroup.map { "\($0)u" } ?? "max(1u, threadsPerThreadgroup / SIMD_WIDTH)"
         let inputStructName = "\(name)_args"
+        let inputValuePrefetch = (0..<effectiveUnroll).map { lane in
+            "float x\(lane) = \(stagedInputRead)(inputLane[\(lane)]);"
+        }.joined(separator: "\n")
         let gateAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
-                return "gateSum += \(readWeight("gateRow[0]")) * \(stagedInputRead)(inputLane[0]);"
+                return "gateSum += \(readWeight("gateRow[0]")) * x0;"
             }
-            return "gateSum += \(readWeight("gateRow[\(lane)]")) * \(stagedInputRead)(inputLane[\(lane)]);"
+            return "gateSum += \(readWeight("gateRow[\(lane)]")) * x\(lane);"
         }.joined(separator: "\n")
         let upAccumulate = (0..<effectiveUnroll).map { lane -> String in
             if lane == 0 {
-                return "upSum += \(readWeight("upRow[0]")) * \(stagedInputRead)(inputLane[0]);"
+                return "upSum += \(readWeight("upRow[0]")) * x0;"
             }
-            return "upSum += \(readWeight("upRow[\(lane)]")) * \(stagedInputRead)(inputLane[\(lane)]);"
+            return "upSum += \(readWeight("upRow[\(lane)]")) * x\(lane);"
         }.joined(separator: "\n")
 
         return """
@@ -2006,6 +2175,7 @@ public struct MetalSourceGenerator: Sendable {
             device const \(wt)* upRow = args.upWeight + row * fixedInputDimension + tiisg * \(effectiveUnroll);
             threadgroup const \(stagedInputType)* inputLane = inputTile + tiisg * \(effectiveUnroll);
             for (uint j = tiisg * \(effectiveUnroll); j < fixedInputDimension; j += SIMD_WIDTH * \(effectiveUnroll)) {
+                \(inputValuePrefetch)
                 \(gateAccumulate)
                 \(upAccumulate)
                 gateRow += SIMD_WIDTH * \(effectiveUnroll);
