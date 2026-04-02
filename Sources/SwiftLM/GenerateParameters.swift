@@ -1,6 +1,6 @@
 /// Parameters controlling text generation.
 public struct GenerateParameters: Sendable {
-    /// Maximum tokens to generate. nil = unlimited.
+    /// Maximum tokens to generate. nil uses the runtime default cap.
     public var maxTokens: Int?
     /// Maximum number of tokens to coalesce into one streamed text chunk.
     public var streamChunkTokenCount: Int

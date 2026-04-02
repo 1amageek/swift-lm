@@ -16,6 +16,32 @@ for await generation in container.generate(input: try container.prepare(input: U
 }
 ```
 
+## Developer Quick Start
+
+Application developers should start with [`docs/using-swift-lm.md`](docs/using-swift-lm.md). It covers:
+
+- SwiftPM integration
+- required model bundle files
+- loading from HuggingFace or a local directory
+- text and chat generation
+- `PromptState` reuse for shared prefixes
+- cache reset and tokenizer helpers
+- current public API limits and troubleshooting
+
+Package requirements currently declared by `Package.swift`:
+
+- Swift 6.2+
+- macOS 26+, iOS 26+, visionOS 26+
+- a Metal-capable device
+
+SwiftPM dependency example:
+
+```swift
+dependencies: [
+    .package(url: "https://github.com/1amageek/swift-lm.git", branch: "main")
+]
+```
+
 ## Architecture
 
 ```
@@ -277,6 +303,7 @@ xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS' \
 
 ## Documentation
 
+- `docs/using-swift-lm.md` — developer integration guide
 - `AGENTS.md` — repository architecture and contribution guidance
 - `DESIGN-Metal4.md` — forward-looking Metal 4 design work
 - `docs/README.md` — documentation map and archive layout
