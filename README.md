@@ -93,6 +93,95 @@ LMIR (IR — no dependencies)
         └── UserInput, ChatMessage, GenerateParameters
 ```
 
+## Declarative Model DSL
+
+Model families in `swift-lm` are not hard-coded as backend-specific execution graphs. They are written as declarative `ModelComponent` trees, then normalized into `LMIR.ModelGraph`, and finally compiled for Metal.
+
+A standard decoder transformer looks like this:
+
+```swift
+public struct Transformer: ModelComponent {
+    public let config: ModelConfig
+
+    @ModelComponentBuilder
+    public var body: some ModelComponent {
+        TokenEmbedding(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
+
+        Repeat(count: config.layerCount, label: "layers") {
+            Residual {
+                RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+                Attention(
+                    hiddenSize: config.hiddenSize,
+                    headCount: config.attentionHeads,
+                    kvHeadCount: config.kvHeads,
+                    headDimension: config.headDim
+                )
+            }
+            Residual {
+                RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+                MLP(inputSize: config.hiddenSize, intermediateSize: config.intermediateSize)
+            }
+        }
+
+        RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+        OutputHead(
+            inputSize: config.hiddenSize,
+            vocabSize: config.vocabSize,
+            tiedToEmbedding: config.tiedEmbeddings
+        )
+    }
+}
+```
+
+A hybrid family such as LFM2 can switch layer structure declaratively:
+
+```swift
+public struct LFM2: ModelComponent {
+    public let config: ModelConfig
+    private let convLayerIndices: Set<Int>
+
+    @ModelComponentBuilder
+    public var body: some ModelComponent {
+        TokenEmbedding(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
+
+        LayerStack(0..<config.layerCount) { layerIndex in
+            if convLayerIndices.contains(layerIndex) {
+                Residual {
+                    RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+                    ShortConv(hiddenSize: config.hiddenSize, kernelSize: config.convLCache ?? 3)
+                }
+            } else {
+                Residual {
+                    RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+                    Attention(
+                        hiddenSize: config.hiddenSize,
+                        headCount: config.attentionHeads,
+                        kvHeadCount: config.kvHeads,
+                        headDimension: config.hiddenSize / config.attentionHeads
+                    )
+                }
+            }
+
+            Residual {
+                RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+                MLP(inputSize: config.hiddenSize, intermediateSize: config.intermediateSize)
+            }
+        }
+
+        RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+        OutputHead(inputSize: config.hiddenSize, vocabSize: config.vocabSize, tiedToEmbedding: config.tiedEmbeddings)
+    }
+}
+```
+
+This is the intended mental model for contributors:
+
+- `LMArchitecture` describes the model semantically with `TokenEmbedding`, `Residual`, `Attention`, `MLP`, `MoE`, `ShortConv`, and `OutputHead`
+- `LMIR` holds the normalized backend-independent graph
+- `MetalCompiler` decides how that graph turns into kernels, pipelines, buffers, and dispatch steps
+
+If you want to inspect the real declarations, start with `Sources/Models/Transformer.swift` and `Sources/Models/LFM2.swift`.
+
 ### Module Dependency Direction
 
 ```
