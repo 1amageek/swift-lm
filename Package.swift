@@ -32,7 +32,11 @@ let package = Package(
         .target(name: "ModelDeclarations", dependencies: ["LMArchitecture"], path: "Sources/Models"),
         .target(
             name: "MetalCompiler",
-            dependencies: ["LMIR"]
+            dependencies: ["LMIR"],
+            exclude: [
+                "STAF/KVCacheSpec.md",
+                "STAF/README.md",
+            ]
         ),
         .target(
             name: "SwiftLM",
