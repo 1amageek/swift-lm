@@ -70,6 +70,32 @@ struct MetalSourceGeneratorTests {
         }
     }
 
+    @Test("Generated specialized fused SwiGLU argument-table kernel keeps runtime outputDimension")
+    func specializedFusedSwiGLUArgumentTableCompilesWithRuntimeOutputDimension() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let name = "fused_swiglu_projection_2048_argbuf_test"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateInput2048FusedSwiGLUProjectionArgumentTableVariant(
+                name: name,
+                argumentBufferIndex: 30,
+                bufferPrecision: .float16,
+                weightFormat: .float16,
+                stagesInputAsFloat: false,
+                fixedRowsPerThreadgroup: 8,
+                fixedSimdgroups: 8,
+                unrollFactor: 8
+            )
+
+        #expect(source.contains("constant uint& outputDimension"))
+        #expect(!source.contains("if (row >= 8192u) return;"))
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
+    }
+
     @Test("Generated GEMM compiles for all weight formats")
     func gemmCompiles() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }

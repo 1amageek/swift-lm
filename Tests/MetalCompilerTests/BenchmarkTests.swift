@@ -61,7 +61,7 @@ struct BenchmarkTests {
             let pfTokPerSec = Double(prefillLength) / pfMedian
             let decMsPerTok = decMedian / Double(decodeSteps) * 1000
             let pfMsPerTok = pfMedian / Double(prefillLength) * 1000
-            let decDispatches = m.plan.fusedEntryCount
+            let decDispatches = m.decodePlan.fusedEntryCount
             let pfSteps = m.prefillPlan?.stepCount ?? 0
 
             let pad = name.padding(toLength: 12, withPad: " ", startingAt: 0)
@@ -149,7 +149,7 @@ struct BenchmarkTests {
         let tokPerSec = Double(decodeSteps) / elapsed
         let msPerToken = elapsed / Double(decodeSteps) * 1000
         print("[Benchmark/aggressive] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
-        print("[Benchmark/aggressive] dispatches: \(inferenceModel.plan.fusedEntryCount) (from \(inferenceModel.plan.unfusedEntryCount))")
+        print("[Benchmark/aggressive] dispatches: \(inferenceModel.decodePlan.fusedEntryCount) (from \(inferenceModel.decodePlan.unfusedEntryCount))")
     }
 
     @Test("End-to-end: prefill + decode with memory diagnostics")
@@ -163,7 +163,7 @@ struct BenchmarkTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let generateCount = 100
 
-        let b = inferenceModel.plan.buffers
+        let b = inferenceModel.buffers
         let hiddenBytes = b.hidden.length
         let scratchBytes = b.scratch.length
         let residualBytes = b.residual.length
@@ -211,8 +211,8 @@ struct BenchmarkTests {
         report += "  total intermediate: \(String(format: "%.1f", Double(totalGPUBytes) / 1024 / 1024)) MB\n"
         report += "  total weights:      \(String(format: "%.1f", Double(totalWeightBytes) / 1024 / 1024)) MB\n"
         report += "\nDispatch:\n"
-        report += "  decode steps: \(inferenceModel.plan.steps.count)\n"
-        report += "  fused entries: \(inferenceModel.plan.fusedEntryCount) (from \(inferenceModel.plan.unfusedEntryCount))\n"
+        report += "  decode steps: \(inferenceModel.decodePlan.steps.count)\n"
+        report += "  fused entries: \(inferenceModel.decodePlan.fusedEntryCount) (from \(inferenceModel.decodePlan.unfusedEntryCount))\n"
         report += "\nThroughput:\n"
         report += "  prefill: \(promptTokens.count) tokens, \(String(format: "%.1f", Double(promptTokens.count) / prefillTime)) tok/s\n"
         report += "  decode:  \(generateCount) tokens, \(String(format: "%.1f", Double(generateCount) / decodeTime)) tok/s (\(String(format: "%.2f", decodeTime / Double(generateCount) * 1000)) ms/tok)\n"

@@ -61,21 +61,30 @@ struct DispatchPlanCompilationTests {
     }
 
     @Test
-    func standardOptimizerDoesNotFuseMlpFrontHalf() throws {
+    func standardOptimizerFusesMlpFrontHalfInDispatchDump() throws {
         let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
 
-        #expect(!dump.contains("fusedSwiGLUProjection("), "Standard optimizer should keep MLP front half unfused:\n\(dump)")
+        #expect(dump.contains("fusedSwiGLUProjection("), "Standard optimizer should fuse MLP front half:\n\(dump)")
     }
 
     @Test
-    func aggressiveOptimizerFusesMlpFrontHalfInDispatchDump() throws {
+    func standardOptimizerDoesNotBatchAttentionProjections() throws {
+        let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
+        let compiler = MetalInferenceCompiler()
+        let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
+
+        #expect(!dump.contains("batchedProjection("), "Standard optimizer should not batch projections:\n\(dump)")
+    }
+
+    @Test
+    func aggressiveOptimizerBatchesAttentionProjectionsInDispatchDump() throws {
         let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
 
-        #expect(dump.contains("fusedSwiGLUProjection("), "Aggressive optimizer should fuse MLP front half:\n\(dump)")
+        #expect(dump.contains("batchedProjection(q_proj,k_proj,v_proj)"), "Aggressive optimizer should batch attention projections:\n\(dump)")
     }
 
     @Test
@@ -95,6 +104,34 @@ struct DispatchPlanCompilationTests {
             #expect(step.threadgroupSize.width % warpWidth == 0 || step.threadgroupSize.width < warpWidth,
                 "Step \(i) threadgroup width \(step.threadgroupSize.width) not aligned to warp \(warpWidth)")
         }
+    }
+
+    @Test
+    func specializedFusedSwiGLUArgumentTableRetainsOutputDimensionConstant() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let graph = try SpecializedSwiGLUTestModel(
+            hiddenSize: 2048,
+            intermediateSize: 6144,
+            vocabSize: 128
+        ).makeModelGraph()
+        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let plan = try compiler.compile(
+            graph: graph,
+            hiddenSize: 2048,
+            intermediateSize: 6144,
+            vocabSize: 128,
+            device: device
+        )
+
+        let step = try #require(plan.steps.first { step in
+            (step.pipeline.label ?? "").hasPrefix("fused_swiglu_projection_2048")
+        })
+        #expect(step.bindings.argumentPolicy == .argumentTable)
+
+        let outputDimensionBinding = try #require(
+            step.bindings.constants.first(where: { $0.index == 4 })
+        )
+        #expect(decodeUInt32(outputDimensionBinding) == 6144)
     }
 }
 
@@ -142,6 +179,47 @@ struct TinyTransformer: ModelComponent {
         RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
         OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
     }
+}
+
+struct SpecializedSwiGLUTestModel: ModelComponent {
+    let hiddenSize: Int
+    let intermediateSize: Int
+    let vocabSize: Int
+
+    var body: some ModelComponent {
+        TokenEmbedding(vocabSize: vocabSize, embeddingSize: hiddenSize)
+        Residual {
+            RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+            MLP(inputSize: hiddenSize, intermediateSize: intermediateSize)
+        }
+        RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+        OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
+    }
+}
+
+private func decodeUInt32(_ binding: MetalConstantBinding) -> UInt32 {
+    switch binding {
+    case .inline(let bytes):
+        return decodeUInt32(bytes.value)
+    case .buffer(let bytes):
+        let start = bytes.offset
+        let end = start + bytes.length
+        guard bytes.length == 4 else {
+            return 0
+        }
+        let contents = bytes.buffer.contents()
+        let pointer = contents.bindMemory(to: UInt8.self, capacity: end)
+        let value = Array(UnsafeBufferPointer(start: pointer.advanced(by: start), count: bytes.length))
+        return decodeUInt32(value)
+    }
+}
+
+private func decodeUInt32(_ bytes: [UInt8]) -> UInt32 {
+    guard bytes.count == 4 else { return 0 }
+    return UInt32(bytes[0])
+        | (UInt32(bytes[1]) << 8)
+        | (UInt32(bytes[2]) << 16)
+        | (UInt32(bytes[3]) << 24)
 }
 
 // MARK: - Kernel Completeness Tests

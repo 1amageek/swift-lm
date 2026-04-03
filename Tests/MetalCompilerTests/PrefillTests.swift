@@ -174,7 +174,7 @@ struct PrefillTests {
         _ config: ModelConfig,
         _ graph: ModelGraph,
         _ device: MTLDevice
-    ) throws -> MetalDispatchPlan {
+    ) throws -> MetalCompiledModel {
         try MetalInferenceCompiler().compile(
             graph: graph, hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,

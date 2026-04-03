@@ -263,9 +263,9 @@ enum BenchmarkSupport {
         var currentToken = model.prefill(tokens: promptTokens)
         for _ in 0..<3 { currentToken = model.decodeSync(tokenID: currentToken) }
 
-        let steps = model.plan.steps.enumerated().filter { filter($0.element) }
-        model.plan.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(model.position)
-        model.plan.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = currentToken
+        let steps = model.decodePlan.steps.enumerated().filter { filter($0.element) }
+        model.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(model.position)
+        model.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = currentToken
 
         var profiles: [StepProfile] = steps.map { index, step in
             StepProfile(
@@ -330,7 +330,7 @@ enum BenchmarkSupport {
         var currentToken = model.prefill(tokens: promptTokens)
         for _ in 0..<3 { currentToken = model.decodeSync(tokenID: currentToken) }
 
-        let buffers = model.plan.buffers
+        let buffers = model.buffers
         var breakdown = DecodeSyncBreakdown()
 
         for _ in 0..<iterations {
@@ -346,7 +346,7 @@ enum BenchmarkSupport {
                   let encoder = commandBuffer.makeComputeCommandEncoder() else {
                 throw BenchError.noDevice
             }
-            for step in model.plan.steps {
+            for step in model.decodePlan.steps {
                 step.bindings.bind(to: encoder)
                 step.descriptor.encode(on: encoder)
             }

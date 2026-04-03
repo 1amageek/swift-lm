@@ -6,7 +6,7 @@ This guide is for application developers integrating `SwiftLM` as a library.
 
 - Swift 6.2+
 - Apple platforms declared by this package: macOS 26+, iOS 26+, visionOS 26+
-- A Metal-capable device
+- An Apple Silicon device with Metal support for local inference
 - A HuggingFace model bundle with `config.json`, `tokenizer.json`, and one or more `.safetensors` files
 
 ## Add the Package

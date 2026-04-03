@@ -12,8 +12,8 @@ import LMIR
 ///
 /// Different implementations allow benchmarking and comparing strategies:
 /// - `NoOptimizer` — baseline, no optimization
-/// - `StandardOptimizer` — norm fusion only (current behavior)
-/// - `AggressiveOptimizer` — full: projection batch + per-head batch + structural fusion
+/// - `StandardOptimizer` — exact-shape MLP front-half fusion plus norm fusion
+/// - `AggressiveOptimizer` — standard optimization plus projection/per-head batching
 public protocol DispatchOptimizer: Sendable {
     /// Strategy name for benchmark reports.
     var name: String { get }

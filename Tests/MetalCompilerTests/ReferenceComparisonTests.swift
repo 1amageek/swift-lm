@@ -137,12 +137,12 @@ struct ReferenceComparisonTests {
         _ = model.prefill(tokens: tokens)
 
         // Read conv_state from DECODE plan's buffer (prefill transfers it)
-        guard let convState = model.plan.buffers.convState else {
+        guard let convState = model.buffers.convState else {
             Issue.record("No conv_state buffer"); return
         }
 
-        let convDim = model.plan.buffers.convStateDimension
-        let kernelSize = model.plan.buffers.convStateKernelSize
+        let convDim = model.buffers.convStateDimension
+        let kernelSize = model.buffers.convStateKernelSize
         let elementSize = MemoryLayout<Float16>.size
 
         for convIdx in 0..<10 {
@@ -434,8 +434,8 @@ struct ReferenceComparisonTests {
         let refHidden = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.final_hidden")
         let refLogits = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.logits")
 
-        let finalHiddenBuffer = finalHiddenInputBuffer(for: env.model.plan)
-        writeDecodeBuffer(refHidden, to: finalHiddenBuffer, precision: env.model.plan.buffers.bufferPrecision)
+        let finalHiddenBuffer = finalHiddenInputBuffer(for: env.model.decodePlan)
+        writeDecodeBuffer(refHidden, to: finalHiddenBuffer, precision: env.model.buffers.bufferPrecision)
 
         guard let cb = env.model.commandQueue.makeCommandBuffer(),
               let enc = cb.makeComputeCommandEncoder() else {
@@ -443,7 +443,7 @@ struct ReferenceComparisonTests {
             return
         }
 
-        for step in env.model.plan.steps.suffix(2) {
+        for step in env.model.decodePlan.steps.suffix(2) {
             enc.setComputePipelineState(step.pipeline)
             step.bindings.bind(to: enc)
             step.descriptor.encode(on: enc)
@@ -453,7 +453,7 @@ struct ReferenceComparisonTests {
         cb.commit()
         cb.waitUntilCompleted()
 
-        let metalLogits = readDecodeBuffer(env.model.plan.buffers.logits, precision: env.model.plan.buffers.bufferPrecision)
+        let metalLogits = readDecodeBuffer(env.model.buffers.logits, precision: env.model.buffers.bufferPrecision)
         let metalTop = argmax(metalLogits)
         let refTop = argmax(refLogits)
         let maxErr = maxAbsoluteError(metalLogits, refLogits)
@@ -481,13 +481,13 @@ struct ReferenceComparisonTests {
         var currentToken = model.prefill(tokens: tokens)
         currentToken = model.decodeSync(tokenID: currentToken)
 
-        model.plan.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(model.position)
-        model.plan.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = currentToken
+        model.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(model.position)
+        model.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = currentToken
 
         var currentLayer = 0
         var waitingForOperatorResidual = false
 
-        for (stepIndex, step) in model.plan.steps.enumerated() {
+        for (stepIndex, step) in model.decodePlan.steps.enumerated() {
             guard stepIndex < entries.count else { break }
 
             let cb = model.commandQueue.makeCommandBuffer()!
@@ -501,7 +501,7 @@ struct ReferenceComparisonTests {
 
             let entry = entries[stepIndex]
             if entry.kind.contains("projection(o_proj") || entry.kind.contains("projection(out_proj") {
-                let metal = readDecodeBuffer(model.plan.buffers.hidden, precision: model.plan.buffers.bufferPrecision)
+                let metal = readDecodeBuffer(model.buffers.hidden, precision: model.buffers.bufferPrecision)
                 let ref = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.layer_\(currentLayer).after_op")
                 let err = maxAbsoluteError(metal, ref)
                 print("[RefComp] Layer \(currentLayer) after_op maxErr=\(String(format: "%.4f", err)) kind=\(entry.kind)")
@@ -509,7 +509,7 @@ struct ReferenceComparisonTests {
             }
 
             if entry.kind.contains("projection(down_proj") {
-                let metal = readDecodeBuffer(model.plan.buffers.hidden, precision: model.plan.buffers.bufferPrecision)
+                let metal = readDecodeBuffer(model.buffers.hidden, precision: model.buffers.bufferPrecision)
                 let ref = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.layer_\(currentLayer).mlp_out")
                 let err = maxAbsoluteError(metal, ref)
                 print("[RefComp] Layer \(currentLayer) mlp_out maxErr=\(String(format: "%.4f", err)) kind=\(entry.kind)")
@@ -519,7 +519,7 @@ struct ReferenceComparisonTests {
                 if waitingForOperatorResidual {
                     waitingForOperatorResidual = false
                 } else {
-                    let metal = readDecodeBuffer(model.plan.buffers.hidden, precision: model.plan.buffers.bufferPrecision)
+                    let metal = readDecodeBuffer(model.buffers.hidden, precision: model.buffers.bufferPrecision)
                     let ref = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.layer_\(currentLayer).after_mlp")
                     let err = maxAbsoluteError(metal, ref)
                     print("[RefComp] Layer \(currentLayer) after_mlp maxErr=\(String(format: "%.4f", err)) kind=\(entry.kind)")
@@ -534,13 +534,13 @@ struct ReferenceComparisonTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
         let env = try setupOrSkip()
-        let normStep = finalNormStep(for: env.model.plan)
+        let normStep = finalNormStep(for: env.model.decodePlan)
         let input = try finalNormDiagnosticInput(for: normStep, env: env)
         let expected = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.final_hidden")
 
-        writeDecodeBuffer(input.hidden, to: env.model.plan.buffers.hidden, precision: env.model.plan.buffers.bufferPrecision)
+        writeDecodeBuffer(input.hidden, to: env.model.buffers.hidden, precision: env.model.buffers.bufferPrecision)
         if let residual = input.residual {
-            writeDecodeBuffer(residual, to: env.model.plan.buffers.residual, precision: env.model.plan.buffers.bufferPrecision)
+            writeDecodeBuffer(residual, to: env.model.buffers.residual, precision: env.model.buffers.bufferPrecision)
         }
 
         guard let cb = env.model.commandQueue.makeCommandBuffer(),
@@ -556,7 +556,7 @@ struct ReferenceComparisonTests {
         cb.commit()
         cb.waitUntilCompleted()
 
-        let actual = readDecodeBuffer(finalHiddenInputBuffer(for: env.model.plan), precision: env.model.plan.buffers.bufferPrecision)
+        let actual = readDecodeBuffer(finalHiddenInputBuffer(for: env.model.decodePlan), precision: env.model.buffers.bufferPrecision)
         let maxErr = maxAbsoluteError(actual, expected)
         print("[RefComp] Final norm kernel maxErr vs Python final_hidden: \(String(format: "%.4f", maxErr))")
         #expect(maxErr < 0.125, "Final norm kernel drifted: maxErr=\(maxErr)")
@@ -567,7 +567,7 @@ struct ReferenceComparisonTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
         let env = try setupOrSkip()
-        let normStep = finalNormStep(for: env.model.plan)
+        let normStep = finalNormStep(for: env.model.decodePlan)
         let input = try finalNormDiagnosticInput(for: normStep, env: env)
         let expected = try readRefTensorAsFloats(env.ref, name: "ref.decode_1.final_hidden")
         let weightBinding = finalNormWeightBinding(for: normStep)
@@ -614,7 +614,7 @@ struct ReferenceComparisonTests {
             if s < step { continue }
 
             // Read from DECODE plan's logits buffer (F16)
-            let metalLogits = readDecodeBuffer(model.plan.buffers.logits, precision: model.plan.buffers.bufferPrecision)
+            let metalLogits = readDecodeBuffer(model.buffers.logits, precision: model.buffers.bufferPrecision)
             let refLogits = try readRefTensorAsFloats(env.ref, name: "ref.decode_\(step).logits")
 
             let refTop = argmax(refLogits)
@@ -630,9 +630,9 @@ struct ReferenceComparisonTests {
             print("  Python top-5: \(refTop5.map { "(\($0.index),\(String(format: "%.2f", $0.value)))" })")
             print("  Max absolute error: \(String(format: "%.4f", maxErr))")
 
-            let finalHiddenBuffer = finalHiddenInputBuffer(for: model.plan)
-            let hiddenSize = finalHiddenBuffer.length / model.plan.buffers.bufferPrecision.byteSize
-            let metalFinalHidden = Array(readDecodeBuffer(finalHiddenBuffer, precision: model.plan.buffers.bufferPrecision).prefix(hiddenSize))
+            let finalHiddenBuffer = finalHiddenInputBuffer(for: model.decodePlan)
+            let hiddenSize = finalHiddenBuffer.length / model.buffers.bufferPrecision.byteSize
+            let metalFinalHidden = Array(readDecodeBuffer(finalHiddenBuffer, precision: model.buffers.bufferPrecision).prefix(hiddenSize))
             if let refFinalHidden = try? readRefTensorAsFloats(env.ref, name: "ref.decode_\(step).final_hidden") {
                 let finalHiddenErr = maxAbsoluteError(metalFinalHidden, refFinalHidden)
                 let metalHiddenSample = (0..<4).map { String(format: "%.4f", metalFinalHidden[$0]) }
@@ -643,9 +643,9 @@ struct ReferenceComparisonTests {
             }
 
             // Compare conv_state after this decode step
-            if let convState = model.plan.buffers.convState {
-                let convDim = model.plan.buffers.convStateDimension
-                let kSize = model.plan.buffers.convStateKernelSize
+            if let convState = model.buffers.convState {
+                let convDim = model.buffers.convStateDimension
+                let kSize = model.buffers.convStateKernelSize
                 let elemSize = MemoryLayout<Float16>.size
                 for convIdx in 0..<10 {
                     if let refData = try? readRefTensorAsFloats(env.ref, name: "ref.decode_\(step).conv_state.\(convIdx)") {

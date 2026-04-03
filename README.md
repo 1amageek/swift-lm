@@ -28,6 +28,8 @@ Application developers should start with [`docs/using-swift-lm.md`](docs/using-s
 - cache reset and tokenizer helpers
 - current public API limits and troubleshooting
 
+DocC sources now live in [`Sources/SwiftLM/SwiftLM.docc`](/Users/1amageek/Desktop/swift-lm/Sources/SwiftLM/SwiftLM.docc).
+
 Package requirements currently declared by `Package.swift`:
 
 - Swift 6.2+
@@ -60,8 +62,9 @@ LMIR (IR — no dependencies)
     ├── MetalCompiler (depends: LMIR only — not LMArchitecture)
     │   ├── PrimitiveMetalKernelFragment protocol
     │   ├── DispatchOptimizer protocol (pluggable graph optimization)
-    │   ├── MetalInferenceCompiler (IR walk → optimize → dispatch plan)
-    │   ├── MetalInferenceModel (decode/prefill execution)
+    │   ├── MetalInferenceCompiler (IR walk → optimize → compiled model)
+    │   ├── MetalCompiledModel (opaque decode/prefill runtime artifact)
+    │   ├── MetalInferenceModel (decode/prefill execution façade)
     │   └── STAF (weight format, parameter resolution)
     │
     └── SwiftLM (consumer API)
@@ -304,6 +307,7 @@ xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS' \
 ## Documentation
 
 - `docs/using-swift-lm.md` — developer integration guide
+- `Sources/SwiftLM/SwiftLM.docc` — DocC catalog for the `SwiftLM` module
 - `AGENTS.md` — repository architecture and contribution guidance
 - `DESIGN-Metal4.md` — forward-looking Metal 4 design work
 - `docs/README.md` — documentation map and archive layout

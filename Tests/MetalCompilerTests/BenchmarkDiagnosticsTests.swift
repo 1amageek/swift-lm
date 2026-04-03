@@ -173,7 +173,7 @@ struct BenchmarkDiagnosticsTests {
         var currentToken = m.prefill(tokens: promptTokens)
         for _ in 0..<3 { currentToken = m.decodeSync(tokenID: currentToken) }
 
-        let plan = m.plan
+        let plan = m.decodePlan
         plan.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(m.position)
         plan.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = currentToken
 

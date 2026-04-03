@@ -319,7 +319,7 @@ struct DecodeTests {
                 if top5.count < 5 { top5.append((i, v)); top5.sort { $0.1 > $1.1 } }
                 else if v > top5.last!.1 { top5[4] = (i, v); top5.sort { $0.1 > $1.1 } }
             }
-            let firstToken = model3.plan.buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+            let firstToken = model3.buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
             print("[Token test] prefill first token (from tokenOut): \(firstToken)")
             print("[Token test] prefill logits top5 (PREFILL buffer): \(top5.map { "id=\($0.0) val=\(String(format: "%.2f", $0.1))" }.joined(separator: ", "))")
         }

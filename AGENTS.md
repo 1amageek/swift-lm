@@ -58,7 +58,7 @@ The repository is intentionally split into five layers.
 
 - `MetalCompiler`
   - Metal backend for `LMIR`.
-  - Walks IR, lowers primitive attributes into fragment trees, runs dispatch optimization, compiles kernels, allocates buffers, and produces `MetalDispatchPlan` / `MetalPrefillPlan`.
+  - Walks IR, lowers primitive attributes into fragment trees, runs dispatch optimization, compiles kernels, allocates buffers, and produces an opaque `MetalCompiledModel` containing decode/prefill runtime state.
   - Also owns STAF, safetensors conversion/loading, weight naming resolution, and execution-side buffer formats.
 
 - `SwiftLM`
