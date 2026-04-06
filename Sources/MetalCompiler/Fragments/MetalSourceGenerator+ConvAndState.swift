@@ -317,21 +317,23 @@ public static func generateSSMRecurrence(
                 float kInv = rsqrt(kNormSq + 1e-6f);
 
                 // Fully fused per-d: decay+kvmem → delta → update+output
+                // kInv/qInv factored out of inner loops to eliminate 2*dk redundant muls per d.
                 float localNormSq = 0.0f;
                 for (uint d = dStart; d < dEnd; ++d) {
-                    float kvmem = 0.0f;
+                    float kvmemRaw = 0.0f;
                     for (uint j = 0; j < dk; ++j) {
                         float s = state[j * dv + d] * decay;
                         state[j * dv + d] = s;
-                        kvmem += s * convSiluCache[kBase + j] * kInv;
+                        kvmemRaw += s * convSiluCache[kBase + j];
                     }
-                    float delta = beta * (convSiluCache[vBase + d] - kvmem);
-                    float dot = 0.0f;
+                    float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
+                    float kInvDelta = kInv * delta;
+                    float dotRaw = 0.0f;
                     for (uint j = 0; j < dk; ++j) {
-                        float k = convSiluCache[kBase + j] * kInv;
-                        state[j * dv + d] += k * delta;
-                        dot += state[j * dv + d] * convSiluCache[qBase + j] * qInv;
+                        state[j * dv + d] += convSiluCache[kBase + j] * kInvDelta;
+                        dotRaw += state[j * dv + d] * convSiluCache[qBase + j];
                     }
+                    float dot = dotRaw * qInv;
                     output[headIndex * dv + d] = \(bt)(dot);
                     localNormSq += dot * dot;
                 }
@@ -473,22 +475,23 @@ public static func generateSSMRecurrenceSequence(
                     float kInv = rsqrt(kNormSq + 1e-6f);
 
                     // Fully fused per-d: decay+kvmem → delta → update+output
-                    // Two dk-loops per d share the same state cache lines.
+                    // kInv/qInv factored out of inner loops to eliminate 2*dk redundant muls per d.
                     float localNormSq = 0.0f;
                     for (uint d = dStart; d < dEnd; ++d) {
-                        float kvmem = 0.0f;
+                        float kvmemRaw = 0.0f;
                         for (uint j = 0; j < dk; ++j) {
                             float s = state[j * dv + d] * decay;
                             state[j * dv + d] = s;
-                            kvmem += s * convSiluCache[kBase + j] * kInv;
+                            kvmemRaw += s * convSiluCache[kBase + j];
                         }
-                        float delta = beta * (convSiluCache[vBase + d] - kvmem);
-                        float dot = 0.0f;
+                        float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
+                        float kInvDelta = kInv * delta;
+                        float dotRaw = 0.0f;
                         for (uint j = 0; j < dk; ++j) {
-                            float k = convSiluCache[kBase + j] * kInv;
-                            state[j * dv + d] += k * delta;
-                            dot += state[j * dv + d] * convSiluCache[qBase + j] * qInv;
+                            state[j * dv + d] += convSiluCache[kBase + j] * kInvDelta;
+                            dotRaw += state[j * dv + d] * convSiluCache[qBase + j];
                         }
+                        float dot = dotRaw * qInv;
                         outputPos[headIndex * dv + d] = \(bt)(dot);
                         localNormSq += dot * dot;
                     }

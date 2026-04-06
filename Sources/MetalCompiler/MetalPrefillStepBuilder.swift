@@ -36,12 +36,115 @@ struct MetalPrefillStepBuilder {
         }
 
         let residentSteps = try makeResidentConstantSteps(steps, allocator: constantAllocator)
+        let optimizedSteps = Self.optimizePrefillBarrierPolicies(residentSteps)
         return MetalPrefillPlan(
-            steps: residentSteps,
+            steps: optimizedSteps,
             buffers: buffers,
             maximumSequenceLength: maximumSequenceLength,
-            stepCount: residentSteps.count
+            stepCount: optimizedSteps.count
         )
+    }
+
+    /// Offset-aware buffer region for precise hazard detection.
+    /// Distinguishes scratch[0] from scratch[1] on the same MTLBuffer.
+    private struct BufferRegion: Hashable {
+        let buffer: ObjectIdentifier
+        let offset: Int
+    }
+
+    /// Eliminate unnecessary memory barriers between prefill steps using
+    /// offset-aware buffer region tracking.
+    ///
+    /// Consecutive projections reading the same scratch slot but writing to different
+    /// slots skip barriers because their write regions don't overlap with any pending read.
+    static func optimizePrefillBarrierPolicies(
+        _ steps: [MetalPrefillStep]
+    ) -> [MetalPrefillStep] {
+        var pendingWrites = Set<BufferRegion>()
+        return steps.map { step in
+            let accesses = prefillRegionAccesses(for: step)
+            let requiresBarrier = !pendingWrites.isDisjoint(with: accesses.reads.union(accesses.writes))
+            let newBarrierPolicy: MetalBarrierPolicy = requiresBarrier ? .bufferBarrier : .none
+
+            if requiresBarrier {
+                pendingWrites = accesses.writes
+            } else {
+                pendingWrites.formUnion(accesses.writes)
+            }
+
+            guard newBarrierPolicy != step.barrierPolicy else { return step }
+
+            let descriptor = MetalDispatchDescriptor(
+                pipeline: step.pipeline,
+                gridSize: step.gridSize,
+                threadgroupSize: step.threadgroupSize,
+                threadgroupMemoryLength: step.threadgroupMemoryLength,
+                barrierPolicy: newBarrierPolicy
+            )
+            return MetalPrefillStep(
+                descriptor: descriptor,
+                bindings: step.bindings,
+                mode: step.mode,
+                sequenceLengthPolicy: step.sequenceLengthPolicy,
+                positionBufferIndex: step.positionBufferIndex,
+                perPositionStrides: step.perPositionStrides,
+                metadata: step.metadata
+            )
+        }
+    }
+
+    /// Determine read/write buffer regions for a prefill step based on kernel name.
+    ///
+    /// Uses (buffer, offset) pairs so that non-overlapping scratch slots don't
+    /// create false write-after-write or read-after-write hazards.
+    private static func prefillRegionAccesses(
+        for step: MetalPrefillStep
+    ) -> (reads: Set<BufferRegion>, writes: Set<BufferRegion>) {
+        let buffers = step.bindings.buffers
+        let name = step.metadata.kernelName ?? ""
+
+        func regions(for indices: Set<Int>) -> Set<BufferRegion> {
+            Set(buffers.filter { indices.contains($0.index) }
+                .map { BufferRegion(buffer: ObjectIdentifier($0.buffer), offset: $0.offset) })
+        }
+
+        if isGEMMKernel(name) {
+            return (reads: regions(for: [0, 1]), writes: regions(for: [2]))
+        }
+
+        if name.hasPrefix("rms_norm") || name.hasPrefix("layer_norm") {
+            return (reads: regions(for: [0, 1]), writes: regions(for: [2]))
+        }
+
+        if name.hasPrefix("copy_buffer") {
+            return (reads: regions(for: [0]), writes: regions(for: [1]))
+        }
+
+        if name.hasPrefix("swiglu") || name.hasPrefix("sigmoid_gate") {
+            return (reads: regions(for: [0, 1]), writes: regions(for: [2]))
+        }
+
+        if name.hasPrefix("residual_add") {
+            return (reads: regions(for: [0, 1]), writes: regions(for: [2]))
+        }
+
+        if name.hasPrefix("embedding_lookup") {
+            return (reads: regions(for: [0, 1]), writes: regions(for: [2]))
+        }
+
+        if name.hasPrefix("argmax") {
+            return (reads: regions(for: [0]), writes: regions(for: [1]))
+        }
+
+        let all = Set(buffers.map {
+            BufferRegion(buffer: ObjectIdentifier($0.buffer), offset: $0.offset)
+        })
+        return (reads: all, writes: all)
+    }
+
+    private static func isGEMMKernel(_ name: String) -> Bool {
+        name.hasPrefix("gemm") || name.hasPrefix("gemv") || name.hasPrefix("matmul")
+            || name.hasPrefix("batched_gemv")
     }
 
     private func makeResidentConstantSteps(
