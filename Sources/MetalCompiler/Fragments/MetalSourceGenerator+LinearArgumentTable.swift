@@ -363,6 +363,7 @@ extension MetalSourceGenerator {
         argumentBufferIndex: Int,
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
+        activation: GatedActivation = .silu,
         fixedOutputDimension: Int? = nil,
         stagesInputAsFloat: Bool = true,
         fixedRowsPerThreadgroup: Int? = nil,
@@ -435,8 +436,8 @@ extension MetalSourceGenerator {
             gateSum = simd_sum(gateSum);
             upSum = simd_sum(upSum);
             if (tiisg == 0) {
-                float sig = 1.0f / (1.0f + fast::exp(-gateSum));
-                args.output[row] = \(bt)(gateSum * sig * upSum);
+                float activated = \(Self.gatedActivationExpression(activation, variable: "gateSum"));
+                args.output[row] = \(bt)(activated * upSum);
             }
         }
         """

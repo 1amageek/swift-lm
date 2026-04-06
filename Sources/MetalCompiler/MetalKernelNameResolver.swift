@@ -160,7 +160,8 @@ struct MetalKernelNameResolver {
                 inputDimension: fused.inputDimension,
                 outputDimension: fused.outputDimension
             )
-            return weightFormat == .bfloat16 ? family.kernelBaseName + "_bf16" : family.kernelBaseName
+            let baseName = family.kernelBaseName(activation: fused.activation)
+            return weightFormat == .bfloat16 ? baseName + "_bf16" : baseName
 
         case .batchedProjection(let batched):
             return "batched_gemv\(batched.projections.count)" + bf16Suffix

@@ -464,15 +464,17 @@ struct MetalKernelSourceCatalog {
                     let family = FusedSwiGLUProjectionFamily.resolve(
                         inputDimension: fused.inputDimension,
                         outputDimension: fused.outputDimension)
+                    let baseName = family.kernelBaseName(activation: fused.activation)
                     let kernelName = weightFormat == .bfloat16
-                        ? family.kernelBaseName + "_bf16"
-                        : family.kernelBaseName
+                        ? baseName + "_bf16"
+                        : baseName
                     if generatedNames.insert(kernelName).inserted {
                         if family == .input2048Dense {
                             sources.append(MetalSourceGenerator.generateInput2048FusedSwiGLUProjection(
                                 name: kernelName,
                                 bufferPrecision: bufferPrecision,
                                 weightFormat: weightFormat,
+                                activation: fused.activation,
                                 fixedRowsPerThreadgroup: 8,
                                 fixedSimdgroups: 8,
                                 unrollFactor: 8))
@@ -483,6 +485,7 @@ struct MetalKernelSourceCatalog {
                                     argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
                                     bufferPrecision: bufferPrecision,
                                     weightFormat: weightFormat,
+                                    activation: fused.activation,
                                     stagesInputAsFloat: false,
                                     fixedRowsPerThreadgroup: 8,
                                     fixedSimdgroups: 8,
@@ -492,7 +495,8 @@ struct MetalKernelSourceCatalog {
                             sources.append(MetalSourceGenerator.generateFusedSwiGLUProjection(
                                 name: kernelName,
                                 bufferPrecision: bufferPrecision,
-                                weightFormat: weightFormat))
+                                weightFormat: weightFormat,
+                                activation: fused.activation))
                         }
                     }
                 } else {

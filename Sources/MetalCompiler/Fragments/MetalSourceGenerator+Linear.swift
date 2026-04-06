@@ -387,11 +387,13 @@ extension MetalSourceGenerator {
     public static func generateFusedSwiGLUProjection(
         name: String,
         bufferPrecision: BufferPrecision,
-        weightFormat: WeightFormat
+        weightFormat: WeightFormat,
+        activation: GatedActivation = .silu
     ) -> String {
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let activationExpr = Self.gatedActivationExpression(activation, variable: "gateSum")
 
         return """
         kernel void \(name)(
@@ -423,8 +425,8 @@ extension MetalSourceGenerator {
             gateSum = simd_sum(gateSum);
             upSum = simd_sum(upSum);
             if (tiisg == 0) {
-                float sig = 1.0f / (1.0f + exp(-gateSum));
-                output[row] = \(bt)(gateSum * sig * upSum);
+                float activated = \(activationExpr);
+                output[row] = \(bt)(activated * upSum);
             }
         }
         """
@@ -438,6 +440,7 @@ extension MetalSourceGenerator {
         name: String,
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
+        activation: GatedActivation = .silu,
         stagesInputAsFloat: Bool = true,
         fixedRowsPerThreadgroup: Int? = nil,
         fixedSimdgroups: Int? = nil,
@@ -506,10 +509,23 @@ extension MetalSourceGenerator {
             gateSum = simd_sum(gateSum);
             upSum = simd_sum(upSum);
             if (tiisg == 0) {
-                float sig = 1.0f / (1.0f + fast::exp(-gateSum));
-                output[row] = \(bt)(gateSum * sig * upSum);
+                float activated = \(Self.gatedActivationExpression(activation, variable: "gateSum"));
+                output[row] = \(bt)(activated * upSum);
             }
         }
         """
+    }
+
+    /// Generate MSL expression for a gated activation function.
+    static func gatedActivationExpression(
+        _ activation: GatedActivation,
+        variable v: String
+    ) -> String {
+        switch activation {
+        case .silu:
+            return "\(v) * (1.0f / (1.0f + exp(-\(v))))"
+        case .geluTanh:
+            return "0.5f * \(v) * (1.0f + tanh(0.7978845608f * (\(v) + 0.044715f * \(v) * \(v) * \(v))))"
+        }
     }
 }

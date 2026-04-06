@@ -1,13 +1,16 @@
 import Metal
 
 /// Elementwise: one thread per element, trivially parallel.
-/// Used by: SwiGLU, SigmoidGate.
+/// Used by: SwiGLU, GEGLU, SigmoidGate.
 public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     public let count: Int
     public let kind: ElementwiseKind
 
-    public enum ElementwiseKind: Sendable {
+    public enum ElementwiseKind: Sendable, Equatable {
+        /// gate * sigmoid(gate) * up — SiLU-gated (Llama, LFM2)
         case swiglu
+        /// gelu_tanh(gate) * up — GELU-gated (Gemma4)
+        case geluGated
         case sigmoidGate
     }
 
@@ -16,11 +19,22 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
         self.kind = kind
     }
 
+    /// Whether this elementwise operation uses a gated activation pattern
+    /// (two input buffers: gate and up).
+    public var isGatedActivation: Bool {
+        switch kind {
+        case .swiglu, .geluGated: return true
+        case .sigmoidGate: return false
+        }
+    }
+
     public var isFusable: Bool { true }
     public func kernelName(context: KernelContext) -> String {
         switch kind {
         case .swiglu:
             return context.bufferPrecision == .float32 ? "swiglu_seq_f32" : "swiglu"
+        case .geluGated:
+            return context.bufferPrecision == .float32 ? "geglu_seq_f32" : "geglu"
         case .sigmoidGate:
             return "sigmoid_gate"
         }
@@ -28,7 +42,17 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: count) }
 
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
-        MetalSourceGenerator.generateSwiGLU(name: name, bufferPrecision: bufferPrecision, isSequence: bufferPrecision == .float32)
+        MetalSourceGenerator.generateGatedActivation(
+            name: name, bufferPrecision: bufferPrecision,
+            activation: gatedActivation, isSequence: bufferPrecision == .float32)
+    }
+
+    /// The activation function used by this elementwise operation.
+    public var gatedActivation: MetalSourceGenerator.GatedActivation {
+        switch kind {
+        case .swiglu, .sigmoidGate: return .silu
+        case .geluGated: return .geluTanh
+        }
     }
 
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {

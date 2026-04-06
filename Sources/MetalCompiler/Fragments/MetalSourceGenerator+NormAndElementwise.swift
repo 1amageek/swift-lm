@@ -163,13 +163,40 @@ extension MetalSourceGenerator {
         """
     }
 
+    /// Activation function applied inside gated MLP kernels.
+    public enum GatedActivation: Sendable {
+        /// SiLU: x * sigmoid(x) — used by SwiGLU (Llama, LFM2)
+        case silu
+        /// GELU (tanh approximation): 0.5x(1+tanh(sqrt(2/π)(x+0.044715x³))) — used by GEGLU (Gemma4)
+        case geluTanh
+    }
+
     /// Generate MSL source for an elementwise kernel (SwiGLU).
     public static func generateSwiGLU(
         name: String,
         bufferPrecision: BufferPrecision,
         isSequence: Bool = true
     ) -> String {
+        generateGatedActivation(name: name, bufferPrecision: bufferPrecision, activation: .silu, isSequence: isSequence)
+    }
+
+    /// Generate MSL source for a gated activation kernel.
+    ///
+    /// Computes `activation(gate) * up` element-wise.
+    /// SwiGLU uses `.silu`, GEGLU uses `.geluTanh`.
+    public static func generateGatedActivation(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        activation: GatedActivation,
+        isSequence: Bool = true
+    ) -> String {
         let bt = bufferPrecision.metalType
+        let activationExpr = switch activation {
+        case .silu:
+            "g * (1.0f / (1.0f + exp(-g)))"
+        case .geluTanh:
+            "0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g)))"
+        }
 
         if isSequence {
             return """
@@ -187,8 +214,8 @@ extension MetalSourceGenerator {
 
                 uint idx = seqPos * dimension + i;
                 float g = float(gate[idx]);
-                float sigmoid = 1.0f / (1.0f + exp(-g));
-                output[idx] = \(bt)(g * sigmoid * float(up[idx]));
+                float activated = \(activationExpr);
+                output[idx] = \(bt)(activated * float(up[idx]));
             }
             """
         } else {
@@ -202,8 +229,8 @@ extension MetalSourceGenerator {
             ) {
                 if (gid >= dimension) return;
                 float g = float(gate[gid]);
-                float sigmoid = 1.0f / (1.0f + exp(-g));
-                output[gid] = \(bt)(g * sigmoid * float(up[gid]));
+                float activated = \(activationExpr);
+                output[gid] = \(bt)(activated * float(up[gid]));
             }
             """
         }

@@ -8,11 +8,11 @@ struct FusedSwiGLUProjectionRule {
         guard index + 2 < primitives.count,
               let firstProjection = projectionInfo(primitives[index]),
               let secondProjection = projectionInfo(primitives[index + 1]),
-              let swiglu = primitives[index + 2].fragment as? ElementwiseFragment,
-              swiglu.kind == .swiglu,
+              let elementwise = primitives[index + 2].fragment as? ElementwiseFragment,
+              elementwise.isGatedActivation,
               firstProjection.inputDimension == secondProjection.inputDimension,
               firstProjection.outputDimension == secondProjection.outputDimension,
-              swiglu.count == firstProjection.outputDimension else {
+              elementwise.count == firstProjection.outputDimension else {
             return nil
         }
 
@@ -23,13 +23,15 @@ struct FusedSwiGLUProjectionRule {
                 inputDimension: firstProjection.inputDimension,
                 outputDimension: firstProjection.outputDimension,
                 gateField: firstProjection.field,
-                upField: secondProjection.field)
+                upField: secondProjection.field,
+                activation: elementwise.gatedActivation)
         case ("up_proj", "gate_proj"):
             projection = FusedSwiGLUProjection(
                 inputDimension: firstProjection.inputDimension,
                 outputDimension: firstProjection.outputDimension,
                 gateField: secondProjection.field,
-                upField: firstProjection.field)
+                upField: firstProjection.field,
+                activation: elementwise.gatedActivation)
         default:
             return nil
         }

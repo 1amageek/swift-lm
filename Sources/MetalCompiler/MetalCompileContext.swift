@@ -100,13 +100,22 @@ enum FusedSwiGLUProjectionFamily {
         return .generic
     }
 
-    var kernelBaseName: String {
+    func kernelBaseName(activation: MetalSourceGenerator.GatedActivation = .silu) -> String {
+        let prefix = switch activation {
+        case .silu: "fused_swiglu_projection"
+        case .geluTanh: "fused_geglu_projection"
+        }
         switch self {
         case .generic:
-            return "fused_swiglu_projection"
+            return prefix
         case .input2048Dense:
-            return "fused_swiglu_projection_2048"
+            return prefix + "_2048"
         }
+    }
+
+    /// Backward-compatible property for callers that don't specify activation.
+    var kernelBaseName: String {
+        kernelBaseName(activation: .silu)
     }
 }
 

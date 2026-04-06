@@ -278,17 +278,20 @@ public struct FusedSwiGLUProjection: Sendable {
     public let outputDimension: Int
     public let gateField: String
     public let upField: String
+    public let activation: MetalSourceGenerator.GatedActivation
 
     public init(
         inputDimension: Int,
         outputDimension: Int,
         gateField: String,
-        upField: String
+        upField: String,
+        activation: MetalSourceGenerator.GatedActivation = .silu
     ) {
         self.inputDimension = inputDimension
         self.outputDimension = outputDimension
         self.gateField = gateField
         self.upField = upField
+        self.activation = activation
     }
 }
 
