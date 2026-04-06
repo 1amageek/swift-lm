@@ -180,8 +180,31 @@ public enum QuantizationSchemeIdentifier: UInt8, Sendable, CaseIterable {
     case q2Group16ScaleF16  = 0x60
     case q2Group32ScaleF16  = 0x61
 
+    // RotorQuant — Clifford Cl(3,0) rotor-rotated KV cache quantization.
+    // Groups of 3 dimensions are rotated via sandwich product RvR̃ before
+    // quantization. Same block layout as base Q8/Q4.
+    case rotorQ8Group32ScaleF16 = 0x70
+    case rotorQ4Group64ScaleF16 = 0x71
+
     // Passthrough (unknown tensor, stored as FP16)
     case passthrough        = 0xFF
+}
+
+extension QuantizationSchemeIdentifier {
+    /// Whether this scheme uses RotorQuant (Clifford rotor pre-rotation).
+    public var isRotorScheme: Bool {
+        self == .rotorQ8Group32ScaleF16 || self == .rotorQ4Group64ScaleF16
+    }
+
+    /// The base quantization scheme underlying a RotorQuant scheme.
+    /// Returns self for non-rotor schemes.
+    public var baseScheme: QuantizationSchemeIdentifier {
+        switch self {
+        case .rotorQ8Group32ScaleF16: return .q8Group32ScaleF16
+        case .rotorQ4Group64ScaleF16: return .q4Group64ScaleF16
+        default: return self
+        }
+    }
 }
 
 // MARK: - Semantic Role

@@ -44,6 +44,7 @@ struct MetalBufferAllocator {
                     headDimension: firstSlot.headDimension,
                     maximumSequenceLength: context.maximumSequenceLength
                 ),
+                qjlDimension: kvCachePolicy.qjlDimension,
                 resourceOptions: gpuOnlyOptions
             )
         } else {
@@ -179,6 +180,7 @@ struct MetalBufferAllocator {
                     headDimension: firstSlot.headDimension,
                     maximumSequenceLength: context.maximumSequenceLength
                 ),
+                qjlDimension: kvCachePolicy.qjlDimension,
                 resourceOptions: gpuOptions
             )
         } else {

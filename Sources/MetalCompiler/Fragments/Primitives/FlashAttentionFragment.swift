@@ -50,6 +50,17 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         let vHeadSlotBytes = cache.specification.bytesPerHeadSlot(
             scheme: cache.specification.valueQuantizationScheme)
 
+        // RotorQuant / QJL buffers — kernel checks is_rotor_scheme() before access,
+        // so a placeholder buffer is safe for non-rotor schemes.
+        let placeholder = cache.keys
+        let rotorParamsBuffer = cache.rotorParameters ?? placeholder
+        let rotorParamsOffset = cache.rotorParameters != nil
+            ? cache.rotorParameterOffset(layer: context.kvCacheIndex) : 0
+        let qjlMatrixBuffer = cache.qjlMatrix ?? placeholder
+        let qjlResidualBuffer = cache.qjlResidualK ?? placeholder
+        let qjlResidualOffset = cache.qjlResidualK != nil
+            ? cache.qjlResidualOffset(layer: context.kvCacheIndex) : 0
+
         return FragmentBindings(
             buffers: [
                 (0, context.bufferSet.scratch, 1 * slotBytes),
@@ -59,6 +70,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 (4, cache.values, valueLayerOffset),
                 (5, context.bufferSet.scratch, 0),
                 (6, context.bufferSet.position, 0),
+                (17, rotorParamsBuffer, rotorParamsOffset),
+                (18, qjlMatrixBuffer, 0),
+                (19, qjlResidualBuffer, qjlResidualOffset),
             ],
             bytes: [
                 uint32Binding(7, UInt32(headCount)),
@@ -71,6 +85,8 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(14, UInt32(cache.specification.valueQuantizationScheme.rawValue)),
                 uint32Binding(15, UInt32(kHeadSlotBytes)),
                 uint32Binding(16, UInt32(vHeadSlotBytes)),
+                uint32Binding(20, UInt32(cache.numRotorGroups)),
+                uint32Binding(21, UInt32(cache.qjlDimension)),
             ],
             outputIsHidden: false,
             resetsProjectionIndex: true,
@@ -97,6 +113,16 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
 
         var steps: [MetalPrefillStep] = []
 
+        // RotorQuant / QJL buffers for prefill — placeholder when nil
+        let placeholder = cache.keys
+        let rotorParamsBuffer = cache.rotorParameters ?? placeholder
+        let rotorParamsOffset = cache.rotorParameters != nil
+            ? cache.rotorParameterOffset(layer: context.kvCacheIndex) : 0
+        let qjlMatrixBuffer = cache.qjlMatrix ?? placeholder
+        let qjlResidualBuffer = cache.qjlResidualK ?? placeholder
+        let qjlResidualOffset = cache.qjlResidualK != nil
+            ? cache.qjlResidualOffset(layer: context.kvCacheIndex) : 0
+
         // Step 1: Fill KV cache for all positions in one batch dispatch.
         // Each threadgroup handles one position; threads within handle headDim elements.
         // Loops over all kvHeads internally.
@@ -111,6 +137,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 (1, context.buffers.scratch, 3 * scratchSlotSize),
                 (2, cache.keys, keyLayerOffset),
                 (3, cache.values, valueLayerOffset),
+                (13, rotorParamsBuffer, rotorParamsOffset),
+                (14, qjlMatrixBuffer, 0),
+                (15, qjlResidualBuffer, qjlResidualOffset),
             ],
             bytesBindings: [
                 uint32Binding(4, UInt32(kvHeadCount)),
@@ -122,6 +151,8 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(10, UInt32(cache.specification.valueQuantizationScheme.rawValue)),
                 uint32Binding(11, UInt32(kHeadSlotBytes)),
                 uint32Binding(12, UInt32(vHeadSlotBytes)),
+                uint32Binding(16, UInt32(cache.numRotorGroups)),
+                uint32Binding(17, UInt32(cache.qjlDimension)),
             ],
             threadgroupMemoryLength: 0,
             sync: .bufferBarrier,
@@ -146,6 +177,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 (1, cache.keys, keyLayerOffset),
                 (2, cache.values, valueLayerOffset),
                 (3, context.buffers.scratch, 0),
+                (15, rotorParamsBuffer, rotorParamsOffset),
+                (16, qjlMatrixBuffer, 0),
+                (17, qjlResidualBuffer, qjlResidualOffset),
             ],
             bytesBindings: [
                 uint32Binding(4, UInt32(headCount)),
@@ -159,6 +193,8 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(12, UInt32(cache.specification.valueQuantizationScheme.rawValue)),
                 uint32Binding(13, UInt32(kHeadSlotBytes)),
                 uint32Binding(14, UInt32(vHeadSlotBytes)),
+                uint32Binding(18, UInt32(cache.numRotorGroups)),
+                uint32Binding(19, UInt32(cache.qjlDimension)),
             ],
             threadgroupMemoryLength: 0,
             sync: .bufferBarrier,

@@ -353,7 +353,7 @@ struct MetalDispatchStepBuilder {
                 return nil
             }
         default:
-            if table.layout.indices == [0, 1, 2, 3, 4, 5, 6] {
+            if table.layout.indices == [0, 1, 2, 3, 4, 5, 6, 17, 18, 19] {
                 switch kernelName {
                 case "flash_attn_decode":
                     return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)

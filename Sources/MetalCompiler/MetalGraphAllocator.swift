@@ -94,6 +94,14 @@ public struct KVCacheSpecification: Sendable {
         case .q4Group128ScaleF16Zero:
             let groups = (headDimension + 127) / 128
             rawBytes = groups * 68
+        case .rotorQ8Group32ScaleF16:
+            // Same block layout as q8Group32: 4B header + 32B int8 = 36B per 32 elements
+            let groups = (headDimension + 31) / 32
+            rawBytes = groups * 36
+        case .rotorQ4Group64ScaleF16:
+            // Same block layout as q4Group64: 4B header + 32B packed 4-bit = 36B per 64 elements
+            let groups = (headDimension + 63) / 64
+            rawBytes = groups * 36
         default:
             rawBytes = headDimension * 2  // fallback FP16
         }
@@ -162,6 +170,48 @@ public struct KVCacheSpecification: Sendable {
         }
     }
 
+    /// Number of Clifford Cl(3,0) rotor groups for RotorQuant.
+    /// Each group covers 3 dimensions. The last group may be zero-padded.
+    public var numRotorGroups: Int {
+        (headDimension + 2) / 3
+    }
+
+    /// Whether either K or V uses a RotorQuant scheme.
+    public var usesRotorQuant: Bool {
+        keyQuantizationScheme.isRotorScheme || valueQuantizationScheme.isRotorScheme
+    }
+
+    /// Byte size of rotor parameters for one layer.
+    /// Layout: [kvHeadCount × numRotorGroups × 4] half values.
+    /// Each rotor has 4 components: [s, b₁₂, b₁₃, b₂₃].
+    public var rotorParametersBytesPerLayer: Int {
+        kvHeadCount * numRotorGroups * 4 * MemoryLayout<UInt16>.size
+    }
+
+    /// Total byte size of rotor parameters across all layers.
+    public var totalRotorParametersSize: Int {
+        layerCount * rotorParametersBytesPerLayer
+    }
+
+    /// Byte size of QJL projected residuals for one layer.
+    /// Layout: [maxSeqLen × kvHeadCount × qjlDim] half values.
+    public func qjlResidualBytesPerLayer(qjlDimension: Int) -> Int {
+        guard qjlDimension > 0 else { return 0 }
+        return maximumSequenceLength * kvHeadCount * qjlDimension * MemoryLayout<UInt16>.size
+    }
+
+    /// Total byte size of QJL projected residuals across all layers.
+    public func totalQJLResidualSize(qjlDimension: Int) -> Int {
+        layerCount * qjlResidualBytesPerLayer(qjlDimension: qjlDimension)
+    }
+
+    /// Byte size of the shared QJL random projection matrix.
+    /// Layout: [headDim × qjlDim] half values.
+    public func qjlMatrixSize(qjlDimension: Int) -> Int {
+        guard qjlDimension > 0 else { return 0 }
+        return headDimension * qjlDimension * MemoryLayout<UInt16>.size
+    }
+
     private func alignUp(_ value: Int, to alignment: Int) -> Int {
         let remainder = value % alignment
         return remainder == 0 ? value : value + (alignment - remainder)
@@ -185,6 +235,10 @@ public enum KVCacheLayoutMode: UInt8, Sendable {
 ///
 /// The entire cache is pre-allocated. Layers are accessed via offset.
 /// K and V are separate buffers to allow independent quantization.
+///
+/// For RotorQuant schemes, additional buffers store per-group Clifford Cl(3,0)
+/// rotor parameters and (optionally) QJL projected residuals for inner product
+/// correction.
 public struct MetalKVCache: @unchecked Sendable {
     /// K cache buffer (all layers consolidated).
     public let keys: MTLBuffer
@@ -195,9 +249,34 @@ public struct MetalKVCache: @unchecked Sendable {
     /// Current number of tokens in cache.
     public var length: Int
 
+    // MARK: - RotorQuant State
+
+    /// Per-layer per-head Clifford rotor parameters.
+    /// Layout: [layer × kvHead × numGroups × 4] half values.
+    /// Each rotor: [s, b₁₂, b₁₃, b₂₃] in Cl(3,0).
+    /// nil when neither K nor V uses a RotorQuant scheme.
+    public let rotorParameters: MTLBuffer?
+
+    /// Shared QJL random projection matrix (Rademacher ±1/√m).
+    /// Layout: [headDim × qjlDim] half values.
+    /// nil when qjlDimension == 0.
+    public let qjlMatrix: MTLBuffer?
+
+    /// Per-layer per-token projected K quantization residuals.
+    /// Layout: [layer × maxSeqLen × kvHead × qjlDim] half values.
+    /// nil when qjlDimension == 0.
+    public let qjlResidualK: MTLBuffer?
+
+    /// Number of Cl(3,0) rotor groups per head (⌈headDim/3⌉). 0 for non-rotor.
+    public let numRotorGroups: Int
+
+    /// QJL projection dimension. 0 = disabled.
+    public let qjlDimension: Int
+
     public init(
         device: MTLDevice,
         specification: KVCacheSpecification,
+        qjlDimension: Int = 0,
         resourceOptions: MTLResourceOptions = [.storageModePrivate, .hazardTrackingModeUntracked]
     ) throws {
         let keySize = specification.totalBufferSize(scheme: specification.keyQuantizationScheme)
@@ -212,6 +291,124 @@ public struct MetalKVCache: @unchecked Sendable {
         self.values = v
         self.specification = specification
         self.length = 0
+        self.qjlDimension = qjlDimension
+
+        // Allocate RotorQuant buffers if needed
+        if specification.usesRotorQuant {
+            let numGroups = specification.numRotorGroups
+            self.numRotorGroups = numGroups
+
+            // Rotor parameters: CPU-writable for initialization, GPU-readable
+            let rotorSize = specification.totalRotorParametersSize
+            guard let rotorBuf = device.makeBuffer(length: max(rotorSize, 16), options: .storageModeShared) else {
+                throw MetalCompilerError.bufferAllocationFailed("Cannot allocate rotor parameters")
+            }
+            // Initialize to random unit rotors for PolarQuant outlier spreading
+            Self.initializeRandomUnitRotors(
+                buffer: rotorBuf,
+                layerCount: specification.layerCount,
+                kvHeadCount: specification.kvHeadCount,
+                numGroups: numGroups
+            )
+            self.rotorParameters = rotorBuf
+
+            // QJL buffers
+            if qjlDimension > 0 {
+                let matrixSize = specification.qjlMatrixSize(qjlDimension: qjlDimension)
+                guard let matBuf = device.makeBuffer(length: max(matrixSize, 16), options: .storageModeShared) else {
+                    throw MetalCompilerError.bufferAllocationFailed("Cannot allocate QJL matrix")
+                }
+                Self.initializeRademacherMatrix(
+                    buffer: matBuf,
+                    headDimension: specification.headDimension,
+                    qjlDimension: qjlDimension
+                )
+                self.qjlMatrix = matBuf
+
+                let residualSize = specification.totalQJLResidualSize(qjlDimension: qjlDimension)
+                guard let resBuf = device.makeBuffer(length: max(residualSize, 16), options: resourceOptions) else {
+                    throw MetalCompilerError.bufferAllocationFailed("Cannot allocate QJL residual buffer")
+                }
+                self.qjlResidualK = resBuf
+            } else {
+                self.qjlMatrix = nil
+                self.qjlResidualK = nil
+            }
+        } else {
+            self.numRotorGroups = 0
+            self.rotorParameters = nil
+            self.qjlMatrix = nil
+            self.qjlResidualK = nil
+        }
+    }
+
+    /// Initialize rotor parameters to random unit quaternions using deterministic LCG hash.
+    ///
+    /// Each rotor [s, b₁₂, b₁₃, b₂₃] satisfies s² + b₁₂² + b₁₃² + b₂₃² = 1.
+    /// The same (layerCount, kvHeadCount, numGroups) always produces the same rotors.
+    private static func initializeRandomUnitRotors(
+        buffer: MTLBuffer,
+        layerCount: Int,
+        kvHeadCount: Int,
+        numGroups: Int
+    ) {
+        let ptr = buffer.contents().bindMemory(
+            to: UInt16.self,
+            capacity: layerCount * kvHeadCount * numGroups * 4
+        )
+        let totalRotors = layerCount * kvHeadCount * numGroups
+        for i in 0..<totalRotors {
+            // 4 sequential LCG hashes for 4 components
+            var hash = UInt64(i) &* 6364136223846793005 &+ 1442695040888963407
+            let raw0 = hash
+            hash = hash &* 6364136223846793005 &+ 1442695040888963407
+            let raw1 = hash
+            hash = hash &* 6364136223846793005 &+ 1442695040888963407
+            let raw2 = hash
+            hash = hash &* 6364136223846793005 &+ 1442695040888963407
+            let raw3 = hash
+
+            // Map to [-1, 1] in Float32
+            let scale: Float = 1.0 / Float(1 << 30)
+            var s   = Float(Int64(bitPattern: raw0 >> 33) - (1 << 30)) * scale
+            var b12 = Float(Int64(bitPattern: raw1 >> 33) - (1 << 30)) * scale
+            var b13 = Float(Int64(bitPattern: raw2 >> 33) - (1 << 30)) * scale
+            var b23 = Float(Int64(bitPattern: raw3 >> 33) - (1 << 30)) * scale
+
+            // Normalize to unit quaternion
+            let norm = (s * s + b12 * b12 + b13 * b13 + b23 * b23).squareRoot()
+            if norm < 1e-8 {
+                s = 1.0; b12 = 0.0; b13 = 0.0; b23 = 0.0
+            } else {
+                let invNorm = 1.0 / norm
+                s *= invNorm; b12 *= invNorm; b13 *= invNorm; b23 *= invNorm
+            }
+
+            ptr[i * 4 + 0] = Float16(s).bitPattern
+            ptr[i * 4 + 1] = Float16(b12).bitPattern
+            ptr[i * 4 + 2] = Float16(b13).bitPattern
+            ptr[i * 4 + 3] = Float16(b23).bitPattern
+        }
+    }
+
+    /// Initialize QJL matrix with Rademacher distribution: ±1/√m.
+    private static func initializeRademacherMatrix(
+        buffer: MTLBuffer,
+        headDimension: Int,
+        qjlDimension: Int
+    ) {
+        let ptr = buffer.contents().bindMemory(
+            to: UInt16.self,
+            capacity: headDimension * qjlDimension
+        )
+        let scale = 1.0 / Float(qjlDimension).squareRoot()
+        let posVal = Float16(scale).bitPattern
+        let negVal = Float16(-scale).bitPattern
+        // Deterministic pseudo-random via simple hash
+        for i in 0..<(headDimension * qjlDimension) {
+            let hash = UInt64(i) &* 6364136223846793005 &+ 1442695040888963407
+            ptr[i] = (hash >> 33) & 1 == 0 ? posVal : negVal
+        }
     }
 
     /// K cache byte offset for a given (layer, head, position).
@@ -236,6 +433,16 @@ public struct MetalKVCache: @unchecked Sendable {
     /// Whether V cache uses quantization (not FP16).
     public var isValueQuantized: Bool {
         specification.valueQuantizationScheme != .fp16RowMajor
+    }
+
+    /// Rotor parameter byte offset for a given layer.
+    public func rotorParameterOffset(layer: Int) -> Int {
+        layer * specification.rotorParametersBytesPerLayer
+    }
+
+    /// QJL residual byte offset for a given layer.
+    public func qjlResidualOffset(layer: Int) -> Int {
+        layer * specification.qjlResidualBytesPerLayer(qjlDimension: qjlDimension)
     }
 }
 

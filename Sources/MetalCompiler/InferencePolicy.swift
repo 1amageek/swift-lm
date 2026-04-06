@@ -43,6 +43,14 @@ public struct InferencePolicy: Sendable {
 /// tolerance for quantization: K is used for dot products (tolerates aggressive
 /// quantization), V is used for weighted sums (requires conservative quantization
 /// to preserve outlier values).
+///
+/// For RotorQuant schemes, Clifford algebra Cl(3,0) rotors are applied per group
+/// of 3 dimensions before quantization. The rotation smooths outliers, improving
+/// quantization quality at the same bit width.
+///
+/// QJL (Quantized Johnson-Lindenstrauss) correction stores projected residuals
+/// alongside the K cache to provide unbiased inner product estimation.
+/// Set `qjlDimension > 0` to enable. Typical value: 16.
 public struct KVCachePolicy: Sendable {
 
     /// Quantization scheme for K cache.
@@ -54,14 +62,23 @@ public struct KVCachePolicy: Sendable {
     /// Memory layout mode.
     public var layoutMode: KVCacheLayoutMode
 
+    /// QJL residual projection dimension for K cache correction.
+    ///
+    /// 0 = disabled (default). When > 0, stores per-token JL-projected
+    /// quantization residuals to correct Q·K inner product estimation.
+    /// Only effective when K uses a RotorQuant scheme.
+    public var qjlDimension: Int
+
     public init(
         keyScheme: SchemeSelection = .automatic,
         valueScheme: SchemeSelection = .automatic,
-        layoutMode: KVCacheLayoutMode = .sequenceMajor
+        layoutMode: KVCacheLayoutMode = .sequenceMajor,
+        qjlDimension: Int = 0
     ) {
         self.keyScheme = keyScheme
         self.valueScheme = valueScheme
         self.layoutMode = layoutMode
+        self.qjlDimension = qjlDimension
     }
 
     /// Automatic: compiler selects scheme based on weight format.
