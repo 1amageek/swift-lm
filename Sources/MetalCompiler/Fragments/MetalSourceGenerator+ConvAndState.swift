@@ -262,23 +262,19 @@ public static func generateSSMRecurrence(
 
         threadgroup float convSiluCache[\(convDimension)];
 
-        // Phase 1: Shift conv state (all threads in parallel)
+        // Fused conv-shift + conv_silu: shift conv state and compute convolution
+        // in one pass using registers, eliminating device barrier and redundant reads.
         for (uint channel = tid; channel < convDim; channel += tgSize) {
             const uint base = channel * convKernelSize;
-            for (uint k = 0; k + 1 < convKernelSize; ++k) {
-                convState[base + k] = convState[base + k + 1];
-            }
-            convState[base + convKernelSize - 1] = half(projectedQKV[channel]);
-        }
-        threadgroup_barrier(mem_flags::mem_device);
-
-        // Phase 2: Precompute all conv_silu values (all threads in parallel)
-        for (uint channel = tid; channel < convDim; channel += tgSize) {
             float sum = 0.0f;
-            const uint base = channel * convKernelSize;
-            for (uint k = 0; k < convKernelSize; ++k) {
-                sum += float(convState[base + k]) * \(readWeight("convWeight[base + k]"));
+            for (uint k = 0; k + 1 < convKernelSize; ++k) {
+                float val = float(convState[base + k + 1]);
+                convState[base + k] = half(val);
+                sum += val * \(readWeight("convWeight[base + k]"));
             }
+            float newVal = float(projectedQKV[channel]);
+            convState[base + convKernelSize - 1] = half(newVal);
+            sum += newVal * \(readWeight("convWeight[base + convKernelSize - 1]"));
             convSiluCache[channel] = sum * stable_sigmoid(sum);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -421,23 +417,19 @@ public static func generateSSMRecurrenceSequence(
             device const \(bt)* projectedAlphaPos = projectedAlpha + pos * numHeads;
             device \(bt)* outputPos = output + pos * outputDim;
 
-            // Phase 1: Shift conv state (all threads)
+            // Fused conv-shift + conv_silu: shift conv state and compute convolution
+            // in one pass using registers, eliminating device barrier and redundant reads.
             for (uint channel = tid; channel < convDim; channel += tgSize) {
                 const uint base = channel * convKernelSize;
-                for (uint k = 0; k + 1 < convKernelSize; ++k) {
-                    convState[base + k] = convState[base + k + 1];
-                }
-                convState[base + convKernelSize - 1] = half(projectedQKVPos[channel]);
-            }
-            threadgroup_barrier(mem_flags::mem_device);
-
-            // Phase 2: Precompute all conv_silu values into threadgroup memory (all threads)
-            for (uint channel = tid; channel < convDim; channel += tgSize) {
                 float sum = 0.0f;
-                const uint base = channel * convKernelSize;
-                for (uint k = 0; k < convKernelSize; ++k) {
-                    sum += float(convState[base + k]) * \(readWeight("convWeight[base + k]"));
+                for (uint k = 0; k + 1 < convKernelSize; ++k) {
+                    float val = float(convState[base + k + 1]);
+                    convState[base + k] = half(val);
+                    sum += val * \(readWeight("convWeight[base + k]"));
                 }
+                float newVal = float(projectedQKVPos[channel]);
+                convState[base + convKernelSize - 1] = half(newVal);
+                sum += newVal * \(readWeight("convWeight[base + convKernelSize - 1]"));
                 convSiluCache[channel] = sum * stable_sigmoid(sum);
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -523,7 +515,11 @@ public static func generateSSMRecurrenceSequence(
                     }
                 }
             }
-            threadgroup_barrier(mem_flags::mem_device);
+            // Skip barrier after final position — no subsequent iteration reads this state,
+            // and the command encoder's implicit barrier handles cross-dispatch visibility.
+            if (pos + 1 < sequenceLength) {
+                threadgroup_barrier(mem_flags::mem_device);
+            }
         }
     }
     """

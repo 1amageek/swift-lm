@@ -376,13 +376,16 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 return parsed
             }
         }
+        // Larger chunks amortize per-chunk overhead (command buffer round-trips,
+        // CPU hidden writes) without increasing total GPU work. SSM serial loops
+        // and GEMMs are memory-bandwidth bound regardless of chunk size.
         if tokenCount >= 64 {
-            return 16
+            return 32
         }
         if tokenCount >= 24 {
-            return 8
+            return 16
         }
-        return 4
+        return 8
     }
 
     // MARK: - Lifecycle

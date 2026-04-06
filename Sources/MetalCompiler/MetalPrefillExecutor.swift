@@ -124,7 +124,10 @@ struct MetalPrefillExecutor: Sendable {
         let layerStepIndices = firstStepIndicesByLayer(in: prefillPlan.steps)
         let embeddingPrefixEnd = firstLayerStepIndex(in: prefillPlan.steps) ?? prefillPlan.steps.count
 
-        if embeddingPrefixEnd > 0 {
+        // Skip embedding dispatch when all tokens will be overwritten by vision hidden states.
+        // For image segments, every token has a hidden override so embedding lookup is wasted work.
+        let allTokensOverridden = hiddenOverridesByTokenIndex.count >= sequenceLength
+        if embeddingPrefixEnd > 0 && !allTokensOverridden {
             _ = try submission.withCompute(label: "prefill.embedding") { encoder in
                 encodePrefillSteps(
                     encoder: encoder,

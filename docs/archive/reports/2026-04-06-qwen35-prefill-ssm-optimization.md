@@ -314,6 +314,83 @@ Text segments の固定オーバーヘッド (~40-70ms/segment) が支配的。C
 | Hardware | Apple M4 Max (36GB, 546 GB/s) |
 | vs original baseline | **90x faster** (28.9s → 0.321s) |
 
+### 5. Conv-Shift + Conv-SiLU Fusion (Phase 1+2 Merge)
+
+SSM kernel の Phase 1 (conv state shift) と Phase 2 (conv_silu 計算) を 1 パスに融合。
+
+```
+Before (2 phases + 1 device barrier):
+  Phase 1: for each channel:
+    read convState[base+1..3], shift to [base+0..2], write new to [base+3]
+  threadgroup_barrier(mem_device)  ← eliminated
+  Phase 2: for each channel:
+    re-read convState[base+0..3] from device memory  ← eliminated
+    compute sum = Σ convState[k] * weight[k]
+    convSiluCache[channel] = sum * sigmoid(sum)
+  threadgroup_barrier(mem_threadgroup)
+
+After (1 fused phase):
+  for each channel:
+    read convState[base+k+1] → register val
+    write shifted val to convState[base+k]
+    accumulate val * weight[k] in register sum
+    write new input to convState[base+3]
+    accumulate new * weight[3]
+    convSiluCache[channel] = sum * sigmoid(sum)
+  threadgroup_barrier(mem_threadgroup)
+```
+
+Each thread processes the same channels in both phases, so device memory writes are visible to the same thread's subsequent reads (MSL program order guarantee). The intermediate device barrier is unnecessary.
+
+Savings per position:
+- 1 device memory barrier (expensive GPU synchronization point)
+- convDimension × convKernelSize = 2560 × 4 = 10,240 device memory reads
+
+For 18 DeltaNet layers × 16 positions: 288 device barriers + 2.95M device reads eliminated.
+
+Decode kernel (`generateSSMRecurrence`) と prefill kernel (`generateSSMRecurrenceSequence`) の両方に適用。
+
+### 6. VLM Embedding Dispatch Skip
+
+VLM multimodal prefill で、全 token に hidden override がある場合 (image segment)、`prefill.embedding` command buffer をスキップ。
+
+```
+Before: image segment (16 tokens)
+  1. GPU: embedding lookup → hidden buffer     ← wasted (immediately overwritten)
+  2. waitUntilCompleted: true                  ← unnecessary sync
+  3. CPU: overwrite all hidden rows with vision embeddings
+
+After:
+  1. CPU: write vision embeddings to hidden buffer directly
+```
+
+64-token image segment (4 chunks of 16): 4 × (GPU dispatch + command buffer round-trip) 削減。
+
+### 7. SSM Prefill Final Position Barrier Skip
+
+Prefill SSM kernel の position loop 最終反復で `threadgroup_barrier(mem_device)` をスキップ。最終 position 後は次の反復がないため、barrier は不要。Command encoder の implicit barrier が cross-dispatch visibility を保証。
+
+18 DeltaNet layers × chunks/segment 分の device barriers 削減。
+
+### 8. Multimodal Chunk Size Increase
+
+VLM multimodal prefill のデフォルト chunk size を増加:
+- 64+ tokens: 16 → 32
+- 24+ tokens: 8 → 16
+- <24 tokens: 4 → 8
+
+Larger chunks amortize per-chunk fixed overhead (command buffer creation, CPU hidden write, GPU sync) without increasing total GPU work. SSM serial loop と GEMM は chunk size に関係なく memory-bandwidth bound。
+
+**変更ファイル (5-8)**:
+
+| File | Change |
+|------|--------|
+| `Sources/MetalCompiler/Fragments/MetalSourceGenerator+ConvAndState.swift` | Phase 1+2 fusion (both kernels), final position barrier skip |
+| `Sources/MetalCompiler/MetalPrefillExecutor.swift` | Skip embedding dispatch when allTokensOverridden |
+| `Sources/MetalCompiler/MetalInferenceModel.swift` | Chunk size defaults doubled |
+
+---
+
 今後の最適化候補:
 
 | Candidate | Expected Impact | Rationale |
@@ -322,7 +399,8 @@ Text segments の固定オーバーヘッド (~40-70ms/segment) が支配的。C
 | ~~Prefill barrier optimization~~ | ~~Medium~~ | **実施済み**: offset-aware buffer region tracking で prefill barriers を最適化。DeltaNet layer あたり 4 barriers 削減 (norm + z + b + a projections) |
 | Segment coalescing | Low-Medium | 隣接テキストセグメントを結合し、GEMM バッチサイズを拡大。固定オーバーヘッド削減 |
 | in_proj_b + in_proj_a 統合 | Low-Medium | 1024→16 の tiny GEMM が 18 DeltaNet 層で 2 回ずつ dispatch。1024→32 に結合すれば dispatch 数半減 |
-| SSM position chunking | Unknown | Position 間の serial dependency を chunk 化して並列度向上。DeltaNet の recurrence は厳密に sequential だが、chunk 単位の並列化は理論的に可能 |
+| in_proj_b + in_proj_a inline in SSM | Medium | SSM kernel 内で beta/alpha projection を直接計算。2 dispatches/layer 削減 × 18 layers。ただし fragment 抽象化の変更が必要 |
+| ~~Conv-shift + conv_silu fusion~~ | ~~Low-Medium~~ | **実施済み**: device barrier + redundant reads 削減 |
 | Metal 4 cooperative tensor | Unknown | 大バッチセグメントで AMX 効率向上 |
 
 ---
@@ -331,10 +409,11 @@ Text segments の固定オーバーヘッド (~40-70ms/segment) が支配的。C
 
 | File | Change |
 |------|--------|
-| `Sources/MetalCompiler/Fragments/MetalSourceGenerator+ConvAndState.swift` | Modified: 3-phase SSM recurrence → multi-thread-per-head Phase 3, fused state passes, kInv/qInv factored |
+| `Sources/MetalCompiler/Fragments/MetalSourceGenerator+ConvAndState.swift` | Modified: 3-phase SSM → fused Phase 1+2, multi-thread Phase 3, kInv/qInv factored, final barrier skip |
 | `Sources/MetalCompiler/Fragments/Primitives/SSMRecurrenceFragment.swift` | Modified: `convDimension` property, threadgroup 1024, dispatch dimension fix |
 | `Sources/MetalCompiler/MetalPrefillStepBuilder.swift` | Modified: offset-aware prefill barrier optimization |
+| `Sources/MetalCompiler/MetalPrefillExecutor.swift` | Modified: skip embedding dispatch for fully-overridden segments |
+| `Sources/MetalCompiler/MetalInferenceModel.swift` | Modified: doubled multimodal chunk size defaults |
 | `Sources/MetalCompiler/MetalKernelSourceCatalog.swift` | Modified: SSM convDimension passthrough + MPP GEMM registration for fused entries |
 | `Sources/MetalCompiler/Fragments/MetalSourceGenerator+Library.swift` | Modified: default convDimension |
 | `Sources/MetalCompiler/MetalPrefillPlan.swift` | Modified: `bindAndAdjustGridHeightTiled` policy |
-| `Sources/MetalCompiler/MetalPrefillStepBuilder.swift` | Modified: MPP step policy |
