@@ -312,6 +312,63 @@ Consumer (ModelBundleLoader)
 - `SchemeSelection.automatic` は weight format から KV cache scheme を導出（BF16 weights → BF16 cache, else → FP16）
 - K/V は独立量子化可能 — K は dot product 用（攻撃的量子化可）、V は weighted sum 用（保守的が必要）
 - `KVCacheSpecification` は compiler 内部の実装詳細。InferencePolicy（意図）→ KVCacheSpecification（実体）の変換は `MetalBufferAllocator` が担う
+### RotorQuant — Clifford Rotor KV Cache Quantization
+
+Clifford Cl(3,0) rotor (3D rotation) で KV cache を回転してから量子化する。PolarQuant の原理: ランダム回転が外れ値を次元間に分散させ、同ビット幅でも量子化品質が向上する。
+
+#### Scheme identifiers
+
+| Scheme | ID | Base | Memory ratio vs FP16 |
+|---|---|---|---|
+| `rotorQ8Group32ScaleF16` | 0x70 | Q8 group32 | 62.5% |
+| `rotorQ4Group64ScaleF16` | 0x71 | Q4 group64 | 37.5% |
+
+#### Rotor representation
+
+Each rotor is a unit quaternion `[s, b₁₂, b₁₃, b₂₃]` in Float16, satisfying `s² + b₁₂² + b₁₃² + b₂₃² = 1`. Groups of 3 dimensions are rotated via sandwich product `RvR̃`. Buffer layout: `[layer × kvHeadCount × numRotorGroups × 4]` where `numRotorGroups = ceil(headDim / 3)`.
+
+#### Initialization
+
+Deterministic LCG hash chain (Knuth multiplier `6364136223846793005`). 4 sequential hashes per rotor → map to [-1,1] in Float32 → normalize to unit quaternion → store as Float16. Same model parameters always produce the same rotors. No calibration data needed.
+
+#### Kernel pipeline
+
+```
+Write path (K/V):  data → rotor_apply_forward → quantize → store
+Read path (K):     pre-rotate Q via rotor_apply_forward → Q'·K' = Q·K (orthogonality)
+Read path (V):     dequantize → weighted sum → rotor_apply_inverse → output
+```
+
+K and V share the same rotor buffer per (layer, head, group). `kRotor`/`vRotor` flags enable/disable rotation per scheme.
+
+#### QJL correction (optional)
+
+Johnson-Lindenstrauss projected residual for unbiased inner product estimation. Rademacher matrix Φ (±1/√m) projects quantization residual. Controlled by `KVCachePolicy.qjlDimension`.
+
+#### Performance characteristics (Gemma4-E2B, 35 attention layers)
+
+**Throughput vs context length (tok/s):**
+
+| Context | FP16 | RotorQ8 | RotorQ4 | RotorQ8/FP16 | RotorQ4/FP16 |
+|---|---|---|---|---|---|
+| 64 | 37.9 | 37.6 | 39.1 | 0.99x | 1.03x |
+| 512 | 21.1 | 22.5 | 21.3 | 1.07x | 1.01x |
+| 1024 | 13.8 | 12.1 | 12.8 | 0.87x | 0.92x |
+| 2048 | 8.6 | 7.8 | 7.0 | 0.90x | 0.81x |
+
+At these context lengths, rotor computation overhead exceeds KV cache bandwidth savings. At fill=2048, KV read is only 3.5% of total decode bandwidth (~70 MB vs ~2 GB weight read). Crossover requires context lengths where KV bandwidth becomes a significant fraction of total bandwidth — estimated at ~55K tokens for this model size.
+
+**Benchmark methodology note:** Multiple `hazardTrackingModeUntracked` models must NOT be simultaneously alive during measurement. GPU cache interference causes anomalous speedups (up to 4.6x) on the last-measured model. Build and measure one model at a time.
+
+**Token quality (FP16 agreement, 100 tokens × 3 prompts):**
+
+| Policy | Agreement | vs Q8 non-rotor |
+|---|---|---|
+| Q8 (non-rotor) | 39.9% | baseline |
+| RotorQ8 | 42.9% | +3.0pp |
+| RotorQ4 | 38.6% | -1.3pp |
+
+Random rotation provides measurable quality improvement for Q8. Q4 information loss exceeds rotation benefit.
 
 ### 新しい計算の追加手順
 

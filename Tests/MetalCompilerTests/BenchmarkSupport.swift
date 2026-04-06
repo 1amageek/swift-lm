@@ -407,6 +407,18 @@ enum BenchmarkSupport {
         optimizer: (any DispatchOptimizer)? = nil,
         maximumPrefillLength: Int = 64
     ) throws -> (MetalInferenceModel, STAFWeightStore, String) {
+        try setupFromBundle(
+            bundlePath: bundlePath,
+            inferencePolicy: InferencePolicy(maximumSequenceLength: maximumPrefillLength),
+            optimizer: optimizer
+        )
+    }
+
+    static func setupFromBundle(
+        bundlePath: String,
+        inferencePolicy: InferencePolicy,
+        optimizer: (any DispatchOptimizer)? = nil
+    ) throws -> (MetalInferenceModel, STAFWeightStore, String) {
         let (device, store) = try loadBundleStoreOrSkip(bundlePath: bundlePath)
 
         let configURL = URL(fileURLWithPath: bundlePath).appendingPathComponent("config.json")
@@ -426,6 +438,7 @@ enum BenchmarkSupport {
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
             vocabSize: config.vocabSize,
+            inferencePolicy: inferencePolicy,
             stafWeightStore: store,
             device: device
         )
@@ -434,7 +447,7 @@ enum BenchmarkSupport {
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
             vocabSize: config.vocabSize,
-            inferencePolicy: InferencePolicy(maximumSequenceLength: maximumPrefillLength),
+            inferencePolicy: inferencePolicy,
             stafWeightStore: store,
             sharedKVCache: compiled.decodePlan.buffers.kvCache,
             sharedConvState: compiled.decodePlan.buffers.convState,
