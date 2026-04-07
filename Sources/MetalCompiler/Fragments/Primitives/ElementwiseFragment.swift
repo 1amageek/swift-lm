@@ -67,7 +67,8 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(3, UInt32(count)),
             ],
             outputIsHidden: false,
-            resetsProjectionIndex: true
+            resetsProjectionIndex: true,
+            writeBufferIndices: Set<Int>([2])
         )
     }
 

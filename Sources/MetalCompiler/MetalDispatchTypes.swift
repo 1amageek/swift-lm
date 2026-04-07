@@ -129,6 +129,11 @@ public struct FragmentBindings: @unchecked Sendable {
     public let consumesConvLayer: Bool
     /// Whether this fragment consumes a recurrent state layer slot.
     public let consumesRecurrentLayer: Bool
+    /// Buffer access pattern for barrier optimization.
+    /// Indices into the `buffers` array that are written by this fragment.
+    /// Buffers not listed here are treated as read-only.
+    /// When nil, the barrier optimizer falls back to conservative (all read+write).
+    public let writeBufferIndices: Set<Int>?
 
     public init(buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
                 bytes: [(index: Int, value: [UInt8])],
@@ -136,7 +141,8 @@ public struct FragmentBindings: @unchecked Sendable {
                 resetsProjectionIndex: Bool = false,
                 consumesKVCacheLayer: Bool = false,
                 consumesConvLayer: Bool = false,
-                consumesRecurrentLayer: Bool = false) {
+                consumesRecurrentLayer: Bool = false,
+                writeBufferIndices: Set<Int>? = nil) {
         self.buffers = buffers
         self.bytes = bytes
         self.outputIsHidden = outputIsHidden
@@ -144,6 +150,7 @@ public struct FragmentBindings: @unchecked Sendable {
         self.consumesKVCacheLayer = consumesKVCacheLayer
         self.consumesConvLayer = consumesConvLayer
         self.consumesRecurrentLayer = consumesRecurrentLayer
+        self.writeBufferIndices = writeBufferIndices
     }
 }
 

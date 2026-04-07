@@ -32,7 +32,9 @@ struct MetalDispatchStepBuilder {
 
         for entry in fusedEntries {
             let resolved = try resolveDispatch(entry)
+            routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
+            let writeIndices = routingPlanner.lastFragmentWriteBufferIndices
             steps.append(MetalDispatchStep(
                 pipeline: resolved.pipeline,
                 gridSize: resolved.config.grid,
@@ -43,7 +45,8 @@ struct MetalDispatchStepBuilder {
                 sync: .bufferBarrier,
                 bufferAccesses: Self.decodeBufferAccesses(
                     for: entry,
-                    buffers: bindings.buffers),
+                    buffers: bindings.buffers,
+                    writeBufferIndices: writeIndices),
                 metadata: MetalDispatchStepMetadata(
                     kernelName: resolved.name,
                     layerIndex: entry.layerIndex
@@ -205,51 +208,60 @@ struct MetalDispatchStepBuilder {
 
     private static func decodeBufferAccesses(
         for entry: DispatchEntry,
-        buffers: [(index: Int, buffer: MTLBuffer, offset: Int)]
+        buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
+        writeBufferIndices: Set<Int>? = nil
     ) -> MetalBufferAccesses {
         let mapped = buffers.map { MetalBufferBinding(index: $0.index, buffer: $0.buffer, offset: $0.offset) }
 
-        func binding(_ index: Int) -> MTLBuffer? {
-            mapped.first(where: { $0.index == index })?.buffer
+        func bindingTuple(_ index: Int) -> (buffer: MTLBuffer, offset: Int)? {
+            mapped.first(where: { $0.index == index }).map { ($0.buffer, $0.offset) }
         }
 
-        func bindings(in indices: some Sequence<Int>) -> [MTLBuffer] {
-            indices.compactMap(binding(_:))
+        func bindingTuples(in indices: some Sequence<Int>) -> [(buffer: MTLBuffer, offset: Int)] {
+            indices.compactMap(bindingTuple(_:))
         }
 
         switch entry.kind {
         case .projection:
             return MetalBufferAccesses(
-                readBuffers: bindings(in: [0, 1]),
-                writeBuffers: bindings(in: [2])
+                readBuffers: bindingTuples(in: [0, 1]),
+                writeBuffers: bindingTuples(in: [2])
             )
         case .fusedSwiGLUProjection:
             return MetalBufferAccesses(
-                readBuffers: bindings(in: [0, 1, 2]),
-                writeBuffers: bindings(in: [3])
+                readBuffers: bindingTuples(in: [0, 1, 2]),
+                writeBuffers: bindingTuples(in: [3])
             )
         case .fusedCopyNorm, .fusedResidualAddCopyNorm, .fusedResidualAddNorm:
             return MetalBufferAccesses(
-                readBuffers: bindings(in: [0, 1, 2]),
-                writeBuffers: bindings(in: [3])
+                readBuffers: bindingTuples(in: [0, 1, 2]),
+                writeBuffers: bindingTuples(in: [3])
             )
         case .structuralCopy:
             return MetalBufferAccesses(
-                readBuffers: bindings(in: [0]),
-                writeBuffers: bindings(in: [1])
+                readBuffers: bindingTuples(in: [0]),
+                writeBuffers: bindingTuples(in: [1])
             )
         case .structuralAdd:
             return MetalBufferAccesses(
-                readBuffers: bindings(in: [0, 1]),
-                writeBuffers: bindings(in: [2])
+                readBuffers: bindingTuples(in: [0, 1]),
+                writeBuffers: bindingTuples(in: [2])
             )
         case .batchedProjection(let batched):
             let count = batched.projections.count
             return MetalBufferAccesses(
-                readBuffers: bindings(in: 0..<(1 + count)),
-                writeBuffers: bindings(in: (1 + count)..<(1 + 2 * count))
+                readBuffers: bindingTuples(in: 0..<(1 + count)),
+                writeBuffers: bindingTuples(in: (1 + count)..<(1 + 2 * count))
             )
         case .batchedFragment, .fragment:
+            if let writeBufferIndices {
+                let allRegions = Set(mapped.map { BufferRegion(buffer: $0.buffer, offset: $0.offset) })
+                let writeRegions = Set(
+                    buffers.filter { writeBufferIndices.contains($0.index) }
+                        .map { BufferRegion(buffer: $0.buffer, offset: $0.offset) }
+                )
+                return MetalBufferAccesses(reads: allRegions, writes: writeRegions)
+            }
             return MetalBufferAccesses.conservative(mapped)
         }
     }
@@ -257,7 +269,7 @@ struct MetalDispatchStepBuilder {
     private static func optimizeDecodeBarrierPolicies(
         _ steps: [MetalDispatchStep]
     ) -> [MetalDispatchStep] {
-        var pendingWrites = Set<ObjectIdentifier>()
+        var pendingWrites = Set<BufferRegion>()
         return steps.map { step in
             let requiresBarrier = step.bufferAccesses.requiresBarrier(after: pendingWrites)
             let barrierPolicy: MetalBarrierPolicy = requiresBarrier ? .bufferBarrier : .none
@@ -385,6 +397,11 @@ struct DecodeRoutingPlanner {
     private let elementSize = MemoryLayout<Float16>.size
     private var kvCacheIndex: Int = 0
     private var routingState = BufferRoutingState()
+
+    /// Write buffer indices from the most recent fragment binding.
+    /// Set by `bindings(for:)` when entry is .fragment or .batchedFragment.
+    /// nil for non-fragment entries or when fragment does not declare write indices.
+    var lastFragmentWriteBufferIndices: Set<Int>?
 
     init(
         bufferSet: MetalBufferSet,
@@ -586,6 +603,7 @@ struct DecodeRoutingPlanner {
             if bindings.consumesConvLayer { routingState.convLayerIndex += 1 }
             if bindings.consumesRecurrentLayer { routingState.recurrentLayerIndex += 1 }
             routingState.lastOutputIsHidden = bindings.outputIsHidden
+            lastFragmentWriteBufferIndices = bindings.writeBufferIndices
             return (buffers: bindings.buffers, bytes: bindings.bytes)
 
         case .fusedResidualAddNorm(let fusedOperation):

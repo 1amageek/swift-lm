@@ -54,7 +54,8 @@ public struct PerLayerInputModulationFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(3, UInt32(dimension)),
             ],
             outputIsHidden: false,
-            resetsProjectionIndex: true
+            resetsProjectionIndex: true,
+            writeBufferIndices: Set<Int>([2])
         )
     }
 

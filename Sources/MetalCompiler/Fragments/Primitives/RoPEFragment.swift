@@ -54,7 +54,8 @@ public struct RoPEFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(10, UInt32(sectionCount(at: 2))),
                 uint32Binding(11, UInt32(mropeAxes?.interleaved == true ? 1 : 0)),
             ],
-            outputIsHidden: false
+            outputIsHidden: false,
+            writeBufferIndices: Set<Int>([0, 1])
         )
     }
 

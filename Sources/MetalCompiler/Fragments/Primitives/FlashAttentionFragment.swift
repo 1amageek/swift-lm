@@ -90,7 +90,8 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
             ],
             outputIsHidden: false,
             resetsProjectionIndex: true,
-            consumesKVCacheLayer: true
+            consumesKVCacheLayer: true,
+            writeBufferIndices: Set<Int>([3, 4, 5, 19])
         )
     }
 

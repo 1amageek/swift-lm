@@ -48,7 +48,8 @@ public struct Conv1dFragment: PrimitiveMetalKernelFragment {
             ],
             outputIsHidden: false,
             resetsProjectionIndex: true,
-            consumesConvLayer: true
+            consumesConvLayer: true,
+            writeBufferIndices: Set<Int>([0, 3])
         )
     }
 

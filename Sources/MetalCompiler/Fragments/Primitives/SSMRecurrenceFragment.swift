@@ -106,7 +106,8 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             outputIsHidden: false,
             resetsProjectionIndex: true,
             consumesConvLayer: true,
-            consumesRecurrentLayer: true
+            consumesRecurrentLayer: true,
+            writeBufferIndices: Set<Int>([3, 8, 9, 10])
         )
     }
 

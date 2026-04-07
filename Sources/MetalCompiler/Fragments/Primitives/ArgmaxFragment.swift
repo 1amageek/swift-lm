@@ -27,7 +27,8 @@ public struct ArgmaxFragment: PrimitiveMetalKernelFragment {
             bytes: [
                 uint32Binding(2, UInt32(vocabularySize)),
             ],
-            outputIsHidden: false
+            outputIsHidden: false,
+            writeBufferIndices: Set<Int>([1])
         )
     }
 

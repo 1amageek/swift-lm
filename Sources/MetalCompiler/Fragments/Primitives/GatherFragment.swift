@@ -36,7 +36,8 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
             bytes: [
                 uint32Binding(3, UInt32(embeddingDimension)),
             ],
-            outputIsHidden: true
+            outputIsHidden: true,
+            writeBufferIndices: Set<Int>([2])
         )
     }
 

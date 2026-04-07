@@ -430,6 +430,36 @@ Vision encoder と text decoder は独立したモデル。IR に vision encoder
 - Prefill GEMM は Metal 4 `matmul2d` への置換で AMX 最適化パスが期待できる
 - Weight quantization (Q4/Q8) が decode 高速化の最大レバー (帯域 2-4x 削減)
 
+### Barrier Optimization — Decode Path
+
+`hazardTrackingModeUntracked` バッファは明示的な `memoryBarrier(scope: .buffers)` が必要。バリアは GPU を同期させるため、不要バリアは深刻なパフォーマンス劣化を起こす。
+
+**Gemma4-E2B 実測値 (705 decode steps):**
+- GPU kernel 計算時間: ~2.8ms
+- バリア同期 overhead: ~17ms（31μs × barrier count）
+- 1 バリアあたり ~31μs — kernel 1 つの平均実行時間 4μs より遥かに大きい
+
+#### BufferRegion 追跡の原則
+
+scratch buffer は単一 MTLBuffer に複数 slot を offset で配置する。`ObjectIdentifier(buffer)` だけでは異なる slot を区別できず、独立した slot 間に false dependency が発生する。
+
+**正しい追跡**: `BufferRegion(buffer: ObjectIdentifier, offset: Int)` で (buffer identity, offset) をペアで管理。scratch[slot0], scratch[slot1], scratch[slot2] は異なる BufferRegion として扱う。
+
+#### Fragment の writeBufferIndices 宣言
+
+各 `PrimitiveMetalKernelFragment` は `decodeBindings()` で `writeBufferIndices: Set<Int>` を宣言し、どのバッファ binding が write されるかを明示する。宣言がない場合は conservative fallback（全 binding を read+write）になり、barrier が急増する。
+
+**新しい fragment を追加するときは必ず `writeBufferIndices` を宣言する。** 省略は conservative fallback を引き起こし、decode 性能が大幅に劣化する。
+
+#### 実績
+
+| 手法 | Barriers | Barrier率 | Single CB GPU |
+|---|---|---|---|
+| conservative (全 read+write) | 669 | 95% | 20.93ms |
+| BufferRegion + writeBufferIndices | 564 | 80% | 20.46ms |
+
+80% のバリアは genuine な WAR/WAW 依存。さらなる削減には kernel fusion（step 数の削減）が必要。
+
 ## Qwen3.5 = VLM（Vision Language Model）
 
 **Qwen3.5 はマルチモーダルモデルである。テキスト専用モデルではない。**

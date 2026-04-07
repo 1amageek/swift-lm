@@ -44,7 +44,8 @@ public struct QKNormFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(3, UInt32(headDimension)),
                 floatBinding(4, epsilon),
             ],
-            outputIsHidden: false
+            outputIsHidden: false,
+            writeBufferIndices: Set<Int>([0])
         )
     }
 

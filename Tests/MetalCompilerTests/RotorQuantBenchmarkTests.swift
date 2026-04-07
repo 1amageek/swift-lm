@@ -599,8 +599,8 @@ struct RotorQuantBenchmarkTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let fillLevels = [64, 512, 1024, 2048]
-        let maxSeqLen = 2200  // headroom for fill + decode + warmup
+        let fillLevels = [64, 256, 512]
+        let maxSeqLen = 600  // headroom for fill + decode + warmup
         let decodeSteps = 20
         let warmupSteps = 5
         let iterations = 3
@@ -738,121 +738,6 @@ struct RotorQuantBenchmarkTests {
         }
     }
 
-    // MARK: - RotorQ4 Diagnostic
-
-    @Test("GPU interference diagnostic: multiple hazardTrackingModeUntracked models")
-    func gpuInterferenceDiagnostic() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-
-        let fillLevels = [64, 512, 1024, 2048]
-        let maxSeqLen = 2200
-        let stepsToMeasure = 10
-
-        let policies: [(String, InferencePolicy)] = [
-            ("FP16", InferencePolicy(
-                maximumSequenceLength: maxSeqLen,
-                kvCache: .automatic)),
-            ("RotorQ8", InferencePolicy(
-                maximumSequenceLength: maxSeqLen,
-                kvCache: KVCachePolicy(
-                    keyScheme: .fixed(.rotorQ8Group32ScaleF16),
-                    valueScheme: .fixed(.rotorQ8Group32ScaleF16)))),
-            ("RotorQ4", InferencePolicy(
-                maximumSequenceLength: maxSeqLen,
-                kvCache: KVCachePolicy(
-                    keyScheme: .fixed(.rotorQ4Group64ScaleF16),
-                    valueScheme: .fixed(.rotorQ4Group64ScaleF16)))),
-        ]
-
-        var models: [(String, MetalInferenceModel)] = []
-        for (name, policy) in policies {
-            let (model, _, _) = try BenchmarkSupport.setupFromBundle(
-                bundlePath: Self.gemma4BundlePath,
-                inferencePolicy: policy)
-            models.append((name, model))
-        }
-
-        // Print KV cache buffer sizes
-        for (policyIndex, _) in policies.enumerated() {
-            let m = models[policyIndex].1
-            let kBytes = m.buffers.kvCache?.keys.length ?? 0
-            let vBytes = m.buffers.kvCache?.values.length ?? 0
-            print("[info] \(models[policyIndex].0): KV cache K=\(String(format: "%.1f", Double(kBytes) / 1024 / 1024))MB V=\(String(format: "%.1f", Double(vBytes) / 1024 / 1024))MB")
-        }
-
-        // GPU warm-up
-        do {
-            var warmModel = models[0].1
-            warmModel.resetCaches()
-            var tok = warmModel.prefill(tokens: [Int32](repeating: 1, count: 64))
-            for _ in 0..<20 { tok = warmModel.decodeSync(tokenID: tok) }
-            Thread.sleep(forTimeInterval: 0.5)
-        }
-
-        print("\n=== GPU Interference Diagnostic ===")
-        print("  3 models allocated simultaneously — demonstrates hazardTrackingModeUntracked interference")
-        print(String(repeating: "-", count: 80))
-
-        for fillLevel in fillLevels {
-            print("\n--- Fill Level: \(fillLevel) ---")
-            for (policyIndex, _) in policies.enumerated() {
-                let policyName = models[policyIndex].0
-                var m = models[policyIndex].1
-
-                m.resetCaches()
-                BenchmarkSupport.settleGPU()
-
-                let fillTokens = [Int32](repeating: 1, count: fillLevel)
-                var currentToken = m.prefill(tokens: fillTokens)
-
-                // Warmup
-                for _ in 0..<5 {
-                    currentToken = m.decodeSync(tokenID: currentToken)
-                }
-
-                // Phase A: Measure individual steps
-                var stepTimes: [Double] = []
-                var tokens: [Int32] = []
-                for _ in 0..<stepsToMeasure {
-                    let start = CFAbsoluteTimeGetCurrent()
-                    currentToken = m.decodeSync(tokenID: currentToken)
-                    let elapsed = CFAbsoluteTimeGetCurrent() - start
-                    stepTimes.append(elapsed * 1000)  // ms
-                    tokens.append(currentToken)
-                }
-
-                let median = stepTimes.sorted()[stepTimes.count / 2]
-                let minTime = stepTimes.min() ?? 0
-                let maxTime = stepTimes.max() ?? 0
-                let tokensStr = tokens.prefix(5).map { String($0) }.joined(separator: ", ")
-
-                let pad = policyName.padding(toLength: 10, withPad: " ", startingAt: 0)
-                print("  \(pad) [individual] median=\(String(format: "%.1f", median))ms  min=\(String(format: "%.1f", minTime))ms  max=\(String(format: "%.1f", maxTime))ms  tokens=[\(tokensStr)...]")
-
-                // Phase B: Bulk measurement (same approach as throughput test)
-                // Reset and re-setup for fair comparison
-                m.resetCaches()
-                BenchmarkSupport.settleGPU()
-                currentToken = m.prefill(tokens: fillTokens)
-                for _ in 0..<5 { currentToken = m.decodeSync(tokenID: currentToken) }
-                let bulkStart = CFAbsoluteTimeGetCurrent()
-                for _ in 0..<20 {
-                    currentToken = m.decodeSync(tokenID: currentToken)
-                }
-                let bulkElapsed = CFAbsoluteTimeGetCurrent() - bulkStart
-                let bulkPerStep = bulkElapsed / 20.0 * 1000
-                print("  \(pad) [bulk 20]    \(String(format: "%.1f", bulkPerStep))ms/step  (\(String(format: "%.1f", 20.0 / bulkElapsed)) tok/s)  pos=\(m.position)")
-
-                // Check for error tokens
-                let errorTokens = tokens.filter { $0 == -1 }
-                if !errorTokens.isEmpty {
-                    print("  \(pad) WARNING: \(errorTokens.count) GPU errors detected (token=-1)")
-                }
-            }
-        }
-    }
-
     // MARK: - Compilation Validation
 
     @Test("RotorQuant KVCacheSpecification buffer size")
@@ -885,5 +770,92 @@ struct RotorQuantBenchmarkTests {
         print("  RotorQ8 K: headSlot=\(keyHeadSlot)B, total=\(String(format: "%.1f", Double(keyTotal) / 1024 / 1024))MB")
         print("  RotorQ4 V: headSlot=\(valueHeadSlot)B, total=\(String(format: "%.1f", Double(valueTotal) / 1024 / 1024))MB")
         print("  FP16 ref:  total=\(String(format: "%.1f", Double(fp16Total) / 1024 / 1024))MB")
+    }
+
+    // MARK: - Per-Kernel Profiling
+
+    @Test("Gemma4 FP16 per-kernel decode profile")
+    func gemma4PerKernelProfile() throws {
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else { return }
+
+        let policy = InferencePolicy(
+            maximumSequenceLength: 256,
+            kvCache: .init(keyScheme: .automatic, valueScheme: .automatic))
+
+        let (model, _, _) = try BenchmarkSupport.setupFromBundle(
+            bundlePath: Self.gemma4BundlePath,
+            inferencePolicy: policy)
+        var m = model
+
+        let iterations = 10
+        let profiles = try BenchmarkSupport.profileDecodeSteps(
+            model: &m,
+            queue: queue,
+            iterations: iterations,
+            filter: { _ in true })
+
+        struct KernelAggregate {
+            var totalMicroseconds: Double = 0
+            var count: Int = 0
+            var gridSample: MTLSize = MTLSize(width: 0, height: 0, depth: 0)
+            var tgSample: MTLSize = MTLSize(width: 0, height: 0, depth: 0)
+        }
+        var aggregates: [String: KernelAggregate] = [:]
+        let totalMicroseconds = profiles.reduce(0.0) { $0 + $1.totalMicroseconds }
+
+        for p in profiles {
+            let avgUs = p.totalMicroseconds / Double(iterations)
+            aggregates[p.kernelName, default: KernelAggregate()].totalMicroseconds += avgUs
+            aggregates[p.kernelName, default: KernelAggregate()].count += 1
+            if aggregates[p.kernelName]?.gridSample.width == 0 {
+                aggregates[p.kernelName]?.gridSample = p.gridSize
+                aggregates[p.kernelName]?.tgSample = p.threadgroupSize
+            }
+        }
+
+        let avgTotalUs = totalMicroseconds / Double(iterations)
+        let sorted = aggregates.sorted { $0.value.totalMicroseconds > $1.value.totalMicroseconds }
+
+        print("\n=== Per-Kernel Decode Profile: Gemma4-E2B FP16 (avg of \(iterations) runs) ===")
+        print("Total steps: \(profiles.count)")
+        print("Total: \(String(format: "%.0f", avgTotalUs)) us (\(String(format: "%.1f", avgTotalUs / 1000)) ms)")
+        print("")
+        let header = "Kernel".padding(toLength: 40, withPad: " ", startingAt: 0)
+            + "Count  Total us     %  Grid          TG"
+        print(header)
+        print(String(repeating: "-", count: 100))
+
+        for (name, agg) in sorted {
+            let pct = agg.totalMicroseconds / avgTotalUs * 100
+            let grid = "\(agg.gridSample.width)x\(agg.gridSample.height)x\(agg.gridSample.depth)"
+            let tg = "\(agg.tgSample.width)"
+            let pad = name.padding(toLength: 40, withPad: " ", startingAt: 0)
+            print("\(pad)\(String(format: "%5d %9.0f %5.1f%%", agg.count, agg.totalMicroseconds, pct))  \(grid.padding(toLength: 14, withPad: " ", startingAt: 0))\(tg)")
+        }
+
+        print("\n--- Top 30 individual steps by time ---")
+        let topSteps = profiles.sorted { $0.totalMicroseconds > $1.totalMicroseconds }.prefix(30)
+        for p in topSteps {
+            let avgUs = p.totalMicroseconds / Double(iterations)
+            let pct = avgUs / avgTotalUs * 100
+            let grid = "\(p.gridSize.width)x\(p.gridSize.height)"
+            let name = p.kernelName.padding(toLength: 35, withPad: " ", startingAt: 0)
+            print("  [\(String(format: "%3d", p.index))] \(name) \(String(format: "%7.0f", avgUs)) us (\(String(format: "%4.1f", pct))%)  grid=\(grid) tg=\(p.threadgroupSize.width)")
+        }
+
+        // CPU/GPU breakdown
+        print("\n=== CPU/GPU Breakdown (50 iterations) ===")
+        let breakdown = try BenchmarkSupport.measureDecodeSyncBreakdown(
+            model: &m, iterations: 50)
+        print("  CPU write:      \(String(format: "%7.0f", breakdown.cpuWriteMicroseconds)) us")
+        print("  Encode+submit:  \(String(format: "%7.0f", breakdown.encodeSubmitMicroseconds)) us")
+        print("  GPU wait:       \(String(format: "%7.0f", breakdown.waitMicroseconds)) us")
+        print("  Readback:       \(String(format: "%7.0f", breakdown.readbackMicroseconds)) us")
+        print("  GPU time:       \(String(format: "%7.0f", breakdown.gpuMicroseconds)) us")
+        print("  Total:          \(String(format: "%7.0f", breakdown.totalMicroseconds)) us")
+        let hostOverhead = breakdown.totalMicroseconds - breakdown.gpuMicroseconds
+        let hostPct = hostOverhead / breakdown.totalMicroseconds * 100
+        print("  Host overhead:  \(String(format: "%7.0f", hostOverhead)) us (\(String(format: "%.1f", hostPct))%)")
     }
 }

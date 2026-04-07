@@ -253,4 +253,68 @@ struct Gemma4BenchmarkTests {
         print("TOTAL                \(String(format: "%8.0f %6d", totalMicroseconds, profiles.count))")
         print("  → \(String(format: "%.2f", totalMicroseconds / 1000)) ms/token")
     }
+
+    @Test("CPU/GPU breakdown: where is decode time spent?")
+    func cpuGpuBreakdown() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let (model, _, _) = try BenchmarkSupport.setupFromBundle(
+            bundlePath: Self.bundlePath
+        )
+        var inferenceModel = model
+
+        let breakdown = try BenchmarkSupport.measureDecodeSyncBreakdown(
+            model: &inferenceModel, iterations: 50)
+
+        print("\n=== Gemma4-E2B CPU/GPU Breakdown (50 iterations) ===")
+        print("  CPU write:      \(String(format: "%7.0f", breakdown.cpuWriteMicroseconds)) us")
+        print("  Encode+submit:  \(String(format: "%7.0f", breakdown.encodeSubmitMicroseconds)) us")
+        print("  GPU wait:       \(String(format: "%7.0f", breakdown.waitMicroseconds)) us")
+        print("  Readback:       \(String(format: "%7.0f", breakdown.readbackMicroseconds)) us")
+        print("  GPU time:       \(String(format: "%7.0f", breakdown.gpuMicroseconds)) us")
+        print("  Total:          \(String(format: "%7.0f", breakdown.totalMicroseconds)) us")
+        let hostOverhead = breakdown.totalMicroseconds - breakdown.gpuMicroseconds
+        let hostPct = hostOverhead / breakdown.totalMicroseconds * 100
+        print("  Host overhead:  \(String(format: "%7.0f", hostOverhead)) us (\(String(format: "%.1f", hostPct))%)")
+        let steps = inferenceModel.decodePlan.steps
+        let barrierCount = steps.filter { $0.barrierPolicy == .bufferBarrier }.count
+        let pipelineNames = Set(steps.map { $0.pipeline.label ?? "(none)" })
+        print("  Decode steps:   \(steps.count)")
+        print("  Barriers:       \(barrierCount) (\(String(format: "%.0f", Double(barrierCount) / Double(steps.count) * 100))%)")
+        print("  Unique pipelines: \(pipelineNames.count)")
+        print("  us/step (encode): \(String(format: "%.1f", breakdown.encodeSubmitMicroseconds / Double(steps.count)))")
+
+        // Per-kernel GPU time using single command buffer (more accurate)
+        guard let queue = inferenceModel.commandQueue as? MTLCommandQueue else { return }
+        inferenceModel.resetCaches()
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        var tok = inferenceModel.prefill(tokens: promptTokens)
+        for _ in 0..<3 { tok = inferenceModel.decodeSync(tokenID: tok) }
+
+        // Measure actual GPU time of a single decode pass (all steps in 1 command buffer)
+        let singleBufIterations = 20
+        var gpuTimes: [Double] = []
+        for _ in 0..<singleBufIterations {
+            inferenceModel.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(inferenceModel.position)
+            inferenceModel.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            for step in steps {
+                step.bindings.bind(to: enc)
+                step.descriptor.encode(on: enc)
+            }
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            let gpuMs = (cb.gpuEndTime - cb.gpuStartTime) * 1000
+            gpuTimes.append(gpuMs)
+            tok = inferenceModel.buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+            inferenceModel.position += 1
+        }
+        let medianGpu = gpuTimes.sorted()[gpuTimes.count / 2]
+        print("\n  Single CB GPU time (median of \(singleBufIterations)): \(String(format: "%.2f", medianGpu)) ms")
+        print("  vs profiled per-step sum: 2.87 ms")
+    }
 }

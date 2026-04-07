@@ -452,11 +452,10 @@ public static func generateFlashAttentionKernel(
         const bool vRotor = is_rotor_scheme(vQuantScheme);
 
         // Rotor params pointer for this KV head
-        device const half* kHeadRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
-        device const half* vHeadRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
+        device const half* headRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
 
         // --- Step 1: Append new K/V to cache ---
-        threadgroup float rotBuf[256];
+        threadgroup float rotBuf[512];
         threadgroup float quantSMin[32], quantSMax[32];
 
         if (writesCurrentKV) {
@@ -470,11 +469,20 @@ public static func generateFlashAttentionKernel(
             }
 
             if (kRotor) {
-                for (uint d = tid; d < headDim; d += threadgroupSize) {
-                    rotBuf[d] = \(castIn("newKey[kvIn + d]"));
+                // Fused load + rotate: each thread loads and rotates its own rotor groups
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? \(castIn("newKey[kvIn + base]")) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? \(castIn("newKey[kvIn + base + 1]")) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? \(castIn("newKey[kvIn + base + 2]")) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotBuf[base] = r.x;
+                    if (base + 1 < headDim) rotBuf[base + 1] = r.y;
+                    if (base + 2 < headDim) rotBuf[base + 2] = r.z;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                rotor_apply_forward(rotBuf, kHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
                 uint kBase = rotor_base_scheme(kQuantScheme);
                 if (kBase == 0x40) {
                     write_kv_quantized_q4(rotBuf, keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
@@ -544,11 +552,20 @@ public static func generateFlashAttentionKernel(
             }
 
             if (vRotor) {
-                for (uint d = tid; d < headDim; d += threadgroupSize) {
-                    rotBuf[d] = \(castIn("newValue[kvIn + d]"));
+                // Fused load + rotate
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? \(castIn("newValue[kvIn + base]")) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? \(castIn("newValue[kvIn + base + 1]")) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? \(castIn("newValue[kvIn + base + 2]")) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotBuf[base] = r.x;
+                    if (base + 1 < headDim) rotBuf[base + 1] = r.y;
+                    if (base + 2 < headDim) rotBuf[base + 2] = r.z;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                rotor_apply_forward(rotBuf, vHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
                 uint vBase = rotor_base_scheme(vQuantScheme);
                 if (vBase == 0x40) {
                     write_kv_quantized_q4(rotBuf, valueCache + vWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
@@ -605,13 +622,22 @@ public static func generateFlashAttentionKernel(
         // RotorQuant K: pre-rotate Q via Clifford rotor so Q'·K' = Q·K.
         const uint queryOffset = headIndex * headDim;
 
-        threadgroup float rotQuery[256];
+        threadgroup float rotQuery[512];
         if (kRotor) {
-            for (uint d = tid; d < headDim; d += threadgroupSize) {
-                rotQuery[d] = \(castIn("query[queryOffset + d]"));
+            // Fused load + rotate
+            for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                uint base = g * 3;
+                float v1 = (base < headDim) ? \(castIn("query[queryOffset + base]")) : 0.0f;
+                float v2 = (base + 1 < headDim) ? \(castIn("query[queryOffset + base + 1]")) : 0.0f;
+                float v3 = (base + 2 < headDim) ? \(castIn("query[queryOffset + base + 2]")) : 0.0f;
+                float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                  float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                if (base < headDim) rotQuery[base] = r.x;
+                if (base + 1 < headDim) rotQuery[base + 1] = r.y;
+                if (base + 2 < headDim) rotQuery[base + 2] = r.z;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_forward(rotQuery, kHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         // QJL: pre-compute Φ·Q_rotated for correction
@@ -623,7 +649,7 @@ public static func generateFlashAttentionKernel(
         float maxScore = -HUGE_VALF;
         float sumExp = 0.0f;
 
-        threadgroup float sharedOutput[4096];
+        threadgroup float sharedOutput[512];
 
         for (uint d = tid; d < headDim; d += threadgroupSize) {
             sharedOutput[d] = 0.0f;
@@ -691,7 +717,7 @@ public static func generateFlashAttentionKernel(
 
         if (vRotor) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_inverse(sharedOutput, vHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
+            rotor_apply_inverse(sharedOutput, headRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         for (uint d = tid; d < headDim; d += threadgroupSize) {
@@ -760,10 +786,9 @@ public static func generateFlashAttentionArgumentTableVariant(
         const bool kRotor = is_rotor_scheme(kQuantScheme);
         const bool vRotor = is_rotor_scheme(vQuantScheme);
 
-        device const half* kHeadRotors = args.rotorParams + kvHeadIndex * numRotorGroups * 4;
-        device const half* vHeadRotors = args.rotorParams + kvHeadIndex * numRotorGroups * 4;
+        device const half* headRotors = args.rotorParams + kvHeadIndex * numRotorGroups * 4;
 
-        threadgroup float rotBuf[256];
+        threadgroup float rotBuf[512];
         threadgroup float quantSMin[32], quantSMax[32];
 
         if (writesCurrentKV) {
@@ -775,11 +800,20 @@ public static func generateFlashAttentionArgumentTableVariant(
             }
 
             if (kRotor) {
-                for (uint d = tid; d < headDim; d += threadgroupSize) {
-                    rotBuf[d] = \(castIn("args.newKey[kvIn + d]"));
+                // Fused load + rotate
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? \(castIn("args.newKey[kvIn + base]")) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? \(castIn("args.newKey[kvIn + base + 1]")) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? \(castIn("args.newKey[kvIn + base + 2]")) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotBuf[base] = r.x;
+                    if (base + 1 < headDim) rotBuf[base + 1] = r.y;
+                    if (base + 2 < headDim) rotBuf[base + 2] = r.z;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                rotor_apply_forward(rotBuf, kHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
                 uint kBase = rotor_base_scheme(kQuantScheme);
                 if (kBase == 0x40) {
                     write_kv_quantized_q4(rotBuf, args.keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
@@ -845,11 +879,20 @@ public static func generateFlashAttentionArgumentTableVariant(
             }
 
             if (vRotor) {
-                for (uint d = tid; d < headDim; d += threadgroupSize) {
-                    rotBuf[d] = \(castIn("args.newValue[kvIn + d]"));
+                // Fused load + rotate
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? \(castIn("args.newValue[kvIn + base]")) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? \(castIn("args.newValue[kvIn + base + 1]")) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? \(castIn("args.newValue[kvIn + base + 2]")) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotBuf[base] = r.x;
+                    if (base + 1 < headDim) rotBuf[base + 1] = r.y;
+                    if (base + 2 < headDim) rotBuf[base + 2] = r.z;
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
-                rotor_apply_forward(rotBuf, vHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
                 uint vBase = rotor_base_scheme(vQuantScheme);
                 if (vBase == 0x40) {
                     write_kv_quantized_q4(rotBuf, args.valueCache + vWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
@@ -903,13 +946,22 @@ public static func generateFlashAttentionArgumentTableVariant(
 
         const uint queryOffset = headIndex * headDim;
 
-        threadgroup float rotQuery[256];
+        threadgroup float rotQuery[512];
         if (kRotor) {
-            for (uint d = tid; d < headDim; d += threadgroupSize) {
-                rotQuery[d] = \(castIn("args.query[queryOffset + d]"));
+            // Fused load + rotate
+            for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                uint base = g * 3;
+                float v1 = (base < headDim) ? \(castIn("args.query[queryOffset + base]")) : 0.0f;
+                float v2 = (base + 1 < headDim) ? \(castIn("args.query[queryOffset + base + 1]")) : 0.0f;
+                float v3 = (base + 2 < headDim) ? \(castIn("args.query[queryOffset + base + 2]")) : 0.0f;
+                float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                  float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                if (base < headDim) rotQuery[base] = r.x;
+                if (base + 1 < headDim) rotQuery[base + 1] = r.y;
+                if (base + 2 < headDim) rotQuery[base + 2] = r.z;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_forward(rotQuery, kHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         threadgroup float qjlQueryProj[64];
@@ -920,7 +972,7 @@ public static func generateFlashAttentionArgumentTableVariant(
         float maxScore = -HUGE_VALF;
         float sumExp = 0.0f;
 
-        threadgroup float sharedOutput[4096];
+        threadgroup float sharedOutput[512];
         for (uint d = tid; d < headDim; d += threadgroupSize) {
             sharedOutput[d] = 0.0f;
         }
@@ -986,7 +1038,7 @@ public static func generateFlashAttentionArgumentTableVariant(
 
         if (vRotor) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_inverse(sharedOutput, vHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
+            rotor_apply_inverse(sharedOutput, headRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         for (uint d = tid; d < headDim; d += threadgroupSize) {
@@ -1056,26 +1108,52 @@ public static func generateKVCacheFillSeq(
         }
 
         // RotorQuant path: load full head → Clifford rotor rotate → quantize
-        threadgroup float rotatedK[256];
-        threadgroup float rotatedV[256];
+        threadgroup float rotatedK[512];
+        threadgroup float rotatedV[512];
         threadgroup float quantSMin[32], quantSMax[32];
 
         for (uint kvHead = 0; kvHead < kvHeadCount; kvHead++) {
             uint baseIdx = pos * kvHeadCount * headDim + kvHead * headDim;
             device const half* headRotors = rotorParams + kvHead * numRotorGroups * 4;
 
-            for (uint d = tid; d < headDim; d += threadgroupSize) {
-                rotatedK[d] = float(newKeys[baseIdx + d]);
-                rotatedV[d] = float(newValues[baseIdx + d]);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
+            // Fused load + rotate for K and V
             if (kRotor) {
-                rotor_apply_forward(rotatedK, headRotors, headDim, numRotorGroups, tid, threadgroupSize);
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? float(newKeys[baseIdx + base]) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? float(newKeys[baseIdx + base + 1]) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? float(newKeys[baseIdx + base + 2]) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotatedK[base] = r.x;
+                    if (base + 1 < headDim) rotatedK[base + 1] = r.y;
+                    if (base + 2 < headDim) rotatedK[base + 2] = r.z;
+                }
+            } else {
+                for (uint d = tid; d < headDim; d += threadgroupSize) {
+                    rotatedK[d] = float(newKeys[baseIdx + d]);
+                }
             }
             if (vRotor) {
-                rotor_apply_forward(rotatedV, headRotors, headDim, numRotorGroups, tid, threadgroupSize);
+                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                    uint base = g * 3;
+                    float v1 = (base < headDim) ? float(newValues[baseIdx + base]) : 0.0f;
+                    float v2 = (base + 1 < headDim) ? float(newValues[baseIdx + base + 1]) : 0.0f;
+                    float v3 = (base + 2 < headDim) ? float(newValues[baseIdx + base + 2]) : 0.0f;
+                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                    if (base < headDim) rotatedV[base] = r.x;
+                    if (base + 1 < headDim) rotatedV[base + 1] = r.y;
+                    if (base + 2 < headDim) rotatedV[base + 2] = r.z;
+                }
+            } else {
+                for (uint d = tid; d < headDim; d += threadgroupSize) {
+                    rotatedV[d] = float(newValues[baseIdx + d]);
+                }
             }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             uint kByteOffset, vByteOffset;
             if (layoutMode == 0) {
@@ -1173,16 +1251,24 @@ public static func generateBatchFlashAttention(
         const bool kRotor = is_rotor_scheme(kQuantScheme);
         const bool vRotor = is_rotor_scheme(vQuantScheme);
 
-        device const half* kHeadRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
-        device const half* vHeadRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
+        device const half* headRotors = rotorParams + kvHeadIndex * numRotorGroups * 4;
 
-        threadgroup float rotQuery[256];
+        threadgroup float rotQuery[512];
         if (kRotor) {
-            for (uint d = tid; d < headDim; d += threadgroupSize) {
-                rotQuery[d] = float(query[queryOffset + d]);
+            // Fused load + rotate
+            for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                uint base = g * 3;
+                float v1 = (base < headDim) ? float(query[queryOffset + base]) : 0.0f;
+                float v2 = (base + 1 < headDim) ? float(query[queryOffset + base + 1]) : 0.0f;
+                float v3 = (base + 2 < headDim) ? float(query[queryOffset + base + 2]) : 0.0f;
+                float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                  float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                if (base < headDim) rotQuery[base] = r.x;
+                if (base + 1 < headDim) rotQuery[base + 1] = r.y;
+                if (base + 2 < headDim) rotQuery[base + 2] = r.z;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_forward(rotQuery, kHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         threadgroup float qjlQueryProj[64];
@@ -1193,7 +1279,7 @@ public static func generateBatchFlashAttention(
         float maxScore = -HUGE_VALF;
         float sumExp = 0.0f;
 
-        threadgroup float sharedOutput[4096];
+        threadgroup float sharedOutput[512];
         for (uint d = tid; d < headDim; d += threadgroupSize) {
             sharedOutput[d] = 0.0f;
         }
@@ -1257,7 +1343,7 @@ public static func generateBatchFlashAttention(
 
         if (vRotor) {
             threadgroup_barrier(mem_flags::mem_threadgroup);
-            rotor_apply_inverse(sharedOutput, vHeadRotors, headDim, numRotorGroups, tid, threadgroupSize);
+            rotor_apply_inverse(sharedOutput, headRotors, headDim, numRotorGroups, tid, threadgroupSize);
         }
 
         for (uint d = tid; d < headDim; d += threadgroupSize) {
@@ -1525,9 +1611,10 @@ inline void write_kv_element_dense(
 /// Compute QJL projected residual from a pre-rotation buffer and the just-quantized cache.
 /// Writes `qjlDim` half values to `qjlOut`.
 /// `rotatedSrc` is the pre-quantization rotated vector in threadgroup memory.
+/// After this call, `rotatedSrc` contains the residual (overwritten in-place).
 /// `quantizedSlot` is the cache slot that was just written (for dequantization).
 inline void qjl_compute_residual(
-    threadgroup const float* rotatedSrc,
+    threadgroup float* rotatedSrc,
     device const uchar* quantizedSlot,
     uint quantScheme,
     device const half* qjlMatrix,   // [headDim × qjlDim]
@@ -1538,14 +1625,19 @@ inline void qjl_compute_residual(
     uint tid,
     uint threadgroupSize
 ) {
-    // Each thread computes one or more QJL output dimensions
+    // Step 1: Compute residual in-place (parallel across headDim).
+    // Dequantize once per element instead of qjlDim times.
+    for (uint d = tid; d < headDim; d += threadgroupSize) {
+        float dequantized = read_kv_element(quantizedSlot, d, quantScheme, headSlotBytes, headDim);
+        rotatedSrc[d] = rotatedSrc[d] - dequantized;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: Project residual via Rademacher matrix (parallel across qjlDim)
     for (uint j = tid; j < qjlDim; j += threadgroupSize) {
         float proj = 0.0f;
         for (uint d = 0; d < headDim; d++) {
-            float original = rotatedSrc[d];
-            float dequantized = read_kv_element(quantizedSlot, d, quantScheme, headSlotBytes, headDim);
-            float residual = original - dequantized;
-            proj += float(qjlMatrix[d * qjlDim + j]) * residual;
+            proj += rotatedSrc[d] * float(qjlMatrix[d * qjlDim + j]);
         }
         qjlOut[j] = half(proj);
     }

@@ -27,7 +27,8 @@ public struct SigmoidGateFragment: PrimitiveMetalKernelFragment {
             bytes: [
                 uint32Binding(3, UInt32(dimension)),
             ],
-            outputIsHidden: false
+            outputIsHidden: false,
+            writeBufferIndices: Set<Int>([2])
         )
     }
 

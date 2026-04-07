@@ -42,7 +42,8 @@ public struct Reduction: PrimitiveMetalKernelFragment {
                 floatBinding(3, epsilon),
             ],
             outputIsHidden: true,
-            resetsProjectionIndex: true
+            resetsProjectionIndex: true,
+            writeBufferIndices: Set<Int>([0])
         )
     }
 
