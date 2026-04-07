@@ -257,6 +257,19 @@ struct MetalKernelSourceCatalog {
                             ssmConvSiluWeightFormats.append(weightFormat)
                         }
                     }
+                    // Fused RoPE+flash_attn: prefill path still needs the standalone rope_seq kernel.
+                    if let flashFragment = fragment as? FlashAttentionFragment, flashFragment.hasInlineRoPE {
+                        let ropeF32 = "rope_seq_f32"
+                        if generatedNames.insert(ropeF32).inserted {
+                            sources.append(MetalSourceGenerator.generateRoPESeq(
+                                name: ropeF32, bufferPrecision: .float32))
+                        }
+                        let ropeF16 = "rope"
+                        if generatedNames.insert(ropeF16).inserted {
+                            sources.append(MetalSourceGenerator.generateRoPE(
+                                name: ropeF16, bufferPrecision: bufferPrecision))
+                        }
+                    }
                     if bufferPrecision == .float32, let ssmFragment = fragment as? SSMRecurrenceFragment {
                         let sequenceKernelName = "ssm_recurrence_seq_f32"
                         if generatedNames.insert(sequenceKernelName).inserted {
@@ -305,6 +318,10 @@ struct MetalKernelSourceCatalog {
                                     name: argumentKernelName,
                                     argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
                                     bufferPrecision: bufferPrecision))
+                            case "rope_flash_attn_decode":
+                                // Fused RoPE+attention — argument table variant not yet implemented.
+                                // Falls back to per-buffer encode path.
+                                break
                             case "conv_state_update_bf16", "conv_state_update":
                                 sources.append(MetalSourceGenerator.generateConvStateUpdateArgumentTableVariant(
                                     name: argumentKernelName,

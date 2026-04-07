@@ -28,7 +28,7 @@ public struct MetalInferenceCompiler: Sendable {
     }
 
     public init(optimizer: (any DispatchOptimizer)? = nil) {
-        self.optimizer = optimizer ?? StandardOptimizer()
+        self.optimizer = optimizer ?? AggressiveOptimizer()
         self.weightAccessPolicyOverride = nil
     }
 
@@ -36,7 +36,7 @@ public struct MetalInferenceCompiler: Sendable {
         optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride
     ) {
-        self.optimizer = optimizer ?? StandardOptimizer()
+        self.optimizer = optimizer ?? AggressiveOptimizer()
         self.weightAccessPolicyOverride = weightAccessPolicyOverride
     }
 

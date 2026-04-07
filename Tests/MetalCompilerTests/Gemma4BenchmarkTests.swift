@@ -279,7 +279,7 @@ struct Gemma4BenchmarkTests {
         let hostPct = hostOverhead / breakdown.totalMicroseconds * 100
         print("  Host overhead:  \(String(format: "%7.0f", hostOverhead)) us (\(String(format: "%.1f", hostPct))%)")
         let steps = inferenceModel.decodePlan.steps
-        let barrierCount = steps.filter { $0.barrierPolicy == .bufferBarrier }.count
+        let barrierCount = steps.filter { $0.barrierPolicy.isBarrier }.count
         let pipelineNames = Set(steps.map { $0.pipeline.label ?? "(none)" })
         print("  Decode steps:   \(steps.count)")
         print("  Barriers:       \(barrierCount) (\(String(format: "%.0f", Double(barrierCount) / Double(steps.count) * 100))%)")

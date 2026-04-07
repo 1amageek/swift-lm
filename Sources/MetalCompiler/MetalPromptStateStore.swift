@@ -4,7 +4,7 @@ struct MetalPromptStateStore: Sendable {
 
     func makePromptState(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         position: Int,
         firstToken: Int32
     ) throws -> MetalPromptState {
@@ -85,7 +85,7 @@ struct MetalPromptStateStore: Sendable {
 
     func restore(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         promptState: MetalPromptState
     ) throws {
         _ = try submission.withTransaction(label: "prompt.restore") { transaction in

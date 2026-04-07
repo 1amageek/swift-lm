@@ -47,11 +47,6 @@ struct MetalPrefillStepBuilder {
 
     /// Offset-aware buffer region for precise hazard detection.
     /// Distinguishes scratch[0] from scratch[1] on the same MTLBuffer.
-    private struct BufferRegion: Hashable {
-        let buffer: ObjectIdentifier
-        let offset: Int
-    }
-
     /// Eliminate unnecessary memory barriers between prefill steps using
     /// offset-aware buffer region tracking.
     ///
@@ -64,8 +59,14 @@ struct MetalPrefillStepBuilder {
         var pendingWrites = Set<BufferRegion>()
         return steps.map { step in
             let accesses = resolveBufferRegions(for: step)
-            let requiresBarrier = !pendingWrites.isDisjoint(with: accesses.reads.union(accesses.writes))
-            let newBarrierPolicy: MetalBarrierPolicy = requiresBarrier ? .bufferBarrier : .none
+            let requiresBarrier = accesses.requiresBarrier(after: pendingWrites)
+            let newBarrierPolicy: MetalBarrierPolicy
+            if requiresBarrier {
+                let resources = accesses.conflictingResources(from: pendingWrites)
+                newBarrierPolicy = resources.isEmpty ? .bufferBarrier : .resourceBarrier(resources: resources)
+            } else {
+                newBarrierPolicy = .none
+            }
 
             if requiresBarrier {
                 pendingWrites = accesses.writes
@@ -98,23 +99,22 @@ struct MetalPrefillStepBuilder {
     /// Falls back to treating all bindings as read+written when no pattern is declared.
     private static func resolveBufferRegions(
         for step: MetalPrefillStep
-    ) -> (reads: Set<BufferRegion>, writes: Set<BufferRegion>) {
+    ) -> MetalBufferAccesses {
         let buffers = step.bindings.buffers
 
         func regions(for indices: Set<Int>) -> Set<BufferRegion> {
             Set(buffers.filter { indices.contains($0.index) }
-                .map { BufferRegion(buffer: ObjectIdentifier($0.buffer), offset: $0.offset) })
+                .map { BufferRegion(buffer: $0.buffer, offset: $0.offset) })
         }
 
         if let pattern = step.metadata.bufferAccessPattern {
-            return (reads: regions(for: pattern.readIndices), writes: regions(for: pattern.writeIndices))
+            return MetalBufferAccesses(
+                reads: regions(for: pattern.readIndices),
+                writes: regions(for: pattern.writeIndices))
         }
 
         // Conservative fallback: treat all bindings as both read and written.
-        let all = Set(buffers.map {
-            BufferRegion(buffer: ObjectIdentifier($0.buffer), offset: $0.offset)
-        })
-        return (reads: all, writes: all)
+        return MetalBufferAccesses.conservative(buffers)
     }
 
     private func makeResidentConstantSteps(

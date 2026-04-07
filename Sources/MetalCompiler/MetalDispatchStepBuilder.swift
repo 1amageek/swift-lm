@@ -270,7 +270,13 @@ struct MetalDispatchStepBuilder {
         var pendingWrites = Set<BufferRegion>()
         return steps.map { step in
             let requiresBarrier = step.bufferAccesses.requiresBarrier(after: pendingWrites)
-            let barrierPolicy: MetalBarrierPolicy = requiresBarrier ? .bufferBarrier : .none
+            let barrierPolicy: MetalBarrierPolicy
+            if requiresBarrier {
+                let resources = step.bufferAccesses.conflictingResources(from: pendingWrites)
+                barrierPolicy = resources.isEmpty ? .bufferBarrier : .resourceBarrier(resources: resources)
+            } else {
+                barrierPolicy = .none
+            }
             let descriptor = MetalDispatchDescriptor(
                 pipeline: step.pipeline,
                 gridSize: step.gridSize,

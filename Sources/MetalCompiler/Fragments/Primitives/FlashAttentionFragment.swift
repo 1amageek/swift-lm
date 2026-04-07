@@ -1,25 +1,38 @@
 import Metal
+import LMIR
 
 /// Single-token attention against KV cache.
+///
+/// When `ropeDimension > 0`, this fragment includes inline RoPE rotation,
+/// eliminating the need for a separate RoPE dispatch and its barrier.
 public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
     public let headCount: Int
     public let kvHeadCount: Int
     public let headDimension: Int
     public let ropeDimension: Int
     public let ropeBase: Float
+    public let mropeAxes: MRoPEAxes?
 
     public init(headCount: Int, kvHeadCount: Int, headDimension: Int,
-                ropeDimension: Int = 0, ropeBase: Float = 0) {
+                ropeDimension: Int = 0, ropeBase: Float = 0,
+                mropeAxes: MRoPEAxes? = nil) {
         self.headCount = headCount
         self.kvHeadCount = kvHeadCount
         self.headDimension = headDimension
         self.ropeDimension = ropeDimension
         self.ropeBase = ropeBase
+        self.mropeAxes = mropeAxes
     }
+
+    /// Whether this fragment includes inline RoPE computation.
+    public var hasInlineRoPE: Bool { ropeDimension > 0 }
 
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32 ? "flash_attn_decode_f32" : "flash_attn_decode"
+        if hasInlineRoPE {
+            return context.bufferPrecision == .float32 ? "rope_flash_attn_decode_f32" : "rope_flash_attn_decode"
+        }
+        return context.bufferPrecision == .float32 ? "flash_attn_decode_f32" : "flash_attn_decode"
     }
     public var dispatchDimension: MetalDispatchDimension {
         .perHead(headCount: headCount)
@@ -29,7 +42,7 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
     }
 
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
-        MetalSourceGenerator.generateFlashAttentionKernel(name: name, bufferPrecision: bufferPrecision)
+        MetalSourceGenerator.generateFlashAttentionKernel(name: name, bufferPrecision: bufferPrecision, inlineRoPE: hasInlineRoPE)
     }
 
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
@@ -61,38 +74,59 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         let qjlResidualOffset = cache.qjlResidualK != nil
             ? cache.qjlResidualOffset(layer: context.kvCacheIndex) : 0
 
+        var buffers: [(Int, MTLBuffer, Int)] = [
+            (0, context.bufferSet.scratch, 1 * slotBytes),
+            (1, context.bufferSet.scratch, 2 * slotBytes),
+            (2, context.bufferSet.scratch, 3 * slotBytes),
+            (3, cache.keys, keyLayerOffset),
+            (4, cache.values, valueLayerOffset),
+            (5, context.bufferSet.scratch, 0),
+            (6, context.bufferSet.position, 0),
+            (17, rotorParamsBuffer, rotorParamsOffset),
+            (18, qjlMatrixBuffer, 0),
+            (19, qjlResidualBuffer, qjlResidualOffset),
+        ]
+
+        var bytes: [(Int, [UInt8])] = [
+            uint32Binding(7, UInt32(headCount)),
+            uint32Binding(8, UInt32(kvHeadCount)),
+            uint32Binding(9, UInt32(headDimension)),
+            floatBinding(10, scale),
+            uint32Binding(11, UInt32(cache.specification.layoutMode.rawValue)),
+            uint32Binding(12, UInt32(cache.specification.maximumSequenceLength)),
+            uint32Binding(13, UInt32(cache.specification.keyQuantizationScheme.rawValue)),
+            uint32Binding(14, UInt32(cache.specification.valueQuantizationScheme.rawValue)),
+            uint32Binding(15, UInt32(kHeadSlotBytes)),
+            uint32Binding(16, UInt32(vHeadSlotBytes)),
+            uint32Binding(20, UInt32(cache.numRotorGroups)),
+            uint32Binding(21, UInt32(cache.qjlDimension)),
+        ]
+
+        if hasInlineRoPE {
+            buffers.append((22, context.bufferSet.ropePositionAxes, 0))
+            bytes.append(contentsOf: [
+                uint32Binding(23, UInt32(ropeDimension)),
+                floatBinding(24, ropeBase),
+                uint32Binding(25, UInt32(mropeSectionCount(at: 0))),
+                uint32Binding(26, UInt32(mropeSectionCount(at: 1))),
+                uint32Binding(27, UInt32(mropeSectionCount(at: 2))),
+                uint32Binding(28, UInt32(mropeAxes?.interleaved == true ? 1 : 0)),
+            ])
+        }
+
         return FragmentBindings(
-            buffers: [
-                (0, context.bufferSet.scratch, 1 * slotBytes),
-                (1, context.bufferSet.scratch, 2 * slotBytes),
-                (2, context.bufferSet.scratch, 3 * slotBytes),
-                (3, cache.keys, keyLayerOffset),
-                (4, cache.values, valueLayerOffset),
-                (5, context.bufferSet.scratch, 0),
-                (6, context.bufferSet.position, 0),
-                (17, rotorParamsBuffer, rotorParamsOffset),
-                (18, qjlMatrixBuffer, 0),
-                (19, qjlResidualBuffer, qjlResidualOffset),
-            ],
-            bytes: [
-                uint32Binding(7, UInt32(headCount)),
-                uint32Binding(8, UInt32(kvHeadCount)),
-                uint32Binding(9, UInt32(headDimension)),
-                floatBinding(10, scale),
-                uint32Binding(11, UInt32(cache.specification.layoutMode.rawValue)),
-                uint32Binding(12, UInt32(cache.specification.maximumSequenceLength)),
-                uint32Binding(13, UInt32(cache.specification.keyQuantizationScheme.rawValue)),
-                uint32Binding(14, UInt32(cache.specification.valueQuantizationScheme.rawValue)),
-                uint32Binding(15, UInt32(kHeadSlotBytes)),
-                uint32Binding(16, UInt32(vHeadSlotBytes)),
-                uint32Binding(20, UInt32(cache.numRotorGroups)),
-                uint32Binding(21, UInt32(cache.qjlDimension)),
-            ],
+            buffers: buffers,
+            bytes: bytes,
             outputIsHidden: false,
             resetsProjectionIndex: true,
             consumesKVCacheLayer: true,
             writeBufferIndices: Set<Int>([3, 4, 5, 19])
         )
+    }
+
+    private func mropeSectionCount(at index: Int) -> Int {
+        guard let mropeAxes, index < mropeAxes.sections.count else { return 0 }
+        return mropeAxes.sections[index]
     }
 
     public func prefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
@@ -123,6 +157,43 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         let qjlResidualBuffer = cache.qjlResidualK ?? placeholder
         let qjlResidualOffset = cache.qjlResidualK != nil
             ? cache.qjlResidualOffset(layer: context.kvCacheIndex) : 0
+
+        // Step 0 (inline RoPE only): Apply RoPE to Q and K in scratch buffers.
+        // This replaces the separate RoPEFragment prefill step.
+        if hasInlineRoPE {
+            let ropeKernelName = context.kernelContext.bufferPrecision == .float32 ? "rope_seq_f32" : "rope"
+            let ropePipeline = try context.getPipeline(ropeKernelName)
+            let ropeThreads = min(32, ropePipeline.maxTotalThreadsPerThreadgroup)
+            let totalHeads = headCount + kvHeadCount
+            steps.append(MetalPrefillStep(
+                pipeline: ropePipeline,
+                gridSize: MTLSize(width: totalHeads, height: context.maximumSequenceLength, depth: 1),
+                threadgroupSize: MTLSize(width: ropeThreads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, context.buffers.scratch, 1 * scratchSlotSize),
+                    (1, context.buffers.scratch, 2 * scratchSlotSize),
+                    (2, context.buffers.ropePositionAxes, 0),
+                ],
+                bytesBindings: [
+                    uint32Binding(3, UInt32(headCount)),
+                    uint32Binding(4, UInt32(kvHeadCount)),
+                    uint32Binding(5, UInt32(headDimension)),
+                    uint32Binding(6, UInt32(ropeDimension)),
+                    floatBinding(7, ropeBase),
+                    uint32Binding(8, UInt32(mropeSectionCount(at: 0))),
+                    uint32Binding(9, UInt32(mropeSectionCount(at: 1))),
+                    uint32Binding(10, UInt32(mropeSectionCount(at: 2))),
+                    uint32Binding(11, UInt32(mropeAxes?.interleaved == true ? 1 : 0)),
+                    uint32Binding(12, UInt32(context.maximumSequenceLength)),
+                ],
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                mode: .batch,
+                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 12),
+                positionBufferIndex: nil,
+                perPositionStrides: [:]
+            ))
+        }
 
         // Step 1: Fill KV cache for all positions in one batch dispatch.
         // Each threadgroup handles one position; threads within handle headDim elements.

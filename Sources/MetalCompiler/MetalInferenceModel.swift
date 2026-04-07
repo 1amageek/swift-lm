@@ -9,7 +9,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
     public let commandQueue: MTLCommandQueue
     public var position: Int = 0
 
-    private let submission: MetalSubmissionContext
+    private var submission: MetalSubmissionContext
+    private let legacySubmission: LegacySubmissionContext
     private let decodeExecutor = MetalDecodeExecutor()
     private let prefillExecutor: MetalPrefillExecutor
     private let promptStateStore = MetalPromptStateStore()
@@ -40,9 +41,10 @@ public struct MetalInferenceModel: @unchecked Sendable {
             throw MetalCompilerError.deviceSetupFailed("Cannot create command queue")
         }
         self.commandQueue = queue
-        self.submission = MetalSubmissionContext(commandQueue: queue)
+        self.submission = try MetalSubmissionContext(device: device)
+        self.legacySubmission = LegacySubmissionContext(commandQueue: queue)
         self.prefillExecutor = MetalPrefillExecutor()
-        try Self.zeroStateBuffers(plan.buffers, submission: submission)
+        try Self.zeroStateBuffers(plan.buffers, legacySubmission: legacySubmission)
     }
 
     public init(compiledModel: MetalCompiledModel, device: MTLDevice) throws {
@@ -51,19 +53,20 @@ public struct MetalInferenceModel: @unchecked Sendable {
             throw MetalCompilerError.deviceSetupFailed("Cannot create command queue")
         }
         self.commandQueue = queue
-        self.submission = MetalSubmissionContext(commandQueue: queue)
+        self.submission = try MetalSubmissionContext(device: device)
+        self.legacySubmission = LegacySubmissionContext(commandQueue: queue)
         self.prefillExecutor = MetalPrefillExecutor(
             hiddenConversionPipeline: Self.resolveHiddenConversionPipeline(compiledModel)
         )
-        try Self.zeroStateBuffers(compiledModel.decodePlan.buffers, submission: submission)
+        try Self.zeroStateBuffers(compiledModel.decodePlan.buffers, legacySubmission: legacySubmission)
     }
 
     public init(plan: MetalCompiledModel, device: MTLDevice) throws {
         try self.init(compiledModel: plan, device: device)
     }
 
-    private static func zeroStateBuffers(_ buffers: MetalBufferSet, submission: MetalSubmissionContext) throws {
-        _ = try submission.withTransaction(label: "state.zero") { transaction in
+    private static func zeroStateBuffers(_ buffers: MetalBufferSet, legacySubmission: LegacySubmissionContext) throws {
+        _ = try legacySubmission.withTransaction(label: "state.zero") { transaction in
             try transaction.withBlitEncoder { blit in
                 blit.fill(buffer: buffers.hidden, range: 0..<buffers.hidden.length, value: 0)
                 blit.fill(buffer: buffers.residual, range: 0..<buffers.residual.length, value: 0)
@@ -91,9 +94,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
         tokenID: Int32,
         ropePositionAxes: (UInt32, UInt32, UInt32)? = nil
     ) -> Int32 {
-        decodeExecutor.decode(
+        decodeExecutor.legacyDecode(
             plan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             position: &position,
             pendingCommandBuffer: &pendingCommandBuffer,
             hasPendingResult: &hasPendingResult,
@@ -108,7 +111,21 @@ public struct MetalInferenceModel: @unchecked Sendable {
     ) -> Int32 {
         decodeExecutor.decodeSync(
             plan: decodePlan,
-            submission: submission,
+            submission: &submission,
+            position: &position,
+            tokenID: tokenID,
+            ropePositionAxes: ropePositionAxes
+        )
+    }
+
+    /// Decode with GPU timing feedback for profiling.
+    public mutating func decodeSyncTimed(
+        tokenID: Int32,
+        ropePositionAxes: (UInt32, UInt32, UInt32)? = nil
+    ) -> (token: Int32, gpuStartTime: CFTimeInterval, gpuEndTime: CFTimeInterval) {
+        decodeExecutor.decodeSyncTimed(
+            plan: decodePlan,
+            submission: &submission,
             position: &position,
             tokenID: tokenID,
             ropePositionAxes: ropePositionAxes
@@ -238,7 +255,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         return prefillExecutor.prefill(
             prefillPlan: prefillPlan,
             decodePlan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             position: &position,
             tokens: tokens
         )
@@ -296,7 +313,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         return try prefillExecutor.prefill(
             prefillPlan: prefillPlan,
             decodePlan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             position: &position,
             tokens: [Int32](repeating: 0, count: hiddenStates.count),
             ropePositionAxesByTokenIndex: ropePositionAxes,
@@ -338,7 +355,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 lastOutput = try prefillExecutor.prefill(
                     prefillPlan: prefillPlan,
                     decodePlan: decodePlan,
-                    submission: submission,
+                    submission: legacySubmission,
                     position: &position,
                     tokens: Array(tokens[startIndex..<endIndex]),
                     ropePositionAxesByTokenIndex: Array(ropePositionAxesByTokenIndex[startIndex..<endIndex]),
@@ -352,7 +369,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         return try prefillExecutor.prefill(
             prefillPlan: prefillPlan,
             decodePlan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             position: &position,
             tokens: tokens,
             ropePositionAxesByTokenIndex: ropePositionAxesByTokenIndex,
@@ -365,9 +382,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
     // MARK: - Lifecycle
 
     public mutating func flush() -> Int32 {
-        decodeExecutor.flush(
+        decodeExecutor.legacyFlush(
             plan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             pendingCommandBuffer: &pendingCommandBuffer,
             hasPendingResult: &hasPendingResult
         )
@@ -376,7 +393,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
     public func makePromptState(firstToken: Int32) throws -> MetalPromptState {
         try promptStateStore.makePromptState(
             plan: decodePlan,
-            submission: submission,
+            submission: legacySubmission,
             position: position,
             firstToken: firstToken
         )
@@ -385,14 +402,14 @@ public struct MetalInferenceModel: @unchecked Sendable {
     public mutating func restore(promptState: MetalPromptState) throws {
         pendingCommandBuffer = nil
         hasPendingResult = false
-        try promptStateStore.restore(plan: decodePlan, submission: submission, promptState: promptState)
+        try promptStateStore.restore(plan: decodePlan, submission: legacySubmission, promptState: promptState)
         position = promptState.position
     }
 
     public mutating func resetCaches() {
         if let pendingCommandBuffer {
             do {
-                try submission.waitUntilCompleted(pendingCommandBuffer)
+                try legacySubmission.waitUntilCompleted(pendingCommandBuffer)
             } catch {
                 print("[MetalInference] Pending decode failed during reset: \(error)")
             }
@@ -401,7 +418,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         hasPendingResult = false
         position = 0
         do {
-            try Self.zeroStateBuffers(decodePlan.buffers, submission: submission)
+            try Self.zeroStateBuffers(decodePlan.buffers, legacySubmission: legacySubmission)
         } catch {
             print("[MetalInference] Failed to reset GPU state: \(error)")
         }
@@ -449,7 +466,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
             throw MetalCompilerError.kernelNotFound("\(copyKernelName) / \(addKernelName)")
         }
 
-        _ = try submission.withTransaction(label: "decode.hidden.sync") { transaction in
+        _ = try legacySubmission.withTransaction(label: "decode.hidden.sync") { transaction in
             try transaction.withBlitEncoder { blit in
                 blit.fill(buffer: buffers.residual, range: 0..<buffers.residual.length, value: 0)
                 blit.fill(buffer: buffers.scratch, range: 0..<buffers.scratch.length, value: 0)

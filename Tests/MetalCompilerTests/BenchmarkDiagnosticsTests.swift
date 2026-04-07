@@ -631,6 +631,130 @@ struct BenchmarkDiagnosticsTests {
         print("delta:       \(String(format: "%+.0f", delta)) us (\(String(format: "%+.1f", deltaPct))%)")
     }
 
+    @Test("Metal 4 vs Metal 3 GPU timing comparison")
+    func metal4VsMetal3GpuTiming() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
+        var m = model
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        var tok = m.prefill(tokens: promptTokens)
+        for _ in 0..<3 { tok = m.decodeSync(tokenID: tok) }
+
+        let iterations = 50
+
+        // Metal 4: use decodeSyncTimed (reusable command buffer + argument table + barrier)
+        var metal4GpuTimes: [Double] = []
+        var metal4WallTimes: [Double] = []
+        for _ in 0..<iterations {
+            let wallStart = CFAbsoluteTimeGetCurrent()
+            let result = m.decodeSyncTimed(tokenID: tok)
+            let wallEnd = CFAbsoluteTimeGetCurrent()
+            tok = result.token
+            metal4GpuTimes.append((result.gpuEndTime - result.gpuStartTime) * 1_000_000)
+            metal4WallTimes.append((wallEnd - wallStart) * 1_000_000)
+        }
+
+        // Reset and re-prefill for Metal 3 measurement
+        m.resetCaches()
+        tok = m.prefill(tokens: promptTokens)
+        for _ in 0..<3 { tok = m.decodeSync(tokenID: tok) }
+
+        // Metal 3: manual command buffer encoding (baseline)
+        guard let queue = m.commandQueue as? MTLCommandQueue else { return }
+        var metal3GpuTimes: [Double] = []
+        var metal3WallTimes: [Double] = []
+        for _ in 0..<iterations {
+            m.buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(m.position)
+            m.buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tok
+
+            let wallStart = CFAbsoluteTimeGetCurrent()
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            for step in m.decodePlan.steps {
+                step.bindings.bind(to: enc)
+                step.descriptor.encode(on: enc)
+            }
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+            let wallEnd = CFAbsoluteTimeGetCurrent()
+
+            metal3GpuTimes.append((cb.gpuEndTime - cb.gpuStartTime) * 1_000_000)
+            metal3WallTimes.append((wallEnd - wallStart) * 1_000_000)
+            tok = m.buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+            m.position += 1
+        }
+
+        let m4GpuMedian = metal4GpuTimes.sorted()[iterations / 2]
+        let m4WallMedian = metal4WallTimes.sorted()[iterations / 2]
+        let m3GpuMedian = metal3GpuTimes.sorted()[iterations / 2]
+        let m3WallMedian = metal3WallTimes.sorted()[iterations / 2]
+
+        let steps = m.decodePlan.steps
+        let barrierCount = steps.filter { $0.barrierPolicy.isBarrier }.count
+
+        print("\n=== Metal 4 vs Metal 3 GPU Timing (LFM, median of \(iterations)) ===")
+        print("  Steps: \(steps.count), Barriers: \(barrierCount)")
+        print("")
+        print("  Metal 4 GPU:  \(String(format: "%.0f", m4GpuMedian)) us")
+        print("  Metal 4 Wall: \(String(format: "%.0f", m4WallMedian)) us")
+        print("  Metal 4 Overhead: \(String(format: "%.0f", m4WallMedian - m4GpuMedian)) us")
+        print("")
+        print("  Metal 3 GPU:  \(String(format: "%.0f", m3GpuMedian)) us")
+        print("  Metal 3 Wall: \(String(format: "%.0f", m3WallMedian)) us")
+        print("  Metal 3 Overhead: \(String(format: "%.0f", m3WallMedian - m3GpuMedian)) us")
+        print("")
+        let gpuDelta = m4GpuMedian - m3GpuMedian
+        let wallDelta = m4WallMedian - m3WallMedian
+        print("  GPU delta: \(String(format: "%+.0f", gpuDelta)) us (\(String(format: "%+.1f", gpuDelta / m3GpuMedian * 100))%)")
+        print("  Wall delta: \(String(format: "%+.0f", wallDelta)) us (\(String(format: "%+.1f", wallDelta / m3WallMedian * 100))%)")
+    }
+
+    @Test("Metal 4 decode produces valid tokens")
+    func metal4DecodeProducesValidTokens() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
+        var m = model
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        let decodeSteps = 30
+
+        // Metal 4 path: decodeSync (argument table + barrier)
+        var tokens: [Int32] = []
+        var tok = m.prefill(tokens: promptTokens)
+        for _ in 0..<decodeSteps {
+            tok = m.decodeSync(tokenID: tok)
+            tokens.append(tok)
+        }
+
+        // Determinism: reset and decode again, should produce identical tokens
+        m.resetCaches()
+        var tokens2: [Int32] = []
+        tok = m.prefill(tokens: promptTokens)
+        for _ in 0..<decodeSteps {
+            tok = m.decodeSync(tokenID: tok)
+            tokens2.append(tok)
+        }
+
+        let nonZeroCount = tokens.filter { $0 != 0 }.count
+        let nonZeroRatio = Double(nonZeroCount) / Double(decodeSteps)
+        let deterministic = tokens == tokens2
+
+        print("\n=== Metal 4 Decode Token Quality ===")
+        print("  Tokens: \(decodeSteps)")
+        print("  Non-zero: \(nonZeroCount) / \(decodeSteps) (\(String(format: "%.0f", nonZeroRatio * 100))%)")
+        print("  Deterministic: \(deterministic)")
+        print("  First 10: \(tokens.prefix(10).map(String.init).joined(separator: ", "))")
+
+        #expect(nonZeroRatio > 0.5, "Most tokens should be non-zero, got \(nonZeroCount)/\(decodeSteps)")
+        #expect(deterministic, "Metal 4 decode should be deterministic across resets")
+    }
+
     private enum DecodeMode {
         case sync
         case pipelined

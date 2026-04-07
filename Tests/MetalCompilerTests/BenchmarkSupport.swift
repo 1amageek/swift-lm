@@ -299,7 +299,7 @@ enum BenchmarkSupport {
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
             throw BenchError.noDevice
         }
-        if step.sync == .bufferBarrier {
+        if step.barrierPolicy.isBarrier {
             encoder.memoryBarrier(scope: .buffers)
         }
         encoder.setComputePipelineState(step.pipeline)

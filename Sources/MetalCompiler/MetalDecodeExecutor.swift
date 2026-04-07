@@ -8,9 +8,79 @@ struct MetalDecodeExecutor: Sendable {
         false
     }
 
-    func decode(
+    // MARK: - Decode
+
+    func decodeSync(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: inout MetalSubmissionContext,
+        position: inout Int,
+        tokenID: Int32,
+        ropePositionAxes: (UInt32, UInt32, UInt32)? = nil
+    ) -> Int32 {
+        let buffers = plan.buffers
+        buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(position)
+        writeRoPEPositionAxes(
+            buffers: buffers,
+            position: UInt32(position),
+            ropePositionAxes: ropePositionAxes
+        )
+        buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tokenID
+
+        do {
+            try submission.withCompute { encoder, argumentTable in
+                MetalDecodeEncoder.encodeSteps(
+                    plan: plan,
+                    encoder: encoder,
+                    argumentTable: argumentTable,
+                    visibilityOptions: []
+                )
+            }
+            position += 1
+            return buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+        } catch {
+            print("[MetalInference] GPU error: \(error)")
+            return -1
+        }
+    }
+
+    /// Decode with GPU timing feedback for profiling.
+    func decodeSyncTimed(
+        plan: MetalDispatchPlan,
+        submission: inout MetalSubmissionContext,
+        position: inout Int,
+        tokenID: Int32,
+        ropePositionAxes: (UInt32, UInt32, UInt32)? = nil
+    ) -> (token: Int32, gpuStartTime: CFTimeInterval, gpuEndTime: CFTimeInterval) {
+        let buffers = plan.buffers
+        buffers.position.contents().bindMemory(to: UInt32.self, capacity: 1).pointee = UInt32(position)
+        writeRoPEPositionAxes(
+            buffers: buffers,
+            position: UInt32(position),
+            ropePositionAxes: ropePositionAxes
+        )
+        buffers.tokenIn.contents().bindMemory(to: Int32.self, capacity: 1).pointee = tokenID
+
+        do {
+            let timing = try submission.withComputeTimed { encoder, argumentTable in
+                MetalDecodeEncoder.encodeSteps(
+                    plan: plan,
+                    encoder: encoder,
+                    argumentTable: argumentTable,
+                    visibilityOptions: []
+                )
+            }
+            position += 1
+            let token = buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+            return (token, timing.gpuStartTime, timing.gpuEndTime)
+        } catch {
+            print("[MetalInference] GPU error: \(error)")
+            return (-1, 0, 0)
+        }
+    }
+
+    func legacyDecode(
+        plan: MetalDispatchPlan,
+        submission: LegacySubmissionContext,
         position: inout Int,
         pendingCommandBuffer: inout MTLCommandBuffer?,
         hasPendingResult: inout Bool,
@@ -50,9 +120,9 @@ struct MetalDecodeExecutor: Sendable {
         return result
     }
 
-    func decodeSync(
+    func legacyDecodeSync(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         position: inout Int,
         tokenID: Int32,
         ropePositionAxes: (UInt32, UInt32, UInt32)? = nil
@@ -89,7 +159,7 @@ struct MetalDecodeExecutor: Sendable {
 
     private func debugDecodeSync(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         position: inout Int,
         tokenID: Int32
     ) -> Int32 {
@@ -146,9 +216,9 @@ struct MetalDecodeExecutor: Sendable {
         }
     }
 
-    func flush(
+    func legacyFlush(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         pendingCommandBuffer: inout MTLCommandBuffer?,
         hasPendingResult: inout Bool
     ) -> Int32 {
@@ -186,7 +256,7 @@ struct MetalDecodeExecutor: Sendable {
 
     private func consumePendingDecodeResult(
         plan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         pendingCommandBuffer: MTLCommandBuffer?
     ) -> Int32 {
         guard let pendingCommandBuffer else {

@@ -11,9 +11,10 @@ public enum MetalConstantBindingPolicy: Sendable, Equatable {
     case residentConstantBuffer
 }
 
-public enum MetalBarrierPolicy: Sendable, Equatable {
+public enum MetalBarrierPolicy: @unchecked Sendable, Equatable {
     case none
     case bufferBarrier
+    case resourceBarrier(resources: [MTLResource])
 
     public init(_ synchronizationKind: SynchronizationKind) {
         switch synchronizationKind {
@@ -28,8 +29,25 @@ public enum MetalBarrierPolicy: Sendable, Equatable {
         switch self {
         case .none:
             return .none
-        case .bufferBarrier:
+        case .bufferBarrier, .resourceBarrier:
             return .bufferBarrier
+        }
+    }
+
+    public var isBarrier: Bool {
+        switch self {
+        case .none: return false
+        case .bufferBarrier, .resourceBarrier: return true
+        }
+    }
+
+    public static func == (lhs: MetalBarrierPolicy, rhs: MetalBarrierPolicy) -> Bool {
+        switch (lhs, rhs) {
+        case (.none, .none): return true
+        case (.bufferBarrier, .bufferBarrier): return true
+        case (.resourceBarrier(let a), .resourceBarrier(let b)):
+            return a.count == b.count
+        default: return false
         }
     }
 }
@@ -281,8 +299,13 @@ public struct MetalDispatchDescriptor: @unchecked Sendable {
     }
 
     public func encode(on encoder: MTLComputeCommandEncoder, gridSize overrideGridSize: MTLSize? = nil) {
-        if barrierPolicy == .bufferBarrier {
+        switch barrierPolicy {
+        case .none:
+            break
+        case .bufferBarrier:
             encoder.memoryBarrier(scope: .buffers)
+        case .resourceBarrier(let resources):
+            encoder.memoryBarrier(resources: resources)
         }
         encoder.setComputePipelineState(pipeline)
         if threadgroupMemoryLength > 0 {

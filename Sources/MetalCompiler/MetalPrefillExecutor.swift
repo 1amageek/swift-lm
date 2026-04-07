@@ -13,7 +13,7 @@ struct MetalPrefillExecutor: Sendable {
     func prefill(
         prefillPlan: MetalPrefillPlan,
         decodePlan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         position: inout Int,
         tokens: [Int32]
     ) -> Int32 {
@@ -71,7 +71,7 @@ struct MetalPrefillExecutor: Sendable {
     func prefill(
         prefillPlan: MetalPrefillPlan,
         decodePlan: MetalDispatchPlan,
-        submission: MetalSubmissionContext,
+        submission: LegacySubmissionContext,
         position: inout Int,
         tokens: [Int32],
         ropePositionAxesByTokenIndex: [(UInt32, UInt32, UInt32)],
@@ -202,14 +202,14 @@ struct MetalPrefillExecutor: Sendable {
                     sequenceLength: UInt32(sequenceLength)
                 )
             case .lastToken:
-                if step.sync == .bufferBarrier { encoder.memoryBarrier(scope: .buffers) }
+                encodeBarrier(step.barrierPolicy, on: encoder)
                 encoder.setComputePipelineState(step.pipeline)
                 let lastPosition = sequenceLength - 1
                 step.bindStaticArguments(encoder: encoder, position: lastPosition)
                 encoder.dispatchThreadgroups(step.gridSize, threadsPerThreadgroup: step.threadgroupSize)
             case .perPosition:
                 for positionOffset in 0..<sequenceLength {
-                    if step.sync == .bufferBarrier { encoder.memoryBarrier(scope: .buffers) }
+                    encodeBarrier(step.barrierPolicy, on: encoder)
                     encoder.setComputePipelineState(step.pipeline)
                     step.bindStaticArguments(encoder: encoder, position: positionOffset)
                     if let positionBufferIndex = step.positionBufferIndex {
@@ -302,6 +302,17 @@ struct MetalPrefillExecutor: Sendable {
             for elementIndex in 0..<hiddenStride {
                 rowPointer[elementIndex] += values[elementIndex]
             }
+        }
+    }
+
+    private func encodeBarrier(_ policy: MetalBarrierPolicy, on encoder: MTLComputeCommandEncoder) {
+        switch policy {
+        case .none:
+            break
+        case .bufferBarrier:
+            encoder.memoryBarrier(scope: .buffers)
+        case .resourceBarrier(let resources):
+            encoder.memoryBarrier(resources: resources)
         }
     }
 

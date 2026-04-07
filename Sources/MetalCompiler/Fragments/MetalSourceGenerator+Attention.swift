@@ -399,9 +399,13 @@ public static func generateRoPESeq(
 // MARK: - Flash Attention
 
 /// Generate flash attention decode kernel with Clifford rotor rotation + QJL correction.
+///
+/// When `inlineRoPE` is true, the kernel includes inline RoPE rotation for Q and K,
+/// eliminating the need for a separate RoPE dispatch and its barrier.
 public static func generateFlashAttentionKernel(
     name: String,
-    bufferPrecision: BufferPrecision
+    bufferPrecision: BufferPrecision,
+    inlineRoPE: Bool = false
 ) -> String {
     let bt = bufferPrecision.metalType
     let castIn: (String) -> String = { expr in
@@ -411,7 +415,76 @@ public static func generateFlashAttentionKernel(
         bufferPrecision == .float32 ? "(\(expr))" : "\(bt)(\(expr))"
     }
 
+    let ropeKernelParams = inlineRoPE ? """
+            device const uint* ropePositionAxes  [[buffer(22)]],
+            constant uint& ropeDimension         [[buffer(23)]],
+            constant float& ropeBase_            [[buffer(24)]],
+            constant uint& temporalSections      [[buffer(25)]],
+            constant uint& heightSections        [[buffer(26)]],
+            constant uint& widthSections         [[buffer(27)]],
+            constant uint& mropeInterleaved      [[buffer(28)]],
+        """ : ""
+
+    let mropeAxisHelper = inlineRoPE ? """
+        inline uint \(name)_mrope_axis(uint h, uint tS, uint hS, uint wS, bool interleaved) {
+            if (tS == 0 && hS == 0 && wS == 0) return 0;
+            if (!interleaved) {
+                if (h < tS) return 0;
+                if (h < tS + hS) return 1;
+                return 2;
+            }
+            if (h < hS * 3 && h % 3 == 1) return 1;
+            if (h < wS * 3 && h % 3 == 2) return 2;
+            return 0;
+        }
+
+        """ : ""
+
+    // RoPE code block: load vector → rotBuf, apply rotation in-place
+    let ropeApplyK = inlineRoPE ? """
+                    // Inline RoPE: load K → rotBuf, apply rotation
+                    for (uint d = tid; d < headDim; d += threadgroupSize) {
+                        rotBuf[d] = \(castIn("newKey[kvIn + d]"));
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    {
+                        const uint halfRopeDim = ropeDimension / 2;
+                        for (uint h = tid; h < halfRopeDim; h += threadgroupSize) {
+                            uint axis = \(name)_mrope_axis(h, temporalSections, heightSections, widthSections, mropeInterleaved != 0);
+                            float pos = float(ropePositionAxes[axis]);
+                            float theta = pos * pow(ropeBase_, -2.0f * float(h) / float(ropeDimension));
+                            float cosT = cos(theta), sinT = sin(theta);
+                            float k0 = rotBuf[h], k1 = rotBuf[h + halfRopeDim];
+                            rotBuf[h] = k0 * cosT - k1 * sinT;
+                            rotBuf[h + halfRopeDim] = k0 * sinT + k1 * cosT;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+        """ : ""
+
+    let ropeApplyQ = inlineRoPE ? """
+                // Inline RoPE: load Q → rotQuery, apply rotation
+                for (uint d = tid; d < headDim; d += threadgroupSize) {
+                    rotQuery[d] = \(castIn("query[queryOffset + d]"));
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                {
+                    const uint halfRopeDim = ropeDimension / 2;
+                    for (uint h = tid; h < halfRopeDim; h += threadgroupSize) {
+                        uint axis = \(name)_mrope_axis(h, temporalSections, heightSections, widthSections, mropeInterleaved != 0);
+                        float pos = float(ropePositionAxes[axis]);
+                        float theta = pos * pow(ropeBase_, -2.0f * float(h) / float(ropeDimension));
+                        float cosT = cos(theta), sinT = sin(theta);
+                        float q0 = rotQuery[h], q1 = rotQuery[h + halfRopeDim];
+                        rotQuery[h] = q0 * cosT - q1 * sinT;
+                        rotQuery[h + halfRopeDim] = q0 * sinT + q1 * cosT;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+        """ : ""
+
     return """
+    \(mropeAxisHelper)
     kernel void \(name)(
         device const \(bt)* query             [[buffer(0)]],
         device const \(bt)* newKey            [[buffer(1)]],
@@ -435,7 +508,7 @@ public static func generateFlashAttentionKernel(
         device half* qjlResidualK            [[buffer(19)]],
         constant uint& numRotorGroups        [[buffer(20)]],
         constant uint& qjlDimension         [[buffer(21)]],
-        uint headIndex                       [[threadgroup_position_in_grid]],
+    \(ropeKernelParams)    uint headIndex                       [[threadgroup_position_in_grid]],
         uint tid                             [[thread_index_in_threadgroup]],
         uint tiisg                           [[thread_index_in_simdgroup]],
         uint sgitg                           [[simdgroup_index_in_threadgroup]],
@@ -468,78 +541,134 @@ public static func generateFlashAttentionKernel(
                     + kvHeadIndex * kHeadSlotBytes;
             }
 
-            if (kRotor) {
-                // Fused load + rotate: each thread loads and rotates its own rotor groups
-                for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
-                    uint base = g * 3;
-                    float v1 = (base < headDim) ? \(castIn("newKey[kvIn + base]")) : 0.0f;
-                    float v2 = (base + 1 < headDim) ? \(castIn("newKey[kvIn + base + 1]")) : 0.0f;
-                    float v3 = (base + 2 < headDim) ? \(castIn("newKey[kvIn + base + 2]")) : 0.0f;
-                    float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
-                                      float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
-                    float3 r = rotor_sandwich(R, float3(v1, v2, v3));
-                    if (base < headDim) rotBuf[base] = r.x;
-                    if (base + 1 < headDim) rotBuf[base + 1] = r.y;
-                    if (base + 2 < headDim) rotBuf[base + 2] = r.z;
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                uint kBase = rotor_base_scheme(kQuantScheme);
-                if (kBase == 0x40) {
-                    write_kv_quantized_q4(rotBuf, keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
+    \(ropeApplyK)
+                if (kRotor) {
+                    // \(inlineRoPE ? "Rotor sandwich on RoPE-rotated K in rotBuf" : "Fused load + rotate"): each thread loads and rotates its own rotor groups
+                    for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
+                        uint base = g * 3;
+    \(inlineRoPE ? """
+                        float v1 = (base < headDim) ? rotBuf[base] : 0.0f;
+                        float v2 = (base + 1 < headDim) ? rotBuf[base + 1] : 0.0f;
+                        float v3 = (base + 2 < headDim) ? rotBuf[base + 2] : 0.0f;
+    """ : """
+                        float v1 = (base < headDim) ? \(castIn("newKey[kvIn + base]")) : 0.0f;
+                        float v2 = (base + 1 < headDim) ? \(castIn("newKey[kvIn + base + 1]")) : 0.0f;
+                        float v3 = (base + 2 < headDim) ? \(castIn("newKey[kvIn + base + 2]")) : 0.0f;
+    """)
+                        float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
+                                          float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
+                        float3 r = rotor_sandwich(R, float3(v1, v2, v3));
+                        if (base < headDim) rotBuf[base] = r.x;
+                        if (base + 1 < headDim) rotBuf[base + 1] = r.y;
+                        if (base + 2 < headDim) rotBuf[base + 2] = r.z;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    uint kBase = rotor_base_scheme(kQuantScheme);
+                    if (kBase == 0x40) {
+                        write_kv_quantized_q4(rotBuf, keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
+                    } else {
+                        write_kv_quantized_q8(rotBuf, keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
+                    }
+                    // QJL: compute and store projected K residual
+                    if (qjlDimension > 0) {
+                        threadgroup_barrier(mem_flags::mem_device);
+                        device half* qjlOut = qjlResidualK + (position * kvHeadCount + kvHeadIndex) * qjlDimension;
+                        qjl_compute_residual(rotBuf, keyCache + kWriteByteOffset, kQuantScheme,
+                            qjlMatrix, qjlOut, headDim, qjlDimension, kHeadSlotBytes, tid, threadgroupSize);
+                    }
+    \(inlineRoPE ? """
+                } else if (kQuantScheme == 0x00 || kQuantScheme == 0x01 || kQuantScheme == 0x02) {
+                    // Write RoPE-rotated K from rotBuf to dense KV cache
+                    for (uint d = tid; d < headDim; d += threadgroupSize) {
+                        write_kv_element_dense(
+                            keyCache + kWriteByteOffset, d, rotBuf[d], kQuantScheme);
+                    }
                 } else {
-                    write_kv_quantized_q8(rotBuf, keyCache + kWriteByteOffset, headDim, tid, threadgroupSize, tiisg, sgitg, quantSMin, quantSMax);
-                }
-                // QJL: compute and store projected K residual
-                if (qjlDimension > 0) {
-                    threadgroup_barrier(mem_flags::mem_device);
-                    device half* qjlOut = qjlResidualK + (position * kvHeadCount + kvHeadIndex) * qjlDimension;
-                    qjl_compute_residual(rotBuf, keyCache + kWriteByteOffset, kQuantScheme,
-                        qjlMatrix, qjlOut, headDim, qjlDimension, kHeadSlotBytes, tid, threadgroupSize);
-                }
-            } else if (kQuantScheme == 0x00 || kQuantScheme == 0x01 || kQuantScheme == 0x02) {
-                for (uint d = tid; d < headDim; d += threadgroupSize) {
-                    write_kv_element_dense(
-                        keyCache + kWriteByteOffset, d, \(castIn("newKey[kvIn + d]")), kQuantScheme);
-                }
-            } else {
-                const uint groupSize = 32;
-                const uint bytesPerBlock = 36;
-                const uint numGroups = (headDim + groupSize - 1) / groupSize;
-                for (uint g = 0; g < numGroups; g++) {
-                    uint groupStart = g * groupSize;
-                    float localMin = HUGE_VALF, localMax = -HUGE_VALF;
-                    for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
-                        float val = \(castIn("newKey[kvIn + groupStart + i]"));
-                        localMin = min(localMin, val); localMax = max(localMax, val);
-                    }
-                    localMin = simd_min(localMin); localMax = simd_max(localMax);
-                    threadgroup float sharedMin[32], sharedMax[32];
-                    if (tiisg == 0) { sharedMin[sgitg] = localMin; sharedMax[sgitg] = localMax; }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    if (tid == 0) {
-                        uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
-                        float gMin = sharedMin[0], gMax = sharedMax[0];
-                        for (uint s = 1; s < sgCount; s++) { gMin = min(gMin, sharedMin[s]); gMax = max(gMax, sharedMax[s]); }
-                        sharedMin[0] = gMin; sharedMax[0] = gMax;
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-                    float groupMin = sharedMin[0], groupMax = sharedMax[0];
-                    float groupScale = (groupMax - groupMin) / 255.0f;
-                    if (groupScale < 1e-10f) groupScale = 1e-10f;
-                    device uchar* blockOutput = keyCache + kWriteByteOffset + g * bytesPerBlock;
-                    if (tid == 0) {
-                        *(device half*)(blockOutput) = half(groupScale);
-                        *(device half*)(blockOutput + 2) = half(groupMin);
-                    }
-                    threadgroup_barrier(mem_flags::mem_device);
-                    for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
-                        float val = \(castIn("newKey[kvIn + groupStart + i]"));
-                        int quantized = int(round((val - groupMin) / groupScale));
-                        quantized = clamp(quantized, 0, 255);
-                        *(device char*)(blockOutput + 4 + i) = char(quantized);
+                    // Write RoPE-rotated K from rotBuf with group quantization
+                    const uint groupSize = 32;
+                    const uint bytesPerBlock = 36;
+                    const uint numGroups = (headDim + groupSize - 1) / groupSize;
+                    for (uint g = 0; g < numGroups; g++) {
+                        uint groupStart = g * groupSize;
+                        float localMin = HUGE_VALF, localMax = -HUGE_VALF;
+                        for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
+                            float val = rotBuf[groupStart + i];
+                            localMin = min(localMin, val); localMax = max(localMax, val);
+                        }
+                        localMin = simd_min(localMin); localMax = simd_max(localMax);
+                        threadgroup float sharedMin[32], sharedMax[32];
+                        if (tiisg == 0) { sharedMin[sgitg] = localMin; sharedMax[sgitg] = localMax; }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (tid == 0) {
+                            uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                            float gMin = sharedMin[0], gMax = sharedMax[0];
+                            for (uint s = 1; s < sgCount; s++) { gMin = min(gMin, sharedMin[s]); gMax = max(gMax, sharedMax[s]); }
+                            sharedMin[0] = gMin; sharedMax[0] = gMax;
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        float groupMin = sharedMin[0], groupMax = sharedMax[0];
+                        float groupScale = (groupMax - groupMin) / 255.0f;
+                        if (groupScale < 1e-10f) groupScale = 1e-10f;
+                        device uchar* blockOutput = keyCache + kWriteByteOffset + g * bytesPerBlock;
+                        if (tid == 0) {
+                            *(device half*)(blockOutput) = half(groupScale);
+                            *(device half*)(blockOutput + 2) = half(groupMin);
+                        }
+                        threadgroup_barrier(mem_flags::mem_device);
+                        for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
+                            float val = rotBuf[groupStart + i];
+                            int quantized = int(round((val - groupMin) / groupScale));
+                            quantized = clamp(quantized, 0, 255);
+                            *(device char*)(blockOutput + 4 + i) = char(quantized);
+                        }
                     }
                 }
-            }
+    """ : """
+                } else if (kQuantScheme == 0x00 || kQuantScheme == 0x01 || kQuantScheme == 0x02) {
+                    for (uint d = tid; d < headDim; d += threadgroupSize) {
+                        write_kv_element_dense(
+                            keyCache + kWriteByteOffset, d, \(castIn("newKey[kvIn + d]")), kQuantScheme);
+                    }
+                } else {
+                    const uint groupSize = 32;
+                    const uint bytesPerBlock = 36;
+                    const uint numGroups = (headDim + groupSize - 1) / groupSize;
+                    for (uint g = 0; g < numGroups; g++) {
+                        uint groupStart = g * groupSize;
+                        float localMin = HUGE_VALF, localMax = -HUGE_VALF;
+                        for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
+                            float val = \(castIn("newKey[kvIn + groupStart + i]"));
+                            localMin = min(localMin, val); localMax = max(localMax, val);
+                        }
+                        localMin = simd_min(localMin); localMax = simd_max(localMax);
+                        threadgroup float sharedMin[32], sharedMax[32];
+                        if (tiisg == 0) { sharedMin[sgitg] = localMin; sharedMax[sgitg] = localMax; }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        if (tid == 0) {
+                            uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                            float gMin = sharedMin[0], gMax = sharedMax[0];
+                            for (uint s = 1; s < sgCount; s++) { gMin = min(gMin, sharedMin[s]); gMax = max(gMax, sharedMax[s]); }
+                            sharedMin[0] = gMin; sharedMax[0] = gMax;
+                        }
+                        threadgroup_barrier(mem_flags::mem_threadgroup);
+                        float groupMin = sharedMin[0], groupMax = sharedMax[0];
+                        float groupScale = (groupMax - groupMin) / 255.0f;
+                        if (groupScale < 1e-10f) groupScale = 1e-10f;
+                        device uchar* blockOutput = keyCache + kWriteByteOffset + g * bytesPerBlock;
+                        if (tid == 0) {
+                            *(device half*)(blockOutput) = half(groupScale);
+                            *(device half*)(blockOutput + 2) = half(groupMin);
+                        }
+                        threadgroup_barrier(mem_flags::mem_device);
+                        for (uint i = tid; i < groupSize && (groupStart + i) < headDim; i += threadgroupSize) {
+                            float val = \(castIn("newKey[kvIn + groupStart + i]"));
+                            int quantized = int(round((val - groupMin) / groupScale));
+                            quantized = clamp(quantized, 0, 255);
+                            *(device char*)(blockOutput + 4 + i) = char(quantized);
+                        }
+                    }
+                }
+    """)
             threadgroup_barrier(mem_flags::mem_device);
 
             uint vWriteByteOffset;
@@ -619,17 +748,24 @@ public static func generateFlashAttentionKernel(
         }
 
         // --- Step 2: Compute attention scores ---
-        // RotorQuant K: pre-rotate Q via Clifford rotor so Q'·K' = Q·K.
+        // \(inlineRoPE ? "Inline RoPE + optional RotorQuant on Q." : "RotorQuant K: pre-rotate Q via Clifford rotor so Q'·K' = Q·K.")
         const uint queryOffset = headIndex * headDim;
 
         threadgroup float rotQuery[512];
+    \(ropeApplyQ)
         if (kRotor) {
-            // Fused load + rotate
+            // \(inlineRoPE ? "Rotor sandwich on RoPE-rotated Q in rotQuery" : "Fused load + rotate")
             for (uint g = tid; g < numRotorGroups; g += threadgroupSize) {
                 uint base = g * 3;
+    \(inlineRoPE ? """
+                float v1 = (base < headDim) ? rotQuery[base] : 0.0f;
+                float v2 = (base + 1 < headDim) ? rotQuery[base + 1] : 0.0f;
+                float v3 = (base + 2 < headDim) ? rotQuery[base + 2] : 0.0f;
+    """ : """
                 float v1 = (base < headDim) ? \(castIn("query[queryOffset + base]")) : 0.0f;
                 float v2 = (base + 1 < headDim) ? \(castIn("query[queryOffset + base + 1]")) : 0.0f;
                 float v3 = (base + 2 < headDim) ? \(castIn("query[queryOffset + base + 2]")) : 0.0f;
+    """)
                 float4 R = float4(float(headRotors[g * 4]), float(headRotors[g * 4 + 1]),
                                   float(headRotors[g * 4 + 2]), float(headRotors[g * 4 + 3]));
                 float3 r = rotor_sandwich(R, float3(v1, v2, v3));
@@ -665,7 +801,7 @@ public static func generateFlashAttentionKernel(
 
             float score = 0.0f;
             for (uint d = tid; d < headDim; d += threadgroupSize) {
-                float q = kRotor ? rotQuery[d] : \(castIn("query[queryOffset + d]"));
+                float q = \(inlineRoPE ? "rotQuery[d]" : "kRotor ? rotQuery[d] : \(castIn("query[queryOffset + d]"))");
                 float k = read_kv_element(keyCache + kByteOffset, d, kQuantScheme, kHeadSlotBytes, headDim);
                 score += q * k;
             }

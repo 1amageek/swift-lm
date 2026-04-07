@@ -429,15 +429,31 @@ swift build
 
 Vision encoder と text decoder は独立したモデル。IR に vision encoder を含めない。
 
-## Metal 4 / Apple GPU References
+## Metal 4 (Primary Target)
+
+**Metal 4 を優先して使用する。** Xcode 26 + Metal 4 が利用可能な環境を前提とし、新規実装は Metal 4 API を最初に採用する。Metal 3 fallback は互換性が必要な場合のみ。
+
+### Metal 4 API 方針
+
+- **MTL4CommandBuffer + MTL4CommandAllocator**: command buffer を長寿命オブジェクトとして reuse する。fire-and-forget パターンは廃止
+- **MTL4ComputeCommandEncoder**: デフォルトで concurrent dispatch。明示的 barrier で順序制御
+- **Barrier model**: `barrierAfterEncoderStages(_:beforeEncoderStages:visibilityOptions:)` で stage-to-stage 同期。`MTL4VisibilityOptionNone`（実行順序のみ）と `MTL4VisibilityOptionDevice`（+ キャッシュ flush）を使い分ける
+- **Argument tables**: per-dispatch のバッファ binding を argument table に事前構築し、encode コストを削減
+- **Cooperative tensors / matmul2d**: Prefill GEMM を Metal 4 `matmul2d` に置換し AMX 最適化パスを活用
+
+### References
 
 - [Metal Shading Language Specification v4](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf) — cooperative tensor, tensor_inline, matmul2d_descriptor, Metal Performance Primitives (MPP)
-- [Metal 4 matmul example](https://github.com/liuliu/example_matmul_metal4) — tensor_inline で既存 MTLBuffer をラップし matmul2d を compute shader から呼ぶ実装例。Metal 3 API でも動作
+- [Metal 4 matmul example](https://github.com/liuliu/example_matmul_metal4) — tensor_inline で既存 MTLBuffer をラップし matmul2d を compute shader から呼ぶ実装例
 - [Discover Metal 4 (WWDC25)](https://developer.apple.com/videos/play/wwdc2025/205/) — MTL4CommandBuffer reuse, command allocator, argument tables, barrier model
-- [Combine Metal 4 ML and graphics (WWDC25)](https://developer.apple.com/videos/play/wwdc2025/262/) — MTL4MachineLearningCommandEncoder, CoreML model を GPU timeline で直接実行
+- [Understanding the Metal 4 core API](https://developer.apple.com/documentation/Metal/understanding-the-metal-4-core-api)
+- [MTL4ComputeCommandEncoder](https://developer.apple.com/documentation/metal/mtl4computecommandencoder) — concurrent dispatch, stage-to-stage barriers
+- [Synchronizing passes with producer barriers](https://developer.apple.com/documentation/Metal/synchronizing-passes-with-producer-barriers)
+- [Synchronizing passes with consumer barriers](https://developer.apple.com/documentation/Metal/synchronizing-passes-with-consumer-barriers)
+- [Combine Metal 4 ML and graphics (WWDC25)](https://developer.apple.com/videos/play/wwdc2025/262/) — MTL4MachineLearningCommandEncoder
 - [Explore LLMs on Apple Silicon with MLX (WWDC25)](https://developer.apple.com/videos/play/wwdc2025/298/) — Apple Silicon 上の LLM 推論最適化手法
-- [Apple GPU TBDR Architecture](https://developer.apple.com/documentation/metal/tailor-your-apps-for-apple-gpus-and-tile-based-deferred-rendering) — tile memory, imageblocks, threadgroup memory の特性
-- [Resource Storage Modes for Apple GPUs](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus) — shared/private/memoryless の使い分け
+- [Apple GPU TBDR Architecture](https://developer.apple.com/documentation/metal/tailor-your-apps-for-apple-gpus-and-tile-based-deferred-rendering)
+- [Resource Storage Modes for Apple GPUs](https://developer.apple.com/documentation/metal/choosing-a-resource-storage-mode-for-apple-gpus)
 
 ### Performance Findings
 
@@ -447,18 +463,37 @@ Vision encoder と text decoder は独立したモデル。IR に vision encoder
 
 ### Barrier Optimization — Decode Path
 
-`hazardTrackingModeUntracked` バッファは明示的な `memoryBarrier(scope: .buffers)` が必要。バリアは GPU を同期させるため、不要バリアは深刻なパフォーマンス劣化を起こす。
+`hazardTrackingModeUntracked` バッファは明示的な barrier が必要。バリアは GPU を同期させるため、不要バリアは深刻なパフォーマンス劣化を起こす。
 
-**Gemma4-E2B 実測値 (705 decode steps):**
-- GPU kernel 計算時間: ~2.8ms
-- バリア同期 overhead: ~17ms（31μs × barrier count）
-- 1 バリアあたり ~31μs — kernel 1 つの平均実行時間 4μs より遥かに大きい
+**Gemma4-E2B 実測値 (564 decode steps, AggressiveOptimizer + RoPE fusion):**
+- GPU kernel 計算時間: ~2.9ms
+- バリア同期 overhead: ~17ms（~30μs × 528 barriers）
+- 1 バリアあたり ~30μs — kernel 1 つの平均実行時間 5μs より遥かに大きい
+
+#### Metal 3 最適化レベル (実施済み)
+
+| 手法 | Steps | Barriers | Encode(μs) | Single CB GPU |
+|---|---|---|---|---|
+| conservative (全 read+write) | 705 | 669 (95%) | ~2000 | 20.93ms |
+| BufferRegion + writeBufferIndices | 705 | 564 (80%) | ~1900 | 20.46ms |
+| + AggressiveOptimizer (Q/K/V batch) | 599 | 563 (94%) | ~1900 | 20.60ms |
+| + `memoryBarrier(resources:)` | 599 | 563 (94%) | **~580** | **20.00ms** |
+| + RoPE + flash_attn fusion | 564 | 528 (94%) | ~540 | ~20.5ms |
+
+#### Metal 4 barrier への移行方針
+
+Metal 3 の `memoryBarrier(resources:)` を Metal 4 の stage-to-stage barrier に置換する:
+- `MTL4VisibilityOptionNone`: private バッファの実行順序保証（キャッシュ flush 不要な場合）
+- `MTL4VisibilityOptionDevice`: shared バッファまたはキャッシュ coherency が必要な場合
+- Decode path の intermediate バッファ (hidden, scratch, residual) は全て `private` + GPU-only → `VisibilityOptionNone` で十分な可能性が高い
+
+#### resource-scoped barrier の原則
+
+`memoryBarrier(scope: .buffers)` は全バッファを同期する。大半のステップは 1 バッファのみに conflict があるため、`memoryBarrier(resources: [conflicting])` で対象を限定。CPU encode コストが **70% 削減** (1,891μs → 580μs)。
 
 #### BufferRegion 追跡の原則
 
-scratch buffer は単一 MTLBuffer に複数 slot を offset で配置する。`ObjectIdentifier(buffer)` だけでは異なる slot を区別できず、独立した slot 間に false dependency が発生する。
-
-**正しい追跡**: `BufferRegion(buffer: ObjectIdentifier, offset: Int)` で (buffer identity, offset) をペアで管理。scratch[slot0], scratch[slot1], scratch[slot2] は異なる BufferRegion として扱う。
+scratch buffer は単一 MTLBuffer に複数 slot を offset で配置する。`BufferRegion(buffer, offset)` で (buffer identity, offset) をペアで管理し、独立した scratch slot 間の false dependency を防ぐ。`conflictingResources(from:)` で conflict する MTLBuffer を特定し、resource-scoped barrier を生成。
 
 #### Fragment の writeBufferIndices 宣言
 
@@ -466,14 +501,9 @@ scratch buffer は単一 MTLBuffer に複数 slot を offset で配置する。`
 
 **新しい fragment を追加するときは必ず `writeBufferIndices` を宣言する。** 省略は conservative fallback を引き起こし、decode 性能が大幅に劣化する。
 
-#### 実績
+#### 残存する barrier overhead
 
-| 手法 | Barriers | Barrier率 | Single CB GPU |
-|---|---|---|---|
-| conservative (全 read+write) | 669 | 95% | 20.93ms |
-| BufferRegion + writeBufferIndices | 564 | 80% | 20.46ms |
-
-80% のバリアは genuine な WAR/WAW 依存。さらなる削減には kernel fusion（step 数の削減）が必要。
+528 barriers × ~30μs = ~15.8ms が GPU 時間の ~85% を占める。これらは全て genuine な RAW 依存（線形計算チェーン）。Metal 4 の `MTL4VisibilityOptionNone` barrier でコスト削減、または kernel fusion で step 数を削減する。
 
 ## Qwen3.5 = VLM（Vision Language Model）
 
