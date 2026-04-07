@@ -141,7 +141,6 @@ struct STAFSpecializedWeightStoreBuilder {
                 }
             }
         }
-        packedBuffer.didModifyRange(0..<totalBytes)
         requestResidency(for: packedBuffer)
 
         let labelSuffix: String

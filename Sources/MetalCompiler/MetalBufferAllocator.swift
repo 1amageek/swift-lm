@@ -134,7 +134,10 @@ struct MetalBufferAllocator {
             maximumScratchProjectionDimension(in: fusedEntries)
         )
         let scratchElementCount = max(slotDimension * 5, resolvedIntermediateSize * 5)
-        let gpuOptions: MTLResourceOptions = [.storageModeShared]
+        // Hidden stays shared for vision model CPU access (overwriteHiddenRows, addDeepstackRows).
+        // Other GPU-only buffers use private for GPU compression on Apple Silicon.
+        let cpuGpuOptions: MTLResourceOptions = [.storageModeShared]
+        let gpuOnlyOptions: MTLResourceOptions = [.storageModePrivate]
 
         let convStateRequirements = convStateRequirements(in: fusedEntries)
         let perLayerInputRequirements = perLayerInputRequirements(in: fusedEntries)
@@ -150,7 +153,7 @@ struct MetalBufferAllocator {
                 * convStateRequirements.kernelSize
                 * convStateRequirements.dimension
                 * elementSize
-            prefillConvStateBuffer = context.device.makeBuffer(length: byteCount, options: gpuOptions)
+            prefillConvStateBuffer = context.device.makeBuffer(length: byteCount, options: cpuGpuOptions)
             if let prefillConvStateBuffer {
                 memset(prefillConvStateBuffer.contents(), 0, prefillConvStateBuffer.length)
             }
@@ -181,7 +184,7 @@ struct MetalBufferAllocator {
                     maximumSequenceLength: context.maximumSequenceLength
                 ),
                 qjlDimension: kvCachePolicy.qjlDimension,
-                resourceOptions: gpuOptions
+                resourceOptions: gpuOnlyOptions
             )
         } else {
             prefillKVCache = nil
@@ -196,7 +199,7 @@ struct MetalBufferAllocator {
         } else if recurrentStateRequirements.layerCount > 0 {
             prefillRecurrentStateBuffer = context.device.makeBuffer(
                 length: recurrentStateRequirements.layerCount * recurrentStateRequirements.bytesPerLayer,
-                options: gpuOptions
+                options: cpuGpuOptions
             )
             if let prefillRecurrentStateBuffer {
                 memset(prefillRecurrentStateBuffer.contents(), 0, prefillRecurrentStateBuffer.length)
@@ -209,9 +212,9 @@ struct MetalBufferAllocator {
 
         let bufferSet = PrefillBufferSet(
             bufferPrecision: .float32,
-            hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: gpuOptions)!,
-            residual: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: gpuOptions)!,
-            scratch: context.device.makeBuffer(length: maximumSequenceLength * scratchElementCount * f32ElementSize, options: gpuOptions)!,
+            hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: cpuGpuOptions)!,
+            residual: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: gpuOnlyOptions)!,
+            scratch: context.device.makeBuffer(length: maximumSequenceLength * scratchElementCount * f32ElementSize, options: gpuOnlyOptions)!,
             weights: context.stafWeightStore.map { [$0.buffer] } ?? [],
             kvCache: prefillKVCache,
             convState: prefillConvStateBuffer,
@@ -228,7 +231,7 @@ struct MetalBufferAllocator {
                         * maximumSequenceLength
                         * perLayerInputRequirements.dimension
                         * MemoryLayout<Float>.size,
-                    options: gpuOptions
+                    options: cpuGpuOptions
                 )
                 if let buffer {
                     memset(buffer.contents(), 0, buffer.length)
@@ -237,7 +240,7 @@ struct MetalBufferAllocator {
             }(),
             perLayerInputDimension: perLayerInputRequirements.dimension,
             perLayerInputLayerCount: perLayerInputRequirements.layerCount,
-            logits: context.device.makeBuffer(length: resolvedVocabSize * f32ElementSize, options: gpuOptions)!,
+            logits: context.device.makeBuffer(length: resolvedVocabSize * f32ElementSize, options: gpuOnlyOptions)!,
             tokenIDs: context.device.makeBuffer(length: maximumSequenceLength * 4, options: [.storageModeShared])!,
             positions: context.device.makeBuffer(length: maximumSequenceLength * 4, options: [.storageModeShared])!,
             ropePositionAxes: context.device.makeBuffer(length: maximumSequenceLength * 3 * 4, options: [.storageModeShared])!,

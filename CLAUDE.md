@@ -276,14 +276,29 @@ GEMV kernel がブロックを直接読んで計算
 
 ### Buffer 管理
 
-用途別に分離。storage mode を最適化:
+Apple Silicon unified memory 前提。`private` バッファは GPU ロスレス圧縮が有効化される。
+
+#### Decode buffers
 
 | Buffer | Mode | 理由 |
 |---|---|---|
-| Weight (STAF) | `shared` + `bytesNoCopy` | mmap ゼロコピー。memcpy なし |
-| KV cache | `shared` | GPU write + read。unified memory で overhead なし |
+| Weight (STAF) | `shared` + `bytesNoCopy` | mmap ゼロコピー |
+| KV cache | `private` + `hazardTrackingModeUntracked` | GPU のみ |
 | hidden / scratch / residual / logits | `private` + `hazardTrackingModeUntracked` | GPU のみ |
 | tokenIn / tokenOut / position | `shared` | CPU read/write 必要 |
+
+#### Prefill buffers
+
+| Buffer | Mode | 理由 |
+|---|---|---|
+| hidden | `shared` | Vision model が CPU から hidden override を注入 |
+| scratch / residual / logits | `private` | GPU のみ |
+| KV cache (prefill-only) | `private` | GPU のみ |
+| tokenIDs / positions / tokenOut | `shared` | CPU read/write 必要 |
+
+#### F32→F16 hidden conversion
+
+Prefill (F32) → Decode (F16) の hidden 転送は `hidden_copy_from_float` GPU kernel で変換。CPU 側のループ変換は行わない（`didModifyRange` も不要 — Apple Silicon unified memory では shared バッファの CPU↔GPU 同期は暗黙的）。
 
 ### InferencePolicy — Deployment Intent
 

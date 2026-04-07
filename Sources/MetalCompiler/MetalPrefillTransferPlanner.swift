@@ -10,17 +10,17 @@ struct MetalPrefillTransferPlanner: Sendable {
         let decodeHiddenSize = decodePlan.buffers.hidden.length / decodeElementSize
         let prefillHiddenStride = decodeHiddenSize * MemoryLayout<Float32>.size
         let hiddenSourceOffset = (sequenceLength - 1) * prefillHiddenStride
-        let requiresCPUHiddenConversion =
-            decodePlan.buffers.hidden.storageMode == .private &&
-            decodePlan.buffers.bufferPrecision != .float32
-        let usesSharedDecodeHidden = decodePlan.buffers.hidden.storageMode != .private
 
-        let hiddenCopySize: Int
-        if hiddenSourceOffset + prefillHiddenStride <= prefillPlan.buffers.hidden.length,
-           decodePlan.buffers.hidden.storageMode == .private {
-            hiddenCopySize = decodeHiddenSize * decodeElementSize
+        // GPU-side F32→decode precision conversion element count.
+        // When decode precision is already F32, a blit copy suffices.
+        let hiddenConversionElementCount: Int
+        let hiddenBlitCopySize: Int
+        if decodePlan.buffers.bufferPrecision == .float32 {
+            hiddenConversionElementCount = 0
+            hiddenBlitCopySize = decodeHiddenSize * decodeElementSize
         } else {
-            hiddenCopySize = 0
+            hiddenConversionElementCount = decodeHiddenSize
+            hiddenBlitCopySize = 0
         }
 
         let kvCopySize: Int
@@ -61,66 +61,25 @@ struct MetalPrefillTransferPlanner: Sendable {
 
         return PostPrefillTransferPlan(
             hiddenSourceOffset: hiddenSourceOffset,
-            hiddenCopySize: hiddenCopySize,
+            hiddenConversionElementCount: hiddenConversionElementCount,
+            hiddenBlitCopySize: hiddenBlitCopySize,
             kvCopySize: kvCopySize,
             valueCopySize: valueCopySize,
             convCopySize: convCopySize,
-            recurrentCopySize: recurrentCopySize,
-            requiresCPUHiddenConversion: requiresCPUHiddenConversion,
-            usesSharedDecodeHidden: usesSharedDecodeHidden
+            recurrentCopySize: recurrentCopySize
         )
     }
 }
 
 struct PostPrefillTransferPlan: Sendable {
     let hiddenSourceOffset: Int
-    let hiddenCopySize: Int
+    /// Element count for GPU-side F32→F16/BF16 hidden conversion.
+    /// Zero when decode precision is F32 (blit copy used instead).
+    let hiddenConversionElementCount: Int
+    /// Byte count for F32→F32 hidden blit copy (only when decode is F32).
+    let hiddenBlitCopySize: Int
     let kvCopySize: Int
     let valueCopySize: Int
     let convCopySize: Int
     let recurrentCopySize: Int
-    let requiresCPUHiddenConversion: Bool
-    let usesSharedDecodeHidden: Bool
-
-    var needsBlit: Bool {
-        hiddenCopySize > 0 || kvCopySize > 0 || valueCopySize > 0 || convCopySize > 0 || recurrentCopySize > 0
-    }
-
-    var canEncodeInSameTransaction: Bool {
-        !requiresCPUHiddenConversion && needsBlit
-    }
-
-    var shouldStageHiddenOnCPU: Bool {
-        requiresCPUHiddenConversion && hiddenCopySize > 0
-    }
-
-    var needsStandaloneBlit: Bool {
-        needsBlit && !canEncodeInSameTransaction
-    }
-
-    func afterInlineBlit() -> Self {
-        Self(
-            hiddenSourceOffset: hiddenSourceOffset,
-            hiddenCopySize: 0,
-            kvCopySize: 0,
-            valueCopySize: 0,
-            convCopySize: 0,
-            recurrentCopySize: 0,
-            requiresCPUHiddenConversion: requiresCPUHiddenConversion,
-            usesSharedDecodeHidden: usesSharedDecodeHidden
-        )
-    }
-
-    func withoutHiddenCopy() -> Self {
-        Self(
-            hiddenSourceOffset: hiddenSourceOffset,
-            hiddenCopySize: 0,
-            kvCopySize: kvCopySize,
-            valueCopySize: valueCopySize,
-            convCopySize: convCopySize,
-            recurrentCopySize: recurrentCopySize,
-            requiresCPUHiddenConversion: false,
-            usesSharedDecodeHidden: false
-        )
-    }
 }

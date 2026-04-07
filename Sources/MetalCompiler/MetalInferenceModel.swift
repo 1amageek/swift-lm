@@ -11,7 +11,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
 
     private let submission: MetalSubmissionContext
     private let decodeExecutor = MetalDecodeExecutor()
-    private let prefillExecutor = MetalPrefillExecutor()
+    private let prefillExecutor: MetalPrefillExecutor
     private let promptStateStore = MetalPromptStateStore()
     private var pendingCommandBuffer: MTLCommandBuffer?
     private var hasPendingResult: Bool = false
@@ -41,6 +41,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         }
         self.commandQueue = queue
         self.submission = MetalSubmissionContext(commandQueue: queue)
+        self.prefillExecutor = MetalPrefillExecutor()
         try Self.zeroStateBuffers(plan.buffers, submission: submission)
     }
 
@@ -51,6 +52,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
         }
         self.commandQueue = queue
         self.submission = MetalSubmissionContext(commandQueue: queue)
+        self.prefillExecutor = MetalPrefillExecutor(
+            hiddenConversionPipeline: Self.resolveHiddenConversionPipeline(compiledModel)
+        )
         try Self.zeroStateBuffers(compiledModel.decodePlan.buffers, submission: submission)
     }
 
@@ -498,6 +502,19 @@ public struct MetalInferenceModel: @unchecked Sendable {
 
         position += 1
         return buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
+    }
+
+    private static func resolveHiddenConversionPipeline(
+        _ compiledModel: MetalCompiledModel
+    ) -> MTLComputePipelineState? {
+        let base = "hidden_copy_from_float"
+        let name: String
+        switch compiledModel.decodePlan.buffers.bufferPrecision {
+        case .float16: name = base
+        case .bfloat16: name = base + "_bf16"
+        case .float32: return nil  // F32→F32 uses blit copy, no conversion needed
+        }
+        return compiledModel.auxiliaryPipelines[name]
     }
 
     private func helperKernelName(base: String) -> String {

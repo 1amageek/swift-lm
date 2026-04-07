@@ -3,6 +3,13 @@ import Metal
 struct MetalPrefillExecutor: Sendable {
     private let transferPlanner = MetalPrefillTransferPlanner()
 
+    /// Pipeline for GPU-side F32→F16/BF16 hidden conversion (replaces CPU staging).
+    let hiddenConversionPipeline: MTLComputePipelineState?
+
+    init(hiddenConversionPipeline: MTLComputePipelineState? = nil) {
+        self.hiddenConversionPipeline = hiddenConversionPipeline
+    }
+
     func prefill(
         prefillPlan: MetalPrefillPlan,
         decodePlan: MetalDispatchPlan,
@@ -21,79 +28,40 @@ struct MetalPrefillExecutor: Sendable {
             ropePositionAxesByTokenIndex: nil
         )
 
-        var transferPlan = transferPlanner.makeTransferPlan(
+        let transferPlan = transferPlanner.makeTransferPlan(
             prefillPlan: prefillPlan,
             decodePlan: decodePlan,
             sequenceLength: sequenceLength
         )
 
         do {
-            if transferPlan.canEncodeInSameTransaction {
-                _ = try submission.withTransaction(label: "prefill+postprocess") { transaction in
-                    try transaction.withComputeEncoder { compute in
-                        encodePrefillSteps(
-                            encoder: compute,
-                            prefillPlan: prefillPlan,
-                            basePosition: position,
-                            sequenceLength: sequenceLength
-                        )
-                    }
-                    try transaction.withBlitEncoder { blit in
-                        encodePostPrefillCopies(
-                            blit: blit,
-                            prefillPlan: prefillPlan,
-                            decodePlan: decodePlan,
-                            transferPlan: transferPlan
-                        )
-                    }
-                }
-                transferPlan = transferPlan.afterInlineBlit()
-            } else {
-                _ = try submission.withCompute(label: "prefill") { encoder in
+            _ = try submission.withTransaction(label: "prefill+postprocess") { transaction in
+                try transaction.withComputeEncoder { compute in
                     encodePrefillSteps(
-                        encoder: encoder,
+                        encoder: compute,
                         prefillPlan: prefillPlan,
                         basePosition: position,
                         sequenceLength: sequenceLength
+                    )
+                    encodeHiddenConversion(
+                        encoder: compute,
+                        transferPlan: transferPlan,
+                        prefillPlan: prefillPlan,
+                        decodePlan: decodePlan
+                    )
+                }
+                try transaction.withBlitEncoder { blit in
+                    encodePostPrefillCopies(
+                        blit: blit,
+                        prefillPlan: prefillPlan,
+                        decodePlan: decodePlan,
+                        transferPlan: transferPlan
                     )
                 }
             }
         } catch {
             print("[MetalInference] PREFILL FAILED: \(error)")
             return -1
-        }
-
-        stageHiddenIfNeeded(
-            transferPlan: transferPlan,
-            prefillPlan: prefillPlan,
-            decodePlan: decodePlan
-        )
-
-        if transferPlan.needsStandaloneBlit {
-            do {
-                try submission.withBlit(label: "prefill.postprocess") { blit in
-                    if transferPlan.shouldStageHiddenOnCPU {
-                        blit.copy(
-                            from: prefillPlan.buffers.scratch,
-                            sourceOffset: 0,
-                            to: decodePlan.buffers.hidden,
-                            destinationOffset: 0,
-                            size: transferPlan.hiddenCopySize
-                        )
-                    }
-                    encodePostPrefillCopies(
-                        blit: blit,
-                        prefillPlan: prefillPlan,
-                        decodePlan: decodePlan,
-                        transferPlan: transferPlan.shouldStageHiddenOnCPU
-                            ? transferPlan.withoutHiddenCopy()
-                            : transferPlan
-                    )
-                }
-            } catch {
-                print("[MetalInference] Failed to copy post-prefill state: \(error)")
-                return -1
-            }
         }
 
         position += sequenceLength
@@ -189,96 +157,27 @@ struct MetalPrefillExecutor: Sendable {
             sequenceLength: sequenceLength
         )
 
-        stageHiddenIfNeeded(
-            transferPlan: transferPlan,
-            prefillPlan: prefillPlan,
-            decodePlan: decodePlan
-        )
-
-        if transferPlan.needsStandaloneBlit {
-            try submission.withBlit(label: "prefill.postprocess") { blit in
-                if transferPlan.shouldStageHiddenOnCPU {
-                    blit.copy(
-                        from: prefillPlan.buffers.scratch,
-                        sourceOffset: 0,
-                        to: decodePlan.buffers.hidden,
-                        destinationOffset: 0,
-                        size: transferPlan.hiddenCopySize
-                    )
-                }
+        _ = try submission.withTransaction(label: "prefill.postprocess") { transaction in
+            try transaction.withComputeEncoder { compute in
+                encodeHiddenConversion(
+                    encoder: compute,
+                    transferPlan: transferPlan,
+                    prefillPlan: prefillPlan,
+                    decodePlan: decodePlan
+                )
+            }
+            try transaction.withBlitEncoder { blit in
                 encodePostPrefillCopies(
                     blit: blit,
                     prefillPlan: prefillPlan,
                     decodePlan: decodePlan,
-                    transferPlan: transferPlan.shouldStageHiddenOnCPU
-                        ? transferPlan.withoutHiddenCopy()
-                        : transferPlan
+                    transferPlan: transferPlan
                 )
             }
         }
 
         position += sequenceLength
         return prefillPlan.buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
-    }
-
-    private func stageHiddenIfNeeded(
-        transferPlan: PostPrefillTransferPlan,
-        prefillPlan: MetalPrefillPlan,
-        decodePlan: MetalDispatchPlan
-    ) {
-        guard transferPlan.shouldStageHiddenOnCPU || transferPlan.usesSharedDecodeHidden else {
-            return
-        }
-
-        let decodeElementSize = decodePlan.buffers.bufferPrecision.byteSize
-        let decodeHiddenSize = decodePlan.buffers.hidden.length / decodeElementSize
-        let source = (prefillPlan.buffers.hidden.contents() + transferPlan.hiddenSourceOffset)
-            .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
-
-        if transferPlan.shouldStageHiddenOnCPU {
-            switch decodePlan.buffers.bufferPrecision {
-            case .float16:
-                let staging = prefillPlan.buffers.scratch.contents()
-                    .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
-                for index in 0..<decodeHiddenSize {
-                    staging[index] = Float16(source[index])
-                }
-            case .bfloat16:
-                let staging = prefillPlan.buffers.scratch.contents()
-                    .bindMemory(to: BFloat16.self, capacity: decodeHiddenSize)
-                for index in 0..<decodeHiddenSize {
-                    staging[index] = BFloat16(source[index])
-                }
-            case .float32:
-                let staging = prefillPlan.buffers.scratch.contents()
-                    .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
-                for index in 0..<decodeHiddenSize {
-                    staging[index] = source[index]
-                }
-            }
-            return
-        }
-
-        switch decodePlan.buffers.bufferPrecision {
-        case .float16:
-            let destination = decodePlan.buffers.hidden.contents()
-                .bindMemory(to: Float16.self, capacity: decodeHiddenSize)
-            for index in 0..<decodeHiddenSize {
-                destination[index] = Float16(source[index])
-            }
-        case .bfloat16:
-            let destination = decodePlan.buffers.hidden.contents()
-                .bindMemory(to: BFloat16.self, capacity: decodeHiddenSize)
-            for index in 0..<decodeHiddenSize {
-                destination[index] = BFloat16(source[index])
-            }
-        case .float32:
-            let destination = decodePlan.buffers.hidden.contents()
-                .bindMemory(to: Float32.self, capacity: decodeHiddenSize)
-            for index in 0..<decodeHiddenSize {
-                destination[index] = source[index]
-            }
-        }
     }
 
     private func encodePrefillSteps(
@@ -417,19 +316,46 @@ struct MetalPrefillExecutor: Sendable {
         step.descriptor.encode(on: encoder, gridSize: gridSize)
     }
 
+    /// Encode GPU-side F32→F16/BF16 hidden conversion from prefill to decode buffer.
+    /// Replaces the former CPU staging path (stageHiddenIfNeeded).
+    private func encodeHiddenConversion(
+        encoder: MTLComputeCommandEncoder,
+        transferPlan: PostPrefillTransferPlan,
+        prefillPlan: MetalPrefillPlan,
+        decodePlan: MetalDispatchPlan
+    ) {
+        guard transferPlan.hiddenConversionElementCount > 0,
+              let pipeline = hiddenConversionPipeline else { return }
+
+        let count = transferPlan.hiddenConversionElementCount
+        encoder.memoryBarrier(scope: .buffers)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(decodePlan.buffers.hidden, offset: 0, index: 0)
+        encoder.setBuffer(prefillPlan.buffers.hidden, offset: transferPlan.hiddenSourceOffset, index: 1)
+        var countValue = UInt32(count)
+        withUnsafeBytes(of: &countValue) { bytes in
+            encoder.setBytes(bytes.baseAddress!, length: bytes.count, index: 2)
+        }
+        let threadCount = min(max(1, count), pipeline.maxTotalThreadsPerThreadgroup)
+        let gridSize = MTLSize(width: (count + threadCount - 1) / threadCount, height: 1, depth: 1)
+        let threadgroupSize = MTLSize(width: threadCount, height: 1, depth: 1)
+        encoder.dispatchThreadgroups(gridSize, threadsPerThreadgroup: threadgroupSize)
+    }
+
     private func encodePostPrefillCopies(
         blit: MTLBlitCommandEncoder,
         prefillPlan: MetalPrefillPlan,
         decodePlan: MetalDispatchPlan,
         transferPlan: PostPrefillTransferPlan
     ) {
-        if transferPlan.hiddenCopySize > 0 {
+        // F32→F32 hidden copy (when decode precision is F32, no conversion needed)
+        if transferPlan.hiddenBlitCopySize > 0 {
             blit.copy(
                 from: prefillPlan.buffers.hidden,
                 sourceOffset: transferPlan.hiddenSourceOffset,
                 to: decodePlan.buffers.hidden,
                 destinationOffset: 0,
-                size: transferPlan.hiddenCopySize
+                size: transferPlan.hiddenBlitCopySize
             )
         }
         if transferPlan.kvCopySize > 0,

@@ -157,8 +157,6 @@ struct MetalDispatchStepBuilder {
             for binding in table.bindings {
                 argumentEncoder.setBuffer(binding.buffer, offset: binding.offset, index: binding.index)
             }
-            encodedArgumentBuffer.didModifyRange(0..<argumentEncoder.encodedLength)
-
             let encodedBindings = MetalBindingTable(
                 bufferBindings: .argumentTable(MetalArgumentTableBindings(
                     layout: table.layout,
