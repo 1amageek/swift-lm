@@ -70,6 +70,10 @@ public struct ParameterResolver: Sendable {
         // Count residual blocks in root scope and divide by 2 to get layer index.
         var residualCount = 0
 
+        // Track norm position within the current scope for sandwich norm disambiguation.
+        // Resets per-region so each Residual body starts from normIndex 0.
+        var normCounter = 0
+
         for operation in region.operations {
             var effectiveScope = scope
             // In root scope, assign layer index from residual block count.
@@ -83,9 +87,16 @@ public struct ParameterResolver: Sendable {
                 operation,
                 convention: convention,
                 scope: effectiveScope,
-                residualIndex: &currentResidualIndex
+                residualIndex: &currentResidualIndex,
+                normIndex: normCounter
             )
             operations.append(resolved)
+
+            // Increment norm counter for each norm primitive encountered in this region.
+            if case .primitive(let attrs) = operation.kind,
+               attrs is RMSNormAttributes || attrs is LayerNormAttributes {
+                normCounter += 1
+            }
         }
 
         return Region(
@@ -99,7 +110,8 @@ public struct ParameterResolver: Sendable {
         _ operation: Operation,
         convention: WeightNamingConvention,
         scope: NamingScope,
-        residualIndex: inout Int
+        residualIndex: inout Int,
+        normIndex: Int = 0
     ) -> Operation {
         switch operation.kind {
 
@@ -108,7 +120,8 @@ public struct ParameterResolver: Sendable {
                 attributes: attributes,
                 convention: convention,
                 scope: scope,
-                residualIndex: residualIndex
+                residualIndex: residualIndex,
+                normIndex: normIndex
             )
             return Operation(
                 key: operation.key,
@@ -184,7 +197,8 @@ public struct ParameterResolver: Sendable {
         attributes: any OperationAttributes,
         convention: WeightNamingConvention,
         scope: NamingScope,
-        residualIndex: Int
+        residualIndex: Int,
+        normIndex: Int = 0
     ) -> [ParameterBinding] {
         switch convention {
         case .llamaFamily:
@@ -195,7 +209,7 @@ public struct ParameterResolver: Sendable {
                 attributes: attributes, scope: scope, residualIndex: residualIndex)
         case .gemma4Family:
             return buildGemma4FamilyBindings(
-                attributes: attributes, scope: scope, residualIndex: residualIndex)
+                attributes: attributes, scope: scope, residualIndex: residualIndex, normIndex: normIndex)
         case .lfm2Family:
             return buildLFM2FamilyBindings(
                 attributes: attributes, scope: scope, residualIndex: residualIndex)
@@ -388,7 +402,8 @@ public struct ParameterResolver: Sendable {
     private func buildGemma4FamilyBindings(
         attributes: any OperationAttributes,
         scope: NamingScope,
-        residualIndex: Int
+        residualIndex: Int,
+        normIndex: Int = 0
     ) -> [ParameterBinding] {
         if let _ = attributes as? TokenEmbeddingAttributes {
             return [ParameterBinding(role: "embedding_table", tensorName: "model.language_model.embed_tokens.weight")]
@@ -412,11 +427,15 @@ public struct ParameterResolver: Sendable {
 
         if attributes is RMSNormAttributes || attributes is LayerNormAttributes {
             let normName: String
-            switch residualIndex {
-            case 0:
+            switch (residualIndex, normIndex) {
+            case (0, 0):
                 normName = "input_layernorm"
-            case 1:
+            case (0, 1):
+                normName = "post_attention_layernorm"
+            case (1, 0):
                 normName = "pre_feedforward_layernorm"
+            case (1, 1):
+                normName = "post_feedforward_layernorm"
             default:
                 return []
             }

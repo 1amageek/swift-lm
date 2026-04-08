@@ -71,7 +71,11 @@ public struct Gemma4: ModelComponent {
 
     @ModelComponentBuilder
     public var body: some ModelComponent {
-        TokenEmbedding(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
+        TokenEmbedding(
+            vocabSize: config.vocabSize,
+            embeddingSize: config.hiddenSize,
+            embeddingScale: Float(config.hiddenSize).squareRoot()
+        )
 
         // Gemma4 layers are normalized as repeating(count: 1) blocks so
         // ParameterResolver and MetalCompiler can substitute the concrete

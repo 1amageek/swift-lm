@@ -12,17 +12,20 @@ public struct TokenEmbedding: ModelComponent {
     public let vocabSize: Int
     public let embeddingSize: Int
     public let dtypeHint: DTypeHint?
+    public let embeddingScale: Float?
 
     public init(
         vocabSize: Int,
         embeddingSize: Int,
-        dtypeHint: DTypeHint? = nil
+        dtypeHint: DTypeHint? = nil,
+        embeddingScale: Float? = nil
     ) {
         precondition(vocabSize > 0, "vocabSize must be positive")
         precondition(embeddingSize > 0, "embeddingSize must be positive")
         self.vocabSize = vocabSize
         self.embeddingSize = embeddingSize
         self.dtypeHint = dtypeHint
+        self.embeddingScale = embeddingScale
     }
 }
 
@@ -32,7 +35,8 @@ extension TokenEmbedding: PrimitiveComponent {
         .primitive(TokenEmbeddingAttributes(
             vocabSize: vocabSize,
             embeddingSize: embeddingSize,
-            dtypeHint: dtypeHint
+            dtypeHint: dtypeHint,
+            embeddingScale: embeddingScale
         ))
     }
 

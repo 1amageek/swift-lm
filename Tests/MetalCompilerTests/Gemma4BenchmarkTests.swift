@@ -317,4 +317,73 @@ struct Gemma4BenchmarkTests {
         print("\n  Single CB GPU time (median of \(singleBufIterations)): \(String(format: "%.2f", medianGpu)) ms")
         print("  vs profiled per-step sum: 2.87 ms")
     }
+
+    @Test("Prefill produces non-zero token")
+    func prefillPipelineDiagnostics() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let (model, _, _) = try BenchmarkSupport.setupFromBundle(
+            bundlePath: Self.bundlePath
+        )
+        var m = model
+
+        guard let prefillPlan = m.prefillPlan else {
+            Issue.record("No prefill plan")
+            return
+        }
+
+        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
+        let hiddenSize = 1536
+        let seqLen = promptTokens.count
+
+        // Step-by-step NaN regression check
+        guard let device = MTLCreateSystemDefaultDevice(),
+              let queue = device.makeCommandQueue() else { return }
+
+        let tokenIDs = prefillPlan.buffers.tokenIDs
+        let positions = prefillPlan.buffers.positions
+        let tokenPtr = tokenIDs.contents().bindMemory(to: Int32.self, capacity: seqLen)
+        let posPtr = positions.contents().bindMemory(to: Int32.self, capacity: seqLen)
+        for i in 0..<seqLen {
+            tokenPtr[i] = promptTokens[i]
+            posPtr[i] = Int32(i)
+        }
+
+        let hiddenBuf = prefillPlan.buffers.hidden
+        let prefillSteps = prefillPlan.steps
+        for stepIdx in 0..<prefillSteps.count {
+            let step = prefillSteps[stepIdx]
+
+            guard let cb = queue.makeCommandBuffer(),
+                  let enc = cb.makeComputeCommandEncoder() else { return }
+            enc.memoryBarrier(scope: .buffers)
+            step.bindings.bind(to: enc)
+            step.bindRuntimeArguments(encoder: enc, sequenceLength: UInt32(seqLen))
+            let gridSize = step.resolvedGridSize(sequenceLength: seqLen)
+            enc.setComputePipelineState(step.pipeline)
+            if step.threadgroupMemoryLength > 0 {
+                enc.setThreadgroupMemoryLength(step.threadgroupMemoryLength, index: 0)
+            }
+            enc.dispatchThreadgroups(gridSize, threadsPerThreadgroup: step.threadgroupSize)
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+
+            let hPtr = hiddenBuf.contents().bindMemory(to: Float.self, capacity: hiddenSize * seqLen)
+            var hasNaN = false
+            for i in 0..<(hiddenSize * seqLen) {
+                if hPtr[i].isNaN { hasNaN = true; break }
+            }
+            if hasNaN {
+                let label = step.pipeline.label ?? "?"
+                Issue.record("NaN in hidden at step \(stepIdx) [\(label)]")
+                return
+            }
+        }
+
+        let tok = m.prefill(tokens: promptTokens)
+        #expect(tok != 0, "Prefill should produce a non-zero token")
+    }
 }

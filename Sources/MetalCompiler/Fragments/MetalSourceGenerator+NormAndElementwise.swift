@@ -195,7 +195,7 @@ extension MetalSourceGenerator {
         case .silu:
             "g * (1.0f / (1.0f + exp(-g)))"
         case .geluTanh:
-            "0.5f * g * (1.0f + tanh(0.7978845608f * (g + 0.044715f * g * g * g)))"
+            "0.5f * g * (1.0f + precise::tanh(0.7978845608f * (g + 0.044715f * g * g * g)))"
         }
 
         if isSequence {
@@ -245,7 +245,7 @@ extension MetalSourceGenerator {
         let bt = bufferPrecision.metalType
         let activated = switch activation {
         case .custom(let kind) where kind == "gelu_pytorch_tanh" || kind == "gelu_new" || kind == "gelu_fast":
-            "0.5f * gateValue * (1.0f + tanh(0.7978845608f * (gateValue + 0.044715f * gateValue * gateValue * gateValue)))"
+            "0.5f * gateValue * (1.0f + precise::tanh(0.7978845608f * (gateValue + 0.044715f * gateValue * gateValue * gateValue)))"
         case .gelu:
             "0.5f * gateValue * (1.0f + erf(gateValue * 0.70710678118f))"
         default:
