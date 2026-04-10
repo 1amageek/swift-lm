@@ -48,6 +48,77 @@ struct ReleaseSmokeTests {
         #expect(!chunks.joined().isEmpty)
     }
 
+    @Test("Local LFM bundle answers the capital-of-Japan prompt", .timeLimit(.minutes(2)))
+    func localBundleCapitalOfJapanOutput() async throws {
+        guard let localModelDirectory = readableLocalModelDirectoryOrSkip() else { return }
+
+        let loader = ModelBundleLoader()
+        let container = try await loader.load(directory: localModelDirectory)
+        let prepared = try await container.prepare(
+            input: ModelInput(prompt: "What is the capital of Japan? Answer briefly.")
+        )
+        let executable = try container.makeExecutablePrompt(from: prepared)
+        let promptState = try container.makePromptState(prompt: executable)
+
+        var chunks: [String] = []
+        var completion: CompletionInfo?
+        for await generation in try container.generate(
+            from: promptState,
+            parameters: GenerateParameters(
+                maxTokens: 64,
+                streamChunkTokenCount: 1,
+                temperature: 0
+            )
+        ) {
+            if let chunk = generation.chunk {
+                chunks.append(chunk)
+            }
+            if let info = generation.info {
+                completion = info
+            }
+        }
+
+        let output = chunks.joined()
+        print("[LFM real text output] \(output)")
+        if let completion {
+            print("[LFM] tokens=\(completion.tokenCount) speed=\(String(format: "%.1f", completion.tokensPerSecond)) tok/s")
+        }
+
+        #expect(output.localizedCaseInsensitiveContains("tokyo"))
+    }
+
+    @Test("Local LFM chat prompt eventually mentions Tokyo", .timeLimit(.minutes(2)))
+    func localBundleCapitalOfJapanChatOutput() async throws {
+        guard let localModelDirectory = readableLocalModelDirectoryOrSkip() else { return }
+
+        let loader = ModelBundleLoader()
+        let container = try await loader.load(directory: localModelDirectory)
+        let prepared = try await container.prepare(
+            input: ModelInput(chat: [
+                .user([.text("What is the capital of Japan? Answer briefly.")])
+            ])
+        )
+        let executable = try container.makeExecutablePrompt(from: prepared)
+
+        var chunks: [String] = []
+        for await generation in try container.generate(
+            prompt: executable,
+            parameters: GenerateParameters(
+                maxTokens: 64,
+                streamChunkTokenCount: 1,
+                temperature: 0
+            )
+        ) {
+            if let chunk = generation.chunk {
+                chunks.append(chunk)
+            }
+        }
+
+        let output = chunks.joined()
+        print("[LFM chat text output] \(output)")
+        #expect(output.localizedCaseInsensitiveContains("tokyo"))
+    }
+
     @Test("Text-only bundle rejects multimodal input", .timeLimit(.minutes(2)))
     func textOnlyBundleRejectsMultimodalInput() async throws {
         guard let localModelDirectory = readableLocalModelDirectoryOrSkip() else { return }

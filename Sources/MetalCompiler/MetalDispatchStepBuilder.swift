@@ -536,7 +536,10 @@ struct DecodeRoutingPlanner {
 
             routingState.lastOutputIsHidden = false
             routingState.currentInputOffset = slotDimension * elementSize
-            routingState.projectionIndex = 0
+            // The fused gate/up projection writes its activated output into scratch slot 1.
+            // The following down projection must not write back into the same slot, or decode
+            // turns into an unsafe in-place GEMV with inter-threadgroup read/write aliasing.
+            routingState.projectionIndex = 1
             let bytes: [(index: Int, value: [UInt8])]
             switch family {
             case .generic:

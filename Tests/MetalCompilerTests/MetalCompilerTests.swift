@@ -133,6 +133,49 @@ struct DispatchPlanCompilationTests {
         )
         #expect(decodeUInt32(outputDimensionBinding) == 6144)
     }
+
+    @Test
+    func fusedSwiGLUDecodeRoutingKeepsFollowingProjectionOutOfPlace() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let graph = try SpecializedSwiGLUTestModel(
+            hiddenSize: 2048,
+            intermediateSize: 6144,
+            vocabSize: 128
+        ).makeModelGraph()
+        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let plan = try compiler.compile(
+            graph: graph,
+            hiddenSize: 2048,
+            intermediateSize: 6144,
+            vocabSize: 128,
+            device: device
+        )
+
+        let fusedIndex = try #require(plan.steps.firstIndex { step in
+            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
+            return name.hasPrefix("fused_swiglu_projection_2048")
+        })
+        let fusedStep = plan.steps[fusedIndex]
+        let fusedOutput = try #require(fusedStep.bindings.buffers.first(where: { $0.index == 3 }))
+
+        let nextStepIndex = fusedIndex + 1
+        #expect(nextStepIndex < plan.steps.count)
+        let downProjection = plan.steps[nextStepIndex]
+        let nextKernelName = downProjection.metadata.kernelName ?? downProjection.pipeline.label ?? ""
+        #expect(
+            nextKernelName.hasPrefix("gemv"),
+            "Expected the step after fused SwiGLU to be the following projection, got \(nextKernelName)"
+        )
+        let downInput = try #require(downProjection.bindings.buffers.first(where: { $0.index == 0 }))
+        let downOutput = try #require(downProjection.bindings.buffers.first(where: { $0.index == 2 }))
+
+        #expect(downInput.buffer === fusedOutput.buffer)
+        #expect(downInput.offset == fusedOutput.offset)
+        #expect(
+            !(downOutput.buffer === downInput.buffer && downOutput.offset == downInput.offset),
+            "Decode down projection must not alias fused SwiGLU output in place"
+        )
+    }
 }
 
 @Suite
