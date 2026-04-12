@@ -9,7 +9,7 @@ let metalProbeSwiftSettings: [SwiftSetting] = enableMetalProbes
 
 let package = Package(
     name: "swift-lm",
-    platforms: [.macOS(.v26), .iOS(.v26), .visionOS(.v26)],
+    platforms: [.macOS("26.1"), .iOS("26.1"), .visionOS("26.1")],
     products: [
         .library(name: "LMIR", targets: ["LMIR"]),
         .library(name: "LMArchitecture", targets: ["LMArchitecture"]),
