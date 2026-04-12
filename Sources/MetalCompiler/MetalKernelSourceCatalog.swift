@@ -92,7 +92,11 @@ struct MetalKernelSourceCatalog {
                        ) {
                         sources.append(source)
                     }
-                    continue
+                    // Q4+float32: also generate dequant + BF16 MPP GEMM below.
+                    // Other quantized formats: skip the rest (decode GEMV only).
+                    if !(bufferPrecision == .float32 && weightFormat.isQuantized) {
+                        continue
+                    }
                 }
 
                 // For Q4 prefill: generate dequant kernel and treat as BF16 for MPP GEMM.
@@ -847,10 +851,6 @@ struct MetalKernelSourceCatalog {
         bufferPrecision: BufferPrecision
     ) -> String? {
         switch (weightFormat, bufferPrecision) {
-        case (.quantized4Bit, .float32):
-            // Prefill: Q4 projections use dequant→AMX path.
-            // Return nil so the catalog falls through to generate BF16 MPP GEMM.
-            return nil
         case (.quantized4Bit(let groupSize), _):
             switch groupSize {
             case 64:

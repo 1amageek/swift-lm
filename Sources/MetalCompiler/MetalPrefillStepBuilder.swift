@@ -467,7 +467,12 @@ private struct PrefillStepPlanner {
                 // Resolve GEMM pipeline
                 let selectedPipeline: MTLComputePipelineState
                 let selectedKernelName: String
-                if !usesMPPForStep,
+                if canDequantForAMX && usesMPPForStep,
+                   let mppPipeline = planBuildContext.pipelineCache["gemm_bf16_f32s"] {
+                    // Dequant path: Q4 unpacked to BF16, use BF16 MPP GEMM
+                    selectedPipeline = mppPipeline
+                    selectedKernelName = "gemm_bf16_f32s"
+                } else if !usesMPPForStep,
                    let naivePipeline = planBuildContext.pipelineCache["naive::\(resolved.name)"] {
                     selectedPipeline = naivePipeline
                     selectedKernelName = "naive::\(resolved.name)"
@@ -804,7 +809,12 @@ private struct PrefillStepPlanner {
             // Resolve GEMM pipeline
             let selectedPipeline: MTLComputePipelineState
             let selectedKernelName: String
-            if !usesMPPForStep,
+            if canDequantForAMX && usesMPPForStep,
+               let mppPipeline = planBuildContext.pipelineCache["gemm_bf16_f32s"] {
+                // Dequant path: Q4 unpacked to BF16, use BF16 MPP GEMM
+                selectedPipeline = mppPipeline
+                selectedKernelName = "gemm_bf16_f32s"
+            } else if !usesMPPForStep,
                let naivePipeline = planBuildContext.pipelineCache["naive::\(resolved.name)"] {
                 selectedPipeline = naivePipeline
                 selectedKernelName = "naive::\(resolved.name)"
