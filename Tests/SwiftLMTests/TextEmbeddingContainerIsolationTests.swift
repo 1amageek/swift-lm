@@ -92,6 +92,7 @@ struct TextEmbeddingContainerIsolationTests {
             positions: try requiredSharedBuffer(device, length: 16),
             ropePositionAxes: try requiredSharedBuffer(device, length: 48),
             tokenOut: try requiredSharedBuffer(device, length: 4),
+            dequantScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )
     }

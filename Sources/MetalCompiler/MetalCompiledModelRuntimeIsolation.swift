@@ -148,6 +148,11 @@ private struct MetalCompiledModelRuntimeCloner {
         } else {
             nil
         }
+        let dequantScratch: MTLBuffer? = if let dequantScratch = buffers.dequantScratch {
+            try clonedRuntimeBuffer(dequantScratch)
+        } else {
+            nil
+        }
         return PrefillBufferSet(
             bufferPrecision: buffers.bufferPrecision,
             hidden: try clonedRuntimeBuffer(buffers.hidden),
@@ -168,6 +173,7 @@ private struct MetalCompiledModelRuntimeCloner {
             positions: try clonedRuntimeBuffer(buffers.positions),
             ropePositionAxes: try clonedRuntimeBuffer(buffers.ropePositionAxes),
             tokenOut: try clonedRuntimeBuffer(buffers.tokenOut),
+            dequantScratch: dequantScratch,
             runtimeConstantBuffer: try clonedRuntimeBuffer(buffers.runtimeConstantBuffer)
         )
     }

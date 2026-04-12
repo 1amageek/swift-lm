@@ -218,6 +218,22 @@ struct MetalBufferAllocator {
             resolvedRecurrentBytesPerLayer = 0
         }
 
+        let dequantScratchBuffer: MTLBuffer?
+        if hasQuantizedProjectionWeights(in: sizingEntries, stafWeightStore: context.stafWeightStore) {
+            let maxWeightElements = maximumProjectionWeightElementCount(in: sizingEntries)
+            if maxWeightElements > 0 {
+                let bf16Size = MemoryLayout<UInt16>.stride
+                dequantScratchBuffer = context.device.makeBuffer(
+                    length: maxWeightElements * bf16Size,
+                    options: gpuOnlyOptions
+                )
+            } else {
+                dequantScratchBuffer = nil
+            }
+        } else {
+            dequantScratchBuffer = nil
+        }
+
         let bufferSet = PrefillBufferSet(
             bufferPrecision: .float32,
             hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: cpuGpuOptions)!,
@@ -253,6 +269,7 @@ struct MetalBufferAllocator {
             positions: context.device.makeBuffer(length: maximumSequenceLength * 4, options: [.storageModeShared])!,
             ropePositionAxes: context.device.makeBuffer(length: maximumSequenceLength * 3 * 4, options: [.storageModeShared])!,
             tokenOut: context.device.makeBuffer(length: 4, options: [.storageModeShared])!,
+            dequantScratch: dequantScratchBuffer,
             runtimeConstantBuffer: context.device.makeBuffer(
                 length: PrefillBufferSet.runtimeConstantBufferSize(maximumSequenceLength: maximumSequenceLength),
                 options: [.storageModeShared]
@@ -285,6 +302,64 @@ struct MetalBufferAllocator {
             return batched.projections.map(\.outputDimension).max() ?? 0
         case .fusedSwiGLUProjection(let fused):
             return fused.outputDimension
+        case .fragment,
+             .batchedFragment,
+             .fusedCopyNorm,
+             .fusedResidualAddCopyNorm,
+             .fusedResidualAddNorm,
+             .structuralCopy,
+             .structuralAdd:
+            return 0
+        }
+    }
+
+    /// Check if any projection weight in the dispatch entries uses quantized format.
+    /// Queries STAF weight store directly since `CompileContext.weightFormat` only reflects
+    /// the dense format (BF16/FP16), not quantized variants.
+    private func hasQuantizedProjectionWeights(
+        in entries: [DispatchEntry],
+        stafWeightStore: STAFWeightStore?
+    ) -> Bool {
+        guard let staf = stafWeightStore else { return false }
+        for entry in entries {
+            let roles: [String]
+            switch entry.kind {
+            case .projection(let p, _):
+                roles = [p.field]
+            case .batchedProjection(let b):
+                roles = b.projections.map(\.field)
+            case .fusedSwiGLUProjection(let f):
+                roles = [f.gateField, f.upField]
+            default:
+                continue
+            }
+            for role in roles {
+                if let binding = entry.parameterBindings.first(where: { $0.role == role }),
+                   let info = staf.tensor(for: binding.tensorName),
+                   info.format.schemeIdentifier.isWeightQuantized {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    /// Maximum weight element count (outputDim × inputDim) across all projections.
+    /// Used to size the dequant scratch buffer for Q4→BF16 unpacking.
+    private func maximumProjectionWeightElementCount(in entries: [DispatchEntry]) -> Int {
+        entries.reduce(into: 0) { maxElements, entry in
+            maxElements = max(maxElements, maximumProjectionWeightElementCount(in: entry.kind))
+        }
+    }
+
+    private func maximumProjectionWeightElementCount(in kind: DispatchKind) -> Int {
+        switch kind {
+        case .projection(let projection, _):
+            return projection.inputDimension * projection.outputDimension
+        case .batchedProjection(let batched):
+            return batched.projections.map { $0.inputDimension * $0.outputDimension }.max() ?? 0
+        case .fusedSwiGLUProjection(let fused):
+            return fused.inputDimension * fused.outputDimension
         case .fragment,
              .batchedFragment,
              .fusedCopyNorm,

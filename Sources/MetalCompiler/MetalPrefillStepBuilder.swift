@@ -421,9 +421,50 @@ private struct PrefillStepPlanner {
                 let outputOffset = (routingState.projectionIndex + 1) * scratchSlotSize
                 lastOutputOffset = outputOffset
                 routingState.projectionIndex += 1
+
+                // Q4 with dequant scratch → dequant to BF16, then AMX matmul2d
+                let canDequantForAMX = quantizationDescriptor.schemeIdentifier.isWeightQuantized
+                    && buffers.dequantScratch != nil
+                    && dequantKernelName(for: quantizationDescriptor.schemeIdentifier) != nil
                 let usesMPPForStep = usesMPP
-                    && !quantizationDescriptor.schemeIdentifier.isWeightQuantized
                     && inputRowStride == projection.inputDimension
+                    && (!quantizationDescriptor.schemeIdentifier.isWeightQuantized || canDequantForAMX)
+
+                // Emit dequant step: Q4 weight → BF16 dequant scratch
+                if canDequantForAMX && usesMPPForStep,
+                   let dequantName = dequantKernelName(for: quantizationDescriptor.schemeIdentifier),
+                   let dequantPipeline = planBuildContext.pipelineCache[dequantName],
+                   let dequantScratch = buffers.dequantScratch {
+                    steps.append(
+                        MetalPrefillStep(
+                            pipeline: dequantPipeline,
+                            gridSize: MTLSize(width: projection.outputDimension, height: 1, depth: 1),
+                            threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                            bufferBindings: [
+                                (0, weightBuffer, weightOffset),
+                                (1, dequantScratch, 0),
+                            ],
+                            bytesBindings: [
+                                uint32Binding(2, UInt32(projection.inputDimension)),
+                                uint32Binding(3, UInt32(projection.outputDimension)),
+                            ],
+                            threadgroupMemoryLength: 0,
+                            sync: .bufferBarrier,
+                            mode: .batch,
+                            sequenceLengthPolicy: .none,
+                            positionBufferIndex: nil,
+                            perPositionStrides: [:],
+                            metadata: .init(
+                                kernelName: dequantName,
+                                entryIndex: entry.index,
+                                weightTensorName: weightTensorName,
+                                bufferAccessPattern: .init(reads: [0], writes: [1])
+                            )
+                        )
+                    )
+                }
+
+                // Resolve GEMM pipeline
                 let selectedPipeline: MTLComputePipelineState
                 let selectedKernelName: String
                 if !usesMPPForStep,
@@ -433,6 +474,17 @@ private struct PrefillStepPlanner {
                 } else {
                     selectedPipeline = resolved.pipeline
                     selectedKernelName = resolved.name
+                }
+
+                // GEMM weight source: dequant scratch (BF16) or original weight buffer
+                let gemmWeightBuffer: MTLBuffer
+                let gemmWeightOffset: Int
+                if canDequantForAMX && usesMPPForStep, let dequantScratch = buffers.dequantScratch {
+                    gemmWeightBuffer = dequantScratch
+                    gemmWeightOffset = 0
+                } else {
+                    gemmWeightBuffer = weightBuffer
+                    gemmWeightOffset = weightOffset
                 }
 
                 let gridSize: MTLSize
@@ -477,7 +529,7 @@ private struct PrefillStepPlanner {
                         threadgroupSize: threadgroupSize,
                         bufferBindings: [
                             (0, inputBuffer, inputOffset),
-                            (1, weightBuffer, weightOffset),
+                            (1, gemmWeightBuffer, gemmWeightOffset),
                             (2, buffers.scratch, outputOffset),
                         ],
                         bytesBindings: [
@@ -705,10 +757,51 @@ private struct PrefillStepPlanner {
                     : projection.inputDimension * scratchElementSize
                 perPositionStrides[0] = inputRowStride
             }
+            // Q4 with dequant scratch → dequant to BF16, then AMX matmul2d
+            let canDequantForAMX = quantizationDescriptor.schemeIdentifier.isWeightQuantized
+                && buffers.dequantScratch != nil
+                && dequantKernelName(for: quantizationDescriptor.schemeIdentifier) != nil
             let usesMPPForStep = usesMPP
-                && !quantizationDescriptor.schemeIdentifier.isWeightQuantized
                 && mode == .batch
                 && inputRowStride == projection.inputDimension
+                && (!quantizationDescriptor.schemeIdentifier.isWeightQuantized || canDequantForAMX)
+
+            // Emit dequant step: Q4 weight → BF16 dequant scratch
+            var dequantSteps: [MetalPrefillStep] = []
+            if canDequantForAMX && usesMPPForStep,
+               let dequantName = dequantKernelName(for: quantizationDescriptor.schemeIdentifier),
+               let dequantPipeline = planBuildContext.pipelineCache[dequantName],
+               let dequantScratch = buffers.dequantScratch {
+                dequantSteps.append(
+                    MetalPrefillStep(
+                        pipeline: dequantPipeline,
+                        gridSize: MTLSize(width: projection.outputDimension, height: 1, depth: 1),
+                        threadgroupSize: MTLSize(width: 256, height: 1, depth: 1),
+                        bufferBindings: [
+                            (0, weightBuffer, weightOffset),
+                            (1, dequantScratch, 0),
+                        ],
+                        bytesBindings: [
+                            uint32Binding(2, UInt32(projection.inputDimension)),
+                            uint32Binding(3, UInt32(projection.outputDimension)),
+                        ],
+                        threadgroupMemoryLength: 0,
+                        sync: .bufferBarrier,
+                        mode: .batch,
+                        sequenceLengthPolicy: .none,
+                        positionBufferIndex: nil,
+                        perPositionStrides: [:],
+                        metadata: .init(
+                            kernelName: dequantName,
+                            entryIndex: entry.index,
+                            weightTensorName: weightTensorName,
+                            bufferAccessPattern: .init(reads: [0], writes: [1])
+                        )
+                    )
+                )
+            }
+
+            // Resolve GEMM pipeline
             let selectedPipeline: MTLComputePipelineState
             let selectedKernelName: String
             if !usesMPPForStep,
@@ -718,6 +811,17 @@ private struct PrefillStepPlanner {
             } else {
                 selectedPipeline = resolved.pipeline
                 selectedKernelName = resolved.name
+            }
+
+            // GEMM weight source: dequant scratch (BF16) or original weight buffer
+            let gemmWeightBuffer: MTLBuffer
+            let gemmWeightOffset: Int
+            if canDequantForAMX && usesMPPForStep, let dequantScratch = buffers.dequantScratch {
+                gemmWeightBuffer = dequantScratch
+                gemmWeightOffset = 0
+            } else {
+                gemmWeightBuffer = weightBuffer
+                gemmWeightOffset = weightOffset
             }
 
             let gridSize: MTLSize
@@ -766,13 +870,13 @@ private struct PrefillStepPlanner {
                 selectedKernelName: selectedKernelName,
                 usesMPPForStep: usesMPPForStep
             )
-            return [MetalPrefillStep(
+            return dequantSteps + [MetalPrefillStep(
                 pipeline: selectedPipeline,
                 gridSize: gridSize,
                 threadgroupSize: threadgroupSize,
                 bufferBindings: [
                     (0, inputBuffer, inputOffset),
-                    (1, weightBuffer, weightOffset),
+                    (1, gemmWeightBuffer, gemmWeightOffset),
                     (2, outputBuffer, outputOffset),
                 ],
                 bytesBindings: [
@@ -1199,4 +1303,16 @@ private struct ProjectionWeightDescriptor {
     let layout: STAFWeightLayout
     let usedFallback: Bool
     let fallbackReason: MetalQuantizationFallbackReason?
+}
+
+// MARK: - Q4 Dequant → AMX Helpers
+
+/// Dequant kernel name for the given quantization scheme.
+/// Returns nil for non-Q4 schemes.
+private func dequantKernelName(for scheme: QuantizationSchemeIdentifier) -> String? {
+    switch scheme {
+    case .q4Group64ScaleF16: return "dequant_q4_g64_bf16"
+    case .q4Group128ScaleF16: return "dequant_q4_g128_bf16"
+    default: return nil
+    }
 }

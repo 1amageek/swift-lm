@@ -244,6 +244,70 @@ public static func generateQuantizedGEMM_Q4(
     """
 }
 
+// MARK: - Dequant Q4 → BF16
+
+/// Dequantize Q4 weight matrix to BFloat16 for AMX matmul2d consumption.
+///
+/// Grid (threadgroups): (outputDimension, 1, 1) — one threadgroup per output row
+/// Threadgroup: (256, 1, 1) — 256 threads process all blocks in the row
+///
+/// Each threadgroup unpacks an entire row of Q4 blocks into BF16 values.
+/// Output layout is N-major (row = outputDim, col = inputDim), matching
+/// the `tensor_inline` layout expected by MPP GEMM.
+///
+/// Previous design dispatched (blocksPerRow × outputDimension) threadgroups of
+/// (groupSize/2) threads each, resulting in ~36K tiny threadgroups for a 1536×1536
+/// matrix. This version collapses to outputDimension threadgroups of 256 threads,
+/// reducing dispatch overhead by ~24x.
+public static func generateDequantQ4ToBFloat(
+    name: String,
+    groupSize: Int
+) -> String {
+    let bytesPerBlock = 4 + groupSize / 2  // scale(f16) + zero(f16) + nibbles
+    let nibbleBytesPerBlock = groupSize / 2
+    return """
+    #include <metal_stdlib>
+    using namespace metal;
+
+    kernel void \(name)(
+        device const uchar* packed       [[buffer(0)]],
+        device bfloat* output            [[buffer(1)]],
+        constant uint& inputDimension    [[buffer(2)]],
+        constant uint& outputDimension   [[buffer(3)]],
+        uint tgpos [[threadgroup_position_in_grid]],
+        uint tid   [[thread_index_in_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(groupSize);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint NIBBLE_BYTES_PER_BLOCK = \(nibbleBytesPerBlock);
+        const uint THREADS_PER_TG = 256;
+        const uint row = tgpos;
+        if (row >= outputDimension) return;
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        const uint totalNibbleBytes = blocksPerRow * NIBBLE_BYTES_PER_BLOCK;
+        device const uchar* rowBase = packed + row * blocksPerRow * BYTES_PER_BLOCK;
+        device bfloat* outRow = output + row * inputDimension;
+
+        for (uint byteIdx = tid; byteIdx < totalNibbleBytes; byteIdx += THREADS_PER_TG) {
+            uint blockIdx = byteIdx / NIBBLE_BYTES_PER_BLOCK;
+            uint localByte = byteIdx % NIBBLE_BYTES_PER_BLOCK;
+
+            device const uchar* block = rowBase + blockIdx * BYTES_PER_BLOCK;
+            float scale = float(*(device const half*)(block));
+            float zero  = float(*(device const half*)(block + 2));
+            uchar packed_byte = block[4 + localByte];
+
+            float w0 = float(packed_byte & 0x0F) * scale + zero;
+            float w1 = float(packed_byte >> 4)   * scale + zero;
+            uint col = blockIdx * WEIGHTS_PER_BLOCK + localByte * 2;
+            outRow[col]     = bfloat(w0);
+            outRow[col + 1] = bfloat(w1);
+        }
+    }
+    """
+}
+
 static let kvQuantizationSource = """
 kernel void quantize_kv_q8(
     device const half* input [[buffer(0)]], device uchar* output [[buffer(1)]],

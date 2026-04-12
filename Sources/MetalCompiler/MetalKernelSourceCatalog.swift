@@ -94,6 +94,23 @@ struct MetalKernelSourceCatalog {
                     }
                     continue
                 }
+
+                // For Q4 prefill: generate dequant kernel and treat as BF16 for MPP GEMM.
+                // The dequant kernel unpacks Q4→BF16, then the standard BF16 MPP path handles GEMM.
+                let needsDequantForAMX = bufferPrecision == .float32 && weightFormat.isQuantized
+                if needsDequantForAMX {
+                    if case .quantized4Bit(let groupSize) = weightFormat {
+                        let dequantName = "dequant_q4_g\(groupSize)_bf16"
+                        if generatedNames.insert(dequantName).inserted {
+                            sources.append(MetalSourceGenerator.generateDequantQ4ToBFloat(
+                                name: dequantName,
+                                groupSize: groupSize
+                            ))
+                        }
+                    }
+                }
+                let effectiveWeightFormat: WeightFormat = needsDequantForAMX ? .bfloat16 : weightFormat
+
                 let decodeFamily = bufferPrecision == .float32
                     ? nil
                     : DecodeProjectionShapeFamily.resolve(
@@ -105,18 +122,18 @@ struct MetalKernelSourceCatalog {
                         for: projection,
                         entry: entry,
                         role: projection.field,
-                        weightFormat: weightFormat,
+                        weightFormat: effectiveWeightFormat,
                         accessPolicyResolver: accessPolicyResolver
                     ) {
                         let baseName = decodeFamily.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
-                        name = weightFormat == .bfloat16 ? baseName + "_bf16" : baseName
+                        name = effectiveWeightFormat == .bfloat16 ? baseName + "_bf16" : baseName
                     } else {
-                        name = weightFormat == .bfloat16
+                        name = effectiveWeightFormat == .bfloat16
                             ? decodeFamily.kernelBaseName + "_bf16"
                             : decodeFamily.kernelBaseName
                     }
                 } else {
-                    name = weightFormat == .bfloat16 ? "gemv_bf16" : "gemv"
+                    name = effectiveWeightFormat == .bfloat16 ? "gemv_bf16" : "gemv"
                 }
                 let usesSequenceGEMV =
                     bufferPrecision == .float32
@@ -127,17 +144,17 @@ struct MetalKernelSourceCatalog {
                 let emittedName = isSequenceKernel
                     ? name.replacingOccurrences(of: "gemv", with: "gemm") + "_f32s"
                     : (usesSequenceGEMV
-                        ? (weightFormat == .bfloat16 ? "gemv_bf16_f32s" : "gemv_f32s")
+                        ? (effectiveWeightFormat == .bfloat16 ? "gemv_bf16_f32s" : "gemv_f32s")
                         : name)
                 if generatedNames.insert(emittedName).inserted {
                     if isSequenceKernel {
-                        let gemmName = weightFormat == .bfloat16 ? "gemm_bf16_f32s" : "gemm_f32s"
+                        let gemmName = effectiveWeightFormat == .bfloat16 ? "gemm_bf16_f32s" : "gemm_f32s"
                         mppGEMMNames.insert(gemmName)
-                        mppGEMMWeightFormat = weightFormat
+                        mppGEMMWeightFormat = effectiveWeightFormat
                         sources.append(MetalSourceGenerator.generateGEMM(
                             name: gemmName,
                             bufferPrecision: bufferPrecision,
-                            weightFormat: weightFormat))
+                            weightFormat: effectiveWeightFormat))
                     } else if usesSequenceGEMV {
                         sources.append(MetalSourceGenerator.generateGEMV(
                             name: emittedName,
@@ -830,15 +847,10 @@ struct MetalKernelSourceCatalog {
         bufferPrecision: BufferPrecision
     ) -> String? {
         switch (weightFormat, bufferPrecision) {
-        case (.quantized4Bit(let groupSize), .float32):
-            switch groupSize {
-            case 64:
-                return "gemm_q4_g64_f32s"
-            case 128:
-                return "gemm_q4_g128_f32s"
-            default:
-                return nil
-            }
+        case (.quantized4Bit, .float32):
+            // Prefill: Q4 projections use dequant→AMX path.
+            // Return nil so the catalog falls through to generate BF16 MPP GEMM.
+            return nil
         case (.quantized4Bit(let groupSize), _):
             switch groupSize {
             case 64:

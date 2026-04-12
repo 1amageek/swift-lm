@@ -238,6 +238,11 @@ public struct PrefillBufferSet: @unchecked Sendable {
     public let ropePositionAxes: MTLBuffer
     public let tokenOut: MTLBuffer
 
+    /// Scratch buffer for dequantized Q4→BF16 weights consumed by AMX matmul2d.
+    /// Sized for the largest projection weight matrix: outputDim × inputDim × sizeof(bfloat16).
+    /// Nil when no Q4 weight dequantization is needed (e.g., BF16 or FP16 models).
+    public let dequantScratch: MTLBuffer?
+
     /// Shared buffer for runtime constants (sequenceLength, positions, etc.)
     /// that replace `setBytes()` calls in Metal 4 prefill encoding.
     ///
@@ -264,6 +269,7 @@ public struct PrefillBufferSet: @unchecked Sendable {
             hidden, residual, scratch, logits,
             tokenIDs, positions, ropePositionAxes, tokenOut, runtimeConstantBuffer,
         ]
+        if let dequantScratch { buffers.append(dequantScratch) }
         if let convState { buffers.append(convState) }
         if let recurrentState { buffers.append(recurrentState) }
         if let perLayerInputs { buffers.append(perLayerInputs) }

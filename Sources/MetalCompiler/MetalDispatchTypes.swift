@@ -70,6 +70,13 @@ public enum WeightFormat: Sendable, Equatable {
         }
     }
 
+    var isQuantized: Bool {
+        switch self {
+        case .quantized4Bit, .quantized8Bit: return true
+        case .float16, .bfloat16, .float32: return false
+        }
+    }
+
     var storageByteSize: Int {
         switch self {
         case .float16, .bfloat16:
