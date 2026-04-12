@@ -2,6 +2,10 @@
 public struct InputMessage: Sendable {
     public var role: Role
     public var content: [Content]
+    /// Tool calls requested by an assistant message.
+    public var toolCalls: [ToolCall]?
+    /// The ID of the tool call this message responds to (tool role only).
+    public var toolCallID: String?
 
     public init(role: Role, content: String) {
         self.role = role
@@ -29,20 +33,28 @@ public struct InputMessage: Sendable {
         InputMessage(role: .user, content: content)
     }
 
-    public static func assistant(_ content: String) -> InputMessage {
-        InputMessage(role: .assistant, content: content)
+    public static func assistant(_ content: String, toolCalls: [ToolCall]? = nil) -> InputMessage {
+        var message = InputMessage(role: .assistant, content: content)
+        message.toolCalls = toolCalls
+        return message
     }
 
-    public static func assistant(_ content: [Content]) -> InputMessage {
-        InputMessage(role: .assistant, content: content)
+    public static func assistant(_ content: [Content], toolCalls: [ToolCall]? = nil) -> InputMessage {
+        var message = InputMessage(role: .assistant, content: content)
+        message.toolCalls = toolCalls
+        return message
     }
 
-    public static func tool(_ content: String) -> InputMessage {
-        InputMessage(role: .tool, content: content)
+    public static func tool(_ content: String, toolCallID: String? = nil) -> InputMessage {
+        var message = InputMessage(role: .tool, content: content)
+        message.toolCallID = toolCallID
+        return message
     }
 
-    public static func tool(_ content: [Content]) -> InputMessage {
-        InputMessage(role: .tool, content: content)
+    public static func tool(_ content: [Content], toolCallID: String? = nil) -> InputMessage {
+        var message = InputMessage(role: .tool, content: content)
+        message.toolCallID = toolCallID
+        return message
     }
 
     var containsImageContent: Bool {
@@ -88,5 +100,27 @@ public struct InputMessage: Sendable {
         case assistant
         case system
         case tool
+    }
+
+    /// A tool call emitted by the model in an assistant message.
+    public struct ToolCall: Sendable {
+        public var id: String
+        public var function: Function
+
+        public init(id: String, function: Function) {
+            self.id = id
+            self.function = function
+        }
+
+        public struct Function: Sendable {
+            public var name: String
+            /// JSON-encoded arguments string.
+            public var arguments: String
+
+            public init(name: String, arguments: String) {
+                self.name = name
+                self.arguments = arguments
+            }
+        }
     }
 }

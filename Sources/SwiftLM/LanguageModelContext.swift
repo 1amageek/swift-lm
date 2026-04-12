@@ -146,12 +146,12 @@ public final class LanguageModelContext: @unchecked Sendable {
             if modelTokenizer.hasChatTemplate || chatTemplate != nil {
                 renderedPrompt = try await applyChatTemplate(messages: [
                     .user([.text(prompt)])
-                ], promptOptions: input.promptOptions)
+                ], tools: input.tools, promptOptions: input.promptOptions)
             } else {
                 renderedPrompt = RenderedPrompt(text: prompt, multimodal: nil)
             }
         case .chat(let messages):
-            renderedPrompt = try await applyChatTemplate(messages: messages, promptOptions: input.promptOptions)
+            renderedPrompt = try await applyChatTemplate(messages: messages, tools: input.tools, promptOptions: input.promptOptions)
         }
         let tokens = renderedPrompt.tokenIDs ?? modelTokenizer.encode(text: renderedPrompt.text)
         var multimodal = renderedPrompt.multimodal
@@ -178,6 +178,7 @@ public final class LanguageModelContext: @unchecked Sendable {
     /// Apply the Jinja chat template to format chat messages into a prompt string.
     private func applyChatTemplate(
         messages: [InputMessage],
+        tools: [ToolDefinition]?,
         promptOptions: PromptPreparationOptions
     ) async throws -> RenderedPrompt {
         let renderedMessages = renderedMessagesWithThinkingControl(
@@ -205,6 +206,9 @@ public final class LanguageModelContext: @unchecked Sendable {
                 "bos_token": .string(modelTokenizer.bosToken ?? ""),
                 "eos_token": .string(modelTokenizer.eosToken ?? ""),
             ]
+            if let tools, !tools.isEmpty {
+                context["tools"] = try .array(tools.map(makeJinjaToolValue))
+            }
             for (key, value) in try jinjaPromptTemplateContext(promptOptions: promptOptions) {
                 context[key] = value
             }
@@ -215,7 +219,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         if modelTokenizer.hasChatTemplate {
             let renderedTokenIDs = try modelTokenizer.applyChatTemplate(
                 messages: try renderedMessages.map(makeTokenizerMessage),
-                tools: nil,
+                tools: tools.map { $0.map(makeTokenizerToolSpec) },
                 additionalContext: try tokenizerPromptTemplateContext(promptOptions: promptOptions)
             )
             let rendered = modelTokenizer.decode(tokens: renderedTokenIDs, skipSpecialTokens: false)
@@ -356,6 +360,12 @@ public final class LanguageModelContext: @unchecked Sendable {
         } else {
             object["content"] = .array(try message.content.map(makeJinjaContentValue))
         }
+        if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+            object["tool_calls"] = .array(toolCalls.map(makeJinjaToolCallValue))
+        }
+        if let toolCallID = message.toolCallID {
+            object["tool_call_id"] = .string(toolCallID)
+        }
         return .object(object)
     }
 
@@ -367,6 +377,12 @@ public final class LanguageModelContext: @unchecked Sendable {
             payload["content"] = text
         } else {
             payload["content"] = try message.content.map(makeTokenizerContentValue)
+        }
+        if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+            payload["tool_calls"] = toolCalls.map(makeTokenizerToolCall)
+        }
+        if let toolCallID = message.toolCallID {
+            payload["tool_call_id"] = toolCallID
         }
         return payload
     }
@@ -423,6 +439,51 @@ public final class LanguageModelContext: @unchecked Sendable {
         case .data:
             return "inline-video"
         }
+    }
+
+    // MARK: - Tool conversion helpers
+
+    private func makeJinjaToolValue(_ tool: ToolDefinition) throws -> Value {
+        var function = OrderedDictionary<String, Value>()
+        function["name"] = .string(tool.function.name)
+        function["description"] = .string(tool.function.description)
+        if let parameters = tool.function.parameters {
+            function["parameters"] = try Value(any: parameters)
+        }
+        var object = OrderedDictionary<String, Value>()
+        object["function"] = .object(function)
+        return .object(object)
+    }
+
+    private func makeJinjaToolCallValue(_ toolCall: InputMessage.ToolCall) -> Value {
+        var function = OrderedDictionary<String, Value>()
+        function["name"] = .string(toolCall.function.name)
+        function["arguments"] = .string(toolCall.function.arguments)
+        var object = OrderedDictionary<String, Value>()
+        object["id"] = .string(toolCall.id)
+        object["function"] = .object(function)
+        return .object(object)
+    }
+
+    private func makeTokenizerToolSpec(_ tool: ToolDefinition) -> ToolSpec {
+        var function: [String: any Sendable] = [
+            "name": tool.function.name,
+            "description": tool.function.description,
+        ]
+        if let parameters = tool.function.parameters {
+            function["parameters"] = parameters
+        }
+        return ["function": function]
+    }
+
+    private func makeTokenizerToolCall(_ toolCall: InputMessage.ToolCall) -> [String: any Sendable] {
+        [
+            "id": toolCall.id,
+            "function": [
+                "name": toolCall.function.name,
+                "arguments": toolCall.function.arguments,
+            ] as [String: any Sendable],
+        ]
     }
 
     private func streamGeneration(
