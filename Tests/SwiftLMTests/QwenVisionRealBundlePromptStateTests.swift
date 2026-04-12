@@ -18,13 +18,12 @@ struct QwenVisionRealBundlePromptStateTests {
 
         let imageData = try TestImageFixtures.makeOnePixelPNGData()
         let promptStateStart = CFAbsoluteTimeGetCurrent()
-        let promptState = try await container.makePromptSnapshot(from: ModelInput(chat: [
+        let promptState = try await PromptSnapshot(from: ModelInput(chat: [
                 .user([
                     .text("Reuse"),
                     .image(InputImage(data: imageData, mimeType: "image/png")),
                 ])
-            ])
-        )
+            ]), using: container)
         let promptStateTime = CFAbsoluteTimeGetCurrent() - promptStateStart
         print("[RealQwenVision] promptState build=\(String(format: "%.3f", promptStateTime))s tokens=\(promptState.promptTokenCount)")
         let generationStart = CFAbsoluteTimeGetCurrent()

@@ -37,6 +37,13 @@ public extension MetalCompiledModel {
     }
 }
 
+public extension MetalPrefillPlan {
+    func makeRuntimeIsolatedCopy(device: MTLDevice) throws -> MetalPrefillPlan {
+        var cloner = MetalCompiledModelRuntimeCloner(device: device)
+        return try cloner.clonePrefillPlan(self)
+    }
+}
+
 private struct MetalCompiledModelRuntimeCloner {
     private let device: MTLDevice
     private var runtimeBufferReplacements: [ObjectIdentifier: MTLBuffer] = [:]

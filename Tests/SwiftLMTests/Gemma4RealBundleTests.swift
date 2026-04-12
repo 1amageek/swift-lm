@@ -20,7 +20,7 @@ struct Gemma4RealBundleTests {
         print("[Gemma4 rendered text]")
         print(prepared.renderedText)
         print("[Gemma4 token count] \(prepared.tokenIDs.count)")
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         if let gemma4PromptContext = prompt.gemma4PromptContext {
             if let lastPromptEmbedding = gemma4PromptContext.promptEmbeddings.last {
                 print("[Gemma4 prompt embedding prefix] \(Array(lastPromptEmbedding.prefix(16)))")
@@ -183,7 +183,7 @@ struct Gemma4RealBundleTests {
                 ])
             ])
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let stream = try container.generate(from: prompt,
             parameters: GenerationParameters(maxTokens: 1, streamChunkTokenCount: 1)
         )
@@ -219,7 +219,7 @@ struct Gemma4RealBundleTests {
         print("[Gemma4 thinking-option rendered text]")
         print(prepared.renderedText)
         #expect(prepared.renderedText.contains("<|think|>"))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let comparison = try RealOutputAssertionSupport.assertGreedyDirectMatchesPromptState(
             container: container,
             prompt: prompt,

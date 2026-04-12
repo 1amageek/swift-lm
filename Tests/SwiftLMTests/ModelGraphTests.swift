@@ -922,7 +922,7 @@ struct ModelGraphTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let once = canonicalize(graph)
         let twice = canonicalize(once)
         #expect(once == twice)
@@ -934,7 +934,7 @@ struct ModelGraphTests {
             vocabSize: 256000, hiddenSize: 4096, headCount: 32,
             kvHeadCount: 8, intermediateSize: 11008, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let once = canonicalize(graph)
         let twice = canonicalize(once)
         #expect(once == twice)

@@ -75,4 +75,154 @@ extension MetalSourceGenerator {
         }
         """
     }
+
+    public static func generateQuantizedEmbeddingLookupQ4(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        groupSize: Int,
+        isSequence: Bool = true,
+        embeddingScale: Float? = nil
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let bytesPerBlock = 4 + groupSize / 2
+        let scaleParam = embeddingScale != nil
+            ? (isSequence
+                ? "\n            constant float& scale            [[buffer(5)]],"
+                : "\n            constant float& scale            [[buffer(4)]],")
+            : ""
+        let scaleExpr = embeddingScale != nil ? " * scale" : ""
+
+        if isSequence {
+            return """
+            kernel void \(name)(
+                device const int* tokenIDs       [[buffer(0)]],
+                device const uchar* table        [[buffer(1)]],
+                device \(bt)* output             [[buffer(2)]],
+                constant uint& embeddingDim      [[buffer(3)]],
+                constant uint& sequenceLength    [[buffer(4)]],\(scaleParam)
+                uint2 gid                        [[thread_position_in_grid]]
+            ) {
+                const uint GROUP_SIZE = \(groupSize);
+                const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+                uint dim = gid.x;
+                uint seqPos = gid.y;
+                if (dim >= embeddingDim || seqPos >= sequenceLength) return;
+
+                uint tokenID = uint(tokenIDs[seqPos]);
+                uint blocksPerRow = embeddingDim / GROUP_SIZE;
+                device const uchar* rowBase = table + tokenID * blocksPerRow * BYTES_PER_BLOCK;
+                uint groupIndex = dim / GROUP_SIZE;
+                uint indexInGroup = dim % GROUP_SIZE;
+                device const uchar* block = rowBase + groupIndex * BYTES_PER_BLOCK;
+                float blockScale = float(*(device const half*)(block));
+                float blockZero = float(*(device const half*)(block + 2));
+                device const uchar* nibbles = block + 4;
+                uchar packed = nibbles[indexInGroup / 2];
+                float quantized = float((indexInGroup & 1u) == 0 ? (packed & 0x0F) : (packed >> 4));
+                float value = quantized * blockScale + blockZero;
+                output[seqPos * embeddingDim + dim] = \(bt)(value\(scaleExpr));
+            }
+            """
+        }
+
+        return """
+        kernel void \(name)(
+            device const int* tokenID        [[buffer(0)]],
+            device const uchar* table        [[buffer(1)]],
+            device \(bt)* output             [[buffer(2)]],
+            constant uint& embeddingDim      [[buffer(3)]],\(scaleParam)
+            uint gid                         [[thread_position_in_grid]]
+        ) {
+            const uint GROUP_SIZE = \(groupSize);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            if (gid >= embeddingDim) return;
+
+            uint blocksPerRow = embeddingDim / GROUP_SIZE;
+            device const uchar* rowBase = table + uint(tokenID[0]) * blocksPerRow * BYTES_PER_BLOCK;
+            uint groupIndex = gid / GROUP_SIZE;
+            uint indexInGroup = gid % GROUP_SIZE;
+            device const uchar* block = rowBase + groupIndex * BYTES_PER_BLOCK;
+            float blockScale = float(*(device const half*)(block));
+            float blockZero = float(*(device const half*)(block + 2));
+            device const uchar* nibbles = block + 4;
+            uchar packed = nibbles[indexInGroup / 2];
+            float quantized = float((indexInGroup & 1u) == 0 ? (packed & 0x0F) : (packed >> 4));
+            float value = quantized * blockScale + blockZero;
+            output[gid] = \(bt)(value\(scaleExpr));
+        }
+        """
+    }
+
+    public static func generateQuantizedEmbeddingLookupQ8(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        groupSize: Int,
+        isSequence: Bool = true,
+        embeddingScale: Float? = nil
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let bytesPerBlock = 4 + groupSize
+        let scaleParam = embeddingScale != nil
+            ? (isSequence
+                ? "\n            constant float& scale            [[buffer(5)]],"
+                : "\n            constant float& scale            [[buffer(4)]],")
+            : ""
+        let scaleExpr = embeddingScale != nil ? " * scale" : ""
+
+        if isSequence {
+            return """
+            kernel void \(name)(
+                device const int* tokenIDs       [[buffer(0)]],
+                device const uchar* table        [[buffer(1)]],
+                device \(bt)* output             [[buffer(2)]],
+                constant uint& embeddingDim      [[buffer(3)]],
+                constant uint& sequenceLength    [[buffer(4)]],\(scaleParam)
+                uint2 gid                        [[thread_position_in_grid]]
+            ) {
+                const uint GROUP_SIZE = \(groupSize);
+                const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+                uint dim = gid.x;
+                uint seqPos = gid.y;
+                if (dim >= embeddingDim || seqPos >= sequenceLength) return;
+
+                uint tokenID = uint(tokenIDs[seqPos]);
+                uint blocksPerRow = embeddingDim / GROUP_SIZE;
+                device const uchar* rowBase = table + tokenID * blocksPerRow * BYTES_PER_BLOCK;
+                uint groupIndex = dim / GROUP_SIZE;
+                uint indexInGroup = dim % GROUP_SIZE;
+                device const uchar* block = rowBase + groupIndex * BYTES_PER_BLOCK;
+                float blockScale = float(*(device const half*)(block));
+                float blockZero = float(*(device const half*)(block + 2));
+                device const uchar* quantized = block + 4;
+                float value = float(quantized[indexInGroup]) * blockScale + blockZero;
+                output[seqPos * embeddingDim + dim] = \(bt)(value\(scaleExpr));
+            }
+            """
+        }
+
+        return """
+        kernel void \(name)(
+            device const int* tokenID        [[buffer(0)]],
+            device const uchar* table        [[buffer(1)]],
+            device \(bt)* output             [[buffer(2)]],
+            constant uint& embeddingDim      [[buffer(3)]],\(scaleParam)
+            uint gid                         [[thread_position_in_grid]]
+        ) {
+            const uint GROUP_SIZE = \(groupSize);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            if (gid >= embeddingDim) return;
+
+            uint blocksPerRow = embeddingDim / GROUP_SIZE;
+            device const uchar* rowBase = table + uint(tokenID[0]) * blocksPerRow * BYTES_PER_BLOCK;
+            uint groupIndex = gid / GROUP_SIZE;
+            uint indexInGroup = gid % GROUP_SIZE;
+            device const uchar* block = rowBase + groupIndex * BYTES_PER_BLOCK;
+            float blockScale = float(*(device const half*)(block));
+            float blockZero = float(*(device const half*)(block + 2));
+            device const uchar* quantized = block + 4;
+            float value = float(quantized[indexInGroup]) * blockScale + blockZero;
+            output[gid] = \(bt)(value\(scaleExpr));
+        }
+        """
+    }
 }

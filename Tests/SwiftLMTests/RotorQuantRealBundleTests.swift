@@ -19,13 +19,13 @@ private enum RotorQuantRealBundleTestSupport {
             directory: directory,
             inferencePolicy: inferencePolicy
         )
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
 
         container.resetState()
         let prepared = try await container.prepare( ModelInput(prompt: promptText)
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
-        let promptState = try container.makePromptSnapshot(from: prompt)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
+        let promptState = try PromptSnapshot(from: prompt, using: container)
         let firstToken = Int(promptState.metalState.firstToken)
         let rawDecoded = container.tokenizer.decode(tokens: [firstToken], skipSpecialTokens: false)
         print("[Gemma4 \(label) prompt-state first token] \(firstToken) -> \(String(reflecting: rawDecoded))")

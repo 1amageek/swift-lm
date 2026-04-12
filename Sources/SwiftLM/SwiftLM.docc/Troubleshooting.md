@@ -28,7 +28,7 @@ GenerationEvent is stream-based. If you need a single final string, collect all 
 - ``PreparedPrompt`` and ``ExecutablePrompt`` separate prompt preparation from executable runtime input
 - ``LanguageModelContainer`` owns the loaded bundle and can prepare prompts or create fresh ``LanguageModelContext`` instances
 - ``LanguageModelContext`` owns mutable generation state such as KV/cache position and prompt snapshots
-- `makeExecutablePrompt(from:)` converts prepared input into an executable prompt, while ``LanguageModelContext/makePromptSnapshot(from:)`` captures reusable decode state for the same context
+- `ExecutablePrompt(preparedPrompt:using:)` converts prepared input into an executable prompt, while `PromptSnapshot(from:using:)` captures reusable decode state for the same context
 - ``ModelConfiguration/vision`` now exposes Qwen-style marker tokens, processor names, and patch sizing metadata
 - ``ModelConfiguration/executionCapabilities`` tells you which prompt shapes the current runtime can prepare and execute
 - unsupported multimodal families still throw ``LanguageModelContextError/multimodalInputNotSupported(_:)``

@@ -24,7 +24,7 @@ struct QwenVisionRealBundleImageTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let stream = try container.generate(from: executable,
             parameters: GenerationParameters(maxTokens: 1, streamChunkTokenCount: 1)
         )

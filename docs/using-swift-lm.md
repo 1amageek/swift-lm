@@ -81,21 +81,44 @@ The current loader resolves these model families from `config.json["model_type"]
 
 | Family | `model_type` examples |
 |---|---|
-| Transformer | `llama`, `qwen2`, `qwen3`, `mistral`, `gemma`, `phi`, `mixtral`, `deepseek` |
-| Qwen 3.5 hybrid / Qwen3-VL text backbone | `qwen3_5`, `qwen3_vl` |
+| Transformer | `llama`, `qwen2`, `qwen3`, `mistral`, `gemma`, `gemma2`, `phi`, `phi3`, `starcoder2`, `gpt_neox`, `internlm2`, `deepseek`, `yi`, `baichuan`, `chatglm`, `mixtral`, `qwen2_moe`, `deepseek_v2`, `arctic`, `dbrx` |
+| Gemma4 | `gemma4`, `gemma4_text` |
+| Qwen 3.5 hybrid / Qwen vision text backbone | `qwen3_5`, `qwen3_vl`, `qwen2_5_vl`, `qwen2_vl` |
 | LFM2 / LFM2.5 hybrid | `lfm2`, `lfm2_moe` |
 | Cohere | `cohere`, `command-r` |
 
 Unsupported or incomplete families currently fail during loading or graph construction. `nemotron_h` is explicitly rejected in the current loader.
+
+## Load a Text Embedding Model
+
+`ModelBundleLoader.loadTextEmbeddings(...)` loads sentence-transformers style embedding bundles and returns a `TextEmbeddingContainer`.
+
+```swift
+import SwiftLM
+
+let embeddings = try await ModelBundleLoader().loadTextEmbeddings(
+    repo: "google/embeddinggemma-300m"
+)
+
+let context = try TextEmbeddingContext(embeddings)
+let vector = try context.embed(
+    "swift metal inference",
+    promptName: embeddings.defaultPromptName
+)
+
+print("embedding dimension =", vector.count)
+```
+
+`TextEmbeddingContainer` is the immutable loaded bundle and factory for execution state. `TextEmbeddingContext` owns the isolated mutable prefill runtime used to compute embeddings.
 
 ## Generate from Text
 
 ```swift
 import SwiftLM
 
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let prepared = try await context.prepare(ModelInput(prompt: "Write a haiku about Metal shaders."))
-let executable = try context.makeExecutablePrompt(from: prepared)
+let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 let stream = try context.generate(
     from: executable,
     parameters: GenerationParameters(
@@ -123,12 +146,12 @@ Use `PreparedPrompt` as the result of prompt preparation and `ExecutablePrompt` 
 ## Generate from Chat Messages
 
 ```swift
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let prepared = try await context.prepare(ModelInput(chat: [
     .system("You are a concise assistant."),
     .user("Summarize the benefits of zero-copy model loading.")
 ]))
-let executable = try context.makeExecutablePrompt(from: prepared)
+let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 
 for await event in try context.generate(from: executable) {
     if let chunk = event.text {
@@ -151,7 +174,7 @@ let input = ModelInput(chat: [
     ])
 ])
 
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let prepared = try await context.prepare(input)
 
 if let multimodal = prepared.multimodalMetadata {
@@ -159,7 +182,7 @@ if let multimodal = prepared.multimodalMetadata {
     print("mm token types =", Array(multimodal.mmTokenTypeIDs.prefix(8)))
 }
 
-let executable = try context.makeExecutablePrompt(from: prepared)
+let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 for await event in try context.generate(from: executable) {
     if let chunk = event.text {
         print(chunk, terminator: "")
@@ -167,18 +190,18 @@ for await event in try context.generate(from: executable) {
 }
 ```
 
-For Qwen3-VL bundles, `prepare(_:)` expands the image and video placeholder counts from the bundle's `preprocessor_config.json` so the token stream matches the processor contract. `makeExecutablePrompt(from:)` builds the executable visual payload, and generation uses the bundled Qwen vision encoder plus the text backbone decode path.
+For Qwen3-VL bundles, `prepare(_:)` expands the image and video placeholder counts from the bundle's `preprocessor_config.json` so the token stream matches the processor contract. `ExecutablePrompt(preparedPrompt:using:)` builds the executable visual payload, and generation uses the bundled Qwen vision encoder plus the text backbone decode path.
 
 ## Reuse a Prompt Prefix
 
 If many requests share the same prompt prefix, build a `PromptSnapshot` once and reuse it.
 
 ```swift
-let context = try container.makeContext()
-let promptSnapshot = try await context.makePromptSnapshot(from: ModelInput(chat: [
+let context = try LanguageModelContext(container)
+let promptSnapshot = try await PromptSnapshot(from: ModelInput(chat: [
     .system("You are a helpful code review assistant."),
     .user("Review this patch carefully.")
-]))
+]), using: context)
 
 for await event in try context.generate(
     from: promptSnapshot,
@@ -206,6 +229,14 @@ context.resetState()
 - `decode(_:)` converts token IDs back to text
 - `resetState()` clears KV/cache state between unrelated conversations
 
+## Text Embedding API
+
+For sentence-transformers bundles:
+
+- `TextEmbeddingContainer.embed(_:,promptName:)` is the one-shot convenience API
+- `TextEmbeddingContext.embed(_:,promptName:)` is the low-level API when you want explicit context ownership
+- `availablePromptNames` and `defaultPromptName` expose prompt presets declared by the bundle
+
 ## Generation Parameters
 
 `GenerationParameters` currently exposes:
@@ -226,7 +257,7 @@ For predictable behavior, set `maxTokens` explicitly. If `maxTokens` is `nil`, t
 - `ModelConfiguration.executionCapabilities` tells you what the current runtime can actually execute or prepare
 - `ModelConfiguration.vision` exposes image/video placeholder token IDs, processor names, and Qwen-style patch sizing metadata when the bundle provides them
 - Image content can be expressed through `ModelInput`, and Qwen3-VL style prompt preparation now expands the correct placeholder count before tokenization
-- `makeExecutablePrompt(from:)` converts prepared input into an executable prompt, while `makePromptSnapshot(from:)` on `LanguageModelContext` captures reusable decode state for the same context
+- `ExecutablePrompt(preparedPrompt:using:)` converts prepared input into an executable prompt, while `PromptSnapshot(from:using:)` captures reusable decode state for the same context
 - Other multimodal model families still throw `multimodalInputNotSupported` until a matching processor + vision runtime is implemented
 - Tool calling and structured function-calling APIs are not part of the current public API
 - Generation is stream-based; collect `GenerationEvent.text` values yourself if you need a single final string

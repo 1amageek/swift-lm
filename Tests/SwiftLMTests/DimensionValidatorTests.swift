@@ -39,7 +39,7 @@ private func graphWith(
 
 /// Build a graph from a DSL model component.
 private func graphFrom(_ component: some ModelComponent) throws -> ModelGraph {
-    try component.makeModelGraph()
+    try component)
 }
 
 // MARK: - Attribute Invariant Tests
@@ -467,7 +467,7 @@ struct RealArchitectureDimensionTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try DimensionValidator.validate(graph)
     }
 
@@ -477,7 +477,7 @@ struct RealArchitectureDimensionTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try DimensionValidator.validate(graph)
     }
 
@@ -488,7 +488,7 @@ struct RealArchitectureDimensionTests {
             kvHeadCount: 2, intermediateSize: 256,
             expertCount: 4, expertsPerToken: 2, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try DimensionValidator.validate(graph)
     }
 
@@ -498,7 +498,7 @@ struct RealArchitectureDimensionTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, stateSize: 16
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try DimensionValidator.validate(graph)
     }
 

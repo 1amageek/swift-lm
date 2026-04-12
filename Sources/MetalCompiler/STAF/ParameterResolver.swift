@@ -9,7 +9,7 @@ import LMIR
 /// family's naming convention.
 ///
 /// ```swift
-/// let graph = try Transformer(config: config).makeModelGraph()
+/// let graph = try ModelGraph(Transformer(config: config))
 /// let resolved = ParameterResolver.resolve(graph: graph, convention: .llamaFamily)
 /// // resolved.rootRegion now has parameterBindings on every primitive operation
 /// ```
@@ -40,6 +40,8 @@ public struct ParameterResolver: Sendable {
     public enum WeightNamingConvention: Sendable {
         /// Llama-family: self_attn.{q,k,v,o}_proj, mlp.{gate,up,down}_proj
         case llamaFamily
+        /// Gemma3-family: model.* with Gemma-style sandwich norms and q_norm/k_norm.
+        case gemma3TextFamily
         /// Qwen3.5-family: model.language_model.* with q_norm/k_norm attention weights.
         case qwen35Family
         /// Gemma4-family: model.language_model.* with per-layer input weights.
@@ -204,6 +206,13 @@ public struct ParameterResolver: Sendable {
         case .llamaFamily:
             return buildLlamaFamilyBindings(
                 attributes: attributes, scope: scope, residualIndex: residualIndex)
+        case .gemma3TextFamily:
+            return buildGemma3TextFamilyBindings(
+                attributes: attributes,
+                scope: scope,
+                residualIndex: residualIndex,
+                normIndex: normIndex
+            )
         case .qwen35Family:
             return buildQwen35FamilyBindings(
                 attributes: attributes, scope: scope, residualIndex: residualIndex)
@@ -301,6 +310,78 @@ public struct ParameterResolver: Sendable {
                 ParameterBinding(role: "in_proj", tensorName: "\(convPrefix).in_proj.weight"),
                 ParameterBinding(role: "conv_weight", tensorName: "\(convPrefix).conv.weight"),
                 ParameterBinding(role: "out_proj", tensorName: "\(convPrefix).out_proj.weight"),
+            ]
+        }
+
+        return []
+    }
+
+    // MARK: - Qwen3.5 Family
+
+    private func buildGemma3TextFamilyBindings(
+        attributes: any OperationAttributes,
+        scope: NamingScope,
+        residualIndex: Int,
+        normIndex: Int = 0
+    ) -> [ParameterBinding] {
+        if let _ = attributes as? TokenEmbeddingAttributes {
+            return [ParameterBinding(role: "embedding_table", tensorName: "model.embed_tokens.weight")]
+        }
+
+        if let attrs = attributes as? OutputHeadAttributes {
+            if attrs.tiedToEmbedding {
+                return [ParameterBinding(role: "weight", tensorName: "model.embed_tokens.weight")]
+            }
+            return [ParameterBinding(role: "weight", tensorName: "lm_head.weight")]
+        }
+
+        guard case .layer(let layerIndex) = scope else {
+            if attributes is RMSNormAttributes || attributes is LayerNormAttributes {
+                return [ParameterBinding(role: "scale", tensorName: "model.norm.weight")]
+            }
+            return []
+        }
+
+        let prefix = "model.layers.\(layerIndex)"
+
+        if attributes is RMSNormAttributes || attributes is LayerNormAttributes {
+            let normName: String
+            switch (residualIndex, normIndex) {
+            case (0, 0):
+                normName = "input_layernorm"
+            case (0, 1):
+                normName = "post_attention_layernorm"
+            case (1, 0):
+                normName = "pre_feedforward_layernorm"
+            case (1, 1):
+                normName = "post_feedforward_layernorm"
+            default:
+                return []
+            }
+            return [ParameterBinding(role: "scale", tensorName: "\(prefix).\(normName).weight")]
+        }
+
+        if let attrs = attributes as? AttentionAttributes {
+            let attnPrefix = "\(prefix).self_attn"
+            var bindings = [
+                ParameterBinding(role: "q_proj", tensorName: "\(attnPrefix).q_proj.weight"),
+                ParameterBinding(role: "k_proj", tensorName: "\(attnPrefix).k_proj.weight"),
+                ParameterBinding(role: "o_proj", tensorName: "\(attnPrefix).o_proj.weight"),
+            ]
+            bindings.append(contentsOf: valueProjectionBindings(attributes: attrs, attentionPrefix: attnPrefix))
+            if let qkNorm = attrs.qkNorm, qkNorm != .none {
+                bindings.append(ParameterBinding(role: "q_layernorm", tensorName: "\(attnPrefix).q_norm.weight"))
+                bindings.append(ParameterBinding(role: "k_layernorm", tensorName: "\(attnPrefix).k_norm.weight"))
+            }
+            return bindings
+        }
+
+        if let _ = attributes as? MLPAttributes {
+            let mlpPrefix = "\(prefix).mlp"
+            return [
+                ParameterBinding(role: "gate_proj", tensorName: "\(mlpPrefix).gate_proj.weight"),
+                ParameterBinding(role: "up_proj", tensorName: "\(mlpPrefix).up_proj.weight"),
+                ParameterBinding(role: "down_proj", tensorName: "\(mlpPrefix).down_proj.weight"),
             ]
         }
 

@@ -9,12 +9,12 @@ import Jinja
 /// Mutable execution context for a loaded language model.
 ///
 /// A context owns decode-time mutable state such as KV cache position,
-/// prompt snapshot restore, and generation progress. Create contexts from
+/// prompt snapshot restore, and generation progress. Initialize it with a
 /// ``LanguageModelContainer`` when you need isolated inference state.
 ///
 /// ```swift
 /// let container = try await ModelBundleLoader().load(repo: "mlx-community/Qwen2.5-0.5B-Instruct")
-/// let context = try container.makeContext()
+/// let context = try LanguageModelContext(container)
 /// let stream = try context.generate(
 ///     from: ExecutablePrompt(tokenIDs: context.encode("Hello")),
 ///     parameters: GenerationParameters(maxTokens: 100)
@@ -37,6 +37,28 @@ public final class LanguageModelContext: @unchecked Sendable {
     private let thinkingTagPolicy: ThinkingTagPolicy?
     private let visionRuntime: QwenVisionRuntime?
     private let gemma4Runtime: Gemma4Runtime?
+
+    public convenience init(_ container: LanguageModelContainer) throws {
+        try self.init(prototypeContext: container.prototypeContext)
+    }
+
+    private convenience init(prototypeContext: LanguageModelContext) throws {
+        let clonedInferenceModel = try Self.makeRuntimeIsolatedInferenceModel(
+            compiledModel: prototypeContext.debugCompiledModel,
+            device: prototypeContext.inferenceModel.device
+        )
+        self.init(
+            inferenceModel: clonedInferenceModel,
+            tokenizer: prototypeContext.modelTokenizer,
+            configuration: prototypeContext.modelConfiguration,
+            chatTemplate: prototypeContext.chatTemplate,
+            chatTemplateSource: prototypeContext.chatTemplateSource,
+            vocabularySize: prototypeContext.vocabularySize,
+            finalLogitSoftcapping: prototypeContext.finalLogitSoftcapping,
+            visionRuntime: prototypeContext.visionRuntime,
+            gemma4Runtime: prototypeContext.gemma4Runtime
+        )
+    }
 
     convenience init(
         inferenceModel: MetalInferenceModel,
@@ -84,6 +106,17 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         self.visionRuntime = visionRuntime
         self.gemma4Runtime = gemma4Runtime
+    }
+
+    private static func makeRuntimeIsolatedInferenceModel(
+        compiledModel: MetalCompiledModel,
+        device: MTLDevice
+    ) throws -> MetalInferenceModel {
+        let isolatedCompiledModel = try compiledModel.makeRuntimeIsolatedCopy(device: device)
+        return try MetalInferenceModel(
+            compiledModel: isolatedCompiledModel,
+            device: device
+        )
     }
 
     /// Model configuration (name, EOS tokens).
@@ -674,7 +707,7 @@ public final class LanguageModelContext: @unchecked Sendable {
     }
 
     /// Convert prepared prompt data into runtime-executable prompt state.
-    public func makeExecutablePrompt(from prepared: PreparedPrompt) throws -> ExecutablePrompt {
+    internal func executablePrompt(for prepared: PreparedPrompt) throws -> ExecutablePrompt {
         if let gemma4Runtime {
             if let multimodal = prepared.multimodalMetadata, !multimodal.videos.isEmpty {
                 throw LanguageModelContextError.multimodalInputNotSupported(
@@ -716,9 +749,9 @@ public final class LanguageModelContext: @unchecked Sendable {
     ///
     /// This runs prefill once, snapshots the decode state, and stores the
     /// first predicted token so the same prompt prefix can be reused later.
-    public func makePromptSnapshot(from prompt: ExecutablePrompt) throws -> PromptSnapshot {
+    internal func promptSnapshot(for prompt: ExecutablePrompt) throws -> PromptSnapshot {
         let prefillResult = try prefill(prompt: prompt)
-        let metalState = try inferenceModel.makePromptSnapshot(firstToken: prefillResult.firstToken)
+        let metalState = try inferenceModel.promptSnapshot(firstToken: prefillResult.firstToken)
         return PromptSnapshot(
             metalState: metalState,
             promptTokenCount: prompt.tokenIDs.count,
@@ -729,15 +762,15 @@ public final class LanguageModelContext: @unchecked Sendable {
     }
 
     /// Build a reusable prompt snapshot from prepared prompt data.
-    public func makePromptSnapshot(from preparedPrompt: PreparedPrompt) throws -> PromptSnapshot {
-        let prompt = try makeExecutablePrompt(from: preparedPrompt)
-        return try makePromptSnapshot(from: prompt)
+    internal func promptSnapshot(for preparedPrompt: PreparedPrompt) throws -> PromptSnapshot {
+        let prompt = try executablePrompt(for: preparedPrompt)
+        return try promptSnapshot(for: prompt)
     }
 
     /// Build a reusable prompt snapshot from user input.
-    public func makePromptSnapshot(from input: ModelInput) async throws -> PromptSnapshot {
+    internal func promptSnapshot(for input: ModelInput) async throws -> PromptSnapshot {
         let preparedPrompt = try await prepare(input)
-        return try makePromptSnapshot(from: preparedPrompt)
+        return try promptSnapshot(for: preparedPrompt)
     }
 
     /// Generate text from an executable prompt.
@@ -831,7 +864,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         parameters: GenerationParameters = GenerationParameters()
     ) async throws -> AsyncStream<GenerationEvent> {
         let prepared = try await prepare(input)
-        let prompt = try makeExecutablePrompt(from: prepared)
+        let prompt = try executablePrompt(for: prepared)
         return try generate(from: prompt, parameters: parameters)
     }
 
@@ -1116,13 +1149,11 @@ public final class LanguageModelContext: @unchecked Sendable {
     internal func cloneContext(
         compiledModel: MetalCompiledModel
     ) throws -> LanguageModelContext {
-        let isolatedCompiledModel = try compiledModel.makeRuntimeIsolatedCopy(device: inferenceModel.device)
-        let clonedInferenceModel = try MetalInferenceModel(
-            compiledModel: isolatedCompiledModel,
-            device: inferenceModel.device
-        )
-        return LanguageModelContext(
-            inferenceModel: clonedInferenceModel,
+        LanguageModelContext(
+            inferenceModel: try Self.makeRuntimeIsolatedInferenceModel(
+                compiledModel: compiledModel,
+                device: inferenceModel.device
+            ),
             tokenizer: modelTokenizer,
             configuration: modelConfiguration,
             chatTemplate: chatTemplate,
@@ -1365,7 +1396,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
 
         resetState()
-        let promptState = try makePromptSnapshot(from: prompt)
+        let promptState = try promptSnapshot(for: prompt)
         try inferenceModel.restore(promptState: promptState.metalState)
         var restoredInitialSamplingState = GenerationSamplingState(
             rngState: promptState.samplingSeed,
@@ -1417,7 +1448,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         let directTokenOut = debugCurrentDecodeTokenOut()
 
         resetState()
-        let promptState = try makePromptSnapshot(from: prompt)
+        let promptState = try promptSnapshot(for: prompt)
         try inferenceModel.restore(promptState: promptState.metalState)
 
         return (
@@ -1459,7 +1490,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
 
         resetState()
-        let promptState = try makePromptSnapshot(from: prompt)
+        let promptState = try promptSnapshot(for: prompt)
         try inferenceModel.restore(promptState: promptState.metalState)
         var restoredSamplingState = GenerationSamplingState(
             rngState: promptState.samplingSeed,

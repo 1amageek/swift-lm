@@ -16,7 +16,7 @@ struct LFMOutputDiagnosticsTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         container.resetState()
         let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
@@ -24,7 +24,7 @@ struct LFMOutputDiagnosticsTests {
         print(prepared.renderedText)
         print("[LFM prepared token count] \(prepared.tokenIDs.count)")
 
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let topLogits = try container.debugPrefillTopLogits(prompt: prompt, topK: 20)
         print("[LFM prefill top logits]")
         for entry in topLogits {

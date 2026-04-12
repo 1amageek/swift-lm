@@ -16,10 +16,10 @@ struct PromptStateTraceDiagnosticTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let trace = try container.debugPromptStateGenerationTrace(
             prompt: prompt,
             parameters: RealOutputAssertionSupport.greedyParameters()
@@ -42,10 +42,10 @@ struct PromptStateTraceDiagnosticTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: directory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let trace = try container.debugPromptStateGenerationTrace(
             prompt: prompt,
             parameters: RealOutputAssertionSupport.greedyParameters()
@@ -73,10 +73,10 @@ struct PromptStateTraceDiagnosticTests {
 
         let loader = ModelBundleLoader()
         let firstLoaded = try await loader.load(directory: localModelDirectory)
-        let firstContext: LanguageModelContext = try firstLoaded.makeContext()
+        let firstContext: LanguageModelContext = try LanguageModelContext(firstLoaded)
         let prepared = try await firstContext.prepare(ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try firstContext.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: firstContext)
 
         firstContext.resetState()
         let sameContainerFirst = try firstContext.debugGeneratedTokenIDs(
@@ -90,10 +90,10 @@ struct PromptStateTraceDiagnosticTests {
         )
 
         let secondLoaded = try await loader.load(directory: localModelDirectory)
-        let secondContext: LanguageModelContext = try secondLoaded.makeContext()
+        let secondContext: LanguageModelContext = try LanguageModelContext(secondLoaded)
         let secondPrepared = try await secondContext.prepare(ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let secondPrompt = try secondContext.makeExecutablePrompt(from: secondPrepared)
+        let secondPrompt = try ExecutablePrompt(preparedPrompt: secondPrepared, using: secondContext)
         secondContext.resetState()
         let freshContainerRun = try secondContext.debugGeneratedTokenIDs(
             prompt: secondPrompt,

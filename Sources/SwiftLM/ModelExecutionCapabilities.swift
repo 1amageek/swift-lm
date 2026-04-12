@@ -4,6 +4,7 @@
 /// the bundle declares in its metadata.
 public struct ModelExecutionCapabilities: Sendable, Equatable {
     public var supportsTextGeneration: Bool
+    public var supportsTextEmbeddings: Bool
     public var supportsPromptStateReuse: Bool
     public var supportsImagePromptPreparation: Bool
     public var supportsImageExecution: Bool
@@ -12,6 +13,7 @@ public struct ModelExecutionCapabilities: Sendable, Equatable {
 
     public init(
         supportsTextGeneration: Bool = true,
+        supportsTextEmbeddings: Bool = false,
         supportsPromptStateReuse: Bool = true,
         supportsImagePromptPreparation: Bool = false,
         supportsImageExecution: Bool = false,
@@ -19,6 +21,7 @@ public struct ModelExecutionCapabilities: Sendable, Equatable {
         supportsVideoExecution: Bool = false
     ) {
         self.supportsTextGeneration = supportsTextGeneration
+        self.supportsTextEmbeddings = supportsTextEmbeddings
         self.supportsPromptStateReuse = supportsPromptStateReuse
         self.supportsImagePromptPreparation = supportsImagePromptPreparation
         self.supportsImageExecution = supportsImageExecution

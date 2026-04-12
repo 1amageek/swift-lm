@@ -6,8 +6,8 @@ import Metal
 @Suite("LanguageModelContainer Isolation", .serialized)
 struct LanguageModelContainerIsolationTests {
 
-    @Test("makeContext returns isolated runtime buffers while sharing immutable weights")
-    func makeContextReturnsIsolatedRuntimeState() throws {
+    @Test("LanguageModelContext initializer returns isolated runtime buffers while sharing immutable weights")
+    func contextInitializerReturnsIsolatedRuntimeState() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -29,8 +29,8 @@ struct LanguageModelContainerIsolationTests {
         )
         let container = LanguageModelContainer(prototypeContext: prototypeContext)
 
-        let first = try container.makeContext()
-        let second = try container.makeContext()
+        let first = try LanguageModelContext(container)
+        let second = try LanguageModelContext(container)
 
         let firstBuffers = first.debugCompiledModel.decodePlan.buffers
         let secondBuffers = second.debugCompiledModel.decodePlan.buffers

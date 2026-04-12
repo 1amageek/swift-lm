@@ -90,7 +90,7 @@ struct Gemma4RuntimeTests {
             return
         }
         let prepared = try await container.prepare( ModelInput(prompt: "hello gemma4"))
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         #expect(executable.visualContext == nil)
         #expect(executable.tokenIDs == prepared.tokenIDs)
@@ -111,7 +111,7 @@ struct Gemma4RuntimeTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         #expect(executable.visualContext == nil)
         #expect(executable.tokenIDs == prepared.tokenIDs)
@@ -171,7 +171,7 @@ struct Gemma4RuntimeTests {
                 ])
             ])
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         let direct = await QwenVisionTestSupport.collectGeneration(
             from: try container.generate(from: prompt,
@@ -185,7 +185,7 @@ struct Gemma4RuntimeTests {
         )
 
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: prompt)
+        let promptState = try PromptSnapshot(from: prompt, using: container)
         let restored = await QwenVisionTestSupport.collectGeneration(
             from: try container.generate(
                 from: promptState,
@@ -210,7 +210,7 @@ struct Gemma4RuntimeTests {
         }
 
         let prepared = try await container.prepare( ModelInput(prompt: "hello gemma4"))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let diagnostics = try container.debugPrefillOutputHeadDiagnostics(prompt: prompt, topK: 5)
 
         #expect(diagnostics.inputLayout.hiddenCount == 64)

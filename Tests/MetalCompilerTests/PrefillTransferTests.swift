@@ -285,7 +285,7 @@ struct PrefillTransferTests {
         }
 
         let config = makeTestConfig(hiddenSize: 128)
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
 
         let compiler = MetalInferenceCompiler()
@@ -323,7 +323,7 @@ struct PrefillTransferTests {
         }
 
         let config = makeTestConfig(hiddenSize: 128)
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
 
         let compiler = MetalInferenceCompiler()
@@ -380,7 +380,7 @@ struct PrefillTransferTests {
         decodePolicy: InferencePolicy = .default,
         prefillPolicy: InferencePolicy? = nil
     ) throws -> (MetalDispatchPlan, MetalPrefillPlan) {
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let compiler = MetalInferenceCompiler()
         let decodePlan = try compiler.compile(

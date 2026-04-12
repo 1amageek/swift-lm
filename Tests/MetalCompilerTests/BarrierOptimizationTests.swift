@@ -219,7 +219,7 @@ struct BarrierOptimizationTests {
             ssmValueHeadDim: nil, convKernelSize: nil,
             partialRotaryFactor: nil, slidingWindow: nil
         )
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let compiled = try MetalInferenceCompiler().compile(
             graph: resolved, hiddenSize: 128, intermediateSize: 512,
@@ -253,7 +253,7 @@ struct BarrierOptimizationTests {
             ssmValueHeadDim: nil, convKernelSize: nil,
             partialRotaryFactor: nil, slidingWindow: nil
         )
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let compiled = try MetalInferenceCompiler().compile(
             graph: resolved, hiddenSize: 128, intermediateSize: 512,

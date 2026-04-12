@@ -2,8 +2,7 @@ import MetalCompiler
 
 /// A reusable snapshot of decode state for a prepared prompt prefix.
 ///
-/// Build a prompt snapshot with ``LanguageModelContext/makePromptSnapshot(from:)`` or
-/// ``LanguageModelContext/makePromptSnapshot(from:)-(ModelInput)`` and reuse it with
+/// Build a prompt snapshot with one of `PromptSnapshot`'s initializers and reuse it with
 /// ``LanguageModelContext/generate(from:parameters:)``.
 ///
 /// `PromptSnapshot` is context-affine runtime state. Reuse it only with the same
@@ -28,6 +27,27 @@ public struct PromptSnapshot: @unchecked Sendable {
         self.samplingSeed = samplingSeed
         self.promptTokenTail = promptTokenTail
         self.promptTokenCount = promptTokenCount
+    }
+
+    public init(
+        from prompt: ExecutablePrompt,
+        using context: LanguageModelContext
+    ) throws {
+        self = try context.promptSnapshot(for: prompt)
+    }
+
+    public init(
+        from preparedPrompt: PreparedPrompt,
+        using context: LanguageModelContext
+    ) throws {
+        self = try context.promptSnapshot(for: preparedPrompt)
+    }
+
+    public init(
+        from input: ModelInput,
+        using context: LanguageModelContext
+    ) async throws {
+        self = try await context.promptSnapshot(for: input)
     }
 }
 

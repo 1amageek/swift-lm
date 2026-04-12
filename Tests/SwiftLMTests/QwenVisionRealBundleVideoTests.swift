@@ -27,7 +27,7 @@ struct QwenVisionRealBundleVideoTests {
         )
         let prepareTime = CFAbsoluteTimeGetCurrent() - prepareStart
         let executableStart = CFAbsoluteTimeGetCurrent()
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let executableTime = CFAbsoluteTimeGetCurrent() - executableStart
         let videoTokenCount = executable.visualContext?.layout.mmTokenTypeIDs.filter { $0 == 2 }.count ?? 0
         print("[RealQwenVision] video prompt prepare=\(String(format: "%.3f", prepareTime))s executable=\(String(format: "%.3f", executableTime))s tokens=\(prepared.tokenIDs.count) videoTokens=\(videoTokenCount)")

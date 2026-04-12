@@ -41,7 +41,7 @@ struct DispatchPlanCompilationTests {
     @Test
     func tinyModelCompilesToMultiDispatch() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let graph = try TinyTestModel(hiddenSize: 64, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTestModel(hiddenSize: 64, vocabSize: 100))
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(graph: graph, hiddenSize: 64, vocabSize: 100, device: device)
 
@@ -52,7 +52,7 @@ struct DispatchPlanCompilationTests {
     @Test
     func transformerCompilesToManyDispatches() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let graph = try TinyTransformer(hiddenSize: 64, layers: 2, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 2, vocabSize: 100))
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(graph: graph, hiddenSize: 64, vocabSize: 100, device: device)
 
@@ -62,7 +62,7 @@ struct DispatchPlanCompilationTests {
 
     @Test
     func standardOptimizerFusesMlpFrontHalfInDispatchDump() throws {
-        let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
 
@@ -71,7 +71,7 @@ struct DispatchPlanCompilationTests {
 
     @Test
     func standardOptimizerDoesNotBatchAttentionProjections() throws {
-        let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
 
@@ -80,7 +80,7 @@ struct DispatchPlanCompilationTests {
 
     @Test
     func aggressiveOptimizerBatchesAttentionProjectionsInDispatchDump() throws {
-        let graph = try TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
 
@@ -90,7 +90,7 @@ struct DispatchPlanCompilationTests {
     @Test
     func threadgroupSizesRespectPipelineLimits() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let graph = try TinyTestModel(hiddenSize: 64, vocabSize: 100).makeModelGraph()
+        let graph = try ModelGraph(TinyTestModel(hiddenSize: 64, vocabSize: 100))
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(graph: graph, hiddenSize: 64, vocabSize: 100, device: device)
 
@@ -109,11 +109,12 @@ struct DispatchPlanCompilationTests {
     @Test
     func specializedFusedSwiGLUArgumentTableRetainsOutputDimensionConstant() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let graph = try SpecializedSwiGLUTestModel(
+        let model = SpecializedSwiGLUTestModel(
             hiddenSize: 2048,
             intermediateSize: 6144,
             vocabSize: 128
-        ).makeModelGraph()
+        )
+        let graph = try ModelGraph(model)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let plan = try compiler.compile(
             graph: graph,
@@ -137,11 +138,12 @@ struct DispatchPlanCompilationTests {
     @Test
     func fusedSwiGLUDecodeRoutingKeepsFollowingProjectionOutOfPlace() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let graph = try SpecializedSwiGLUTestModel(
+        let model = SpecializedSwiGLUTestModel(
             hiddenSize: 2048,
             intermediateSize: 6144,
             vocabSize: 128
-        ).makeModelGraph()
+        )
+        let graph = try ModelGraph(model)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let plan = try compiler.compile(
             graph: graph,

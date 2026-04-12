@@ -12,7 +12,7 @@
 ///     kvHeads: 8,
 ///     vocabularySize: 32000
 /// ))
-/// let graph = try llama.makeModelGraph()
+/// let graph = try llama)
 /// ```
 public struct Transformer: ModelComponent {
 

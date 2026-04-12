@@ -25,14 +25,14 @@ struct TemporaryRealOutputTests {
         )
         print("[Gemma4 prepared]")
         print(prepared.renderedText)
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         print("[Gemma prefill steps]")
         for summary in container.debugPrefillStepSummaries().prefix(32) {
             let layerLabel = summary.layerIndex.map(String.init) ?? "-"
             print("  step=\(summary.index) layer=\(layerLabel) kernel=\(summary.kernelName)")
         }
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: prompt)
+        let promptState = try PromptSnapshot(from: prompt, using: container)
         let firstToken = Int(promptState.metalState.firstToken)
         let decoded = container.tokenizer.decode(tokens: [firstToken], skipSpecialTokens: false)
         print("[Gemma4 first token] \(firstToken) -> \(String(reflecting: decoded))")
@@ -115,9 +115,9 @@ struct TemporaryRealOutputTests {
         try printPromptStateDiagnostics(
             label: "Qwen text",
             container: container,
-            prompt: try container.makeExecutablePrompt(from: textPrepared)
+            prompt: try ExecutablePrompt(preparedPrompt: textPrepared, using: container)
         )
-        let textStream = try container.generate(from: try container.makeExecutablePrompt(from: textPrepared),
+        let textStream = try container.generate(from: try ExecutablePrompt(preparedPrompt: textPrepared, using: container),
             parameters: GenerationParameters(
                 maxTokens: 12,
                 streamChunkTokenCount: 8,
@@ -133,7 +133,7 @@ struct TemporaryRealOutputTests {
         print("[Qwen text joined]")
         print(textResult.chunks.joined())
         let textTokenIDs = try container.debugGeneratedTokenIDs(
-            prompt: try container.makeExecutablePrompt(from: textPrepared),
+            prompt: try ExecutablePrompt(preparedPrompt: textPrepared, using: container),
             parameters: GenerationParameters(
                 maxTokens: 12,
                 streamChunkTokenCount: 8,
@@ -147,7 +147,7 @@ struct TemporaryRealOutputTests {
         print(textTokenIDs)
         try printQwenEmbeddingDiagnostics(
             container: container,
-            prompt: try container.makeExecutablePrompt(from: textPrepared)
+            prompt: try ExecutablePrompt(preparedPrompt: textPrepared, using: container)
         )
 
         container.resetState()
@@ -161,9 +161,9 @@ struct TemporaryRealOutputTests {
         try printPromptStateDiagnostics(
             label: "Qwen chat",
             container: container,
-            prompt: try container.makeExecutablePrompt(from: chatPrepared)
+            prompt: try ExecutablePrompt(preparedPrompt: chatPrepared, using: container)
         )
-        let chatStream = try container.generate(from: try container.makeExecutablePrompt(from: chatPrepared),
+        let chatStream = try container.generate(from: try ExecutablePrompt(preparedPrompt: chatPrepared, using: container),
             parameters: GenerationParameters(
                 maxTokens: 12,
                 streamChunkTokenCount: 8,
@@ -179,7 +179,7 @@ struct TemporaryRealOutputTests {
         print("[Qwen chat joined]")
         print(chatResult.chunks.joined())
         let chatTokenIDs = try container.debugGeneratedTokenIDs(
-            prompt: try container.makeExecutablePrompt(from: chatPrepared),
+            prompt: try ExecutablePrompt(preparedPrompt: chatPrepared, using: container),
             parameters: GenerationParameters(
                 maxTokens: 12,
                 streamChunkTokenCount: 8,
@@ -324,7 +324,7 @@ struct TemporaryRealOutputTests {
         }
 
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: prompt)
+        let promptState = try PromptSnapshot(from: prompt, using: container)
         let firstToken = Int(promptState.metalState.firstToken)
         let decoded = container.tokenizer.decode(tokens: [firstToken], skipSpecialTokens: false)
         print("[\(label) first token] \(firstToken) -> \(String(reflecting: decoded))")

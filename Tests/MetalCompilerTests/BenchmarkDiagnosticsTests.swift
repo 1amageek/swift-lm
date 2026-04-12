@@ -126,7 +126,7 @@ struct BenchmarkDiagnosticsTests {
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let start = CFAbsoluteTimeGetCurrent()
@@ -289,7 +289,7 @@ struct BenchmarkDiagnosticsTests {
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 2048)
 
@@ -343,7 +343,7 @@ struct BenchmarkDiagnosticsTests {
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 2048)
         let squareRoles = dump

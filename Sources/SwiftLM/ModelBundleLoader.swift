@@ -17,6 +17,16 @@ import MetalCompiler
 /// let container = try await ModelBundleLoader().load(repo: "Qwen/Qwen2.5-0.5B-Instruct")
 /// ```
 public struct ModelBundleLoader: Sendable {
+    static let textEmbeddingSnapshotPatterns = [
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "*.safetensors",
+        "special_tokens_map.json",
+        "modules.json",
+        "config_sentence_transformers.json",
+        "**/config.json",
+    ]
 
     public init() {}
 
@@ -39,24 +49,35 @@ public struct ModelBundleLoader: Sendable {
         )
     }
 
+    /// Load a sentence-transformers text embedding bundle from a HuggingFace repository.
+    public func loadTextEmbeddings(
+        repo: String,
+        inferencePolicy: InferencePolicy = .default,
+        progress: Progress? = nil
+    ) async throws -> TextEmbeddingContainer {
+        let hubApi = HubApi()
+        let repoId = Hub.Repo(id: repo)
+        let directory = try await hubApi.snapshot(
+            from: repoId,
+            matching: Self.textEmbeddingSnapshotPatterns
+        )
+        return try await loadTextEmbeddings(
+            directory: directory,
+            inferencePolicy: inferencePolicy
+        )
+    }
+
     /// Load a model from a local directory.
     public func load(
         directory: URL,
         inferencePolicy: InferencePolicy = .default
     ) async throws -> LanguageModelContainer {
-        guard let device = MTLCreateSystemDefaultDevice() else {
-            throw ModelBundleLoaderError.noMetalDevice
-        }
-
         let startTime = CFAbsoluteTimeGetCurrent()
-        let inspector = ModelBundleInspector()
-        let resources = try inspector.inspect(directory: directory)
-        // 2. Parallel: tokenizer + chat template + STAF
-        async let tokenizerTask = AutoTokenizer.from(modelFolder: directory)
-        async let weightStoreTask = STAFCacheLoader().load(resources: resources, device: device)
-
-        let tokenizer = try await tokenizerTask
-        let weightStore = try await weightStoreTask
+        let device = try Self.requireMetalDevice()
+        let (resources, tokenizer, weightStore) = try await loadBundleArtifacts(
+            directory: directory,
+            device: device
+        )
         let visionRuntime = try QwenVisionRuntime.makeIfSupported(resources: resources, device: device)
         let gemma4Runtime = try Gemma4Runtime.makeIfSupported(
             resources: resources,
@@ -187,6 +208,86 @@ public struct ModelBundleLoader: Sendable {
         return LanguageModelContainer(prototypeContext: prototypeContext)
     }
 
+    /// Load a sentence-transformers text embedding bundle from a local directory.
+    public func loadTextEmbeddings(
+        directory: URL,
+        inferencePolicy: InferencePolicy = .default
+    ) async throws -> TextEmbeddingContainer {
+        let startTime = CFAbsoluteTimeGetCurrent()
+        let device = try Self.requireMetalDevice()
+        let (resources, tokenizer, weightStore) = try await loadBundleArtifacts(
+            directory: directory,
+            device: device
+        )
+        let runtime = try SentenceTransformerTextEmbeddingRuntime(
+            resources: resources,
+            weights: weightStore
+        )
+
+        let graphResolver = ModelGraphResolver()
+        let graph = try graphResolver.resolveEmbeddingBackboneGraph(
+            modelType: resources.modelType,
+            config: resources.config
+        )
+        let convention = graphResolver.namingConvention(for: resources.modelType)
+        let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: convention)
+
+        let compiler = Self.makeInferenceCompiler()
+        let resolvedInferencePolicy = Self.resolveInferencePolicy(
+            inferencePolicy,
+            for: resolvedGraph
+        )
+        let prefillPlan = try compiler.compilePrefill(
+            graph: resolvedGraph,
+            hiddenSize: resources.config.hiddenSize,
+            intermediateSize: resources.config.intermediateSize,
+            vocabSize: resources.config.vocabSize,
+            inferencePolicy: Self.prefillInferencePolicy(for: resolvedInferencePolicy),
+            stafWeightStore: weightStore,
+            device: device
+        )
+
+        var configuration = ModelConfiguration(
+            name: resources.modelType,
+            inputCapabilities: .textOnly,
+            executionCapabilities: ModelExecutionCapabilities(
+                supportsTextGeneration: false,
+                supportsTextEmbeddings: true,
+                supportsPromptStateReuse: false
+            ),
+            vision: nil
+        )
+        if let eosTokenID = tokenizer.eosTokenId {
+            configuration.eosTokenIds.insert(eosTokenID)
+        }
+
+        let totalTime = CFAbsoluteTimeGetCurrent() - startTime
+        print("[ModelBundleLoader] embedding bundle ready: \(configuration.name) [\(String(format: "%.3f", totalTime))s]")
+
+        return TextEmbeddingContainer(
+            prefillPlan: prefillPlan,
+            device: device,
+            tokenizer: tokenizer,
+            runtime: runtime,
+            configuration: configuration
+        )
+    }
+
+    private func loadBundleArtifacts(
+        directory: URL,
+        device: MTLDevice
+    ) async throws -> (ModelBundleResources, any Tokenizer, STAFWeightStore) {
+        let inspector = ModelBundleInspector()
+        let resources = try inspector.inspect(directory: directory)
+
+        async let tokenizerTask = AutoTokenizer.from(modelFolder: directory)
+        async let weightStoreTask = STAFCacheLoader().load(resources: resources, device: device)
+
+        let tokenizer = try await tokenizerTask
+        let weightStore = try await weightStoreTask
+        return (resources, tokenizer, weightStore)
+    }
+
     static func resolveInferencePolicy(
         _ requestedPolicy: InferencePolicy,
         for graph: ModelGraph
@@ -205,6 +306,13 @@ public struct ModelBundleLoader: Sendable {
                 valueScheme: .fixed(.rotorQ4Group64ScaleF16)
             )
         )
+    }
+
+    private static func requireMetalDevice() throws -> MTLDevice {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            throw ModelBundleLoaderError.noMetalDevice
+        }
+        return device
     }
 
     private static func isLoaderDefaultPolicy(_ policy: InferencePolicy) -> Bool {

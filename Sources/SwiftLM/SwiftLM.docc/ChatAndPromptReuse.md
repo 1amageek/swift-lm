@@ -5,14 +5,14 @@
 Use ``ModelInput`` with ``InputMessage`` values to generate from a conversation:
 
 ```swift
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let prepared = try await context.prepare(
     ModelInput(chat: [
         .system("You are a concise assistant."),
         .user("Summarize the benefits of zero-copy model loading.")
     ])
 )
-let executable = try context.makeExecutablePrompt(from: prepared)
+let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 
 for await event in try context.generate(from: executable) {
     if let chunk = event.text {
@@ -30,12 +30,13 @@ For Qwen3-VL style bundles, image-bearing and video-bearing chat messages are no
 If many requests share the same prefix, build a ``PromptSnapshot`` once and restore it later:
 
 ```swift
-let context = try container.makeContext()
-let promptSnapshot = try await context.makePromptSnapshot(
+let context = try LanguageModelContext(container)
+let promptSnapshot = try await PromptSnapshot(
     from: ModelInput(chat: [
         .system("You are a helpful code review assistant."),
         .user("Review this patch carefully.")
-    ])
+    ]),
+    using: context
 )
 
 for await event in try context.generate(

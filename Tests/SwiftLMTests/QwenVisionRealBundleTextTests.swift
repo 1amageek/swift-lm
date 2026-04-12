@@ -11,12 +11,12 @@ struct QwenVisionRealBundleTextTests {
             return
         }
         let loaded = try await ModelBundleLoader().load(directory: directory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
 
         container.resetState()
         let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let comparison = try RealOutputAssertionSupport.assertGreedyDirectMatchesPromptState(
             container: container,
             prompt: prompt,
@@ -37,7 +37,7 @@ struct QwenVisionRealBundleTextTests {
             return
         }
         let loaded = try await ModelBundleLoader().load(directory: directory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
 
         let parameters = GenerationParameters(
             maxTokens: 64,
@@ -53,7 +53,7 @@ struct QwenVisionRealBundleTextTests {
         ))
         print("[Qwen3.5 thinking rendered text prefix]")
         print(String(prepared.renderedText.prefix(400)))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         container.resetState()
         let visibleTokenIDs = try container.debugGeneratedTokenIDs(

@@ -13,7 +13,7 @@ struct QwenVisionExecutionTests {
         container.resetState()
 
         let prepared = try await container.prepare( ModelInput(prompt: "Hello multimodal runtime"))
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         #expect(executable.visualContext == nil)
         #expect(executable.tokenIDs == prepared.tokenIDs)
@@ -35,7 +35,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         let multimodal = try #require(executable.visualContext)
         #expect(multimodal.layout.mmTokenTypeIDs.contains(1))
@@ -59,7 +59,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         let multimodal = try #require(executable.visualContext)
         #expect(multimodal.layout.mmTokenTypeIDs.contains(2))
@@ -100,14 +100,13 @@ struct QwenVisionExecutionTests {
         container.resetState()
 
         let videoData = try await TestVideoFixtures.makeMP4Data()
-        let promptState = try await container.makePromptSnapshot(from: ModelInput(chat: [
+        let promptState = try await PromptSnapshot(from: ModelInput(chat: [
                 .user([
                     .text("Watch"),
                     .video(InputVideo(data: videoData, mimeType: "video/mp4")),
                     .text("carefully"),
                 ])
-            ])
-        )
+            ]), using: container)
 
         #expect(promptState.promptTokenCount > 0)
     }
@@ -129,14 +128,14 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let directStream = try container.generate(from: executable,
             parameters: GenerationParameters(maxTokens: 2, streamChunkTokenCount: 1)
         )
         let direct = await QwenVisionTestSupport.collectGeneration(from: directStream)
 
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: executable)
+        let promptState = try PromptSnapshot(from: executable, using: container)
         let restoredStream = try container.generate(
             from: promptState,
             parameters: GenerationParameters(maxTokens: 2, streamChunkTokenCount: 1)
@@ -164,7 +163,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let diagnostics = try container.debugPromptStateRestoreDiagnostics(prompt: executable, topK: 5)
 
         #expect(diagnostics.directTokenOut == diagnostics.promptStateFirstToken)
@@ -189,7 +188,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let parameters = GenerationParameters(maxTokens: 1, streamChunkTokenCount: 1)
 
         let direct = await QwenVisionTestSupport.collectGeneration(
@@ -197,7 +196,7 @@ struct QwenVisionExecutionTests {
         )
 
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: executable)
+        let promptState = try PromptSnapshot(from: executable, using: container)
         let restored = await QwenVisionTestSupport.collectGeneration(
             from: try container.generate(from: promptState, parameters: parameters)
         )
@@ -222,7 +221,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let initial = try container.debugPrefillTopLogits(prompt: executable, topK: 5)
 
         _ = await QwenVisionTestSupport.collectGeneration(
@@ -254,7 +253,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let sampled = try container.debugPromptStateSampledFirstTokens(
             prompt: executable,
             parameters: GenerationParameters(maxTokens: 1, streamChunkTokenCount: 1)
@@ -283,7 +282,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let repeated = try container.debugRepeatedPrefillSampledFirstTokens(
             prompt: executable,
             parameters: GenerationParameters(maxTokens: 1, streamChunkTokenCount: 1)
@@ -318,7 +317,7 @@ struct QwenVisionExecutionTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let diagnostics = try container.debugRepeatedPrefillFinalHiddenDiagnostics(prompt: executable)
         print(
             "[Qwen repeated hidden] nanCounts=(\(diagnostics.firstNaNCount), \(diagnostics.secondNaNCount)) "

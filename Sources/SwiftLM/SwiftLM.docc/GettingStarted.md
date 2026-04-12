@@ -47,14 +47,34 @@ let container = try await ModelBundleLoader().load(directory: directory)
 
 `SwiftLM` creates `model.staf` next to the source weights as a regenerable execution cache.
 
+## Load a Text Embedding Model
+
+```swift
+import SwiftLM
+
+let embeddings = try await ModelBundleLoader().loadTextEmbeddings(
+    repo: "google/embeddinggemma-300m"
+)
+
+let context = try TextEmbeddingContext(embeddings)
+let vector = try context.embed(
+    "swift metal inference",
+    promptName: embeddings.defaultPromptName
+)
+
+print(vector.count)
+```
+
+``TextEmbeddingContainer`` is the immutable loaded bundle and factory for execution state. ``TextEmbeddingContext`` owns the isolated mutable prefill runtime used for embedding execution.
+
 ## Generate from Text
 
 ```swift
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let input = try await context.prepare(
     ModelInput(prompt: "Write a haiku about Metal shaders.")
 )
-let executable = try context.makeExecutablePrompt(from: input)
+let executable = try ExecutablePrompt(preparedPrompt: input, using: context)
 
 let stream = try context.generate(
     from: executable,
@@ -90,8 +110,9 @@ The current loader resolves these families from `config.json["model_type"]`:
 
 | Family | `model_type` examples |
 |---|---|
-| Transformer | `llama`, `qwen2`, `qwen3`, `mistral`, `gemma`, `phi`, `mixtral`, `deepseek` |
-| Qwen 3.5 hybrid / Qwen3-VL text backbone | `qwen3_5`, `qwen3_vl` |
+| Transformer | `llama`, `qwen2`, `qwen3`, `mistral`, `gemma`, `gemma2`, `phi`, `phi3`, `starcoder2`, `gpt_neox`, `internlm2`, `deepseek`, `yi`, `baichuan`, `chatglm`, `mixtral`, `qwen2_moe`, `deepseek_v2`, `arctic`, `dbrx` |
+| Gemma4 | `gemma4`, `gemma4_text` |
+| Qwen 3.5 hybrid / Qwen vision text backbone | `qwen3_5`, `qwen3_vl`, `qwen2_5_vl`, `qwen2_vl` |
 | LFM2 / LFM2.5 hybrid | `lfm2`, `lfm2_moe` |
 | Cohere | `cohere`, `command-r` |
 

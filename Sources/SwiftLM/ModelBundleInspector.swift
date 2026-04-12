@@ -9,6 +9,10 @@ struct ModelBundleInspector {
         let config = try decoder.decode(from: configData)
         let modelType = try decoder.modelType(from: configData)
         let safetensorsURLs = try findSafetensorsFiles(in: directory)
+        let modulesData = try loadOptionalData(from: directory.appendingPathComponent("modules.json"))
+        let sentenceTransformersConfigData = try loadOptionalData(
+            from: directory.appendingPathComponent("config_sentence_transformers.json")
+        )
         let chatTemplate = try loadChatTemplate(from: directory, modelType: modelType)
         let preprocessorConfigData = try loadProcessorConfigData(from: directory)
         let visionConfiguration = try decoder.visionConfiguration(
@@ -26,6 +30,8 @@ struct ModelBundleInspector {
             config: config,
             modelType: modelType,
             safetensorsURLs: safetensorsURLs,
+            modulesData: modulesData,
+            sentenceTransformersConfigData: sentenceTransformersConfigData,
             chatTemplate: chatTemplate.template,
             chatTemplateSource: chatTemplate.source,
             preprocessorConfigData: preprocessorConfigData,

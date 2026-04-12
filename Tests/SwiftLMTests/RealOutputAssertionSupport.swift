@@ -39,7 +39,7 @@ enum RealOutputAssertionSupport {
         )
 
         container.resetState()
-        let promptState = try container.makePromptSnapshot(from: prompt)
+        let promptState = try PromptSnapshot(from: prompt, using: container)
         let restoredTokenIDs = try container.debugPromptStateGeneratedTokenIDs(
             promptState: promptState,
             parameters: parameters

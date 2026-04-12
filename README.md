@@ -18,6 +18,8 @@ The public API is centered on:
 - `ModelBundleLoader`
 - `LanguageModelContainer`
 - `LanguageModelContext`
+- `TextEmbeddingContainer`
+- `TextEmbeddingContext`
 - `ModelInput`
 - `GenerationParameters`
 - `PromptSnapshot`
@@ -31,7 +33,7 @@ let container = try await ModelBundleLoader().load(
     repo: "LiquidAI/LFM2.5-1.2B-Instruct"
 )
 
-let context = try container.makeContext()
+let context = try LanguageModelContext(container)
 let input = ModelInput(
     chat: [
         .system("You are a concise assistant."),
@@ -41,7 +43,7 @@ let input = ModelInput(
 )
 
 let prepared = try await context.prepare(input)
-let executable = try context.makeExecutablePrompt(from: prepared)
+let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 let stream = try context.generate(
     from: executable,
     parameters: GenerationParameters(
@@ -80,6 +82,22 @@ let container = try await ModelBundleLoader().load(
 ```
 
 `load(repo:)` and `load(directory:)` also accept `inferencePolicy:`. The loader may upgrade the default KV cache policy to RotorQuant for eligible attention-backed decode graphs. Pass an explicit `InferencePolicy` when you want to override that behavior.
+
+### Text Embeddings
+
+`ModelBundleLoader.loadTextEmbeddings(...)` loads sentence-transformers style text embedding bundles and returns a `TextEmbeddingContainer`.
+
+```swift
+let embeddings = try await ModelBundleLoader().loadTextEmbeddings(
+    repo: "google/embeddinggemma-300m"
+)
+
+let context = try TextEmbeddingContext(embeddings)
+let vector = try context.embed("swift metal inference", promptName: embeddings.defaultPromptName)
+print(vector.count)
+```
+
+As with language generation, `TextEmbeddingContainer` is immutable and shareable, while `TextEmbeddingContext` owns isolated mutable runtime state for embedding execution.
 
 ### Prompt Preparation
 
@@ -120,11 +138,11 @@ This separation matters because prompt-template variables affect rendered input,
 Use `PromptSnapshot` when many requests share the same prefix.
 
 ```swift
-let context = try container.makeContext()
-let snapshot = try await context.makePromptSnapshot(from: ModelInput(chat: [
+let context = try LanguageModelContext(container)
+let snapshot = try await PromptSnapshot(from: ModelInput(chat: [
     .system("You are a careful code reviewer."),
     .user("Review this patch.")
-]))
+]), using: context)
 
 for await event in try context.generate(
     from: snapshot,
@@ -183,7 +201,7 @@ if container.configuration.executionCapabilities.supportsImagePromptPreparation 
     ])
 
     let prepared = try await context.prepare(input)
-    let executable = try context.makeExecutablePrompt(from: prepared)
+    let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 
     for await event in try context.generate(from: executable) {
         if case .text(let chunk) = event {

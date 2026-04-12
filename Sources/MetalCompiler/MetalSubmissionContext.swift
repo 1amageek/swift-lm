@@ -190,8 +190,11 @@ struct MetalSubmissionContext: @unchecked Sendable {
     }
 
     /// Fill buffer contents using unified compute+blit encoder.
-    mutating func fillBuffers(_ fills: [(buffer: MTLBuffer, value: UInt8)]) throws {
-        try withCompute { encoder, _ in
+    mutating func fillBuffers(
+        _ fills: [(buffer: MTLBuffer, value: UInt8)],
+        ephemeralResidency: MetalResidencyLease = .empty
+    ) throws {
+        try withCompute(ephemeralResidency: ephemeralResidency) { encoder, _ in
             for fill in fills {
                 encoder.fill(buffer: fill.buffer, range: 0..<fill.buffer.length, value: fill.value)
             }
@@ -200,9 +203,10 @@ struct MetalSubmissionContext: @unchecked Sendable {
 
     /// Copy buffers using unified compute+blit encoder.
     mutating func copyBuffers(
-        _ copies: [(from: MTLBuffer, sourceOffset: Int, to: MTLBuffer, destinationOffset: Int, size: Int)]
+        _ copies: [(from: MTLBuffer, sourceOffset: Int, to: MTLBuffer, destinationOffset: Int, size: Int)],
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws {
-        try withCompute { encoder, _ in
+        try withCompute(ephemeralResidency: ephemeralResidency) { encoder, _ in
             for copy in copies {
                 encoder.copy(
                     sourceBuffer: copy.from, sourceOffset: copy.sourceOffset,

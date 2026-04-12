@@ -316,7 +316,7 @@ struct IRInvariantTests {
         ]
 
         for model in models {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             try GraphValidator.validate(graph)
 
             let canon = canonicalize(graph)
@@ -335,7 +335,7 @@ struct IRInvariantTests {
         ]
 
         for model in models {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             #expect(allValueIDsUnique(in: graph.rootRegion))
         }
     }
@@ -350,7 +350,7 @@ struct IRInvariantTests {
         ]
 
         for model in models {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             #expect(verifySSARecursive(graph.rootRegion))
         }
     }
@@ -361,7 +361,7 @@ struct IRInvariantTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4, kvHeadCount: 2,
             intermediateSize: 256, expertCount: 4, expertsPerToken: 2, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let canon = canonicalize(graph)
 
         #expect(verifySSARecursive(canon.rootRegion))
@@ -519,7 +519,7 @@ struct IRInvariantTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
 
         // Collect values defined inside nested regions
         var nestedValues = Set<ValueID>()
@@ -574,7 +574,7 @@ struct IRInvariantTests {
             vocabSize: 100, hiddenSize: 64, headCount: 4,
             kvHeadCount: 2, intermediateSize: 256, layerCount: 2
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let canon = canonicalize(graph)
 
         // Same number of root operations
@@ -641,7 +641,7 @@ struct IRInvariantTests {
             expertCount: 8, expertsPerToken: 2, layerCount: 2
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try GraphValidator.validate(graph)
         try LLMProfileValidator.validate(graph)
 
@@ -677,7 +677,7 @@ struct IRInvariantTests {
             kvHeadCount: 8, intermediateSize: 14336, stateSize: 16
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         try GraphValidator.validate(graph)
         try LLMProfileValidator.validate(graph)
 
@@ -721,8 +721,8 @@ struct IRInvariantTests {
             intermediateSize: 256, stateSize: 16
         )
 
-        let g1 = canonicalize(try mixtral.makeModelGraph())
-        let g2 = canonicalize(try jamba.makeModelGraph())
+        let g1 = canonicalize(try ModelGraph(mixtral))
+        let g2 = canonicalize(try ModelGraph(jamba))
 
         #expect(g1 != g2)
     }
@@ -848,7 +848,7 @@ struct IRInvariantTests {
         let decoder = JSONDecoder()
 
         for model in models {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             let data = try encoder.encode(graph)
             let decoded = try decoder.decode(ModelGraph.self, from: data)
             #expect(graph == decoded)
@@ -867,7 +867,7 @@ struct IRInvariantTests {
         ]
 
         for model in models {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             try GraphValidator.validate(graph)
             try LLMProfileValidator.validate(graph)
         }

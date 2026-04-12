@@ -12,6 +12,14 @@ struct KernelWeightFormatResolver {
             return .bfloat16
         case .fp32RowMajor:
             return .float32
+        case .q4Group64ScaleF16:
+            return .quantized4Bit(groupSize: 64)
+        case .q4Group128ScaleF16:
+            return .quantized4Bit(groupSize: 128)
+        case .q8Group32ScaleF16:
+            return .quantized8Bit(groupSize: 32)
+        case .q8Group64ScaleF16:
+            return .quantized8Bit(groupSize: 64)
         default:
             return .float16
         }
@@ -34,8 +42,8 @@ struct KernelWeightFormatResolver {
         let roles = slotRoles + ["scale", "embedding_table", "conv_weight"]
         for role in roles {
             let format = resolve(role: role, entry: entry)
-            if format == .bfloat16 {
-                return .bfloat16
+            if format != .float16 {
+                return format
             }
         }
         return .float16
@@ -57,6 +65,7 @@ struct MetalKernelSourceCatalog {
 
     func generateSources(entries: [DispatchEntry]) -> GeneratedKernelSources {
         let weightFormatResolver = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
+        let sourceEntries = sourceGenerationEntries(from: entries)
         var sources: [String] = [MetalSourceGenerator.commonHeader]
         var generatedNames: Set<String> = []
         var mppGEMMNames: Set<String> = []
@@ -66,11 +75,25 @@ struct MetalKernelSourceCatalog {
         var needsSSMHelpers = false
         var ssmConvSiluWeightFormats: [MetalSourceGenerator.WeightFormat] = []
 
-        for entry in entries {
+        for entry in sourceEntries {
             let name: String
             switch entry.kind {
             case .projection(let projection, let isOutput):
                 let weightFormat = weightFormatResolver.resolve(role: projection.field, entry: entry)
+                if let quantizedKernelName = quantizedProjectionKernelName(
+                    for: weightFormat,
+                    bufferPrecision: bufferPrecision
+                ) {
+                    if generatedNames.insert(quantizedKernelName).inserted,
+                       let source = quantizedProjectionSource(
+                        named: quantizedKernelName,
+                        weightFormat: weightFormat,
+                        bufferPrecision: bufferPrecision
+                       ) {
+                        sources.append(source)
+                    }
+                    continue
+                }
                 let decodeFamily = bufferPrecision == .float32
                     ? nil
                     : DecodeProjectionShapeFamily.resolve(
@@ -724,6 +747,159 @@ struct MetalKernelSourceCatalog {
             baseSource: sources.joined(separator: "\n\n"),
             mppSources: mppSources,
             mppKernelNames: mppGEMMNames)
+    }
+
+    private func sourceGenerationEntries(from entries: [DispatchEntry]) -> [DispatchEntry] {
+        guard bufferPrecision == .float32 else { return entries }
+        return entries.flatMap { entry in
+            switch entry.kind {
+            case .batchedProjection(let batched):
+                return batched.projections.map { projection in
+                    DispatchEntry(
+                        index: entry.index,
+                        kind: .projection(
+                            MetalProjection(
+                                field: projection.field,
+                                inputDimension: projection.inputDimension,
+                                outputDimension: projection.outputDimension
+                            ),
+                            isOutput: false
+                        ),
+                        parameterBindings: entry.parameterBindings,
+                        layerIndex: entry.layerIndex,
+                        compositeID: entry.compositeID
+                    )
+                }
+            case .fusedSwiGLUProjection(let fused):
+                let elementwiseKind: ElementwiseFragment.ElementwiseKind = switch fused.activation {
+                case .silu:
+                    .swiglu
+                case .geluTanh:
+                    .geluGated
+                }
+                return [
+                    DispatchEntry(
+                        index: entry.index,
+                        kind: .projection(
+                            MetalProjection(
+                                field: fused.gateField,
+                                inputDimension: fused.inputDimension,
+                                outputDimension: fused.outputDimension
+                            ),
+                            isOutput: false
+                        ),
+                        parameterBindings: entry.parameterBindings,
+                        layerIndex: entry.layerIndex,
+                        compositeID: entry.compositeID
+                    ),
+                    DispatchEntry(
+                        index: entry.index,
+                        kind: .projection(
+                            MetalProjection(
+                                field: fused.upField,
+                                inputDimension: fused.inputDimension,
+                                outputDimension: fused.outputDimension
+                            ),
+                            isOutput: false
+                        ),
+                        parameterBindings: entry.parameterBindings,
+                        layerIndex: entry.layerIndex,
+                        compositeID: entry.compositeID
+                    ),
+                    DispatchEntry(
+                        index: entry.index,
+                        kind: .fragment(
+                            ElementwiseFragment(
+                                count: fused.outputDimension,
+                                kind: elementwiseKind
+                            )
+                        ),
+                        parameterBindings: entry.parameterBindings,
+                        layerIndex: entry.layerIndex,
+                        compositeID: entry.compositeID
+                    ),
+                ]
+            default:
+                return [entry]
+            }
+        }
+    }
+
+    private func quantizedProjectionKernelName(
+        for weightFormat: WeightFormat,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        switch (weightFormat, bufferPrecision) {
+        case (.quantized4Bit(let groupSize), .float32):
+            switch groupSize {
+            case 64:
+                return "gemm_q4_g64_f32s"
+            case 128:
+                return "gemm_q4_g128_f32s"
+            default:
+                return nil
+            }
+        case (.quantized4Bit(let groupSize), _):
+            switch groupSize {
+            case 64:
+                return "gemv_q4_g64"
+            case 128:
+                return "gemv_q4_g128"
+            default:
+                return nil
+            }
+        case (.quantized8Bit(let groupSize), _):
+            switch groupSize {
+            case 32:
+                return "gemv_q8_g32"
+            case 64:
+                return "gemv_q8_g64"
+            default:
+                return nil
+            }
+        default:
+            return nil
+        }
+    }
+
+    private func quantizedProjectionSource(
+        named kernelName: String,
+        weightFormat: WeightFormat,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        switch (weightFormat, bufferPrecision) {
+        case (.quantized4Bit(let groupSize), .float32):
+            guard groupSize == 64 || groupSize == 128 else { return nil }
+            return MetalSourceGenerator.generateQuantizedGEMM_Q4(
+                name: kernelName,
+                bufferPrecision: bufferPrecision,
+                groupSize: groupSize
+            )
+        case (.quantized4Bit(let groupSize), _):
+            switch groupSize {
+            case 64:
+                return MetalSourceGenerator.generateQuantizedGEMV_Q4G64(
+                    name: kernelName,
+                    bufferPrecision: bufferPrecision
+                )
+            case 128:
+                return MetalSourceGenerator.generateQuantizedGEMV_Q4G128(
+                    name: kernelName,
+                    bufferPrecision: bufferPrecision
+                )
+            default:
+                return nil
+            }
+        case (.quantized8Bit(let groupSize), _):
+            guard groupSize == 32 || groupSize == 64 else { return nil }
+            return MetalSourceGenerator.generateQuantizedGEMV_Q8(
+                name: kernelName,
+                bufferPrecision: bufferPrecision,
+                groupSize: groupSize
+            )
+        default:
+            return nil
+        }
     }
 
     func format(_ generated: GeneratedKernelSources) -> String {

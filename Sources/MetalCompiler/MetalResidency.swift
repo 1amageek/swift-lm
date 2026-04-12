@@ -51,6 +51,28 @@ struct MetalResidencyLease: @unchecked Sendable {
         }
     }
 
+    static func combined(
+        label: String? = nil,
+        leases: [MetalResidencyLease]
+    ) -> MetalResidencyLease {
+        var seen = Set<ObjectIdentifier>()
+        var sets: [MTLResidencySet] = []
+        var trackedBufferCount = 0
+        for lease in leases {
+            trackedBufferCount += lease.trackedBufferCount
+            for residencySet in lease.sets {
+                let identifier = ObjectIdentifier(residencySet)
+                guard seen.insert(identifier).inserted else { continue }
+                sets.append(residencySet)
+            }
+        }
+        return MetalResidencyLease(
+            label: label,
+            sets: sets,
+            trackedBufferCount: trackedBufferCount
+        )
+    }
+
     private static func deduplicated(_ buffers: [MTLBuffer]) -> [MTLBuffer] {
         var seen = Set<ObjectIdentifier>()
         var uniqueBuffers: [MTLBuffer] = []
@@ -121,6 +143,13 @@ struct MetalStableResidencyRegistry: @unchecked Sendable {
         runtimeLease.remove(from: queue)
         weightLease.remove(from: queue)
         supplementalLease.remove(from: queue)
+    }
+
+    var combinedLease: MetalResidencyLease {
+        MetalResidencyLease.combined(
+            label: "swift-lm.stable",
+            leases: [runtimeLease, weightLease, supplementalLease]
+        )
     }
 
     private enum QueueResidencyPolicy {

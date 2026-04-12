@@ -348,7 +348,7 @@ struct DSLLoweringTests {
             layerCount: 2
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
 
         // Root region: TokenEmbedding, Repeat, RMSNorm, OutputHead
         #expect(graph.rootRegion.operations.count == 4)
@@ -394,7 +394,7 @@ struct DSLLoweringTests {
             layerCount: 1
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
 
         #expect(graph.rootRegion.operations.count == 4)
 
@@ -468,7 +468,7 @@ struct DSLLoweringTests {
             layerCount: 2
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = .sortedKeys
@@ -478,7 +478,7 @@ struct DSLLoweringTests {
         #expect(graph == decoded)
     }
 
-    @Test("ModelComponent.makeModelGraph() convenience method")
+    @Test("ModelComponent) convenience method")
     func modelComponentConvenience() throws {
         let model = TinyLlama(
             vocabSize: 100,
@@ -489,13 +489,13 @@ struct DSLLoweringTests {
             layerCount: 1
         )
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let manual = try normalize(model.body).graph
 
         #expect(graph == manual)
     }
 
-    @Test("ModelComponent.makeNormalizedModel() returns graph + metadata")
+    @Test("ModelComponent) returns graph + metadata")
     func normalizedModelConvenience() throws {
         let model = TinyLlama(
             vocabSize: 100,
@@ -506,8 +506,8 @@ struct DSLLoweringTests {
             layerCount: 1
         )
 
-        let normalized = try model.makeNormalizedModel()
-        let graph = try model.makeModelGraph()
+        let normalized = try NormalizedModel(model)
+        let graph = try ModelGraph(model)
         #expect(normalized.graph == graph)
     }
 
@@ -800,7 +800,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try ThreeOps().makeModelGraph()
+        let graph = try ModelGraph(ThreeOps())
         #expect(graph.rootRegion.operations.count == 3)
 
         // Value chain: each op consumes the previous op's result
@@ -817,7 +817,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try SingleOp().makeModelGraph()
+        let graph = try ModelGraph(SingleOp())
         #expect(graph.rootRegion.operations.count == 1)
         if case .rmsNorm(let attrs) = graph.rootRegion.operations[0].kind {
             #expect(attrs.dimension == 64)
@@ -841,7 +841,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try ConditionalModel(includeNorm: true).makeModelGraph()
+        let graph = try ModelGraph(ConditionalModel(includeNorm: true))
         // tokenEmbedding + rmsNorm + outputHead
         #expect(graph.rootRegion.operations.count == 3)
         if case .rmsNorm = graph.rootRegion.operations[1].kind {
@@ -864,7 +864,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try ConditionalModel(includeNorm: false).makeModelGraph()
+        let graph = try ModelGraph(ConditionalModel(includeNorm: false))
         // tokenEmbedding + outputHead (rmsNorm skipped)
         #expect(graph.rootRegion.operations.count == 2)
         if case .outputHead = graph.rootRegion.operations[1].kind {
@@ -892,10 +892,10 @@ struct DSLLoweringTests {
             }
         }
 
-        let withBlock = try Model(addBlock: true).makeModelGraph()
+        let withBlock = try ModelGraph(Model(addBlock: true))
         #expect(withBlock.rootRegion.operations.count == 4)
 
-        let withoutBlock = try Model(addBlock: false).makeModelGraph()
+        let withoutBlock = try ModelGraph(Model(addBlock: false))
         #expect(withoutBlock.rootRegion.operations.count == 2)
     }
 
@@ -916,7 +916,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try Model(useAttention: true).makeModelGraph()
+        let graph = try ModelGraph(Model(useAttention: true))
         #expect(graph.rootRegion.operations.count == 3)
         if case .attention = graph.rootRegion.operations[1].kind {
             // OK
@@ -940,7 +940,7 @@ struct DSLLoweringTests {
             }
         }
 
-        let graph = try Model(useAttention: false).makeModelGraph()
+        let graph = try ModelGraph(Model(useAttention: false))
         #expect(graph.rootRegion.operations.count == 3)
         if case .mlp = graph.rootRegion.operations[1].kind {
             // OK
@@ -962,7 +962,7 @@ struct DSLLoweringTests {
             layerCount: 32
         )
 
-        let normalized = try model.makeNormalizedModel()
+        let normalized = try NormalizedModel(model)
         let output = normalized.dump()
         print(output)
 
@@ -988,7 +988,7 @@ struct DSLLoweringTests {
             layerCount: 40
         )
 
-        let normalized = try model.makeNormalizedModel()
+        let normalized = try NormalizedModel(model)
         let output = normalized.dump()
         print(output)
 
@@ -1009,7 +1009,7 @@ struct DSLLoweringTests {
             layerCount: 1
         )
 
-        let normalized = try model.makeNormalizedModel()
+        let normalized = try NormalizedModel(model)
         let compact = normalized.dump(verbose: false)
         let verbose = normalized.dump(verbose: true)
         print("--- compact ---")
@@ -1039,7 +1039,7 @@ struct DSLLoweringTests {
 
         // Both branches should produce valid SSA value chains
         for b in [true, false] {
-            let graph = try Model(branch: b).makeModelGraph()
+            let graph = try ModelGraph(Model(branch: b))
             let ops = graph.rootRegion.operations
             #expect(ops.count == 3)
             #expect(ops[1].operands[0].value == ops[0].results[0].id)

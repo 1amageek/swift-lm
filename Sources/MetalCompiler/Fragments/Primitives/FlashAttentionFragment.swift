@@ -15,7 +15,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
     public let ropeScaling: RoPEScaling?
     public let mropeAxes: MRoPEAxes?
     public let querySlotIndex: Int
+    public let causal: Bool
     public let windowLeft: Int?
+    public let windowRight: Int?
     public let sharedKVSourceLayerIndex: Int?
 
     public init(headCount: Int, kvHeadCount: Int, headDimension: Int,
@@ -24,7 +26,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 ropeScaling: RoPEScaling? = nil,
                 mropeAxes: MRoPEAxes? = nil,
                 querySlotIndex: Int = 1,
+                causal: Bool = true,
                 windowLeft: Int? = nil,
+                windowRight: Int? = nil,
                 sharedKVSourceLayerIndex: Int? = nil) {
         self.headCount = headCount
         self.kvHeadCount = kvHeadCount
@@ -35,7 +39,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         self.ropeScaling = ropeScaling
         self.mropeAxes = mropeAxes
         self.querySlotIndex = querySlotIndex
+        self.causal = causal
         self.windowLeft = windowLeft
+        self.windowRight = windowRight
         self.sharedKVSourceLayerIndex = sharedKVSourceLayerIndex
     }
 
@@ -305,7 +311,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(14, UInt32(vHeadSlotBytes)),
                 uint32Binding(18, UInt32(cache.numRotorGroups)),
                 uint32Binding(19, UInt32(cache.qjlDimension)),
-                uint32Binding(20, windowLeft.map(UInt32.init) ?? UInt32.max),
+                uint32Binding(20, causal ? 1 : 0),
+                uint32Binding(21, windowLeft.map(UInt32.init) ?? UInt32.max),
+                uint32Binding(22, windowRight.map(UInt32.init) ?? UInt32.max),
             ],
             threadgroupMemoryLength: 0,
             sync: .bufferBarrier,

@@ -66,7 +66,9 @@ extension AttentionAttributes: MetalKernelFragment, _FragmentBodyAccessor {
             ropeScaling: rope?.scaling,
             mropeAxes: rope?.mropeAxes,
             querySlotIndex: queryScratchSlotIndex,
+            causal: causal,
             windowLeft: window?.left,
+            windowRight: window?.right,
             sharedKVSourceLayerIndex: sharedKeyValueSourceLayerIndex)
         if outputGate == .sigmoidPackedInQProj {
             PackedSigmoidGateFragment(

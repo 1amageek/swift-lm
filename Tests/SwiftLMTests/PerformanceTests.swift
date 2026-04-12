@@ -269,32 +269,32 @@ struct ModelNormalizationPerformanceTests {
     @Test("TinyLlama 2 layers normalization")
     func tinyLlama2() throws {
         let model = makeTinyLlama(layerCount: 2)
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] TinyLlama(2 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] TinyLlama(2 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 
     @Test("TinyLlama 32 layers normalization")
     func tinyLlama32() throws {
         let model = makeTinyLlama(layerCount: 32)
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] TinyLlama(32 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] TinyLlama(32 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 
     @Test("TinyLlama 80 layers normalization")
     func tinyLlama80() throws {
         let model = makeTinyLlama(layerCount: 80)
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] TinyLlama(80 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] TinyLlama(80 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(100))
     }
 
     @Test("Transformer 32 layers normalization")
     func transformer32() throws {
         let model = makeTransformer(hiddenLayers: 32)
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] Transformer(32 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] Transformer(32 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 
@@ -304,8 +304,8 @@ struct ModelNormalizationPerformanceTests {
             hiddenLayers: 32,
             moe: .init(expertCount: 8, expertsPerToken: 2)
         )
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] Transformer+MoE(32 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] Transformer+MoE(32 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 
@@ -319,8 +319,8 @@ struct ModelNormalizationPerformanceTests {
             intermediateSize: 11008,
             layerCount: 32
         )
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] TinyCohere(32 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] TinyCohere(32 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 
@@ -336,8 +336,8 @@ struct ModelNormalizationPerformanceTests {
             expertsPerToken: 2,
             layerCount: 32
         )
-        let d = try measure { _ = try model.makeModelGraph() }
-        print("[perf] TinyMixtral(32 layers) makeModelGraph: \(d)")
+        let d = try measure { _ = try ModelGraph(model) }
+        print("[perf] TinyMixtral(32 layers) ModelGraph init: \(d)")
         #expect(d < .milliseconds(50))
     }
 }
@@ -349,7 +349,7 @@ struct CanonicalizationPerformanceTests {
 
     @Test("Canonicalize small graph (2 layers)")
     func canonicalizeSmall() throws {
-        let graph = try makeTinyLlama(layerCount: 2).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 2))
         let d = measure { _ = canonicalize(graph) }
         print("[perf] canonicalize(2 layers): \(d)")
         #expect(d < .milliseconds(10))
@@ -357,7 +357,7 @@ struct CanonicalizationPerformanceTests {
 
     @Test("Canonicalize medium graph (32 layers)")
     func canonicalizeMedium() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let d = measure { _ = canonicalize(graph) }
         print("[perf] canonicalize(32 layers): \(d)")
         #expect(d < .milliseconds(50))
@@ -365,7 +365,7 @@ struct CanonicalizationPerformanceTests {
 
     @Test("Canonicalize large graph (80 layers)")
     func canonicalizeLarge() throws {
-        let graph = try makeTinyLlama(layerCount: 80).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 80))
         let d = measure { _ = canonicalize(graph) }
         print("[perf] canonicalize(80 layers): \(d)")
         #expect(d < .milliseconds(100))
@@ -377,7 +377,7 @@ struct CanonicalizationPerformanceTests {
             hiddenLayers: 32,
             moe: .init(expertCount: 8, expertsPerToken: 2)
         )
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let d = measure { _ = canonicalize(graph) }
         print("[perf] canonicalize(MoE 32 layers): \(d)")
         #expect(d < .milliseconds(50))
@@ -385,7 +385,7 @@ struct CanonicalizationPerformanceTests {
 
     @Test("Double canonicalization is idempotent and fast")
     func canonicalizeIdempotent() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let canon1 = canonicalize(graph)
         let d = measure { _ = canonicalize(canon1) }
         print("[perf] canonicalize(already canonical): \(d)")
@@ -401,7 +401,7 @@ struct ValidationPerformanceTests {
 
     @Test("GraphValidator small graph (2 layers)")
     func graphValidatorSmall() throws {
-        let graph = try makeTinyLlama(layerCount: 2).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 2))
         let d = try measure { try GraphValidator.validate(graph) }
         print("[perf] GraphValidator(2 layers): \(d)")
         #expect(d < .milliseconds(10))
@@ -409,7 +409,7 @@ struct ValidationPerformanceTests {
 
     @Test("GraphValidator medium graph (32 layers)")
     func graphValidatorMedium() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let d = try measure { try GraphValidator.validate(graph) }
         print("[perf] GraphValidator(32 layers): \(d)")
         #expect(d < .milliseconds(50))
@@ -417,7 +417,7 @@ struct ValidationPerformanceTests {
 
     @Test("GraphValidator large graph (80 layers)")
     func graphValidatorLarge() throws {
-        let graph = try makeTinyLlama(layerCount: 80).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 80))
         let d = try measure { try GraphValidator.validate(graph) }
         print("[perf] GraphValidator(80 layers): \(d)")
         #expect(d < .milliseconds(100))
@@ -425,7 +425,7 @@ struct ValidationPerformanceTests {
 
     @Test("LLMProfileValidator medium graph (32 layers)")
     func profileValidatorMedium() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let d = try measure { try LLMProfileValidator.validate(graph) }
         print("[perf] LLMProfileValidator(32 layers): \(d)")
         #expect(d < .milliseconds(50))
@@ -433,7 +433,7 @@ struct ValidationPerformanceTests {
 
     @Test("Combined validate + profile (32 layers)")
     func combinedValidation() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let d = try measure {
             try GraphValidator.validate(graph)
             try LLMProfileValidator.validate(graph)
@@ -450,7 +450,7 @@ struct CodablePerformanceTests {
 
     @Test("JSON encode small graph (2 layers)")
     func encodeSmall() throws {
-        let graph = try makeTinyLlama(layerCount: 2).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 2))
         let encoder = JSONEncoder()
         let d = try measure { _ = try encoder.encode(graph) }
         print("[perf] JSON encode(2 layers): \(d)")
@@ -459,7 +459,7 @@ struct CodablePerformanceTests {
 
     @Test("JSON encode medium graph (32 layers)")
     func encodeMedium() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let encoder = JSONEncoder()
         let d = try measure { _ = try encoder.encode(graph) }
         print("[perf] JSON encode(32 layers): \(d)")
@@ -468,7 +468,7 @@ struct CodablePerformanceTests {
 
     @Test("JSON decode medium graph (32 layers)")
     func decodeMedium() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let data = try JSONEncoder().encode(graph)
         let decoder = JSONDecoder()
         let d = try measure { _ = try decoder.decode(ModelGraph.self, from: data) }
@@ -478,7 +478,7 @@ struct CodablePerformanceTests {
 
     @Test("JSON roundtrip large graph (80 layers)")
     func roundtripLarge() throws {
-        let graph = try makeTinyLlama(layerCount: 80).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 80))
         let encoder = JSONEncoder()
         let decoder = JSONDecoder()
         let d = try measure {
@@ -492,9 +492,9 @@ struct CodablePerformanceTests {
 
     @Test("JSON encode size is proportional to layer count")
     func encodeSizeScaling() throws {
-        let graph8 = try makeTinyLlama(layerCount: 8).makeModelGraph()
-        let graph32 = try makeTinyLlama(layerCount: 32).makeModelGraph()
-        let graph80 = try makeTinyLlama(layerCount: 80).makeModelGraph()
+        let graph8 = try ModelGraph(makeTinyLlama(layerCount: 8))
+        let graph32 = try ModelGraph(makeTinyLlama(layerCount: 32))
+        let graph80 = try ModelGraph(makeTinyLlama(layerCount: 80))
 
         let size8 = try JSONEncoder().encode(graph8).count
         let size32 = try JSONEncoder().encode(graph32).count
@@ -582,7 +582,7 @@ struct ScalingPerformanceTests {
         ]
 
         for (name, model) in configs {
-            let graph = try model.makeModelGraph()
+            let graph = try ModelGraph(model)
             let opCount = totalOperationCount(in: graph.rootRegion)
             let rootOps = graph.rootRegion.operations.count
             print("[perf] \(name): rootOps=\(rootOps) totalOps=\(opCount)")
@@ -597,8 +597,8 @@ struct EqualityPerformanceTests {
 
     @Test("Graph equality comparison (identical, 32 layers)")
     func equalGraphs() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
-        let copy = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
+        let copy = try ModelGraph(makeTinyLlama(layerCount: 32))
         let d = measure { _ = graph == copy }
         print("[perf] graph == graph (32 layers, identical): \(d)")
         #expect(d < .milliseconds(10))
@@ -607,8 +607,8 @@ struct EqualityPerformanceTests {
 
     @Test("Graph equality comparison (different, 32 layers)")
     func differentGraphs() throws {
-        let graphA = try makeTinyLlama(layerCount: 32).makeModelGraph()
-        let graphB = try makeTinyLlama(layerCount: 33).makeModelGraph()
+        let graphA = try ModelGraph(makeTinyLlama(layerCount: 32))
+        let graphB = try ModelGraph(makeTinyLlama(layerCount: 33))
         let d = measure { _ = graphA == graphB }
         print("[perf] graph != graph (32 vs 33 layers): \(d)")
         #expect(d < .milliseconds(10))
@@ -617,7 +617,7 @@ struct EqualityPerformanceTests {
 
     @Test("Canonical equality comparison (32 layers)")
     func canonicalEquality() throws {
-        let graph = try makeTinyLlama(layerCount: 32).makeModelGraph()
+        let graph = try ModelGraph(makeTinyLlama(layerCount: 32))
         let canonA = canonicalize(graph)
         let canonB = canonicalize(graph)
         let d = measure { _ = canonA == canonB }
@@ -638,7 +638,7 @@ struct FullPipelinePerformanceTests {
         let encoder = JSONEncoder()
 
         let d = try measure(iterations: 5) {
-            let normalized = try model.makeNormalizedModel()
+            let normalized = try NormalizedModel(model)
             let canon = canonicalize(normalized.graph)
             try GraphValidator.validate(canon)
             try LLMProfileValidator.validate(canon)
@@ -657,7 +657,7 @@ struct FullPipelinePerformanceTests {
         let encoder = JSONEncoder()
 
         let d = try measure(iterations: 5) {
-            let normalized = try model.makeNormalizedModel()
+            let normalized = try NormalizedModel(model)
             let canon = canonicalize(normalized.graph)
             try GraphValidator.validate(canon)
             try LLMProfileValidator.validate(canon)
@@ -673,7 +673,7 @@ struct FullPipelinePerformanceTests {
         let encoder = JSONEncoder()
 
         let d = try measure(iterations: 5) {
-            let normalized = try model.makeNormalizedModel()
+            let normalized = try NormalizedModel(model)
             let canon = canonicalize(normalized.graph)
             try GraphValidator.validate(canon)
             _ = try encoder.encode(canon)
@@ -682,4 +682,3 @@ struct FullPipelinePerformanceTests {
         #expect(d < .milliseconds(200))
     }
 }
-

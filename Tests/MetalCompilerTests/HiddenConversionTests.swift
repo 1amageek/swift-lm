@@ -162,7 +162,7 @@ struct HiddenConversionTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let compiled = try MetalInferenceCompiler().compile(
             graph: resolved, hiddenSize: config.hiddenSize,

@@ -224,7 +224,7 @@ struct LoadTests {
             fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
         )
 
-        let graph = try Gemma4(config: config).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
 
         let repeatingLayers = resolved.rootRegion.operations.compactMap { operation -> Region? in
@@ -259,11 +259,11 @@ struct LoadTests {
         let graph: ModelGraph
         switch modelType.lowercased() {
         case "lfm2":
-            graph = try LFM2(config: config).makeModelGraph()
+            graph = try ModelGraph(LFM2(config: config))
         case "qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl":
-            graph = try Qwen35(config: config).makeModelGraph()
+            graph = try ModelGraph(Qwen35(config: config))
         default:
-            graph = try Transformer(config: config).makeModelGraph()
+            graph = try ModelGraph(Transformer(config: config))
         }
 
         let opCount = countOperations(graph.rootRegion)
@@ -280,7 +280,7 @@ struct LoadTests {
         let config = try HFConfigDecoder().decode(from: configData)
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let convention: ParameterResolver.WeightNamingConvention = modelType == "lfm2" ? .lfm2Family : .llamaFamily
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
@@ -305,7 +305,7 @@ struct LoadTests {
         let config = try HFConfigDecoder().decode(from: configData)
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let convention: ParameterResolver.WeightNamingConvention = modelType == "lfm2" ? .lfm2Family : .llamaFamily
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 

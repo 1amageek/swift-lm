@@ -87,15 +87,22 @@ struct MetalKernelNameResolver {
 
         switch entry.kind {
         case .projection(let projection, let isOutput):
-            if isPrefill,
-               isOutput,
-               projection.field == "weight",
-               projection.outputDimension > projection.inputDimension {
-                return isBF16 ? "gemv_bf16_f32s" : "gemv_f32s"
-            }
             if let binding = entry.parameterBindings.first(where: { $0.role == projection.field }),
                let stafWeightStore,
                let tensorInfo = stafWeightStore.tensor(for: binding.tensorName) {
+                if isPrefill,
+                   isOutput,
+                   projection.field == "weight",
+                   projection.outputDimension > projection.inputDimension,
+                   (
+                    tensorInfo.format.schemeIdentifier == .fp16RowMajor
+                    || tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                    || tensorInfo.format.schemeIdentifier == .fp32RowMajor
+                   ) {
+                    return tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                        ? "gemv_bf16_f32s"
+                        : "gemv_f32s"
+                }
                 if !isPrefill,
                    let family = Self.denseDecodeProjectionFamily(
                     outputDimension: projection.outputDimension,
@@ -124,6 +131,13 @@ struct MetalKernelNameResolver {
                 return isPrefill
                     ? tensorInfo.format.gemmKernelName(bufferPrecision: kernelContext.bufferPrecision)
                     : tensorInfo.format.gemvKernelName
+            }
+
+            if isPrefill,
+               isOutput,
+               projection.field == "weight",
+               projection.outputDimension > projection.inputDimension {
+                return isBF16 ? "gemv_bf16_f32s" : "gemv_f32s"
             }
 
             if !isPrefill,

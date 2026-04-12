@@ -260,7 +260,7 @@ struct FragmentBindingTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let prefillPlan = try MetalInferenceCompiler().compilePrefill(
             graph: resolved, hiddenSize: config.hiddenSize,
@@ -288,7 +288,7 @@ struct FragmentBindingTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let prefillPlan = try MetalInferenceCompiler().compilePrefill(
             graph: resolved, hiddenSize: config.hiddenSize,
@@ -320,7 +320,7 @@ struct FragmentBindingTests {
     }
 
     private func compileModel(config: ModelConfig, device: MTLDevice) throws -> MetalCompiledModel {
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         return try MetalInferenceCompiler().compile(
             graph: resolved, hiddenSize: config.hiddenSize,

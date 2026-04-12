@@ -12,7 +12,7 @@ struct ModelDeclarationTests {
     func transformerGraph() throws {
         let model = Transformer(config: TestConfigs.transformer7B)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -21,7 +21,7 @@ struct ModelDeclarationTests {
     func transformerMoEGraph() throws {
         let model = Transformer(config: TestConfigs.transformerMoE)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -30,8 +30,8 @@ struct ModelDeclarationTests {
     func transformerDeterministic() throws {
         let config = TestConfigs.transformerSmall
 
-        let graph1 = try Transformer(config: config).makeModelGraph()
-        let graph2 = try Transformer(config: config).makeModelGraph()
+        let graph1 = try ModelGraph(Transformer(config: config))
+        let graph2 = try ModelGraph(Transformer(config: config))
 
         let canonical1 = canonicalize(graph1)
         let canonical2 = canonicalize(graph2)
@@ -44,7 +44,7 @@ struct ModelDeclarationTests {
     func qwen35Graph() throws {
         let model = Qwen35(config: TestConfigs.qwen35_0_8B)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -64,7 +64,7 @@ struct ModelDeclarationTests {
     func qwen35TextOnlyGraph() throws {
         let model = Qwen35(config: TestConfigs.qwen35TextOnly)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
 
@@ -79,7 +79,7 @@ struct ModelDeclarationTests {
 
     @Test("Qwen35 attention uses M-RoPE")
     func qwen35MRoPE() throws {
-        let graph = try Qwen35(config: TestConfigs.qwen35_0_8B).makeModelGraph()
+        let graph = try ModelGraph(Qwen35(config: TestConfigs.qwen35_0_8B))
 
         // Find the first attention operation (inside repeating > residual)
         let attnOp = findFirstOperation(in: graph.rootRegion) { kind in
@@ -102,12 +102,82 @@ struct ModelDeclarationTests {
 
     @Test("Qwen35 declaration is deterministic")
     func qwen35Deterministic() throws {
-        let graph1 = try Qwen35(config: TestConfigs.qwen35_0_8B).makeModelGraph()
-        let graph2 = try Qwen35(config: TestConfigs.qwen35_0_8B).makeModelGraph()
+        let graph1 = try ModelGraph(Qwen35(config: TestConfigs.qwen35_0_8B))
+        let graph2 = try ModelGraph(Qwen35(config: TestConfigs.qwen35_0_8B))
 
         let canonical1 = canonicalize(graph1)
         let canonical2 = canonicalize(graph2)
         #expect(canonical1.dump() == canonical2.dump())
+    }
+
+    // MARK: - Gemma 3 Text
+
+    @Test("Gemma3Text produces valid ModelGraph")
+    func gemma3TextGraph() throws {
+        let graph = try ModelGraph(Gemma3Text(config: TestConfigs.gemma3TextEmbedding))
+        #expect(graph.rootRegion.operations.isEmpty == false)
+        #expect(graph.rootRegion.results.count == 1)
+    }
+
+    @Test("Gemma3Text keeps full bidirectional masks while preserving local and full RoPE bases")
+    func gemma3TextSchedule() throws {
+        let graph = try ModelGraph(Gemma3Text(config: TestConfigs.gemma3TextEmbedding))
+
+        var localRopeLayerCount = 0
+        var fullRopeLayerCount = 0
+        var validatedAttentionScale = false
+        var validatedLocalRopeLayer = false
+        var validatedFullLayer = false
+
+        traverse(graph.rootRegion) { operation in
+            guard case .primitive(let rawAttributes) = operation.kind,
+                  let attributes = rawAttributes as? AttentionAttributes else {
+                return
+            }
+            #expect(attributes.causal == false)
+            #expect(attributes.qkNorm == .rmsNorm)
+            #expect(attributes.window == nil)
+
+            let expectedScale = 1.0 / Float(256).squareRoot()
+            #expect(attributes.attentionScale != nil)
+            if validatedAttentionScale == false {
+                #expect(abs((attributes.attentionScale ?? 0) - expectedScale) < 0.0001)
+                validatedAttentionScale = true
+            }
+
+            let ropeBase = attributes.rope?.base ?? 0
+            if abs(ropeBase - 10_000.0) < 0.0001 {
+                localRopeLayerCount += 1
+                validatedLocalRopeLayer = true
+            } else {
+                fullRopeLayerCount += 1
+                if validatedFullLayer == false {
+                    #expect(abs(ropeBase - 1_000_000.0) < 0.0001)
+                    validatedFullLayer = true
+                }
+            }
+        }
+
+        #expect(localRopeLayerCount == 20)
+        #expect(fullRopeLayerCount == 4)
+        #expect(validatedAttentionScale)
+        #expect(validatedLocalRopeLayer)
+        #expect(validatedFullLayer)
+    }
+
+    @Test("Gemma3TextBackbone omits output head while preserving final norm")
+    func gemma3TextBackboneOmitsOutputHead() throws {
+        let graph = try ModelGraph(Gemma3TextBackbone(config: TestConfigs.gemma3TextEmbedding))
+
+        let outputHeadCount = countOperations(in: graph.rootRegion) { attributes in
+            attributes is OutputHeadAttributes
+        }
+        let rmsNormCount = countOperations(in: graph.rootRegion) { attributes in
+            attributes is RMSNormAttributes
+        }
+
+        #expect(outputHeadCount == 0)
+        #expect(rmsNormCount == 97, "Expected 4 RMSNorms per layer plus one final RMSNorm")
     }
 
     // MARK: - Gemma 4
@@ -116,14 +186,14 @@ struct ModelDeclarationTests {
     func gemma4Graph() throws {
         let model = try Gemma4(config: TestConfigs.gemma4E2B)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
 
     @Test("Gemma4 sliding/full attention schedule is preserved")
     func gemma4LayerSchedule() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         var slidingAttentionCount = 0
         var fullAttentionCount = 0
@@ -152,7 +222,7 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 full-attention keeps proportional RoPE metadata")
     func gemma4FullAttentionRopeDimension() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         var fullAttentionAttributes: [AttentionAttributes] = []
         traverse(graph.rootRegion) { operation in
@@ -175,7 +245,7 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 decoder RMSNorms keep explicit checkpoint scales")
     func gemma4DecoderNormsKeepExplicitCheckpointScales() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         var regularNormCount = 0
         var attentionQKNormCount = 0
@@ -199,7 +269,7 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 emits one per-layer input residual per decoder layer")
     func gemma4PerLayerInput() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         let perLayerInputCount = countOperations(in: graph.rootRegion) { kind in
             if kind is PerLayerInputAttributes { return true }
@@ -211,7 +281,7 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 preserves per-layer templates as repeating blocks")
     func gemma4RepeatingLayerTemplates() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
         let repeatingOps = graph.rootRegion.operations.filter {
             if case .repeating(count: 1, _) = $0.kind { return true }
             return false
@@ -221,7 +291,7 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 doubles MLP width on KV-shared layers")
     func gemma4DoubleWideMLP() throws {
-        let graph = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         var regularMLPCount = 0
         var doubleWideMLPCount = 0
@@ -243,8 +313,8 @@ struct ModelDeclarationTests {
 
     @Test("Gemma4 declaration is deterministic")
     func gemma4Deterministic() throws {
-        let graph1 = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
-        let graph2 = try Gemma4(config: TestConfigs.gemma4E2B).makeModelGraph()
+        let graph1 = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
+        let graph2 = try ModelGraph(Gemma4(config: TestConfigs.gemma4E2B))
 
         let canonical1 = canonicalize(graph1)
         let canonical2 = canonicalize(graph2)
@@ -285,7 +355,7 @@ struct ModelDeclarationTests {
     func cohereGraph() throws {
         let model = Cohere(config: TestConfigs.cohereCommandR)
 
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -294,35 +364,35 @@ struct ModelDeclarationTests {
 
     @Test("LFM2.5 1.2B produces valid ModelGraph")
     func lfm25_1_2B() throws {
-        let graph = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
 
     @Test("LFM2 350M produces valid ModelGraph")
     func lfm2_350M() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_350M).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_350M))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
 
     @Test("LFM2 2.6B produces valid ModelGraph")
     func lfm2_2_6B() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_2_6B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_2_6B))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
 
     @Test("LFM2 8B-A1B MoE produces valid ModelGraph")
     func lfm2_8B_A1B() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_8B_A1B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
 
     @Test("LFM2 24B-A2B MoE produces valid ModelGraph")
     func lfm2_24B_A2B() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_24B_A2B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_24B_A2B))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -346,8 +416,8 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 declaration is deterministic")
     func lfm2Deterministic() throws {
-        let graph1 = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
-        let graph2 = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
+        let graph1 = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
+        let graph2 = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
 
         let canonical1 = canonicalize(graph1)
         let canonical2 = canonicalize(graph2)
@@ -356,8 +426,8 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 MoE deterministic")
     func lfm2MoeDeterministic() throws {
-        let graph1 = try LFM2(config: TestConfigs.lfm2_8B_A1B).makeModelGraph()
-        let graph2 = try LFM2(config: TestConfigs.lfm2_8B_A1B).makeModelGraph()
+        let graph1 = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
+        let graph2 = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
 
         let canonical1 = canonicalize(graph1)
         let canonical2 = canonicalize(graph2)
@@ -367,7 +437,7 @@ struct ModelDeclarationTests {
     @Test("LFM2 24B-A2B numDenseLayers splits dense and MoE layers")
     func lfm2NumDenseLayers() throws {
         let model = try LFM2(config: TestConfigs.lfm2_24B_A2B)
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
 
         // Count MLP and MoE ops in the graph
         let mlpCount = countOperations(in: graph.rootRegion) { kind in
@@ -386,7 +456,7 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 8B-A1B graph has 2 MLP and 22 MoE (numDenseLayers=2)")
     func lfm2_8B_A1B_DenseLayersInGraph() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_8B_A1B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
 
         let mlpCount = countOperations(in: graph.rootRegion) { kind in
             if kind is MLPAttributes { return true }
@@ -404,7 +474,7 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 non-MoE graph has all MLP, no MoE")
     func lfm2AllMLPInGraph() throws {
-        let graph = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
 
         let mlpCount = countOperations(in: graph.rootRegion) { kind in
             if kind is MLPAttributes { return true }
@@ -425,7 +495,7 @@ struct ModelDeclarationTests {
         let config = TestConfigs.lfm2CustomMoE
 
         let model = try LFM2(config: config)
-        let graph = try model.makeModelGraph()
+        let graph = try ModelGraph(model)
         let mlpCount = countOperations(in: graph.rootRegion) { kind in
             if kind is MLPAttributes { return true }
             return false
@@ -442,7 +512,7 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 graph conv/attn op count matches sections")
     func lfm2GraphLayerTypes() throws {
-        let graph = try LFM2(config: TestConfigs.lfm2_350M).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_350M))
 
         let convCount = countOperations(in: graph.rootRegion) { kind in
             if kind is ShortConvAttributes { return true }
@@ -462,7 +532,7 @@ struct ModelDeclarationTests {
     @Test("Qwen35 graph has correct DeltaNet and Attention layer counts")
     func qwen35GraphLayerCounts() throws {
         let config = TestConfigs.qwen35_0_8B
-        let graph = try Qwen35(config: config).makeModelGraph()
+        let graph = try ModelGraph(Qwen35(config: config))
 
         // Qwen35 uses LayerStack with flat layer schedule.
         // Count stateSpace and attention ops across all layers.
@@ -484,8 +554,8 @@ struct ModelDeclarationTests {
 
     @Test("Different architectures produce different graphs")
     func crossModelComparison() throws {
-        let transformer = try Transformer(config: TestConfigs.transformerSmall2).makeModelGraph()
-        let qwen35 = try Qwen35(config: TestConfigs.qwen35_0_8B).makeModelGraph()
+        let transformer = try ModelGraph(Transformer(config: TestConfigs.transformerSmall2))
+        let qwen35 = try ModelGraph(Qwen35(config: TestConfigs.qwen35_0_8B))
 
         let canonTransformer = canonicalize(transformer)
         let canonQwen35 = canonicalize(qwen35)
@@ -494,8 +564,8 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 graph differs from Transformer and Qwen35")
     func lfm2CrossComparison() throws {
-        let lfm2 = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
-        let transformer = try Transformer(config: TestConfigs.transformerMatchLFM2).makeModelGraph()
+        let lfm2 = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
+        let transformer = try ModelGraph(Transformer(config: TestConfigs.transformerMatchLFM2))
 
         let canonLFM2 = canonicalize(lfm2)
         let canonTransformer = canonicalize(transformer)
@@ -504,8 +574,8 @@ struct ModelDeclarationTests {
 
     @Test("LFM2 dense vs MoE produce different graphs")
     func lfm2DenseVsMoE() throws {
-        let dense = try LFM2(config: TestConfigs.lfm25_1_2B).makeModelGraph()
-        let moe = try LFM2(config: TestConfigs.lfm2_8B_A1B).makeModelGraph()
+        let dense = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
+        let moe = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
 
         let canonDense = canonicalize(dense)
         let canonMoE = canonicalize(moe)
@@ -517,7 +587,7 @@ struct ModelDeclarationTests {
         // 2*(3+1) + 1*2 = 10 layers
         let config = TestConfigs.lfm2Custom10L
 
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
@@ -694,6 +764,35 @@ private enum TestConfigs {
         fullAttentionRopeTheta: 1_000_000.0,
         fullAttentionPartialRotaryFactor: 0.25,
         fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
+    )
+
+    /// EmbeddingGemma 300M 4bit text backbone preset from the public HF config.
+    static let gemma3TextEmbedding = ModelConfig(
+        hiddenSize: 768, layerCount: 24, intermediateSize: 1152, vocabSize: 262144,
+        attentionHeads: 3, kvHeads: 1, headDim: 256,
+        attentionBias: false, mlpBias: false,
+        normEps: 1e-6, normKind: .rmsNorm,
+        ropeTheta: 10_000.0, ropeDimension: 256, ropeScaling: nil,
+        tiedEmbeddings: true,
+        expertCount: nil, expertsPerToken: nil,
+        qkNorm: false,
+        fullAttentionInterval: nil,
+        ssmNumHeads: nil, ssmKeyHeadDim: nil, ssmValueHeadDim: nil,
+        convKernelSize: nil, partialRotaryFactor: nil, slidingWindow: 512,
+        useBidirectionalAttention: true,
+        queryPreAttentionScalar: 256,
+        localAttentionRopeTheta: 10_000.0,
+        layerTypes: [
+            "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+            "sliding_attention", "full_attention",
+            "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+            "sliding_attention", "full_attention",
+            "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+            "sliding_attention", "full_attention",
+            "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+            "sliding_attention", "full_attention",
+        ],
+        fullAttentionRopeTheta: 1_000_000.0
     )
 
     // MARK: - LFM2 Presets

@@ -82,7 +82,7 @@ struct MetalResidencyOwnershipTests {
         var submission = try MetalSubmissionContext(device: device)
         let store = MetalPromptStateStore()
 
-        let promptState = try store.makePromptSnapshot(
+        let promptState = try store.promptSnapshot(
             plan: plan,
             submission: &submission,
             position: 7,

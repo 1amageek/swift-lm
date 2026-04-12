@@ -21,7 +21,7 @@ struct QwenVisionIntegrationTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let stream = try container.generate(from: executable,
             parameters: GenerationParameters(maxTokens: 2, streamChunkTokenCount: 1)
         )
@@ -49,7 +49,7 @@ struct QwenVisionIntegrationTests {
                 ])
             ])
         )
-        let executable = try container.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let stream = try container.generate(from: executable,
             parameters: GenerationParameters(maxTokens: 2, streamChunkTokenCount: 1)
         )
@@ -96,14 +96,13 @@ struct QwenVisionIntegrationTests {
         container.resetState()
 
         let imageData = try TestImageFixtures.makeOnePixelPNGData()
-        let promptState = try await container.makePromptSnapshot(from: ModelInput(chat: [
+        let promptState = try await PromptSnapshot(from: ModelInput(chat: [
                 .user([
                     .text("Reuse"),
                     .image(InputImage(data: imageData, mimeType: "image/png")),
                     .text("this"),
                 ])
-            ])
-        )
+            ]), using: container)
         let stream = try container.generate(
             from: promptState,
             parameters: GenerationParameters(maxTokens: 2, streamChunkTokenCount: 1)

@@ -47,6 +47,10 @@ public struct MetalInferenceModel: @unchecked Sendable {
     /// The Metal 4 command queue used for all submissions.
     public var queue: MTL4CommandQueue { submission.queue }
 
+    private var stableResidencyLease: MetalResidencyLease {
+        stableResidencyRegistry.combinedLease
+    }
+
 #if ENABLE_METAL_PROBES
     /// Compile-time gated GPU binding probes used by focused diagnostics.
     /// Enable with `-DENABLE_METAL_PROBES` when you need to inspect live
@@ -135,9 +139,17 @@ public struct MetalInferenceModel: @unchecked Sendable {
             hiddenOverrideConstantBuffer: self.hiddenOverrideConstantBuffer
         )
         self.stableResidencyRegistry.register(on: self.submission.queue)
-        try Self.zeroStateBuffers(plan.buffers, submission: &self.submission)
+        try Self.zeroStateBuffers(
+            plan.buffers,
+            submission: &self.submission,
+            residency: self.stableResidencyLease
+        )
         if let prefillPlan = self.compiledModel.prefillPlan {
-            try Self.zeroStateBuffers(prefillPlan.buffers, submission: &self.submission)
+            try Self.zeroStateBuffers(
+                prefillPlan.buffers,
+                submission: &self.submission,
+                residency: self.stableResidencyLease
+            )
         }
     }
 
@@ -156,9 +168,17 @@ public struct MetalInferenceModel: @unchecked Sendable {
             hiddenOverrideConstantBuffer: self.hiddenOverrideConstantBuffer
         )
         self.stableResidencyRegistry.register(on: self.submission.queue)
-        try Self.zeroStateBuffers(compiledModel.decodePlan.buffers, submission: &self.submission)
+        try Self.zeroStateBuffers(
+            compiledModel.decodePlan.buffers,
+            submission: &self.submission,
+            residency: self.stableResidencyLease
+        )
         if let prefillPlan = compiledModel.prefillPlan {
-            try Self.zeroStateBuffers(prefillPlan.buffers, submission: &self.submission)
+            try Self.zeroStateBuffers(
+                prefillPlan.buffers,
+                submission: &self.submission,
+                residency: self.stableResidencyLease
+            )
         }
     }
 
@@ -184,7 +204,11 @@ public struct MetalInferenceModel: @unchecked Sendable {
         return buffer
     }
 
-    private static func zeroStateBuffers(_ buffers: MetalBufferSet, submission: inout MetalSubmissionContext) throws {
+    private static func zeroStateBuffers(
+        _ buffers: MetalBufferSet,
+        submission: inout MetalSubmissionContext,
+        residency: MetalResidencyLease = .empty
+    ) throws {
         var fills: [(buffer: MTLBuffer, value: UInt8)] = [
             (buffers.hidden, 0),
             (buffers.residual, 0),
@@ -211,10 +235,14 @@ public struct MetalInferenceModel: @unchecked Sendable {
         if let perLayerInputs = buffers.perLayerInputs {
             fills.append((perLayerInputs, 0))
         }
-        try submission.fillBuffers(fills)
+        try submission.fillBuffers(fills, ephemeralResidency: residency)
     }
 
-    private static func zeroStateBuffers(_ buffers: PrefillBufferSet, submission: inout MetalSubmissionContext) throws {
+    private static func zeroStateBuffers(
+        _ buffers: PrefillBufferSet,
+        submission: inout MetalSubmissionContext,
+        residency: MetalResidencyLease = .empty
+    ) throws {
         var fills: [(buffer: MTLBuffer, value: UInt8)] = [
             (buffers.hidden, 0),
             (buffers.residual, 0),
@@ -242,7 +270,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         if let perLayerInputs = buffers.perLayerInputs {
             fills.append((perLayerInputs, 0))
         }
-        try submission.fillBuffers(fills)
+        try submission.fillBuffers(fills, ephemeralResidency: residency)
     }
 
     public mutating func decode(
@@ -412,7 +440,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             decodePlan: decodePlan,
             submission: &submission,
             position: &position,
-            tokens: tokens
+            tokens: tokens,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -473,7 +502,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             tokens: [Int32](repeating: 0, count: hiddenStates.count),
             ropePositionAxesByTokenIndex: ropePositionAxes,
             hiddenOverridesByTokenIndex: hiddenOverridesByTokenIndex,
-            deepstackFeaturesByLayerAndTokenIndex: deepstackFeaturesByLayerAndTokenIndex
+            deepstackFeaturesByLayerAndTokenIndex: deepstackFeaturesByLayerAndTokenIndex,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -515,7 +545,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
                     tokens: Array(tokens[startIndex..<endIndex]),
                     ropePositionAxesByTokenIndex: Array(ropePositionAxesByTokenIndex[startIndex..<endIndex]),
                     hiddenOverridesByTokenIndex: localHiddenOverrides,
-                    deepstackFeaturesByLayerAndTokenIndex: localDeepstack
+                    deepstackFeaturesByLayerAndTokenIndex: localDeepstack,
+                    ephemeralResidency: stableResidencyLease
                 )
                 startIndex = endIndex
             }
@@ -529,7 +560,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             tokens: tokens,
             ropePositionAxesByTokenIndex: ropePositionAxesByTokenIndex,
             hiddenOverridesByTokenIndex: hiddenOverridesByTokenIndex,
-            deepstackFeaturesByLayerAndTokenIndex: deepstackFeaturesByLayerAndTokenIndex
+            deepstackFeaturesByLayerAndTokenIndex: deepstackFeaturesByLayerAndTokenIndex,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -552,7 +584,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             submission: &submission,
             position: position,
             tokens: tokens,
-            stepIndices: stepIndices
+            stepIndices: stepIndices,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -570,7 +603,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             prefillPlan: prefillPlan,
             submission: &submission,
             position: position,
-            tokens: tokens
+            tokens: tokens,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -589,7 +623,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             submission: &submission,
             position: position,
             tokens: tokens,
-            stepIndices: stepIndices
+            stepIndices: stepIndices,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -629,7 +664,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             tokens: [Int32](repeating: 0, count: hiddenStates.count),
             ropePositionAxesByTokenIndex: ropePositionAxes,
             hiddenOverridesByTokenIndex: hiddenOverridesByTokenIndex,
-            stepIndices: stepIndices
+            stepIndices: stepIndices,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -667,7 +703,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             tokens: [Int32](repeating: 0, count: hiddenStates.count),
             ropePositionAxesByTokenIndex: ropePositionAxes,
             hiddenOverridesByTokenIndex: hiddenOverridesByTokenIndex,
-            stepIndices: stepIndices
+            stepIndices: stepIndices,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -700,7 +737,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
             stepIndices: stepIndices,
             slotIndex: slotIndex,
             rowStride: rowStride,
-            count: count
+            count: count,
+            ephemeralResidency: stableResidencyLease
         )
     }
 
@@ -1670,8 +1708,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
 
     // MARK: - Lifecycle
 
-    public mutating func makePromptSnapshot(firstToken: Int32) throws -> MetalPromptState {
-        try promptStateStore.makePromptSnapshot(
+    public mutating func promptSnapshot(firstToken: Int32) throws -> MetalPromptState {
+        try promptStateStore.promptSnapshot(
             plan: decodePlan,
             submission: &submission,
             position: position,

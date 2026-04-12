@@ -9,25 +9,32 @@ struct ModelGraphResolver {
              "phi", "phi3", "starcoder2", "gpt_neox", "internlm2",
              "deepseek", "yi", "baichuan", "chatglm",
              "mixtral", "qwen2_moe", "deepseek_v2", "arctic", "dbrx":
-            return try Transformer(config: config).makeModelGraph()
+            return try ModelGraph(Transformer(config: config))
         case "gemma4", "gemma4_text":
             do {
                 try Gemma4.validate(config)
             } catch let error as ModelGraphBuildError {
                 throw ModelBundleLoaderError.invalidConfig(error.description)
             }
-            return try Gemma4(config: config).makeModelGraph()
+            return try ModelGraph(Gemma4(config: config))
+        case "gemma3_text":
+            do {
+                try Gemma3Text.validate(config)
+            } catch let error as ModelGraphBuildError {
+                throw ModelBundleLoaderError.invalidConfig(error.description)
+            }
+            return try ModelGraph(Gemma3Text(config: config))
         case "qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl":
             do {
                 try Qwen35.validate(config)
             } catch let error as ModelGraphBuildError {
                 throw ModelBundleLoaderError.invalidConfig(error.description)
             }
-            return try Qwen35(config: config).makeModelGraph()
+            return try ModelGraph(Qwen35(config: config))
         case "lfm2", "lfm2_moe":
-            return try LFM2(config: config).makeModelGraph()
+            return try ModelGraph(LFM2(config: config))
         case "cohere", "command-r":
-            return try Cohere(config: config).makeModelGraph()
+            return try ModelGraph(Cohere(config: config))
         case "nemotron_h":
             throw ModelBundleLoaderError.invalidConfig(
                 "nemotron_h (Mamba-2 hybrid) is not yet supported"
@@ -39,8 +46,26 @@ struct ModelGraphResolver {
         }
     }
 
+    func resolveEmbeddingBackboneGraph(modelType: String, config: ModelConfig) throws -> ModelGraph {
+        switch modelType.lowercased() {
+        case "gemma3_text":
+            do {
+                try Gemma3Text.validate(config)
+            } catch let error as ModelGraphBuildError {
+                throw ModelBundleLoaderError.invalidConfig(error.description)
+            }
+            return try ModelGraph(Gemma3TextBackbone(config: config))
+        default:
+            throw ModelBundleLoaderError.invalidConfig(
+                "Text embedding backbone is not supported for model_type: \(modelType)"
+            )
+        }
+    }
+
     func namingConvention(for modelType: String) -> ParameterResolver.WeightNamingConvention {
         switch modelType.lowercased() {
+        case "gemma3_text":
+            return .gemma3TextFamily
         case "gemma4", "gemma4_text":
             return .gemma4Family
         case "qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl":

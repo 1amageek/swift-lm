@@ -326,8 +326,9 @@ struct GenerationStreamingBenchmarkTests {
             maximumSequenceLength: promptTokens.count
         )
         defer { resources.release() }
-        let promptState = try resources.container.makePromptSnapshot(
-            from: ExecutablePrompt(tokenIDs: promptTokens)
+        let promptState = try PromptSnapshot(
+            from: ExecutablePrompt(tokenIDs: promptTokens),
+            using: resources.container
         )
 
         let baseline = try await GenerationPipelineBenchmarkSupport.measureStreamMedian(

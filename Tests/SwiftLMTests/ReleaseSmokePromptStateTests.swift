@@ -9,10 +9,10 @@ struct ReleaseSmokePromptStateTests {
 
         let loader = ModelBundleLoader()
         let container = try await loader.load(directory: localModelDirectory)
-        let context = try container.makeContext()
+        let context = try LanguageModelContext(container)
         let input = try await context.prepare(ModelInput(prompt: "Hello"))
-        let executable = try context.makeExecutablePrompt(from: input)
-        let promptState = try context.makePromptSnapshot(from: executable)
+        let executable = try ExecutablePrompt(preparedPrompt: input, using: context)
+        let promptState = try PromptSnapshot(from: executable, using: context)
 
         var chunks: [String] = []
         var completion: CompletionInfo?
@@ -39,10 +39,10 @@ struct ReleaseSmokePromptStateTests {
 
         let loader = ModelBundleLoader()
         let container = try await loader.load(directory: localModelDirectory)
-        let context = try container.makeContext()
+        let context = try LanguageModelContext(container)
         let prepared = try await context.prepare(ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let executable = try context.makeExecutablePrompt(from: prepared)
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
 
         try RealOutputAssertionSupport.assertPromptStateSamplingMatchesDirect(
             container: context,

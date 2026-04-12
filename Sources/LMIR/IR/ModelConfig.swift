@@ -66,6 +66,9 @@ public struct ModelConfig: Sendable {
     // MARK: Sliding Window
 
     public let slidingWindow: Int?
+    public let useBidirectionalAttention: Bool
+    public let queryPreAttentionScalar: Float?
+    public let localAttentionRopeTheta: Float?
 
     // MARK: Per-Layer Schedule
 
@@ -145,7 +148,11 @@ public struct ModelConfig: Sendable {
             ssmValueHeadDim: ssmValueHeadDim,
             convKernelSize: convKernelSize, convLCache: convLCache,
             partialRotaryFactor: partialRotaryFactor,
-            slidingWindow: slidingWindow, layerTypes: layerTypes,
+            slidingWindow: slidingWindow,
+            useBidirectionalAttention: useBidirectionalAttention,
+            queryPreAttentionScalar: queryPreAttentionScalar,
+            localAttentionRopeTheta: localAttentionRopeTheta,
+            layerTypes: layerTypes,
             hiddenSizePerLayerInput: hiddenSizePerLayerInput,
             vocabSizePerLayerInput: vocabSizePerLayerInput,
             globalHeadDim: globalHeadDim,
@@ -191,6 +198,9 @@ public struct ModelConfig: Sendable {
         convLCache: Int? = nil,
         partialRotaryFactor: Float?,
         slidingWindow: Int?,
+        useBidirectionalAttention: Bool = false,
+        queryPreAttentionScalar: Float? = nil,
+        localAttentionRopeTheta: Float? = nil,
         layerTypes: [String]? = nil,
         hiddenSizePerLayerInput: Int? = nil,
         vocabSizePerLayerInput: Int? = nil,
@@ -234,6 +244,9 @@ public struct ModelConfig: Sendable {
         self.convLCache = convLCache
         self.partialRotaryFactor = partialRotaryFactor
         self.slidingWindow = slidingWindow
+        self.useBidirectionalAttention = useBidirectionalAttention
+        self.queryPreAttentionScalar = queryPreAttentionScalar
+        self.localAttentionRopeTheta = localAttentionRopeTheta
         self.layerTypes = layerTypes
         self.hiddenSizePerLayerInput = hiddenSizePerLayerInput
         self.vocabSizePerLayerInput = vocabSizePerLayerInput

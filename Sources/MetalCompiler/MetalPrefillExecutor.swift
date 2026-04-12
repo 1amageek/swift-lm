@@ -258,7 +258,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         tokens: [Int32],
         ropePositionAxesByTokenIndex: [(UInt32, UInt32, UInt32)]? = nil,
         hiddenOverridesByTokenIndex: [Int: [Float]] = [:],
-        stepIndices: Set<Int>
+        stepIndices: Set<Int>,
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws -> [Int: [Float]] {
         guard !tokens.isEmpty else { return [:] }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return [:] }
@@ -305,7 +306,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: 0..<hiddenOverrideReplayStart
+                    range: 0..<hiddenOverrideReplayStart,
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try overwriteHiddenRows(
@@ -322,7 +324,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: lowerBound..<(stepIndex + 1)
+                    range: lowerBound..<(stepIndex + 1),
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try submission.copyBuffers([
@@ -333,7 +336,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     destinationOffset: 0,
                     size: stagingLength
                 )
-            ])
+            ], ephemeralResidency: ephemeralResidency)
             lowerBound = stepIndex + 1
         }
 
@@ -359,7 +362,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         stepIndices: Set<Int>,
         slotIndex: Int,
         rowStride: Int,
-        count: Int
+        count: Int,
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws -> [Int: [Float]] {
         guard !tokens.isEmpty else { return [:] }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return [:] }
@@ -417,7 +421,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: 0..<hiddenOverrideReplayStart
+                    range: 0..<hiddenOverrideReplayStart,
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try overwriteHiddenRows(
@@ -434,7 +439,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: lowerBound..<(stepIndex + 1)
+                    range: lowerBound..<(stepIndex + 1),
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try submission.copyBuffers([
@@ -445,7 +451,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     destinationOffset: 0,
                     size: stagingLength
                 )
-            ])
+            ], ephemeralResidency: ephemeralResidency)
             lowerBound = stepIndex + 1
         }
 
@@ -468,7 +474,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         tokens: [Int32],
         ropePositionAxesByTokenIndex: [(UInt32, UInt32, UInt32)]? = nil,
         hiddenOverridesByTokenIndex: [Int: [Float]] = [:],
-        stepIndices: Set<Int>
+        stepIndices: Set<Int>,
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws -> [Int: [Float]] {
         guard !tokens.isEmpty else { return [:] }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return [:] }
@@ -514,7 +521,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: 0..<hiddenOverrideReplayStart
+                    range: 0..<hiddenOverrideReplayStart,
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try overwriteHiddenRows(
@@ -531,7 +539,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: lowerBound..<(stepIndex + 1)
+                    range: lowerBound..<(stepIndex + 1),
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try submission.copyBuffers([
@@ -542,7 +551,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     destinationOffset: 0,
                     size: stagingLength
                 )
-            ])
+            ], ephemeralResidency: ephemeralResidency)
             lowerBound = stepIndex + 1
         }
 
@@ -562,7 +571,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         prefillPlan: MetalPrefillPlan,
         submission: inout MetalSubmissionContext,
         position: Int,
-        tokens: [Int32]
+        tokens: [Int32],
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws -> [Float] {
         guard !tokens.isEmpty else { return [] }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return [] }
@@ -594,7 +604,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
             submission: &submission,
             prefillPlan: prefillPlan,
             basePosition: position,
-            sequenceLength: sequenceLength
+            sequenceLength: sequenceLength,
+            ephemeralResidency: ephemeralResidency
         )
         let source = prefillPlan.finalHiddenSource(sequenceLength: sequenceLength)
         try submission.copyBuffers([
@@ -605,7 +616,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                 destinationOffset: 0,
                 size: stagingLength
             )
-        ])
+        ], ephemeralResidency: ephemeralResidency)
 
         return Self.readBuffer(
             stagingBuffer,
@@ -614,12 +625,95 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         )
     }
 
+    func captureFinalHiddenRows(
+        prefillPlan: MetalPrefillPlan,
+        submission: inout MetalSubmissionContext,
+        position: Int,
+        tokens: [Int32],
+        ephemeralResidency: MetalResidencyLease = .empty
+    ) throws -> [[Float]] {
+        guard !tokens.isEmpty else { return [] }
+        guard tokens.count <= prefillPlan.maximumSequenceLength else { return [] }
+
+        let sequenceLength = tokens.count
+        populatePrefillInputs(
+            prefillPlan: prefillPlan,
+            position: position,
+            tokens: tokens,
+            ropePositionAxesByTokenIndex: nil
+        )
+        writeRuntimeConstants(
+            prefillPlan: prefillPlan,
+            basePosition: position,
+            sequenceLength: sequenceLength,
+            hiddenConversionElementCount: 0
+        )
+
+        let elementSize = max(prefillPlan.buffers.bufferPrecision.byteSize, 1)
+        let hiddenCount = prefillPlan.buffers.hidden.length
+            / max(prefillPlan.maximumSequenceLength, 1)
+            / elementSize
+        let rowLength = hiddenCount * elementSize
+
+        try encodePrefillPasses(
+            submission: &submission,
+            prefillPlan: prefillPlan,
+            basePosition: position,
+            sequenceLength: sequenceLength,
+            ephemeralResidency: ephemeralResidency
+        )
+
+        if prefillPlan.finalHiddenBuffer.storageMode == .shared {
+            return Self.readRows(
+                from: prefillPlan.finalHiddenBuffer,
+                precision: prefillPlan.buffers.bufferPrecision,
+                baseOffset: prefillPlan.finalHiddenBaseOffset,
+                rowStride: prefillPlan.finalHiddenRowStride,
+                rowCount: sequenceLength,
+                elementsPerRow: hiddenCount
+            )
+        }
+
+        let stagingLength = rowLength * sequenceLength
+        guard let stagingBuffer = submission.device.makeBuffer(length: stagingLength, options: [.storageModeShared]) else {
+            throw MetalCompilerError.deviceSetupFailed("Cannot allocate embedding hidden staging buffer")
+        }
+
+        var copies: [(from: MTLBuffer, sourceOffset: Int, to: MTLBuffer, destinationOffset: Int, size: Int)] = []
+        copies.reserveCapacity(sequenceLength)
+        for rowIndex in 0..<sequenceLength {
+            copies.append((
+                from: prefillPlan.finalHiddenBuffer,
+                sourceOffset: prefillPlan.finalHiddenBaseOffset + rowIndex * prefillPlan.finalHiddenRowStride,
+                to: stagingBuffer,
+                destinationOffset: rowIndex * rowLength,
+                size: rowLength
+            ))
+        }
+        try submission.copyBuffers(copies, ephemeralResidency: ephemeralResidency)
+
+        let flattened = Self.readBuffer(
+            stagingBuffer,
+            precision: prefillPlan.buffers.bufferPrecision,
+            count: sequenceLength * hiddenCount
+        )
+
+        var rows: [[Float]] = []
+        rows.reserveCapacity(sequenceLength)
+        for rowIndex in 0..<sequenceLength {
+            let startIndex = rowIndex * hiddenCount
+            rows.append(Array(flattened[startIndex..<(startIndex + hiddenCount)]))
+        }
+        return rows
+    }
+
     func prefill(
         prefillPlan: MetalPrefillPlan,
         decodePlan: MetalDispatchPlan,
         submission: inout MetalSubmissionContext,
         position: inout Int,
-        tokens: [Int32]
+        tokens: [Int32],
+        ephemeralResidency: MetalResidencyLease = .empty
     ) -> Int32 {
         guard !tokens.isEmpty else { return -1 }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return -1 }
@@ -650,9 +744,10 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                 submission: &submission,
                 prefillPlan: prefillPlan,
                 basePosition: position,
-                sequenceLength: sequenceLength
+                sequenceLength: sequenceLength,
+                ephemeralResidency: ephemeralResidency
             )
-            try submission.withCompute { encoder, argumentTable in
+            try submission.withCompute(ephemeralResidency: ephemeralResidency) { encoder, argumentTable in
                 encodeHiddenConversion(
                     encoder: encoder,
                     argumentTable: argumentTable,
@@ -690,7 +785,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         tokens: [Int32],
         ropePositionAxesByTokenIndex: [(UInt32, UInt32, UInt32)],
         hiddenOverridesByTokenIndex: [Int: [Float]],
-        deepstackFeaturesByLayerAndTokenIndex: [Int: [Int: [Float]]]
+        deepstackFeaturesByLayerAndTokenIndex: [Int: [Int: [Float]]],
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws -> Int32 {
         guard !tokens.isEmpty else { return -1 }
         guard tokens.count <= prefillPlan.maximumSequenceLength else { return -1 }
@@ -722,7 +818,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                 prefillPlan: prefillPlan,
                 basePosition: position,
                 sequenceLength: sequenceLength,
-                range: 0..<hiddenOverrideReplayStart
+                range: 0..<hiddenOverrideReplayStart,
+                ephemeralResidency: ephemeralResidency
             )
         }
 
@@ -745,7 +842,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                     prefillPlan: prefillPlan,
                     basePosition: position,
                     sequenceLength: sequenceLength,
-                    range: currentStepIndex..<layerStepIndex
+                    range: currentStepIndex..<layerStepIndex,
+                    ephemeralResidency: ephemeralResidency
                 )
             }
             try addDeepstackRows(
@@ -762,7 +860,8 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                 prefillPlan: prefillPlan,
                 basePosition: position,
                 sequenceLength: sequenceLength,
-                range: currentStepIndex..<prefillPlan.steps.count
+                range: currentStepIndex..<prefillPlan.steps.count,
+                ephemeralResidency: ephemeralResidency
             )
         }
 
@@ -779,7 +878,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
             hiddenConversionElementCount: transferPlan.hiddenConversionElementCount
         )
 
-        try submission.withCompute { encoder, argumentTable in
+        try submission.withCompute(ephemeralResidency: ephemeralResidency) { encoder, argumentTable in
             encodeHiddenConversion(
                 encoder: encoder,
                 argumentTable: argumentTable,
@@ -935,11 +1034,12 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         prefillPlan: MetalPrefillPlan,
         basePosition: Int,
         sequenceLength: Int,
-        range: Range<Int>? = nil
+        range: Range<Int>? = nil,
+        ephemeralResidency: MetalResidencyLease = .empty
     ) throws {
         let targetRange = range ?? (0..<prefillPlan.steps.count)
         for passRange in prefillPassRanges(for: prefillPlan.steps, within: targetRange) {
-            try submission.withCompute { encoder, argumentTable in
+            try submission.withCompute(ephemeralResidency: ephemeralResidency) { encoder, argumentTable in
                 encodePrefillSteps(
                     encoder: encoder,
                     argumentTable: argumentTable,
@@ -1216,6 +1316,56 @@ struct MetalPrefillExecutor: @unchecked Sendable {
         case .bfloat16:
             let pointer = buffer.contents().bindMemory(to: UInt16.self, capacity: count)
             return (0..<count).map { Float(bitPattern: UInt32(pointer[$0]) << 16) }
+        }
+    }
+
+    private static func readRows(
+        from buffer: MTLBuffer,
+        precision: BufferPrecision,
+        baseOffset: Int,
+        rowStride: Int,
+        rowCount: Int,
+        elementsPerRow: Int
+    ) -> [[Float]] {
+        guard rowCount > 0, elementsPerRow > 0 else { return [] }
+        switch precision {
+        case .float32:
+            let pointer = buffer.contents().bindMemory(
+                to: Float.self,
+                capacity: buffer.length / MemoryLayout<Float>.stride
+            )
+            let baseElementOffset = baseOffset / MemoryLayout<Float>.stride
+            let rowElementStride = rowStride / MemoryLayout<Float>.stride
+            return (0..<rowCount).map { rowIndex in
+                let start = baseElementOffset + rowIndex * rowElementStride
+                return Array(UnsafeBufferPointer(start: pointer + start, count: elementsPerRow))
+            }
+        case .float16:
+            let pointer = buffer.contents().bindMemory(
+                to: Float16.self,
+                capacity: buffer.length / MemoryLayout<Float16>.stride
+            )
+            let baseElementOffset = baseOffset / MemoryLayout<Float16>.stride
+            let rowElementStride = rowStride / MemoryLayout<Float16>.stride
+            return (0..<rowCount).map { rowIndex in
+                let start = baseElementOffset + rowIndex * rowElementStride
+                return (0..<elementsPerRow).map { elementIndex in
+                    Float(pointer[start + elementIndex])
+                }
+            }
+        case .bfloat16:
+            let pointer = buffer.contents().bindMemory(
+                to: UInt16.self,
+                capacity: buffer.length / MemoryLayout<UInt16>.stride
+            )
+            let baseElementOffset = baseOffset / MemoryLayout<UInt16>.stride
+            let rowElementStride = rowStride / MemoryLayout<UInt16>.stride
+            return (0..<rowCount).map { rowIndex in
+                let start = baseElementOffset + rowIndex * rowElementStride
+                return (0..<elementsPerRow).map { elementIndex in
+                    Float(bitPattern: UInt32(pointer[start + elementIndex]) << 16)
+                }
+            }
         }
     }
 }

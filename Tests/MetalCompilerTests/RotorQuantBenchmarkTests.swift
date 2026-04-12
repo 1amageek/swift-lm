@@ -36,7 +36,7 @@ struct RotorQuantBenchmarkTests {
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let compiler = MetalInferenceCompiler(optimizer: optimizer)

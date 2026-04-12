@@ -1581,7 +1581,9 @@ public static func generateBatchFlashAttention(
         device const half* qjlResidualK       [[buffer(17)]],
         constant uint& numRotorGroups         [[buffer(18)]],
         constant uint& qjlDimension           [[buffer(19)]],
-        constant uint& windowLeft             [[buffer(20)]],
+        constant uint& causal                 [[buffer(20)]],
+        constant uint& windowLeft             [[buffer(21)]],
+        constant uint& windowRight            [[buffer(22)]],
         uint flatGroupId                      [[threadgroup_position_in_grid]],
         uint tid                              [[thread_index_in_threadgroup]],
         uint tiisg                            [[thread_index_in_simdgroup]],
@@ -1631,11 +1633,20 @@ public static func generateBatchFlashAttention(
             sharedOutput[d] = 0.0f;
         }
 
-        const uint attentionStart = (windowLeft == 0xFFFFFFFFu)
-            ? 0u
-            : ((posId + 1 > windowLeft) ? (posId - windowLeft + 1u) : 0u);
+        const bool isCausal = (causal != 0);
+        const uint leftReach = (windowLeft == 0xFFFFFFFFu || windowLeft == 0u)
+            ? posId
+            : min(posId, windowLeft - 1u);
+        const uint attentionStart = posId - leftReach;
+        const uint attentionEnd = isCausal
+            ? posId
+            : (
+                (windowRight == 0xFFFFFFFFu)
+                    ? (sequenceLength - 1u)
+                    : min(sequenceLength - 1u, posId + (windowRight == 0u ? 0u : windowRight - 1u))
+            );
 
-        for (uint t = attentionStart; t <= posId; t++) {
+        for (uint t = attentionStart; t <= attentionEnd; t++) {
             uint kByteOffset;
             if (layoutMode == 0) {
                 kByteOffset = kvHeadIndex * maxSequenceLength * kHeadSlotBytes + t * kHeadSlotBytes;

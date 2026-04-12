@@ -16,7 +16,7 @@ struct Gemma4OutputHeadDiagnosticsTests {
         container.resetState()
         let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let diagnostics = try container.debugPrefillOutputHeadDiagnostics(prompt: prompt, topK: 10)
 
         guard let directory = try Gemma4TestSupport.optionalRealGemma4Directory(),

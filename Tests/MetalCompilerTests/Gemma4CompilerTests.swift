@@ -85,7 +85,7 @@ struct Gemma4CompilerTests {
             fullAttentionPartialRotaryFactor: 0.25,
             fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
         )
-        let graph = try Gemma4(config: config).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         var compiled = try compiler.compile(
@@ -160,7 +160,7 @@ struct Gemma4CompilerTests {
             fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
         )
 
-        let graph = try Gemma4(config: config).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
         let repeatingLayers = resolvedGraph.rootRegion.operations.compactMap { operation -> Region? in
             guard case .repeating(count: 1, let body) = operation.kind else { return nil }
@@ -234,7 +234,7 @@ struct Gemma4CompilerTests {
             fullAttentionPartialRotaryFactor: 0.25,
             fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
         )
-        let graph = try Gemma4(config: config).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let compiled = try compiler.compile(

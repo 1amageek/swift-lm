@@ -65,9 +65,11 @@ struct HFConfigDecoder {
         let ropeParams = json["rope_parameters"] as? [String: Any]
         let slidingAttentionRoPE = ropeParams?["sliding_attention"] as? [String: Any]
         let fullAttentionRoPE = ropeParams?["full_attention"] as? [String: Any]
-        let ropeTheta = json["rope_theta"] as? Double
-            ?? (ropeParams?["rope_theta"] as? Double)
+        let localAttentionRopeTheta = (json["rope_local_base_freq"] as? Double)
             ?? (slidingAttentionRoPE?["rope_theta"] as? Double)
+        let ropeTheta = localAttentionRopeTheta
+            ?? (json["rope_theta"] as? Double)
+            ?? (ropeParams?["rope_theta"] as? Double)
             ?? 500000.0
         let tiedEmbeddings = json["tie_word_embeddings"] as? Bool
             ?? json["tie_embedding"] as? Bool
@@ -116,6 +118,11 @@ struct HFConfigDecoder {
             partialRotaryFactor: (json["partial_rotary_factor"] as? Double
                 ?? ropeParams?["partial_rotary_factor"] as? Double).map { Float($0) },
             slidingWindow: json["sliding_window"] as? Int,
+            useBidirectionalAttention: json["use_bidirectional_attention"] as? Bool ?? false,
+            queryPreAttentionScalar: (json["query_pre_attn_scalar"] as? Double).map {
+                Float($0)
+            },
+            localAttentionRopeTheta: localAttentionRopeTheta.map { Float($0) },
             layerTypes: {
                 if let types = json["layer_types"] as? [String] { return types }
                 if let attnIdxs = json["full_attn_idxs"] as? [Int] {
@@ -131,7 +138,10 @@ struct HFConfigDecoder {
             numKVSharedLayers: json["num_kv_shared_layers"] as? Int,
             useDoubleWideMLP: json["use_double_wide_mlp"] as? Bool ?? false,
             attentionKEqualsV: json["attention_k_eq_v"] as? Bool ?? false,
-            fullAttentionRopeTheta: (fullAttentionRoPE?["rope_theta"] as? Double).map { Float($0) },
+            fullAttentionRopeTheta: (
+                fullAttentionRoPE?["rope_theta"] as? Double
+                ?? (json["rope_theta"] as? Double)
+            ).map { Float($0) },
             fullAttentionPartialRotaryFactor: (fullAttentionRoPE?["partial_rotary_factor"] as? Double)
                 .map { Float($0) },
             fullAttentionRoPEScaling: {

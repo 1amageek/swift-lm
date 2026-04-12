@@ -62,7 +62,7 @@ struct RealModelDiagnosticTests {
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv", "attention"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let compiler = MetalInferenceCompiler()

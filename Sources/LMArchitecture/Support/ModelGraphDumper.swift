@@ -4,7 +4,7 @@
 /// value flow annotations, and compact attribute summaries.
 ///
 /// ```swift
-/// let graph = try model.makeModelGraph()
+/// let graph = try ModelGraph(model)
 /// print(ModelGraphDumper.dump(graph))
 /// ```
 public enum ModelGraphDumper {

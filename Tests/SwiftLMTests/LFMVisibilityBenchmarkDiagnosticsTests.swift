@@ -16,7 +16,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let prompt = ExecutablePrompt(tokenIDs: [1, 1, 6, 6423, 708])
         let parameters = GenerationParameters(maxTokens: 50, streamChunkTokenCount: 8, temperature: 0)
 
@@ -62,9 +62,9 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let prepared = try await container.prepare( ModelInput(prompt: "Hello"))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
         let parameters = GenerationParameters(maxTokens: 4, streamChunkTokenCount: 1, temperature: 0)
 
         container.resetState()
@@ -108,7 +108,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let parameters = GenerationParameters(
             maxTokens: 64,
             streamChunkTokenCount: 1,
@@ -119,7 +119,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
             prompt: "Hello",
             promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
         ))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         container.resetState()
         let visibleTokenIDs = try container.debugGeneratedTokenIDs(
@@ -165,7 +165,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
         }
 
         let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
-        let container = try loaded.makeContext()
+        let container = try LanguageModelContext(loaded)
         let parameters = GenerationParameters(
             maxTokens: 64,
             streamChunkTokenCount: 1,
@@ -176,7 +176,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
             prompt: "Hello",
             promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
         ))
-        let prompt = try container.makeExecutablePrompt(from: prepared)
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
 
         container.resetState()
         let stream = try container.generate(from: prompt, parameters: parameters)

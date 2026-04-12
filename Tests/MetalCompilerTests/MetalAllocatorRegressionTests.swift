@@ -60,7 +60,7 @@ struct MetalAllocatorRegressionTests {
             mropeAxes: MRoPEAxes(sections: [11, 11, 10], interleaved: true)
         )
 
-        let graph = try Qwen35(config: config).makeModelGraph()
+        let graph = try ModelGraph(Qwen35(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .qwen35Family)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         let maxSequenceLength = 8

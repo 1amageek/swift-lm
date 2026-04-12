@@ -3,10 +3,10 @@ import Foundation
 /// Immutable, shareable container for a compiled language model bundle.
 ///
 /// A container owns the loaded model assets, tokenizer, templates, and compile
-/// products. Create ``LanguageModelContext`` instances from it when you need
-/// isolated mutable inference state.
+/// products. Initialize ``LanguageModelContext`` with it when you need isolated
+/// mutable inference state.
 public final class LanguageModelContainer: @unchecked Sendable {
-    private let prototypeContext: LanguageModelContext
+    let prototypeContext: LanguageModelContext
 
     init(prototypeContext: LanguageModelContext) {
         self.prototypeContext = prototypeContext
@@ -17,19 +17,9 @@ public final class LanguageModelContainer: @unchecked Sendable {
         prototypeContext.configuration
     }
 
-    /// Create a fresh mutable context backed by this container's compiled model.
-    public func makeContext() throws -> LanguageModelContext {
-        try prototypeContext.cloneContext(compiledModel: prototypeContext.debugCompiledModel)
-    }
-
     /// Prepare user-facing input into rendered text, tokens, and prompt metadata.
     public func prepare(_ input: ModelInput) async throws -> PreparedPrompt {
         try await prototypeContext.prepare(input)
-    }
-
-    /// Convert a prepared prompt into the executable runtime form.
-    public func makeExecutablePrompt(from preparedPrompt: PreparedPrompt) throws -> ExecutablePrompt {
-        try prototypeContext.makeExecutablePrompt(from: preparedPrompt)
     }
 
     /// Decode token IDs to text.
@@ -50,7 +40,7 @@ public final class LanguageModelContainer: @unchecked Sendable {
         from prompt: ExecutablePrompt,
         parameters: GenerationParameters = GenerationParameters()
     ) throws -> AsyncStream<GenerationEvent> {
-        let context = try makeContext()
+        let context = try LanguageModelContext(self)
         return try context.generate(from: prompt, parameters: parameters)
     }
 
@@ -62,7 +52,7 @@ public final class LanguageModelContainer: @unchecked Sendable {
         _ input: ModelInput,
         parameters: GenerationParameters = GenerationParameters()
     ) async throws -> AsyncStream<GenerationEvent> {
-        let context = try makeContext()
+        let context = try LanguageModelContext(self)
         return try await context.generate(input, parameters: parameters)
     }
 }

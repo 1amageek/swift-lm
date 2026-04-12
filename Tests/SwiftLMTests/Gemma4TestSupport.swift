@@ -375,7 +375,7 @@ private actor Gemma4SyntheticContainerCache {
         }
 
         let config = Gemma4TestSupport.syntheticConfig()
-        let graph = try Gemma4(config: config).makeModelGraph()
+        let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         var compiledModel = try compiler.compile(
@@ -424,7 +424,7 @@ private actor Gemma4RealBundleCache {
         }
         if let repo = Gemma4TestSupport.optionalRealGemma4RepoID() {
             let loaded = try await ModelBundleLoader().load(repo: repo)
-            let context = try loaded.makeContext()
+            let context = try LanguageModelContext(loaded)
             cachedContainer = context
             return context
         }
@@ -432,7 +432,7 @@ private actor Gemma4RealBundleCache {
             return nil
         }
         let loaded = try await ModelBundleLoader().load(directory: directory)
-        let context = try loaded.makeContext()
+        let context = try LanguageModelContext(loaded)
         cachedContainer = context
         return context
     }

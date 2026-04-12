@@ -31,4 +31,18 @@ public struct ExecutablePrompt: Sendable {
         self.visualContext = visualContext
         self.gemma4PromptContext = gemma4PromptContext
     }
+
+    public init(
+        preparedPrompt: PreparedPrompt,
+        using context: LanguageModelContext
+    ) throws {
+        self = try context.executablePrompt(for: preparedPrompt)
+    }
+
+    public init(
+        preparedPrompt: PreparedPrompt,
+        using container: LanguageModelContainer
+    ) throws {
+        self = try container.prototypeContext.executablePrompt(for: preparedPrompt)
+    }
 }

@@ -97,8 +97,8 @@ struct Metal4ResidencyTests {
         #expect(pointer[0] == 1.0, "Page-aligned buffer with residency should work")
     }
 
-    @Test("Compiler-allocated prefill buffers are resident and writable")
-    func prefillBuffersAreResident() throws {
+    @Test("Compiler-allocated prefill buffers are writable with explicit runtime residency")
+    func prefillBuffersUseRuntimeResidency() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -138,7 +138,7 @@ struct Metal4ResidencyTests {
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv", "attention"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let compiler = MetalInferenceCompiler()
@@ -166,8 +166,14 @@ struct Metal4ResidencyTests {
         let hiddenPointer = prefillPlan.buffers.hidden.contents().bindMemory(to: Float.self, capacity: 64)
         hiddenPointer[0] = -999.0
 
+        let residency = try MetalResidencyLease.required(
+            device: device,
+            label: "swift-lm.tests.prefill-runtime",
+            buffers: prefillPlan.buffers.runtimeResidencyBuffers
+        )
+
         var submission = try MetalSubmissionContext(device: device)
-        try submission.withCompute { encoder, argumentTable in
+        try submission.withCompute(ephemeralResidency: residency) { encoder, argumentTable in
             argumentTable.setAddress(prefillPlan.buffers.hidden.gpuAddress, index: 0)
             encoder.setArgumentTable(argumentTable)
             encoder.setComputePipelineState(pipeline)
@@ -179,7 +185,7 @@ struct Metal4ResidencyTests {
 
         #expect(
             hiddenPointer[0] == 1.0,
-            "Plan-allocated hidden buffer must be GPU-resident and writable via Metal 4"
+            "Plan-allocated hidden buffer must be writable once runtime residency is supplied"
         )
     }
 }

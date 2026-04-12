@@ -54,7 +54,7 @@ struct PrefillNaNDiagnosticTests {
             ssmValueHeadDim: nil, convKernelSize: nil,
             partialRotaryFactor: nil, slidingWindow: nil
         )
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
 
         // Compile prefill plan
@@ -240,7 +240,7 @@ struct PrefillNaNDiagnosticTests {
             partialRotaryFactor: nil, slidingWindow: nil,
             layerTypes: ["conv"]
         )
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         // Compile prefill plan

@@ -8,6 +8,8 @@ struct ModelBundleResources {
     let config: ModelConfig
     let modelType: String
     let safetensorsURLs: [URL]
+    let modulesData: Data?
+    let sentenceTransformersConfigData: Data?
     let chatTemplate: Template?
     let chatTemplateSource: String?
     let preprocessorConfigData: Data?

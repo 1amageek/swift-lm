@@ -48,7 +48,7 @@ struct ReleaseSmokeCapabilityTests {
         }
 
         do {
-            _ = try container.makeExecutablePrompt(from: prepared)
+            _ = try ExecutablePrompt(preparedPrompt: prepared, using: container)
             Issue.record("Expected multimodal prepared input to remain non-executable")
         } catch LanguageModelContextError.multimodalInputNotSupported {
         }

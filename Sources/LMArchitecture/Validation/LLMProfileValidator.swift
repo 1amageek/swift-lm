@@ -12,7 +12,7 @@
 /// while profile validators enforce domain constraints.
 ///
 /// ```swift
-/// let graph = try model.makeModelGraph()
+/// let graph = try ModelGraph(model)
 /// try GraphValidator.validate(graph)       // structural well-formedness
 /// try LLMProfileValidator.validate(graph)  // LLM domain constraints
 /// ```

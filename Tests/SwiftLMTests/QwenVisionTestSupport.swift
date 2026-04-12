@@ -458,7 +458,7 @@ private actor QwenVisionSyntheticContainerCache {
             partialRotaryFactor: nil,
             slidingWindow: nil
         )
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
         var compiledModel = try compiler.compile(
@@ -516,7 +516,7 @@ private actor QwenVisionRealBundleCache {
         }
         if let repo = QwenVisionTestSupport.optionalRealQwen35RepoID() {
             let loaded = try await ModelBundleLoader().load(repo: repo)
-            let context = try loaded.makeContext()
+            let context = try LanguageModelContext(loaded)
             cachedContainer = context
             return context
         }
@@ -524,7 +524,7 @@ private actor QwenVisionRealBundleCache {
             return nil
         }
         let loaded = try await ModelBundleLoader().load(directory: directory)
-        let context = try loaded.makeContext()
+        let context = try LanguageModelContext(loaded)
         cachedContainer = context
         return context
     }

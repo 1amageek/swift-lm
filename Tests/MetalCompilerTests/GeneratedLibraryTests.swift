@@ -39,6 +39,61 @@ struct GeneratedLibraryTests {
         print("[GenLib] Library: \(library.functionNames.count) functions, \(source.count) chars")
     }
 
+    @Test("Kernel source catalog emits q4 prefill projection kernels for quantized weights")
+    func sourceCatalogEmitsQ4PrefillProjectionKernel() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+        let buffer = try #require(device.makeBuffer(length: 1, options: .storageModeShared))
+        let store = STAFWeightStore(
+            buffer: buffer,
+            entries: [
+                "dense.0.weight": STAFTensorEntry(
+                    name: "dense.0.weight",
+                    payloadOffset: 0,
+                    payloadSize: 0,
+                    schemeIdentifier: .q4Group64ScaleF16,
+                    semanticRole: .other,
+                    shape: [3072, 96],
+                    blockSize: 64,
+                    groupSize: 64,
+                    bufferOffset: 0
+                )
+            ],
+            metadata: .empty,
+            specializedBufferAccesses: [:]
+        )
+        let entry = DispatchEntry(
+            index: 0,
+            kind: .projection(
+                .init(field: "weight", inputDimension: 768, outputDimension: 3072)
+            ),
+            parameterBindings: [
+                .init(role: "weight", tensorName: "dense.0.weight")
+            ]
+        )
+        let resolver = MetalKernelNameResolver(
+            stafWeightStore: store,
+            weightAccessPolicyOverride: nil
+        )
+        let kernelName = resolver.kernelName(
+            for: entry,
+            kernelContext: .init(
+                bufferPrecision: .float32,
+                weightFormat: .quantized4Bit(groupSize: 64)
+            )
+        )
+        #expect(kernelName == "gemm_q4_g64_f32s")
+
+        let catalog = MetalKernelSourceCatalog(
+            stafWeightStore: store,
+            modelWeightFormat: .quantized4Bit(groupSize: 64),
+            bufferPrecision: .float32,
+            accessPolicyResolver: ProjectionWeightAccessPolicyResolver(),
+            kernelNameResolver: resolver
+        )
+        let generated = catalog.generateSources(entries: [entry])
+        #expect(generated.baseSource.contains("kernel void gemm_q4_g64_f32s"))
+    }
+
     @Test("Dump generated decode kernel library for LFM2")
     func dumpGeneratedDecodeKernelLibraryForLFM2() throws {
         guard let resources = try RealModelTestSupport.loadOrSkip(skipMessage: "STAF not found — skipping") else {
@@ -60,7 +115,7 @@ struct GeneratedLibraryTests {
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"])
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let compiler = MetalInferenceCompiler()
         let dump = compiler.dumpGeneratedDecodeKernelLibrary(
@@ -95,7 +150,7 @@ struct GeneratedLibraryTests {
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"])
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(
@@ -164,7 +219,7 @@ struct GeneratedLibraryTests {
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"])
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(
@@ -211,7 +266,7 @@ struct GeneratedLibraryTests {
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"])
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let compiler = MetalInferenceCompiler()
         let plan = try compiler.compile(
@@ -276,7 +331,7 @@ struct GeneratedLibraryTests {
             layerTypes: ["conv", "conv", "full_attention", "conv", "conv", "full_attention",
                          "conv", "conv", "full_attention", "conv", "full_attention", "conv",
                          "full_attention", "conv", "full_attention", "conv"])
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let compiler = MetalInferenceCompiler()
         let report = try compiler.analyzeDecodeProjectionCosts(

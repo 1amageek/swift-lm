@@ -28,7 +28,7 @@ struct LiveModelDiagnosticTests {
         let device = resources.device
         let store = resources.store
         let config = Self.makeConfig()
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let seqLen = 986
 
@@ -148,7 +148,7 @@ struct LiveModelDiagnosticTests {
         let device = resources.device
         let store = resources.store
         let config = Self.makeConfig()
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         // Print the same params the app uses
@@ -338,7 +338,7 @@ struct LiveModelDiagnosticTests {
 
         // Compile model (same as app)
         let config = Self.makeConfig()
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let compiler = MetalInferenceCompiler()
@@ -376,7 +376,7 @@ struct LiveModelDiagnosticTests {
 
         let config = Self.makeConfig()
 
-        let graph = try LFM2(config: config).makeModelGraph()
+        let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let seqLen = 986

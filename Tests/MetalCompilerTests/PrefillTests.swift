@@ -15,7 +15,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let plan = try compileDecodePlan(config, resolved, device)
         var model = try MetalInferenceModel(plan: plan, device: device)
@@ -36,7 +36,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let plan = try compileDecodePlan(config, resolved, device)
         var model = try MetalInferenceModel(plan: plan, device: device)
@@ -54,7 +54,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let prefillPlan = try compilePrefillPlan(config, resolved, device)
 
@@ -78,7 +78,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let plan = try compileDecodePlan(config, resolved, device)
         let prefillPlan = try compilePrefillPlan(config, resolved, device)
@@ -104,7 +104,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let prefillPlan = try compilePrefillPlan(config, resolved, device)
 
@@ -136,7 +136,7 @@ struct PrefillTests {
         }
 
         let config = makeTestConfig()
-        let graph = try Transformer(config: config).makeModelGraph()
+        let graph = try ModelGraph(Transformer(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
         let prefillPlan = try compilePrefillPlan(config, resolved, device)
 
