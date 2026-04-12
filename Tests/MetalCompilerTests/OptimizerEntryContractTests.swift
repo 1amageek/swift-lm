@@ -4103,6 +4103,7 @@ struct OptimizerEntryContractTests {
                 (index: 3, value: uint32Bytes(UInt32(inputDimension))),
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
+                (index: 6, value: uint32Bytes(UInt32(inputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -4223,6 +4224,7 @@ struct OptimizerEntryContractTests {
                 (index: 3, value: uint32Bytes(UInt32(inputDimension))),
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
+                (index: 6, value: uint32Bytes(UInt32(inputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -4341,6 +4343,7 @@ struct OptimizerEntryContractTests {
                 (index: 3, value: uint32Bytes(UInt32(inputDimension))),
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
+                (index: 6, value: uint32Bytes(UInt32(inputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -4441,6 +4444,7 @@ struct OptimizerEntryContractTests {
             slotDimension: plan.slotDimension,
             maximumSequenceLength: plan.maximumSequenceLength,
             stepCount: remappedSteps.count,
+            usesMPP: plan.usesMPP,
             finalHiddenBuffer: plan.finalHiddenBuffer,
             finalHiddenBaseOffset: plan.finalHiddenBaseOffset,
             finalHiddenRowStride: plan.finalHiddenRowStride,

@@ -293,6 +293,7 @@ struct PlanBuildContext {
     let compileContext: CompileContext
     let kernelContext: KernelContext
     let pipelineCache: [String: MTLComputePipelineState]
+    let quantizationCapabilities: MetalQuantizationCapabilities
     let dispatchHeuristics: DispatchHeuristics
 
     var hiddenSize: Int { compileContext.hiddenSize }

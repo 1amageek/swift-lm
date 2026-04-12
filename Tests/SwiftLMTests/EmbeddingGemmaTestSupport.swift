@@ -1,13 +1,41 @@
 import Foundation
 @testable import SwiftLM
 
+enum EmbeddingGemmaVariant: String, CaseIterable, Sendable {
+    case community4Bit = "community-4bit"
+    case official = "official"
+    case communityBF16 = "community-bf16"
+
+    var autoDiscoveredDirectoryNames: [String] {
+        switch self {
+        case .community4Bit:
+            ["models--mlx-community--embeddinggemma-300m-4bit"]
+        case .official:
+            ["models--google--embeddinggemma-300m"]
+        case .communityBF16:
+            [
+                "models--mlx-community--embeddinggemma-300m-bf16",
+                "models--mlx-community--embeddinggemma-300m",
+            ]
+        }
+    }
+}
+
 enum EmbeddingGemmaTestSupport {
-    static func realEmbeddingGemmaContainer() async throws -> TextEmbeddingContainer? {
+    private static let preferredAutoDiscoveredDirectoryNames = [
+        "models--mlx-community--embeddinggemma-300m-4bit",
+        "models--google--embeddinggemma-300m",
+        "models--mlx-community--embeddinggemma-300m-bf16",
+    ]
+
+    static func realEmbeddingGemmaContainer(
+        variant: EmbeddingGemmaVariant? = nil
+    ) async throws -> TextEmbeddingContainer? {
         let loader = ModelBundleLoader()
-        if let repo = optionalRealEmbeddingGemmaRepoID() {
+        if let repo = optionalRealEmbeddingGemmaRepoID(variant: variant) {
             return try await loader.loadTextEmbeddings(repo: repo)
         }
-        guard let directory = try optionalRealEmbeddingGemmaDirectory() else {
+        guard let directory = try optionalRealEmbeddingGemmaDirectory(variant: variant) else {
             return nil
         }
         return try await loader.loadTextEmbeddings(directory: directory)
@@ -25,7 +53,9 @@ enum EmbeddingGemmaTestSupport {
         return try JSONDecoder().decode(TextEmbeddingReferenceSupport.Snapshot.self, from: data)
     }
 
-    static func optionalRealEmbeddingGemmaDirectory() throws -> URL? {
+    static func optionalRealEmbeddingGemmaDirectory(
+        variant: EmbeddingGemmaVariant? = nil
+    ) throws -> URL? {
         let envCandidates = [
             ProcessInfo.processInfo.environment["SWIFTLM_EMBEDDINGGEMMA_DIR"],
             ProcessInfo.processInfo.environment["SWIFTLM_EMBEDDING_GEMMA_DIR"],
@@ -49,9 +79,10 @@ enum EmbeddingGemmaTestSupport {
             at: hubRoot,
             includingPropertiesForKeys: nil
         )
-        let candidates = entries
-            .filter { $0.lastPathComponent.lowercased() == "models--mlx-community--embeddinggemma-300m-4bit" }
-            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        let preferredNames = variant?.autoDiscoveredDirectoryNames ?? preferredAutoDiscoveredDirectoryNames
+        let candidates = preferredNames.compactMap { expectedName in
+            entries.first { $0.lastPathComponent.lowercased() == expectedName }
+        }
         for entry in candidates {
             let snapshots = try snapshotDirectories(baseURL: entry)
             for snapshot in snapshots where try isUsableModelDirectory(snapshot) {
@@ -61,7 +92,10 @@ enum EmbeddingGemmaTestSupport {
         return nil
     }
 
-    static func optionalRealEmbeddingGemmaRepoID() -> String? {
+    static func optionalRealEmbeddingGemmaRepoID(
+        variant: EmbeddingGemmaVariant? = nil
+    ) -> String? {
+        _ = variant
         let candidates = [
             ProcessInfo.processInfo.environment["SWIFTLM_EMBEDDINGGEMMA_REPO"],
             ProcessInfo.processInfo.environment["SWIFTLM_EMBEDDING_GEMMA_REPO"],
@@ -71,6 +105,16 @@ enum EmbeddingGemmaTestSupport {
             return trimmed.isEmpty ? nil : trimmed
         }
         return candidates.first
+    }
+
+    static func sourceDescription(for variant: EmbeddingGemmaVariant) throws -> String {
+        if let repo = optionalRealEmbeddingGemmaRepoID(variant: variant) {
+            return repo
+        }
+        if let directory = try optionalRealEmbeddingGemmaDirectory(variant: variant) {
+            return directory.lastPathComponent
+        }
+        return variant.rawValue
     }
 
     private static func snapshotDirectories(baseURL: URL) throws -> [URL] {

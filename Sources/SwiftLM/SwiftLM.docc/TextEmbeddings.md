@@ -29,6 +29,11 @@ let embeddings = try await ModelBundleLoader().loadTextEmbeddings(
 
 `SwiftLM` loads the tokenizer, sentence-transformer metadata, and the compiled Metal runtime for the embedding model.
 
+EmbeddingGemma is supported with both:
+
+- `google/embeddinggemma-300m`
+- `mlx-community/embeddinggemma-300m-4bit`
+
 ## Embed Text
 
 ```swift

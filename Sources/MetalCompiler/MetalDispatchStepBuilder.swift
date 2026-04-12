@@ -22,6 +22,7 @@ struct MetalDispatchStepBuilder {
         let preparedArgumentAllocator = MetalPreparedArgumentBufferAllocator(device: planBuildContext.device)
 
         var steps: [MetalDispatchStep] = []
+        var quantizationEntries: [MetalQuantizationPlanEntry] = []
         var routingPlanner = DecodeRoutingPlanner(
             bufferSet: bufferSet,
             stafWeightStore: stafWeightStore,
@@ -41,6 +42,14 @@ struct MetalDispatchStepBuilder {
             let bindings = routingPlanner.bindings(for: entry)
             let writeIndices = routingPlanner.lastFragmentWriteBufferIndices
             let weightTensorName = Self.primaryWeightTensorName(for: entry)
+            Self.recordQuantizationEntries(
+                for: entry,
+                selectedKernelName: resolved.name,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver,
+                fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.quantizationSchemeIdentifier,
+                into: &quantizationEntries
+            )
             if let step = try makeDecodeStructuralAddInPlaceStepIfNeeded(
                 entry: entry,
                 resolved: resolved,
@@ -91,6 +100,10 @@ struct MetalDispatchStepBuilder {
             buffers: bufferSet,
             unfusedEntryCount: unfusedCount,
             fusedEntryCount: fusedEntries.count,
+            quantizationPlan: MetalQuantizationPlan(
+                capabilities: planBuildContext.quantizationCapabilities,
+                entries: quantizationEntries
+            ),
             supplementalResidencyBuffers: supplementalResidencyBuffers
         )
     }
@@ -411,6 +424,142 @@ struct MetalDispatchStepBuilder {
         )
     }
 
+    private static func recordQuantizationEntries(
+        for entry: DispatchEntry,
+        selectedKernelName: String,
+        stafWeightStore: STAFWeightStore?,
+        accessPolicyResolver: ProjectionWeightAccessPolicyResolver,
+        fallbackSchemeIdentifier: QuantizationSchemeIdentifier,
+        into entries: inout [MetalQuantizationPlanEntry]
+    ) {
+        switch entry.kind {
+        case .projection(let projection, _):
+            let descriptor = resolveWeightDescriptor(
+                role: projection.field,
+                entry: entry,
+                executionPhase: .decode,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver,
+                fallbackSchemeIdentifier: fallbackSchemeIdentifier
+            )
+            entries.append(
+                MetalQuantizationPlanEntry(
+                    entryIndex: entry.index,
+                    layerIndex: entry.layerIndex,
+                    tensorName: descriptor.tensorName,
+                    path: .decodeProjection,
+                    schemeIdentifier: descriptor.schemeIdentifier,
+                    layout: descriptor.layout,
+                    kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
+                    usedFallback: descriptor.usedFallback,
+                    fallbackReason: descriptor.fallbackReason
+                )
+            )
+        case .batchedProjection(let batched):
+            for projection in batched.projections {
+                let descriptor = resolveWeightDescriptor(
+                    role: projection.field,
+                    entry: entry,
+                    executionPhase: .decode,
+                    stafWeightStore: stafWeightStore,
+                    accessPolicyResolver: accessPolicyResolver,
+                    fallbackSchemeIdentifier: fallbackSchemeIdentifier
+                )
+                entries.append(
+                    MetalQuantizationPlanEntry(
+                        entryIndex: entry.index,
+                        layerIndex: entry.layerIndex,
+                        tensorName: descriptor.tensorName,
+                        path: .decodeProjection,
+                        schemeIdentifier: descriptor.schemeIdentifier,
+                        layout: descriptor.layout,
+                        kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
+                        usedFallback: descriptor.usedFallback,
+                        fallbackReason: descriptor.fallbackReason
+                    )
+                )
+            }
+        case .fragment(let fragment):
+            guard fragment is GatherFragment else { return }
+            let descriptor = resolveWeightDescriptor(
+                role: "embedding_table",
+                entry: entry,
+                executionPhase: .decode,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver,
+                fallbackSchemeIdentifier: fallbackSchemeIdentifier
+            )
+            entries.append(
+                MetalQuantizationPlanEntry(
+                    entryIndex: entry.index,
+                    layerIndex: entry.layerIndex,
+                    tensorName: descriptor.tensorName,
+                    path: .embeddingLookup,
+                    schemeIdentifier: descriptor.schemeIdentifier,
+                    layout: descriptor.layout,
+                    kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
+                    usedFallback: descriptor.usedFallback,
+                    fallbackReason: descriptor.fallbackReason
+                )
+            )
+        default:
+            return
+        }
+    }
+
+    private static func resolveWeightDescriptor(
+        role: String,
+        entry: DispatchEntry,
+        executionPhase: STAFWeightExecutionPhase,
+        stafWeightStore: STAFWeightStore?,
+        accessPolicyResolver: ProjectionWeightAccessPolicyResolver,
+        fallbackSchemeIdentifier: QuantizationSchemeIdentifier
+    ) -> DecodeWeightDescriptor {
+        guard let binding = entry.parameterBindings.first(where: { $0.role == role }) else {
+            return DecodeWeightDescriptor(
+                tensorName: nil,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: .rowMajor,
+                usedFallback: true,
+                fallbackReason: .missingTensorBinding
+            )
+        }
+        guard let stafWeightStore else {
+            return DecodeWeightDescriptor(
+                tensorName: binding.tensorName,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: .rowMajor,
+                usedFallback: true,
+                fallbackReason: .missingWeightStore
+            )
+        }
+
+        let request = accessPolicyResolver.accessRequest(
+            for: entry,
+            role: role,
+            binding: binding,
+            executionPhase: executionPhase,
+            stafWeightStore: stafWeightStore
+        )
+        let layout = stafWeightStore.resolvedBufferAccess(for: request)?.layout ?? request.preferredLayout
+        guard let tensorEntry = stafWeightStore.entries[binding.tensorName] else {
+            return DecodeWeightDescriptor(
+                tensorName: binding.tensorName,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: layout,
+                usedFallback: true,
+                fallbackReason: .missingTensorMetadata
+            )
+        }
+        return DecodeWeightDescriptor(
+            tensorName: binding.tensorName,
+            schemeIdentifier: tensorEntry.schemeIdentifier,
+            layout: layout,
+            usedFallback: false,
+            fallbackReason: nil
+        )
+    }
+
     private static func encodedArgumentTableKernelName(
         for kernelName: String,
         bindings: MetalBindingTable
@@ -503,6 +652,14 @@ struct MetalDispatchStepBuilder {
             return nil
         }
     }
+}
+
+private struct DecodeWeightDescriptor {
+    let tensorName: String?
+    let schemeIdentifier: QuantizationSchemeIdentifier
+    let layout: STAFWeightLayout
+    let usedFallback: Bool
+    let fallbackReason: MetalQuantizationFallbackReason?
 }
 
 struct DecodeRoutingPlanner {

@@ -79,7 +79,7 @@ public struct Gemma3TextBackbone: ModelComponent {
             Gemma3TextDecoderLayer(config: config, layerIndex: layerIndex)
         }
 
-        RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+        RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
     }
 }
 
@@ -127,7 +127,7 @@ struct Gemma3TextDecoderLayer: ModelComponent {
     @ModelComponentBuilder
     var body: some ModelComponent {
         Residual {
-            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
             Attention(
                 hiddenSize: config.hiddenSize,
                 headCount: config.attentionHeads,
@@ -141,14 +141,14 @@ struct Gemma3TextDecoderLayer: ModelComponent {
                     base: ropeBase,
                     scaling: isFullAttention ? config.fullAttentionRoPEScaling : config.ropeScaling
                 ),
-                qkNorm: .rmsNorm,
+                qkNorm: .rmsNormUnitOffset,
                 window: attentionWindow
             )
-            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
         }
 
         Residual {
-            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
             MLP(
                 inputSize: config.hiddenSize,
                 intermediateSize: config.intermediateSize,
@@ -156,7 +156,7 @@ struct Gemma3TextDecoderLayer: ModelComponent {
                 gating: .none,
                 bias: config.mlpBias
             )
-            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
+            RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
         }
     }
 }

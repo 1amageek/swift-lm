@@ -352,6 +352,7 @@ struct CompiledPlanDiagnosticsFormatter {
         if !layoutUsage.isEmpty {
             lines.append("  topArgLayouts: \(describe(layoutUsage: layoutUsage, limit: 5))")
         }
+        lines.append(contentsOf: plan.quantizationPlan.summarizedLines())
         for (index, step) in plan.steps.enumerated() {
             lines.append(formatDecodeStep(step, index: index, buffers: plan.buffers))
         }
@@ -381,6 +382,7 @@ struct CompiledPlanDiagnosticsFormatter {
         if !layoutUsage.isEmpty {
             lines.append("  topArgLayouts: \(describe(layoutUsage: layoutUsage, limit: 5))")
         }
+        lines.append(contentsOf: plan.quantizationPlan.summarizedLines())
         for (index, step) in plan.steps.enumerated() {
             lines.append(formatPrefillStep(step, index: index, buffers: plan.buffers))
         }

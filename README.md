@@ -167,6 +167,11 @@ Internally, sentence-transformers embedding pipelines are modeled as:
 
 This keeps embedding structure separate from output modifiers without exposing a fluent modifier API publicly.
 
+EmbeddingGemma is supported with both the official bundle and the quantized community bundle:
+
+- `google/embeddinggemma-300m`
+- `mlx-community/embeddinggemma-300m-4bit`
+
 ### Prompt Preparation
 
 `ModelInput` is the user-facing input type.
@@ -468,3 +473,4 @@ The key design constraints are:
 - `Sources/SwiftLM/SwiftLM.docc` contains the DocC sources
 - [`AGENTS.md`](/Users/1amageek/Desktop/swift-lm/AGENTS.md) documents repository-specific testing and debugging procedure
 - [`DESIGN-Metal4.md`](/Users/1amageek/Desktop/swift-lm/DESIGN-Metal4.md) contains backend design notes; treat it as design guidance, not as a guarantee that every forward-looking idea is already shipped
+- [`DESIGN-Quantization.md`](/Users/1amageek/Desktop/swift-lm/DESIGN-Quantization.md) contains the forward-looking quantization architecture direction for schemes, layouts, kernel families, and policy boundaries

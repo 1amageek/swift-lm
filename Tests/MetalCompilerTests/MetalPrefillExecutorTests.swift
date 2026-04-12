@@ -81,6 +81,7 @@ struct MetalPrefillExecutorTests {
             slotDimension: hiddenSize,
             maximumSequenceLength: maximumSequenceLength,
             stepCount: 1,
+            usesMPP: false,
             finalHiddenBuffer: hidden,
             finalHiddenBaseOffset: 0,
             finalHiddenRowStride: rowStride,

@@ -7,8 +7,16 @@ extension MetalSourceGenerator {
         weightFormat: WeightFormat
     ) -> String {
         let bt = bufferPrecision.metalType
-        // MPP tensor type for weight: bfloat for BF16, half for FP16
-        let tensorWeightType = weightFormat == .bfloat16 ? "bfloat" : bt
+        let tensorWeightType: String = switch weightFormat {
+        case .bfloat16:
+            "bfloat"
+        case .float16:
+            "half"
+        case .float32:
+            "float"
+        case .quantized4Bit, .quantized8Bit:
+            bt
+        }
 
         return """
         #include <metal_stdlib>
@@ -23,9 +31,11 @@ extension MetalSourceGenerator {
             constant uint& inputDimension    [[buffer(3)]],
             constant uint& outputDimension   [[buffer(4)]],
             constant uint& sequenceLength    [[buffer(5)]],
+            constant uint& inputRowStride    [[buffer(6)]],
             uint2 tgid [[threadgroup_position_in_grid]]
         ) {
             using namespace mpp::tensor_ops;
+            (void)inputRowStride;
 
             auto A = tensor<device \(bt), dextents<int32_t, 2>, tensor_inline>(
                 input, dextents<int32_t, 2>(inputDimension, sequenceLength));
@@ -66,6 +76,7 @@ extension MetalSourceGenerator {
             constant uint& inputDimension          [[buffer(3)]],
             constant uint& outputDimension         [[buffer(4)]],
             constant uint& sequenceLength          [[buffer(5)]],
+            constant uint& inputRowStride         [[buffer(6)]],
             uint2 gid                              [[threadgroup_position_in_grid]],
             uint tiisg                             [[thread_index_in_simdgroup]],
             uint sgitg                             [[simdgroup_index_in_threadgroup]]
@@ -76,7 +87,7 @@ extension MetalSourceGenerator {
             if (row >= outputDimension || seqPos >= sequenceLength) return;
 
             float sum = 0.0f;
-            device const \(bt)* inputRow = input + seqPos * inputDimension;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device const \(wt)* weightRow = weight + row * inputDimension;
             for (uint j = tiisg; j < inputDimension; j += SIMD_WIDTH) {
                 sum += \(readWeight("weightRow[j]")) * float(inputRow[j]);

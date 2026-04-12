@@ -23,7 +23,7 @@ struct MetalPipelineCompiler {
     func compile(_ generated: GeneratedKernelSources) throws -> (
         pipelines: [String: MTLComputePipelineState],
         argumentEncoders: [String: MTLArgumentEncoder],
-        usesMPP: Bool
+        quantizationCapabilities: MetalQuantizationCapabilities
     ) {
         let mppDisabled = ProcessInfo.processInfo.environment["SWIFTLM_DISABLE_MPP"] == "1"
         let baseLibrary = try makeLibrary(source: generated.baseSource, options: baseCompileOptions())
@@ -32,10 +32,26 @@ struct MetalPipelineCompiler {
             library: baseLibrary
         )
         var pipelineCache = try makeBasePipelineCache(from: baseLibrary)
+        for kernelName in generated.mppKernelNames {
+            if let basePipeline = pipelineCache[kernelName] {
+                pipelineCache["naive::\(kernelName)"] = basePipeline
+            }
+        }
         var argumentEncoderCache = makeArgumentEncoderCache(from: baseLibrary)
 
         guard !mppDisabled, !generated.mppSources.isEmpty else {
-            return (pipelineCache, argumentEncoderCache, false)
+            let accelerationAvailability: MetalPrefillProjectionAccelerationAvailability = if mppDisabled {
+                .disabledByEnvironment
+            } else {
+                .unavailable
+            }
+            return (
+                pipelineCache,
+                argumentEncoderCache,
+                MetalQuantizationCapabilities(
+                    prefillProjectionAcceleration: accelerationAvailability
+                )
+            )
         }
 
         do {
@@ -46,9 +62,17 @@ struct MetalPipelineCompiler {
             argumentEncoderCache.merge(
                 makeArgumentEncoderCache(from: mppLibrary),
                 uniquingKeysWith: { existing, _ in existing })
-            return (pipelineCache, argumentEncoderCache, true)
+            return (
+                pipelineCache,
+                argumentEncoderCache,
+                MetalQuantizationCapabilities(prefillProjectionAcceleration: .enabled)
+            )
         } catch {
-            return (pipelineCache, argumentEncoderCache, false)
+            return (
+                pipelineCache,
+                argumentEncoderCache,
+                MetalQuantizationCapabilities(prefillProjectionAcceleration: .unavailable)
+            )
         }
     }
 

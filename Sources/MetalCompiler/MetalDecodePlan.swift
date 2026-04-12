@@ -102,6 +102,7 @@ public struct MetalDispatchPlan: @unchecked Sendable {
     public let buffers: MetalBufferSet
     public let unfusedEntryCount: Int
     public let fusedEntryCount: Int
+    let quantizationPlan: MetalQuantizationPlan
     let supplementalResidencyBuffers: [MTLBuffer]
 
     package var outputHeadSteps: ArraySlice<MetalDispatchStep> {
@@ -116,6 +117,35 @@ public struct MetalDispatchPlan: @unchecked Sendable {
             preconditionFailure("Output head projection missing input buffer binding")
         }
         return binding
+    }
+
+    package func quantizationSummary(limit: Int = 8) -> String {
+        quantizationPlan.summarizedLines(limit: limit).joined(separator: "\n")
+    }
+
+    package func quantizationKernelFamilies(path: String? = nil) -> [String] {
+        quantizationPlan.entries
+            .filter { entry in
+                guard let path else { return true }
+                return entry.path.rawValue == path
+            }
+            .map { $0.kernelFamily.description }
+    }
+
+    init(
+        steps: [MetalDispatchStep],
+        buffers: MetalBufferSet,
+        unfusedEntryCount: Int,
+        fusedEntryCount: Int,
+        quantizationPlan: MetalQuantizationPlan = .empty,
+        supplementalResidencyBuffers: [MTLBuffer]
+    ) {
+        self.steps = steps
+        self.buffers = buffers
+        self.unfusedEntryCount = unfusedEntryCount
+        self.fusedEntryCount = fusedEntryCount
+        self.quantizationPlan = quantizationPlan
+        self.supplementalResidencyBuffers = supplementalResidencyBuffers
     }
 }
 

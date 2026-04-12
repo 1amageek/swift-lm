@@ -164,14 +164,55 @@ public struct MetalPrefillPlan: @unchecked Sendable {
     public let slotDimension: Int
     public let maximumSequenceLength: Int
     public let stepCount: Int
+    public let usesMPP: Bool
+    let quantizationPlan: MetalQuantizationPlan
     let finalHiddenBuffer: MTLBuffer
     let finalHiddenBaseOffset: Int
     let finalHiddenRowStride: Int
     let supplementalResidencyBuffers: [MTLBuffer]
 
+    init(
+        steps: [MetalPrefillStep],
+        buffers: PrefillBufferSet,
+        slotDimension: Int,
+        maximumSequenceLength: Int,
+        stepCount: Int,
+        usesMPP: Bool,
+        quantizationPlan: MetalQuantizationPlan = .empty,
+        finalHiddenBuffer: MTLBuffer,
+        finalHiddenBaseOffset: Int,
+        finalHiddenRowStride: Int,
+        supplementalResidencyBuffers: [MTLBuffer]
+    ) {
+        self.steps = steps
+        self.buffers = buffers
+        self.slotDimension = slotDimension
+        self.maximumSequenceLength = maximumSequenceLength
+        self.stepCount = stepCount
+        self.usesMPP = usesMPP
+        self.quantizationPlan = quantizationPlan
+        self.finalHiddenBuffer = finalHiddenBuffer
+        self.finalHiddenBaseOffset = finalHiddenBaseOffset
+        self.finalHiddenRowStride = finalHiddenRowStride
+        self.supplementalResidencyBuffers = supplementalResidencyBuffers
+    }
+
     package func finalHiddenSource(sequenceLength: Int) -> (buffer: MTLBuffer, offset: Int) {
         let positionOffset = max(sequenceLength - 1, 0) * finalHiddenRowStride
         return (buffer: finalHiddenBuffer, offset: finalHiddenBaseOffset + positionOffset)
+    }
+
+    package func quantizationSummary(limit: Int = 8) -> String {
+        quantizationPlan.summarizedLines(limit: limit).joined(separator: "\n")
+    }
+
+    package func quantizationKernelFamilies(path: String? = nil) -> [String] {
+        quantizationPlan.entries
+            .filter { entry in
+                guard let path else { return true }
+                return entry.path.rawValue == path
+            }
+            .map { $0.kernelFamily.description }
     }
 }
 

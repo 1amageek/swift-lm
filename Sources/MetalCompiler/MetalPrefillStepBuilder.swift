@@ -45,6 +45,8 @@ struct MetalPrefillStepBuilder {
             slotDimension: slotDimension,
             maximumSequenceLength: maximumSequenceLength,
             stepCount: optimizedSteps.count,
+            usesMPP: usesMPP,
+            quantizationPlan: planner.makeQuantizationPlan(),
             finalHiddenBuffer: finalHiddenSource.buffer,
             finalHiddenBaseOffset: finalHiddenSource.offset,
             finalHiddenRowStride: finalHiddenSource.rowStride,
@@ -194,6 +196,7 @@ private struct PrefillStepPlanner {
     var outputHeadInputSource: (buffer: MTLBuffer, offset: Int, rowStride: Int)?
     var activeCompositeID: Int?
     var compositeInputSource: (buffer: MTLBuffer, offset: Int)?
+    var quantizationEntries: [MetalQuantizationPlanEntry] = []
 
     init(
         buffers: PrefillBufferSet,
@@ -345,6 +348,25 @@ private struct PrefillStepPlanner {
                 return annotate(steps, entryIndex: entry.index, layerIndex: entry.layerIndex)
             }
             let result = try frag.prefillSteps(context: prefillContext)
+            if frag is GatherFragment, let selectedKernelName = result.steps.first?.pipeline.label {
+                let descriptor = resolveProjectionWeightDescriptor(role: "embedding_table", entry: entry)
+                quantizationEntries.append(
+                    MetalQuantizationPlanEntry(
+                        entryIndex: entry.index,
+                        layerIndex: entry.layerIndex,
+                        tensorName: descriptor.tensorName,
+                        path: .embeddingLookup,
+                        schemeIdentifier: descriptor.schemeIdentifier,
+                        layout: descriptor.layout,
+                        kernelFamily: .classify(
+                            kernelName: selectedKernelName,
+                            usesMPP: false
+                        ),
+                        usedFallback: descriptor.usedFallback,
+                        fallbackReason: descriptor.fallbackReason
+                    )
+                )
+            }
             if result.resetsProjectionIndex {
                 routingState.projectionIndex = 0
                 if !result.outputIsHidden {
@@ -374,8 +396,10 @@ private struct PrefillStepPlanner {
             var steps: [MetalPrefillStep] = []
             steps.reserveCapacity(batched.projections.count)
             var lastOutputOffset = routingState.currentInputOffset
-
             for projection in batched.projections {
+                let inputRowStride = inputBuffer === buffers.hidden
+                    ? (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+                    : projection.inputDimension
                 let resolved = try resolveDispatch(
                     DispatchEntry(
                         index: entry.index,
@@ -393,14 +417,28 @@ private struct PrefillStepPlanner {
                 )
                 let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
                 let weightTensorName = entry.parameterBindings.first(where: { $0.role == projection.field })?.tensorName
+                let quantizationDescriptor = resolveProjectionWeightDescriptor(role: projection.field, entry: entry)
                 let outputOffset = (routingState.projectionIndex + 1) * scratchSlotSize
                 lastOutputOffset = outputOffset
                 routingState.projectionIndex += 1
+                let usesMPPForStep = usesMPP
+                    && !quantizationDescriptor.schemeIdentifier.isWeightQuantized
+                    && inputRowStride == projection.inputDimension
+                let selectedPipeline: MTLComputePipelineState
+                let selectedKernelName: String
+                if !usesMPPForStep,
+                   let naivePipeline = planBuildContext.pipelineCache["naive::\(resolved.name)"] {
+                    selectedPipeline = naivePipeline
+                    selectedKernelName = "naive::\(resolved.name)"
+                } else {
+                    selectedPipeline = resolved.pipeline
+                    selectedKernelName = resolved.name
+                }
 
                 let gridSize: MTLSize
                 let threadgroupSize: MTLSize
-                if usesMPP {
-                    let simdWidth = resolved.pipeline.threadExecutionWidth
+                if usesMPPForStep {
+                    let simdWidth = selectedPipeline.threadExecutionWidth
                     gridSize = MTLSize(
                         width: (projection.outputDimension + 31) / 32,
                         height: (maximumSequenceLength + 63) / 64,
@@ -408,11 +446,11 @@ private struct PrefillStepPlanner {
                     )
                     threadgroupSize = MTLSize(width: simdWidth * 4, height: 1, depth: 1)
                 } else {
-                    let simdWidth = max(resolved.pipeline.threadExecutionWidth, 1)
+                    let simdWidth = max(selectedPipeline.threadExecutionWidth, 1)
                     let rowsPerThreadgroup = 2
                     let threads = min(
                         simdWidth * rowsPerThreadgroup,
-                        resolved.pipeline.maxTotalThreadsPerThreadgroup
+                        selectedPipeline.maxTotalThreadsPerThreadgroup
                     )
                     gridSize = MTLSize(
                         width: (projection.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
@@ -423,9 +461,18 @@ private struct PrefillStepPlanner {
                 }
 
                 let gemmPattern = MetalDispatchStepMetadata.BufferAccessPattern(reads: [0, 1], writes: [2])
+                recordProjectionQuantization(
+                    entry: entry,
+                    descriptor: quantizationDescriptor,
+                    mode: .batch,
+                    inputRowStride: inputRowStride,
+                    inputDimension: projection.inputDimension,
+                    selectedKernelName: selectedKernelName,
+                    usesMPPForStep: usesMPPForStep
+                )
                 steps.append(
                     MetalPrefillStep(
-                        pipeline: resolved.pipeline,
+                        pipeline: selectedPipeline,
                         gridSize: gridSize,
                         threadgroupSize: threadgroupSize,
                         bufferBindings: [
@@ -437,16 +484,18 @@ private struct PrefillStepPlanner {
                             uint32Binding(3, UInt32(projection.inputDimension)),
                             uint32Binding(4, UInt32(projection.outputDimension)),
                             uint32Binding(5, UInt32(maximumSequenceLength)),
+                            uint32Binding(6, UInt32(inputRowStride)),
                         ],
-                        threadgroupMemoryLength: usesMPP ? 0 : resolved.config.sharedMemoryBytes,
+                        threadgroupMemoryLength: usesMPPForStep ? 0 : resolved.config.sharedMemoryBytes,
                         sync: .bufferBarrier,
                         mode: .batch,
-                        sequenceLengthPolicy: usesMPP
+                        sequenceLengthPolicy: usesMPPForStep
                             ? .bindAndAdjustGridHeightTiled(index: 5, tileHeight: 64)
                             : .bindAndAdjustGridHeight(index: 5),
                         positionBufferIndex: nil,
                         perPositionStrides: [:],
                         metadata: .init(
+                            kernelName: selectedKernelName,
                             entryIndex: entry.index,
                             weightTensorName: weightTensorName,
                             bufferAccessPattern: gemmPattern
@@ -592,6 +641,7 @@ private struct PrefillStepPlanner {
             let resolved = try resolveDispatch(entry)
             let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
             let weightTensorName = entry.parameterBindings.first(where: { $0.role == projection.field })?.tensorName
+            let quantizationDescriptor = resolveProjectionWeightDescriptor(role: projection.field, entry: entry)
 
             let inputBuffer: MTLBuffer
             let inputOffset: Int
@@ -611,11 +661,14 @@ private struct PrefillStepPlanner {
             let mode: PrefillStepMode
             let seqLenValue: UInt32
             let scratchSlotSize = slotDimension * scratchElementSize * maximumSequenceLength
+            let inputRowStride = inputBuffer === buffers.hidden
+                ? (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+                : projection.inputDimension
 
             if isOutput && projection.outputDimension > hiddenSize {
                 let inputRowStride = inputBuffer === buffers.hidden
                     ? buffers.hidden.length / max(maximumSequenceLength, 1)
-                    : slotDimension * scratchElementSize
+                    : projection.inputDimension * scratchElementSize
                 outputHeadInputSource = (
                     buffer: inputBuffer,
                     offset: inputOffset,
@@ -649,26 +702,40 @@ private struct PrefillStepPlanner {
             if mode == .lastToken {
                 let inputRowStride = inputBuffer === buffers.hidden
                     ? buffers.hidden.length / max(maximumSequenceLength, 1)
-                    : slotDimension * scratchElementSize
+                    : projection.inputDimension * scratchElementSize
                 perPositionStrides[0] = inputRowStride
+            }
+            let usesMPPForStep = usesMPP
+                && !quantizationDescriptor.schemeIdentifier.isWeightQuantized
+                && mode == .batch
+                && inputRowStride == projection.inputDimension
+            let selectedPipeline: MTLComputePipelineState
+            let selectedKernelName: String
+            if !usesMPPForStep,
+               let naivePipeline = planBuildContext.pipelineCache["naive::\(resolved.name)"] {
+                selectedPipeline = naivePipeline
+                selectedKernelName = "naive::\(resolved.name)"
+            } else {
+                selectedPipeline = resolved.pipeline
+                selectedKernelName = resolved.name
             }
 
             let gridSize: MTLSize
             let threadgroupSize: MTLSize
-            if usesMPP && mode == .batch {
-                let simdWidth = resolved.pipeline.threadExecutionWidth
+            if usesMPPForStep {
+                let simdWidth = selectedPipeline.threadExecutionWidth
                 gridSize = MTLSize(
                     width: (projection.outputDimension + 31) / 32,
                     height: (maximumSequenceLength + 63) / 64,
                     depth: 1
                 )
                 threadgroupSize = MTLSize(width: simdWidth * 4, height: 1, depth: 1)
-            } else if !usesMPP && mode == .batch {
-                let simdWidth = max(resolved.pipeline.threadExecutionWidth, 1)
+            } else if mode == .batch {
+                let simdWidth = max(selectedPipeline.threadExecutionWidth, 1)
                 let rowsPerThreadgroup = 2
                 let threads = min(
                     simdWidth * rowsPerThreadgroup,
-                    resolved.pipeline.maxTotalThreadsPerThreadgroup
+                    selectedPipeline.maxTotalThreadsPerThreadgroup
                 )
                 gridSize = MTLSize(
                     width: (projection.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
@@ -690,8 +757,17 @@ private struct PrefillStepPlanner {
 
             // GEMM: reads input[0] + weight[1], writes output[2]
             let gemmPattern = MetalDispatchStepMetadata.BufferAccessPattern(reads: [0, 1], writes: [2])
+            recordProjectionQuantization(
+                entry: entry,
+                descriptor: quantizationDescriptor,
+                mode: mode,
+                inputRowStride: inputRowStride,
+                inputDimension: projection.inputDimension,
+                selectedKernelName: selectedKernelName,
+                usesMPPForStep: usesMPPForStep
+            )
             return [MetalPrefillStep(
-                pipeline: resolved.pipeline,
+                pipeline: selectedPipeline,
                 gridSize: gridSize,
                 threadgroupSize: threadgroupSize,
                 bufferBindings: [
@@ -703,18 +779,20 @@ private struct PrefillStepPlanner {
                     uint32Binding(3, UInt32(projection.inputDimension)),
                     uint32Binding(4, UInt32(projection.outputDimension)),
                     uint32Binding(5, seqLenValue),
+                    uint32Binding(6, UInt32(inputRowStride)),
                 ],
-                threadgroupMemoryLength: (usesMPP && mode == .batch) ? 0 : resolved.config.sharedMemoryBytes,
+                threadgroupMemoryLength: usesMPPForStep ? 0 : resolved.config.sharedMemoryBytes,
                 sync: .bufferBarrier,
                 mode: mode,
                 sequenceLengthPolicy: mode == .batch
-                    ? (usesMPP
+                    ? (usesMPPForStep
                         ? .bindAndAdjustGridHeightTiled(index: 5, tileHeight: 64)
                         : .bindAndAdjustGridHeight(index: 5))
                     : .none,
                 positionBufferIndex: nil,
                 perPositionStrides: perPositionStrides,
                 metadata: .init(
+                    kernelName: selectedKernelName,
                     entryIndex: entry.index,
                     weightTensorName: weightTensorName,
                     bufferAccessPattern: gemmPattern
@@ -960,4 +1038,165 @@ private struct PrefillStepPlanner {
         let rowStride = slotDimension * scratchElementSize
         return (buffers.scratch, routingState.currentInputOffset, rowStride)
     }
+
+    mutating func makeQuantizationPlan() -> MetalQuantizationPlan {
+        MetalQuantizationPlan(
+            capabilities: planBuildContext.quantizationCapabilities,
+            entries: quantizationEntries
+        )
+    }
+
+    private mutating func recordProjectionQuantization(
+        entry: DispatchEntry,
+        descriptor: ProjectionWeightDescriptor,
+        mode: PrefillStepMode,
+        inputRowStride: Int,
+        inputDimension: Int,
+        selectedKernelName: String,
+        usesMPPForStep: Bool
+    ) {
+        let fallbackReason = resolveProjectionFallbackReason(
+            descriptor: descriptor,
+            mode: mode,
+            inputRowStride: inputRowStride,
+            inputDimension: inputDimension,
+            usesMPPForStep: usesMPPForStep
+        )
+        quantizationEntries.append(
+            MetalQuantizationPlanEntry(
+                entryIndex: entry.index,
+                layerIndex: entry.layerIndex,
+                tensorName: descriptor.tensorName,
+                path: .prefillProjection,
+                schemeIdentifier: descriptor.schemeIdentifier,
+                layout: descriptor.layout,
+                kernelFamily: .classify(
+                    kernelName: selectedKernelName,
+                    usesMPP: usesMPPForStep
+                ),
+                usedFallback: descriptor.usedFallback || fallbackReason != nil,
+                fallbackReason: descriptor.fallbackReason ?? fallbackReason
+            )
+        )
+    }
+
+    private func resolveProjectionWeightDescriptor(
+        role: String,
+        entry: DispatchEntry
+    ) -> ProjectionWeightDescriptor {
+        guard let binding = entry.parameterBindings.first(where: { $0.role == role }) else {
+            return ProjectionWeightDescriptor(
+                tensorName: nil,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: .rowMajor,
+                usedFallback: true,
+                fallbackReason: .missingTensorBinding
+            )
+        }
+        guard let stafWeightStore else {
+            return ProjectionWeightDescriptor(
+                tensorName: binding.tensorName,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: .rowMajor,
+                usedFallback: true,
+                fallbackReason: .missingWeightStore
+            )
+        }
+
+        let request = planBuildContext.compileContext.accessPolicyResolver.accessRequest(
+            for: entry,
+            role: role,
+            binding: binding,
+            executionPhase: .prefill,
+            stafWeightStore: stafWeightStore
+        )
+        let layout = stafWeightStore.resolvedBufferAccess(for: request)?.layout ?? request.preferredLayout
+        guard let tensorEntry = stafWeightStore.entries[binding.tensorName] else {
+            return ProjectionWeightDescriptor(
+                tensorName: binding.tensorName,
+                schemeIdentifier: fallbackSchemeIdentifier,
+                layout: layout,
+                usedFallback: true,
+                fallbackReason: .missingTensorMetadata
+            )
+        }
+        return ProjectionWeightDescriptor(
+            tensorName: binding.tensorName,
+            schemeIdentifier: tensorEntry.schemeIdentifier,
+            layout: layout,
+            usedFallback: false,
+            fallbackReason: nil
+        )
+    }
+
+    private func resolveProjectionFallbackReason(
+        descriptor: ProjectionWeightDescriptor,
+        mode: PrefillStepMode,
+        inputRowStride: Int,
+        inputDimension: Int,
+        usesMPPForStep: Bool
+    ) -> MetalQuantizationFallbackReason? {
+        if let fallbackReason = descriptor.fallbackReason {
+            return fallbackReason
+        }
+        if mode == .lastToken {
+            return .lastTokenProjectionUsesDecodeKernel
+        }
+        if inputRowStride != inputDimension {
+            return .inputStrideMismatch
+        }
+        guard !descriptor.schemeIdentifier.isWeightQuantized else {
+            return nil
+        }
+        guard !usesMPPForStep else {
+            return nil
+        }
+        switch planBuildContext.quantizationCapabilities.prefillProjectionAcceleration {
+        case .disabledByEnvironment:
+            return .disabledByEnvironment
+        case .unavailable:
+            return .unavailableAcceleration
+        case .enabled:
+            return nil
+        }
+    }
+
+    private var fallbackSchemeIdentifier: QuantizationSchemeIdentifier {
+        switch fallbackWeightFormat {
+        case .float16:
+            return .fp16RowMajor
+        case .bfloat16:
+            return .bf16RowMajor
+        case .float32:
+            return .fp32RowMajor
+        case .quantized4Bit(let groupSize):
+            switch groupSize {
+            case 64:
+                return .q4Group64ScaleF16
+            case 128:
+                return .q4Group128ScaleF16
+            default:
+                return .passthrough
+            }
+        case .quantized8Bit(let groupSize):
+            switch groupSize {
+            case 32:
+                return .q8Group32ScaleF16
+            case 64:
+                return .q8Group64ScaleF16
+            case 128:
+                return .q8Group128ScaleF16
+            default:
+                return .passthrough
+            }
+        }
+    }
+}
+
+private struct ProjectionWeightDescriptor {
+    let tensorName: String?
+    let schemeIdentifier: QuantizationSchemeIdentifier
+    let layout: STAFWeightLayout
+    let usedFallback: Bool
+    let fallbackReason: MetalQuantizationFallbackReason?
 }

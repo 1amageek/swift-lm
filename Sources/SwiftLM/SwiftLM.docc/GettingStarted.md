@@ -72,6 +72,8 @@ For most applications, start from ``TextEmbeddingContainer/embed(_:)`` and pass 
 
 For more details, see <doc:TextEmbeddings>.
 
+EmbeddingGemma is supported with both the official bundle and the quantized community bundle: `google/embeddinggemma-300m` and `mlx-community/embeddinggemma-300m-4bit`.
+
 ## Generate from Text
 
 ```swift

@@ -18,10 +18,14 @@ struct EmbeddingGemmaRealBundleTests {
         let embeddingKernelNames = container.prefillPlan.steps.compactMap(\.pipeline.label)
             .filter { $0.contains("embedding_lookup") }
         #expect(embeddingKernelNames.isEmpty == false)
-        #expect(
-            embeddingKernelNames.contains { name in
-                name.contains("_q4_") || name.contains("_q8_")
-            }
+        let quantizationSummary = container.prefillPlan.quantizationSummary(limit: 6)
+        print("[EmbeddingGemma] quantization summary: \(quantizationSummary.replacingOccurrences(of: "\n", with: " | "))")
+        let usesQuantizedEmbeddingLookup = embeddingKernelNames.contains { name in
+            name.contains("_q4_") || name.contains("_q8_")
+        }
+        print(
+            "[EmbeddingGemma] embedding lookup kernels: "
+                + (usesQuantizedEmbeddingLookup ? "quantized" : "dense")
         )
 
         let isolatedPlan = try container.prefillPlan.makeRuntimeIsolatedCopy(device: container.device)

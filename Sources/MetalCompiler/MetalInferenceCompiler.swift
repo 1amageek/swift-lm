@@ -94,12 +94,14 @@ public struct MetalInferenceCompiler: Sendable {
     private func makePlanBuildContext(
         compileContext: CompileContext,
         kernelContext: KernelContext,
-        pipelineCache: [String: MTLComputePipelineState]
+        pipelineCache: [String: MTLComputePipelineState],
+        quantizationCapabilities: MetalQuantizationCapabilities = .none
     ) -> PlanBuildContext {
         PlanBuildContext(
             compileContext: compileContext,
             kernelContext: kernelContext,
             pipelineCache: pipelineCache,
+            quantizationCapabilities: quantizationCapabilities,
             dispatchHeuristics: DispatchHeuristics())
     }
 
@@ -506,13 +508,14 @@ public struct MetalInferenceCompiler: Sendable {
 
         // Phase 3: Compile only the kernels needed by this model's dispatch entries
         // Decode uses F16 buffers (single token, no accumulation)
-        let (pipelineCache, argumentEncoderCache, _) = try compilePipelineCache(
+        let (pipelineCache, argumentEncoderCache, quantizationCapabilities) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: context.stafWeightStore,
             bufferPrecision: context.decodeBufferPrecision, device: context.device)
         let planBuildContext = makePlanBuildContext(
             compileContext: context,
             kernelContext: context.decodeKernelContext,
-            pipelineCache: pipelineCache)
+            pipelineCache: pipelineCache,
+            quantizationCapabilities: quantizationCapabilities)
         let allocation = try bufferAllocator.makeDecodeBufferAllocation(
             compileContext: context,
             walkContext: walkContext,
@@ -580,13 +583,15 @@ public struct MetalInferenceCompiler: Sendable {
 
         // Compile only the kernels needed by this model's prefill dispatch entries
         // For prefill (F32), attempts Metal 4 MPP GEMM with fallback to naive GEMM.
-        let (pipelineCache, _, prefillUsesMPP) = try compilePipelineCache(
+        let (pipelineCache, _, quantizationCapabilities) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: context.stafWeightStore,
             bufferPrecision: .float32, device: context.device)
+        let prefillUsesMPP = quantizationCapabilities.prefillProjectionAcceleration.isEnabled
         let planBuildContext = makePlanBuildContext(
             compileContext: context,
             kernelContext: context.prefillKernelContext,
-            pipelineCache: pipelineCache)
+            pipelineCache: pipelineCache,
+            quantizationCapabilities: quantizationCapabilities)
         let allocation = try bufferAllocator.makePrefillBufferAllocation(
             compileContext: context,
             walkContext: walkContext,
@@ -629,7 +634,7 @@ public struct MetalInferenceCompiler: Sendable {
     ) throws -> (
         pipelines: [String: MTLComputePipelineState],
         argumentEncoders: [String: MTLArgumentEncoder],
-        usesMPP: Bool
+        quantizationCapabilities: MetalQuantizationCapabilities
     ) {
         let kernelNameResolver = MetalKernelNameResolver(
             stafWeightStore: stafWeightStore,

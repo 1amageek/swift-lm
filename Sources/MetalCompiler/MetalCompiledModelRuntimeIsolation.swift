@@ -60,6 +60,7 @@ private struct MetalCompiledModelRuntimeCloner {
             buffers: buffers,
             unfusedEntryCount: plan.unfusedEntryCount,
             fusedEntryCount: plan.fusedEntryCount,
+            quantizationPlan: plan.quantizationPlan,
             supplementalResidencyBuffers: supplementalResidencyBuffers(from: steps)
         )
     }
@@ -73,6 +74,8 @@ private struct MetalCompiledModelRuntimeCloner {
             slotDimension: plan.slotDimension,
             maximumSequenceLength: plan.maximumSequenceLength,
             stepCount: plan.stepCount,
+            usesMPP: plan.usesMPP,
+            quantizationPlan: plan.quantizationPlan,
             finalHiddenBuffer: mappedBuffer(plan.finalHiddenBuffer),
             finalHiddenBaseOffset: plan.finalHiddenBaseOffset,
             finalHiddenRowStride: plan.finalHiddenRowStride,

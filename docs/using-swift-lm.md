@@ -150,6 +150,11 @@ Internally, embedding bundles are normalized into structural stages and output-o
 
 `normalize` is treated as a postprocessor, not as a structural argument.
 
+EmbeddingGemma is supported with both:
+
+- `google/embeddinggemma-300m`
+- `mlx-community/embeddinggemma-300m-4bit`
+
 ## Public API Shape
 
 `swift-lm` uses a consistent public API split:

@@ -135,7 +135,7 @@ struct ModelDeclarationTests {
                 return
             }
             #expect(attributes.causal == false)
-            #expect(attributes.qkNorm == .rmsNorm)
+            #expect(attributes.qkNorm == .rmsNormUnitOffset)
             #expect(attributes.window == nil)
 
             let expectedScale = 1.0 / Float(256).squareRoot()
@@ -178,6 +178,23 @@ struct ModelDeclarationTests {
 
         #expect(outputHeadCount == 0)
         #expect(rmsNormCount == 97, "Expected 4 RMSNorms per layer plus one final RMSNorm")
+    }
+
+    @Test("Gemma3Text RMSNorms use Gemma unit-offset scales")
+    func gemma3TextRMSNormWeightBias() throws {
+        let graph = try ModelGraph(Gemma3TextBackbone(config: TestConfigs.gemma3TextEmbedding))
+
+        var rmsNormCount = 0
+        traverse(graph.rootRegion) { operation in
+            guard case .primitive(let rawAttributes) = operation.kind,
+                  let attributes = rawAttributes as? RMSNormAttributes else {
+                return
+            }
+            rmsNormCount += 1
+            #expect(attributes.weightBias == 1)
+        }
+
+        #expect(rmsNormCount == 97)
     }
 
     // MARK: - Gemma 4

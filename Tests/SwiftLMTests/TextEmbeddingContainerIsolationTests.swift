@@ -21,6 +21,7 @@ struct TextEmbeddingContainerIsolationTests {
             slotDimension: 128,
             maximumSequenceLength: 8,
             stepCount: 0,
+            usesMPP: false,
             finalHiddenBuffer: buffers.hidden,
             finalHiddenBaseOffset: 0,
             finalHiddenRowStride: 128,
