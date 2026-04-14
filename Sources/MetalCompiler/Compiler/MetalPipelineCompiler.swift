@@ -77,7 +77,14 @@ struct MetalPipelineCompiler {
     }
 
     private func makeLibrary(source: String, options: MTLCompileOptions) throws -> MTLLibrary {
-        try device.makeLibrary(source: source, options: options)
+        do {
+            return try device.makeLibrary(source: source, options: options)
+        } catch {
+            // Diagnostic: dump source on compilation failure
+            let url = URL(fileURLWithPath: "/tmp/swiftlm_failed_msl.metal")
+            try? source.write(to: url, atomically: true, encoding: .utf8)
+            throw error
+        }
     }
 
     private func emitKernelDiagnosticsIfRequested(

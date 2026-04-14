@@ -388,6 +388,99 @@ struct FusionSynthesizerTests {
         #expect(result4 == "float v = _fused;")
     }
 
+    // MARK: - BF16 Weight Format Fusion
+
+    @Test("BF16 weight format produces bf16_to_float read expression in fused body")
+    func bfloat16WeightFusionBody() throws {
+        let reduction = Reduction(dimension: 896, epsilon: 1e-6, weightRole: "scale")
+        let contractA = try #require(reduction.fusionContract)
+        let bodyA = try #require(reduction.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        // BF16 read expression should use bf16_to_float
+        #expect(bodyA.contains("bf16_to_float"))
+
+        let scalar = ScalarMultiplyFragment(count: 896, weightRole: "layer_scalar")
+        let contractB = try #require(scalar.fusionContract)
+        let bodyB = try #require(scalar.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        #expect(bodyB.contains("bf16_to_float"))
+
+        let result = try FusionSynthesizer.synthesize([
+            .init(contract: contractA, body: bodyA, weightFormats: ["scale": .bfloat16]),
+            .init(contract: contractB, body: bodyB, weightFormats: ["layer_scalar": .bfloat16]),
+        ])
+
+        // BF16 weight formats preserved in result
+        #expect(result.weightFormats["scale"] == .bfloat16)
+        #expect(result.weightFormats["layer_scalar"] == .bfloat16)
+
+        // Fused body retains bf16_to_float calls
+        #expect(result.body.contains("bf16_to_float"))
+    }
+
+    @Test("BF16 weight scaffold generates uint16_t buffer declarations")
+    func bfloat16WeightScaffold() throws {
+        let reduction = Reduction(dimension: 256, epsilon: 1e-5, weightRole: "norm_weight")
+        let contract = try #require(reduction.fusionContract)
+        let body = try #require(reduction.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        let scalar = ScalarMultiplyFragment(count: 256, weightRole: "layer_scalar")
+        let contractB = try #require(scalar.fusionContract)
+        let bodyB = try #require(scalar.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        let result = try FusionSynthesizer.synthesize([
+            .init(contract: contract, body: body, weightFormats: ["norm_weight": .bfloat16]),
+            .init(contract: contractB, body: bodyB, weightFormats: ["layer_scalar": .bfloat16]),
+        ])
+
+        let msl = KernelScaffold.generate(
+            name: "fused_bf16_test",
+            body: result.body,
+            contract: result.contract,
+            bufferPrecision: .float32,
+            weightFormats: result.weightFormats,
+            isSequence: true
+        )
+
+        // BF16 weight ports should use uint16_t buffer type
+        #expect(msl.contains("uint16_t*"))
+        // Data buffers should use float (F32 prefill)
+        #expect(msl.contains("float*"))
+    }
+
+    @Test("Mixed F16 and BF16 weight formats are preserved per port")
+    func mixedWeightFormats() throws {
+        let reduction = Reduction(dimension: 256, epsilon: 1e-5, weightRole: "norm_weight")
+        let contract = try #require(reduction.fusionContract)
+        let bodyA = try #require(reduction.kernelBody(bufferPrecision: .float32, weightFormat: .float16))
+
+        let scalar = ScalarMultiplyFragment(count: 256, weightRole: "layer_scalar")
+        let contractB = try #require(scalar.fusionContract)
+        let bodyB = try #require(scalar.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        let result = try FusionSynthesizer.synthesize([
+            .init(contract: contract, body: bodyA, weightFormats: ["norm_weight": .float16]),
+            .init(contract: contractB, body: bodyB, weightFormats: ["layer_scalar": .bfloat16]),
+        ])
+
+        // Both weight formats preserved independently
+        #expect(result.weightFormats["norm_weight"] == .float16)
+        #expect(result.weightFormats["layer_scalar"] == .bfloat16)
+
+        let msl = KernelScaffold.generate(
+            name: "fused_mixed_weights",
+            body: result.body,
+            contract: result.contract,
+            bufferPrecision: .float32,
+            weightFormats: result.weightFormats,
+            isSequence: true
+        )
+
+        // Both half and uint16_t declarations should appear
+        #expect(msl.contains("half*"))
+        #expect(msl.contains("uint16_t*"))
+    }
+
     // MARK: - Sequence Mode Fusion
 
     @Test("Register fusion works in sequence mode (F32 prefill)")

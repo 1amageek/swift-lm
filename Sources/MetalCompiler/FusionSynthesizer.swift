@@ -54,6 +54,14 @@ public struct FusionSynthesizer {
     ///
     /// Entries must be in execution order: entry[0] produces data consumed by entry[1], etc.
     ///
+    /// The synthesis groups entries into **LoopGroups** separated by threadgroup memory
+    /// boundaries. Within each group, bodies share a single cooperative loop and use
+    /// register intermediates. Between groups, threadgroup barriers synchronize writes.
+    ///
+    /// This ensures register intermediates are only read within the same loop iteration
+    /// that wrote them — preventing the stale-value bug where separate loops would only
+    /// retain the last iteration's value.
+    ///
     /// - Returns: A `SynthesisResult` containing the merged contract, concatenated body,
     ///   and combined weight formats. Pass these to `KernelScaffold.generate()` to produce
     ///   the complete MSL kernel.
@@ -72,126 +80,120 @@ public struct FusionSynthesizer {
             resolvedParallelism = resolvedParallelism.resolved(with: next)
         }
 
-        // Phase 2: Determine intermediate storage and build rename map
-        var bodyParts: [String] = []
+        // Phase 2: Split entries into LoopGroups.
+        //
+        // A LoopGroup is a maximal contiguous run of entries connected by register
+        // intermediates. Threadgroup memory intermediates create group boundaries.
+        // Within a group, bodies are concatenated into a single loop so register
+        // variables are read in the same iteration that wrote them.
+        let groups = buildLoopGroups(entries: entries, resolvedParallelism: resolvedParallelism)
 
-        /// Tracks how each renamed variable should be substituted.
-        /// `.scalar` strips array subscripts (register intermediate).
-        /// `.array` preserves subscripts (threadgroup memory intermediate).
-        enum RenameKind {
-            case scalar   // register: `name[idx]` → `newName`
-            case array    // threadgroup: `name` → `newName` (subscript preserved)
-        }
-        var renameMap: [(oldName: String, newName: String, kind: RenameKind)] = []
-        var intermediateNames: Set<String> = []
+        // Phase 3: Process each LoopGroup — rename variables and concatenate bodies.
+        //
+        // Rename scoping: register renames are group-local (same loop context).
+        // Threadgroup renames propagate across groups (different loop contexts).
+        var interGroupRenames: [(oldName: String, newName: String, kind: RenameKind)] = []
+        var processedGroupBodies: [String] = []
+        var threadgroupDeclarations: [String] = []
 
-        for i in 0..<entries.count {
-            let entry = entries[i]
-            var body = entry.body
+        for (groupIdx, group) in groups.enumerated() {
+            var intraGroupRenames: [(oldName: String, newName: String, kind: RenameKind)] = []
+            var groupBodyParts: [String] = []
+            var registerDeclarations: [String] = []
 
-            // Phase 2a: Parallelism adaptation
-            // When the fused kernel runs under perRow scaffold but a fragment's
-            // body was written for perElement dispatch, wrap it in a cooperative loop.
-            let entryParallelism = entry.contract.parallelism
-            if case .perRow = resolvedParallelism, case .perElement = entryParallelism {
-                body = wrapPerElementBodyForPerRow(body)
-            }
+            for (localIdx, entryIdx) in group.entryIndices.enumerated() {
+                var body = entries[entryIdx].body
 
-            // Apply accumulated renames to this body
-            for rename in renameMap {
-                switch rename.kind {
-                case .scalar:
-                    body = replaceArrayAccessWithScalar(in: body, arrayName: rename.oldName, scalarName: rename.newName)
-                case .array:
-                    body = replaceVariableName(in: body, oldName: rename.oldName, newName: rename.newName)
-                }
-            }
+                // Apply inter-group renames (threadgroup intermediates from previous groups)
+                body = applyRenames(body, interGroupRenames)
 
-            if i < entries.count - 1 {
-                let producer = entries[i].contract
-                let consumer = entries[i + 1].contract
-                let storage = producer.intermediateStorage(to: consumer)
+                // Apply intra-group renames (register intermediates from earlier in this group)
+                body = applyRenames(body, intraGroupRenames)
 
-                // Find the connection: producer's primary output → consumer's primary input
-                guard let producerOutput = producer.primaryOutput,
-                      let consumerInput = consumer.primaryInput else {
-                    throw SynthesisError.noConnectablePort(producerIndex: i, consumerIndex: i + 1)
-                }
-
-                let intermediateName: String
-                switch storage {
-                case .register:
-                    // Register intermediate: strip subscripts from array access
-                    intermediateName = "_fused_\(i)"
-                    let resolvedOutputName = renameMap.first(where: { $0.oldName == producerOutput.name })?.newName ?? producerOutput.name
+                // Register intermediate to next entry within this group
+                if localIdx < group.entryIndices.count - 1 {
+                    let nextEntryIdx = group.entryIndices[localIdx + 1]
+                    guard let producerOutput = entries[entryIdx].contract.primaryOutput,
+                          let consumerInput = entries[nextEntryIdx].contract.primaryInput else {
+                        throw SynthesisError.noConnectablePort(
+                            producerIndex: entryIdx, consumerIndex: nextEntryIdx)
+                    }
+                    let intermediateName = "_fused_\(entryIdx)"
                     body = replaceArrayAccessWithScalar(
                         in: body,
-                        arrayName: resolvedOutputName,
+                        arrayName: producerOutput.name,
                         scalarName: intermediateName
                     )
-                    renameMap.append((consumerInput.name, intermediateName, .scalar))
-                    intermediateNames.insert(intermediateName)
+                    intraGroupRenames.append((consumerInput.name, intermediateName, .scalar))
+                    registerDeclarations.append("    float \(intermediateName);")
+                }
 
-                case .threadgroupMemory(let dimension):
-                    // Threadgroup memory: simple variable rename (subscript preserved)
-                    intermediateName = "_tg_fused_\(i)"
-                    let resolvedOutputName = renameMap.first(where: { $0.oldName == producerOutput.name })?.newName ?? producerOutput.name
-                    body = replaceVariableName(
-                        in: body,
-                        oldName: resolvedOutputName,
-                        newName: intermediateName
-                    )
-                    renameMap.append((consumerInput.name, intermediateName, .array))
-                    intermediateNames.insert(intermediateName)
-                    _ = dimension
+                groupBodyParts.append(body)
+            }
+
+            // Concatenate bodies within the group (same loop context)
+            var groupBody = groupBodyParts.joined(separator: "\n")
+
+            // Threadgroup intermediate to the next group
+            if groupIdx < groups.count - 1 {
+                let lastEntryIdx = group.entryIndices.last!
+                let nextGroupFirstIdx = groups[groupIdx + 1].entryIndices.first!
+                guard let producerOutput = entries[lastEntryIdx].contract.primaryOutput,
+                      let consumerInput = entries[nextGroupFirstIdx].contract.primaryInput else {
+                    throw SynthesisError.noConnectablePort(
+                        producerIndex: lastEntryIdx, consumerIndex: nextGroupFirstIdx)
+                }
+                let tgName = "_tg_fused_\(groupIdx)"
+                groupBody = replaceVariableName(
+                    in: groupBody,
+                    oldName: producerOutput.name,
+                    newName: tgName
+                )
+                interGroupRenames.append((consumerInput.name, tgName, .array))
+
+                let storage = entries[lastEntryIdx].contract.intermediateStorage(
+                    to: entries[nextGroupFirstIdx].contract)
+                if case .threadgroupMemory(let dimension) = storage {
+                    threadgroupDeclarations.append(
+                        "    threadgroup float \(tgName)[\(dimension)];")
                 }
             }
 
-            bodyParts.append(body)
+            // Prepend register declarations inside the group body
+            if !registerDeclarations.isEmpty {
+                groupBody = registerDeclarations.joined(separator: "\n") + "\n" + groupBody
+            }
+
+            // Wrap the entire group in a cooperative loop if perElement bodies
+            // are running under a perRow kernel scaffold
+            if group.needsPerRowWrapping {
+                groupBody = wrapPerElementBodyForPerRow(groupBody)
+            }
+
+            processedGroupBodies.append(groupBody)
         }
 
-        // Phase 3: Insert intermediate declarations and barriers
+        // Phase 4: Assemble final body — declarations, groups, barriers
         var fusedBody = ""
-        var partIndex = 0
-        for i in 0..<entries.count {
-            if i > 0 {
-                let storage = entries[i - 1].contract.intermediateStorage(to: entries[i].contract)
-                switch storage {
-                case .register:
-                    // Register declaration before the producer body that writes it
-                    // (already handled inline — the write becomes an assignment)
-                    break
-                case .threadgroupMemory(let dimension):
-                    // Threadgroup barrier between producer write and consumer read
-                    fusedBody += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\n"
-                    _ = dimension  // dimension used in declaration at top
-                }
-            }
-
-            if !fusedBody.isEmpty && !fusedBody.hasSuffix("\n\n") {
-                fusedBody += "\n"
-            }
-            fusedBody += bodyParts[partIndex]
-            partIndex += 1
+        if !threadgroupDeclarations.isEmpty {
+            fusedBody += threadgroupDeclarations.joined(separator: "\n") + "\n\n"
         }
-
-        // Phase 4: Prepend intermediate variable declarations
-        var declarations = ""
-        for i in 0..<(entries.count - 1) {
-            let storage = entries[i].contract.intermediateStorage(to: entries[i + 1].contract)
-            switch storage {
-            case .register:
-                declarations += "    float _fused_\(i);\n"
-            case .threadgroupMemory(let dimension):
-                declarations += "    threadgroup float _tg_fused_\(i)[\(dimension)];\n"
+        for (groupIdx, groupBody) in processedGroupBodies.enumerated() {
+            if groupIdx > 0 {
+                fusedBody += "    threadgroup_barrier(mem_flags::mem_threadgroup);\n\n"
             }
-        }
-        if !declarations.isEmpty {
-            fusedBody = declarations + "\n" + fusedBody
+            fusedBody += groupBody
+            if groupIdx < processedGroupBodies.count - 1 {
+                fusedBody += "\n\n"
+            }
         }
 
         // Phase 5: Build merged contract
-        let mergedContract = mergeContracts(entries: entries, resolvedParallelism: resolvedParallelism, intermediateNames: intermediateNames)
+        let mergedContract = mergeContracts(
+            entries: entries,
+            resolvedParallelism: resolvedParallelism,
+            intermediateNames: Set<String>()
+        )
 
         // Phase 6: Combine weight formats
         var combinedWeightFormats: [String: WeightFormat] = [:]
@@ -208,21 +210,105 @@ public struct FusionSynthesizer {
         )
     }
 
+    // MARK: - LoopGroup
+
+    /// A contiguous group of entries that share a single cooperative loop.
+    ///
+    /// Entries within a group are connected by register intermediates. Group
+    /// boundaries occur at threadgroup memory intermediates where a barrier
+    /// is required between the producer's write and the consumer's read.
+    private struct LoopGroup {
+        /// Indices into the entries array, in execution order.
+        var entryIndices: [Int]
+        /// Whether any entry in this group requires perElement→perRow wrapping.
+        var needsPerRowWrapping: Bool
+    }
+
+    /// Split entries into LoopGroups based on intermediate storage type.
+    private static func buildLoopGroups(
+        entries: [Entry],
+        resolvedParallelism: KernelParallelism
+    ) -> [LoopGroup] {
+        func needsWrapping(_ entry: Entry) -> Bool {
+            if case .perRow = resolvedParallelism, case .perElement = entry.contract.parallelism {
+                return true
+            }
+            return false
+        }
+
+        var groups: [LoopGroup] = []
+        var current = LoopGroup(
+            entryIndices: [0],
+            needsPerRowWrapping: needsWrapping(entries[0])
+        )
+
+        for i in 1..<entries.count {
+            let storage = entries[i - 1].contract.intermediateStorage(to: entries[i].contract)
+            switch storage {
+            case .register:
+                current.entryIndices.append(i)
+                if needsWrapping(entries[i]) {
+                    current.needsPerRowWrapping = true
+                }
+            case .threadgroupMemory:
+                groups.append(current)
+                current = LoopGroup(
+                    entryIndices: [i],
+                    needsPerRowWrapping: needsWrapping(entries[i])
+                )
+            }
+        }
+        groups.append(current)
+        return groups
+    }
+
+    /// Tracks how each renamed variable should be substituted.
+    private enum RenameKind {
+        /// Register: `name[idx]` → `newName` (strip array subscript).
+        case scalar
+        /// Threadgroup: `name` → `newName` (preserve subscript).
+        case array
+    }
+
+    /// Apply a list of renames to a body string.
+    private static func applyRenames(
+        _ body: String,
+        _ renames: [(oldName: String, newName: String, kind: RenameKind)]
+    ) -> String {
+        var result = body
+        for rename in renames {
+            switch rename.kind {
+            case .scalar:
+                result = replaceArrayAccessWithScalar(
+                    in: result, arrayName: rename.oldName, scalarName: rename.newName)
+            case .array:
+                result = replaceVariableName(
+                    in: result, oldName: rename.oldName, newName: rename.newName)
+            }
+        }
+        return result
+    }
+
     // MARK: - Contract Merging
 
-    /// Merge contracts from entries into a single fused contract.
+    /// Merge contracts from N entries into a single fused contract.
     ///
-    /// Called by the optimizer at graph-level to build the merged contract
-    /// without generating bodies. The optimizer stores this in SynthesizedFragment;
-    /// actual body synthesis happens lazily in kernelSource().
+    /// Called by the fusion pass to build the merged contract without generating
+    /// bodies. The result is stored in SynthesizedFragment; actual body synthesis
+    /// happens lazily in kernelSource().
+    ///
+    /// Handles arbitrary entry counts — computes intermediate storage for each
+    /// adjacent pair automatically.
     public static func mergeContracts(
         entries: [Entry],
-        resolvedParallelism: KernelParallelism,
-        storage: IntermediateStorage
+        resolvedParallelism: KernelParallelism
     ) -> FusionContract {
         var intermediateTGMemory = 0
-        if case .threadgroupMemory(let dim) = storage {
-            intermediateTGMemory = dim * MemoryLayout<Float>.size
+        for i in 0..<(entries.count - 1) {
+            let storage = entries[i].contract.intermediateStorage(to: entries[i + 1].contract)
+            if case .threadgroupMemory(let dim) = storage {
+                intermediateTGMemory += dim * MemoryLayout<Float>.size
+            }
         }
         return mergeContractsInternal(
             entries: entries,
@@ -281,6 +367,29 @@ public struct FusionSynthesizer {
                     }
                 }
 
+                // Deduplicate same-named residual ports that reference the same physical buffer.
+                // When ResidualAdd reads "residual" (input/const) and CopyFragment writes
+                // "residual" (output/non-const), they share the same physical residual buffer.
+                // Merge into a single output (non-const) port so the MSL parameter is writable.
+                if port.bufferIntent == .residual,
+                   let existingIndex = externalPorts.firstIndex(where: {
+                       $0.name == port.name && $0.bufferIntent == .residual
+                   }) {
+                    let existing = externalPorts[existingIndex]
+                    if existing.direction != port.direction {
+                        // Same residual buffer, different directions → promote to output (non-const).
+                        let merged = FusionPort(
+                            name: port.name,
+                            direction: .output,
+                            role: existing.role,
+                            accessPattern: existing.accessPattern,
+                            bufferIntent: .residual
+                        )
+                        externalPorts[existingIndex] = merged
+                        continue
+                    }
+                }
+
                 externalPorts.append(port)
             }
         }
@@ -293,13 +402,6 @@ public struct FusionSynthesizer {
 
         // Combined threadgroup memory
         let baseTGMemory = entries.map(\.contract.threadgroupMemoryBytes).max() ?? 0
-        var intermediateTGMemory = 0
-        for i in 0..<(entries.count - 1) {
-            let storage = entries[i].contract.intermediateStorage(to: entries[i + 1].contract)
-            if case .threadgroupMemory(let dim) = storage {
-                intermediateTGMemory += dim * MemoryLayout<Float>.size
-            }
-        }
 
         let requiresSIMD = entries.contains { $0.contract.requiresSIMDReduction }
 

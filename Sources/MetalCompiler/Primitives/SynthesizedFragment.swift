@@ -59,7 +59,16 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
         case .perHead(let h, let d): parallelismTag = "head\(h)x\(d)"
         }
         let precisionTag = context.bufferPrecision == .float32 ? "f32" : "f16"
-        return "synthesized_\(fragments.count)way_\(parallelismTag)_\(precisionTag)"
+        let weightTag: String
+        switch context.weightFormat {
+        case .float16: weightTag = "wf16"
+        case .bfloat16: weightTag = "wbf16"
+        case .float32: weightTag = "wf32"
+        case .quantized4Bit(let gs): weightTag = "wq4g\(gs)"
+        case .quantized8Bit(let gs): weightTag = "wq8g\(gs)"
+        }
+        let portCount = mergedContract.ports.count
+        return "synthesized_\(fragments.count)way_\(portCount)p_\(parallelismTag)_\(precisionTag)_\(weightTag)"
     }
 
     public func kernelBody(bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String? {

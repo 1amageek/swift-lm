@@ -37,22 +37,29 @@ extension MetalSourceGenerator {
             using namespace mpp::tensor_ops;
             (void)inputRowStride;
 
+            // Pad sequence extent to the M-tile boundary so that edge
+            // threadgroups never slice beyond the tensor declaration.
+            // The backing buffers are allocated for maximumSequenceLength,
+            // which is always >= paddedSeqLen.
+            constexpr uint M_TILE = 64;
+            const uint paddedSeqLen = ((sequenceLength + M_TILE - 1) / M_TILE) * M_TILE;
+
             auto A = tensor<device \(bt), dextents<int32_t, 2>, tensor_inline>(
-                input, dextents<int32_t, 2>(inputDimension, sequenceLength));
+                input, dextents<int32_t, 2>(inputDimension, paddedSeqLen));
             auto B = tensor<device \(tensorWeightType), dextents<int32_t, 2>, tensor_inline>(
                 weight, dextents<int32_t, 2>(inputDimension, outputDimension));
             auto C = tensor<device \(bt), dextents<int32_t, 2>, tensor_inline>(
-                output, dextents<int32_t, 2>(outputDimension, sequenceLength));
+                output, dextents<int32_t, 2>(outputDimension, paddedSeqLen));
 
             constexpr auto desc = matmul2d_descriptor(
-                64, 32, dynamic_length_v<int>,
+                M_TILE, 32, dynamic_length_v<int>,
                 false, true, false,
                 matmul2d_descriptor::mode::multiply);
             matmul2d<desc, execution_simdgroups<4>> op;
 
-            auto mA = A.slice(0, tgid.y * 64);
+            auto mA = A.slice(0, tgid.y * M_TILE);
             auto mB = B.slice(0, tgid.x * 32);
-            auto mC = C.slice(tgid.x * 32, tgid.y * 64);
+            auto mC = C.slice(tgid.x * 32, tgid.y * M_TILE);
             op.run(mA, mB, mC);
         }
         """

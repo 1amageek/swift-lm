@@ -81,6 +81,11 @@ struct MetalEntryCollector {
 
         // Generic fusion: adjacent .fragment entries with compatible FusionContracts.
         // Uses FusionContract only — no concrete type inspection.
+        //
+        // When extending an existing SynthesizedFragment, flatten the leaf fragments
+        // rather than nesting. SynthesizedFragment always holds a flat list of leaf
+        // PrimitiveMetalKernelFragments — this ensures synthesize() processes all
+        // fragments in a single pass with consistent variable naming.
         var changed = true
 
         while changed {
@@ -101,17 +106,36 @@ struct MetalEntryCollector {
                         tgMemory += dim * MemoryLayout<Float>.size
                     }
                     if tgMemory <= context.threadgroupMemoryLimit {
-                        let resolvedParallelism = contractA.parallelism.resolved(with: contractB.parallelism)
+                        // Flatten: unpack existing SynthesizedFragments into leaf fragments
+                        let leftFragments: [any PrimitiveMetalKernelFragment]
+                        if let synth = result[index].fragment as? SynthesizedFragment {
+                            leftFragments = synth.fragments
+                        } else {
+                            leftFragments = [result[index].fragment]
+                        }
+                        let rightFragments: [any PrimitiveMetalKernelFragment]
+                        if let synth = result[index + 1].fragment as? SynthesizedFragment {
+                            rightFragments = synth.fragments
+                        } else {
+                            rightFragments = [result[index + 1].fragment]
+                        }
+                        let flatFragments = leftFragments + rightFragments
+
+                        // Build entries from leaf contracts and compute resolved parallelism
+                        let flatEntries = flatFragments.map { frag in
+                            FusionSynthesizer.Entry(contract: frag.fusionContract!, body: "")
+                        }
+                        var resolvedParallelism = flatEntries[0].contract.parallelism
+                        for i in 1..<flatEntries.count {
+                            resolvedParallelism = resolvedParallelism.resolved(with: flatEntries[i].contract.parallelism)
+                        }
+
                         let mergedContract = FusionSynthesizer.mergeContracts(
-                            entries: [
-                                .init(contract: contractA, body: ""),
-                                .init(contract: contractB, body: ""),
-                            ],
-                            resolvedParallelism: resolvedParallelism,
-                            storage: storage
+                            entries: flatEntries,
+                            resolvedParallelism: resolvedParallelism
                         )
                         let synthesized = SynthesizedFragment(
-                            fragments: [result[index].fragment, result[index + 1].fragment],
+                            fragments: flatFragments,
                             mergedContract: mergedContract
                         )
                         let mergedBindings = result[index].parameterBindings + result[index + 1].parameterBindings

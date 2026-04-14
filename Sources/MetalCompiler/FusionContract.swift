@@ -4,14 +4,44 @@
 ///
 /// Determines the scaffold template the compiler uses to wrap `kernelBody()`.
 ///
-/// Convention per parallelism:
-/// - `.perRow`: body contains its own loops (`for (uint i = tid; ...)`) and
-///   threadgroup barriers. Scaffold provides row-offset pointers, `tid`,
-///   `threadgroupSize`, `dimension`, and `threadgroup float shared[32]`.
-/// - `.perElement`: body is a single-element expression using `i` as the
-///   element index. No loop. Scaffold wraps with iteration context.
-/// - `.perHead`: body contains its own loops using `tid` within `headDimension`.
-///   Scaffold provides head-offset pointer and shared memory.
+/// ## Available variables per parallelism (kernelBody() contract)
+///
+/// ### `.perRow(dimension:)`
+/// Body **contains its own cooperative loops** and threadgroup barriers.
+/// Scaffold provides these variables — body must not redeclare them:
+///
+/// | Variable | Type | Description |
+/// |---|---|---|
+/// | `tid` | `uint` | Thread index within threadgroup |
+/// | `threadgroupSize` | `uint` | Number of threads in threadgroup |
+/// | `dimension` | `uint` | Row width (from contract parallelism) |
+/// | `shared[32]` | `threadgroup float` | SIMD reduction scratch (only when `requiresSIMDReduction == true`) |
+/// | `<port_name>` | `device [const] T*` | Row-local pointer (sequence mode: offset by `seqPos * dimension`) |
+///
+/// Typical loop pattern: `for (uint i = tid; i < dimension; i += threadgroupSize)`
+///
+/// **`shared[32]` dependency**: When `FusionContract.requiresSIMDReduction` is `true`,
+/// the scaffold declares `threadgroup float shared[32]`. The body references `shared`
+/// by name for SIMD warp reduction (e.g., `shared[simdIndex] = simd_sum(value)`).
+/// If `requiresSIMDReduction` is `false`, `shared` is not declared and must not be used.
+///
+/// ### `.perElement(count:)`
+/// Body is a **single-element expression** — no loop, no barriers.
+/// Scaffold wraps with iteration context:
+///
+/// | Variable | Type | Description |
+/// |---|---|---|
+/// | `i` | `uint` | Element index within row (0..<count) |
+/// | `idx` | `uint` | Flat buffer index (sequence mode: `seqPos * count + i`) |
+/// | `dimension` | `uint` | Element count (from contract parallelism) |
+/// | `<port_name>` | `device [const] T*` | Buffer pointer (subscript with `[idx]`) |
+///
+/// When fused into a `.perRow` kernel, the synthesizer wraps the body in a
+/// cooperative loop: `for (uint i = tid; i < dimension; ...) { uint idx = i; body }`
+///
+/// ### `.perHead(headCount:, headDimension:)`
+/// Body contains its own loops using `tid` within `headDimension`.
+/// Scaffold provides head-offset pointers and shared memory.
 public enum KernelParallelism: Sendable, Equatable {
     /// One threadgroup per row. Threads cooperate to process `dimension` elements.
     case perRow(dimension: Int)
@@ -179,7 +209,17 @@ public struct FusionContract: Sendable {
     /// Does not include intermediate storage — the compiler adds that separately.
     public let threadgroupMemoryBytes: Int
 
-    /// Whether the fragment uses SIMD reduction (`simd_sum`, threadgroup barriers).
+    /// Whether the fragment's `kernelBody()` uses SIMD reduction via `shared[32]`.
+    ///
+    /// When `true`, `KernelScaffold` declares `threadgroup float shared[32]` in the
+    /// kernel signature. The body can then use `shared` for SIMD warp reduction
+    /// (e.g., `shared[simdIndex] = simd_sum(value)`).
+    ///
+    /// This is a **scaffold generation hint**, not a fusion eligibility criterion.
+    /// The fusion pass does not use this field to determine whether two fragments
+    /// can be fused — only `parallelism`, `ports`, and `threadgroupMemoryBytes`
+    /// affect fusion eligibility. When merging contracts, `requiresSIMDReduction`
+    /// is OR-combined: if any constituent fragment needs it, the fused kernel gets it.
     public let requiresSIMDReduction: Bool
 
     public init(
@@ -211,9 +251,14 @@ public struct FusionContract: Sendable {
         ports.first { $0.direction == .input && isBufferRole($0.role) }
     }
 
-    /// The primary output port (first output).
+    /// The primary output port — the main dataflow output.
+    ///
+    /// Prefers `.dataFlow` intent over `.residual` intent. Residual ports are
+    /// side-channel outputs that should not be used as the internal junction
+    /// when fusing with downstream fragments.
     public var primaryOutput: FusionPort? {
-        ports.first { $0.direction == .output }
+        ports.first { $0.direction == .output && $0.bufferIntent == .dataFlow }
+            ?? ports.first { $0.direction == .output }
     }
 }
 
@@ -285,7 +330,18 @@ extension FusionContract {
             if case .perElement = effective {
                 return .register
             }
-            // perRow with singlePass: use TG memory for now (loop merging optimization deferred)
+            // perRow + singlePass → threadgroup memory.
+            //
+            // Rationale: perRow bodies contain their own cooperative loops
+            // (`for (uint i = tid; ...)`). A register intermediate requires
+            // producer and consumer to execute within the same loop iteration.
+            // Merging two independent cooperative loops into one shared loop
+            // is non-trivial (different loop bodies, barrier placement, SIMD
+            // reduction scope). Threadgroup memory safely decouples the loops:
+            // producer writes all elements → barrier → consumer reads.
+            //
+            // Future optimization: loop merging could enable register intermediates
+            // for perRow+singlePass when both bodies have compatible loop structure.
             return .threadgroupMemory(dimension: effective.dimension)
 
         case .multiPass:
