@@ -162,9 +162,6 @@ public enum ModelGraphDumper {
         case let a as LayerScaleAttributes:
             return "layerScale(dim=\(a.dimension))"
 
-        case let a as PositionalEmbeddingAttributes:
-            return "positionalEmbedding(\(a.kind), dim=\(a.embeddingSize), maxPos=\(a.maxPositions))"
-
         case let a as RoPEAttributes:
             var parts = ["dim=\(a.dimension)", "base=\(formatFloat(a.base))"]
             if let s = a.scaling { parts.append("scaling=\(s.kind)(\(formatFloat(s.factor)))") }
@@ -239,9 +236,6 @@ public enum ModelGraphDumper {
         case let a as ShortConvAttributes:
             return "shortConv(hidden=\(a.hiddenSize), kernel=\(a.kernelSize))"
 
-        case let a as CustomNodeAttributes:
-            return "custom(\(a.domain).\(a.name))"
-
         default:
             return "primitive(\(type(of: attrs)))"
         }
@@ -253,8 +247,7 @@ public enum ModelGraphDumper {
         if v == Float(Int(v)) {
             return String(Int(v))
         }
-        let s = String(format: "%.6g", v)
-        return s
+        return "\(v)"
     }
 
     private static func dtypeStr(_ hint: DTypeHint?) -> String {

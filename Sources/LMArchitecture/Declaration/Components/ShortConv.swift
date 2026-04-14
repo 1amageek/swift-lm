@@ -8,7 +8,7 @@
 /// ```
 public struct ShortConv: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = ShortConvAttributes
 
     public let hiddenSize: Int
     public let kernelSize: Int
@@ -21,16 +21,12 @@ public struct ShortConv: ModelComponent {
     }
 }
 
-extension ShortConv: PrimitiveComponent {
+extension ShortConv {
 
-    package var operationKind: OperationKind {
-        .primitive(ShortConvAttributes(
+    public var attributes: ShortConvAttributes {
+        ShortConvAttributes(
             hiddenSize: hiddenSize,
             kernelSize: kernelSize
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

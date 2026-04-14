@@ -38,13 +38,13 @@ struct STAFSpecializedWeightStoreBuilder {
         var seen: Set<STAFSpecializedWeightKey> = []
 
         for entry in entries {
-            guard case .projection(let projection, _) = entry.kind,
-                  let binding = entry.parameterBindings.first(where: { $0.role == projection.field }) else {
+            guard let linear = entry.fragment as? LinearFragment,
+                  let binding = entry.parameterBindings.first(where: { $0.role == linear.field }) else {
                 continue
             }
             let request = accessPolicyResolver.accessRequest(
                 for: entry,
-                role: projection.field,
+                role: linear.field,
                 binding: binding,
                 executionPhase: .decode,
                 stafWeightStore: store

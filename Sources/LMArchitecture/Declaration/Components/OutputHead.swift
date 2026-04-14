@@ -7,7 +7,7 @@
 /// ```
 public struct OutputHead: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = OutputHeadAttributes
 
     public let inputSize: Int
     public let vocabSize: Int
@@ -29,18 +29,14 @@ public struct OutputHead: ModelComponent {
     }
 }
 
-extension OutputHead: PrimitiveComponent {
+extension OutputHead {
 
-    package var operationKind: OperationKind {
-        .primitive(OutputHeadAttributes(
+    public var attributes: OutputHeadAttributes {
+        OutputHeadAttributes(
             inputSize: inputSize,
             vocabSize: vocabSize,
             tiedToEmbedding: tiedToEmbedding,
             bias: bias
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

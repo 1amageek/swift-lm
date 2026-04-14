@@ -5,7 +5,7 @@
 /// ```
 public struct MLP: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = MLPAttributes
 
     public let inputSize: Int
     public let outputSize: Int
@@ -35,20 +35,16 @@ public struct MLP: ModelComponent {
     }
 }
 
-extension MLP: PrimitiveComponent {
+extension MLP {
 
-    package var operationKind: OperationKind {
-        .primitive(MLPAttributes(
+    public var attributes: MLPAttributes {
+        MLPAttributes(
             inputSize: inputSize,
             outputSize: outputSize,
             intermediateSize: intermediateSize,
             activation: activation,
             gating: gating,
             bias: bias
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

@@ -1,59 +1,11 @@
 import LMIR
 
-// MARK: - Optimizer Protocol
-
-/// Pluggable optimization strategy for dispatch entry generation.
-///
-/// The compiler calls the optimizer at two phases:
-/// 1. **Fragment-level** (`optimizeFragment`): called per composite fragment during IR walk.
-///    Primitives within a composite fragment are implicitly independent.
-/// 2. **Graph-level** (`optimizeGraph`): called on the complete dispatch list after IR walk.
-///    Handles cross-fragment fusion (structural operations + reductions).
-///
-/// Different implementations allow benchmarking and comparing strategies:
-/// - `NoOptimizer` — baseline, no optimization
-/// - `StandardOptimizer` — exact-shape MLP front-half fusion plus norm fusion
-/// - `AggressiveOptimizer` — standard optimization plus projection/per-head batching
-public protocol DispatchOptimizer: Sendable {
-    /// Strategy name for benchmark reports.
-    var name: String { get }
-
-    /// Optimize primitives collected from a single composite fragment.
-    ///
-    /// Called once per IR primitive operation (Attention, MLP, ShortConv, etc.).
-    /// Primitives within a composite fragment belong to the same operation —
-    /// they operate on disjoint data and are implicitly independent.
-    ///
-    /// The optimizer may:
-    /// - Batch consecutive non-output projections into a single dispatch
-    /// - Batch consecutive in-place fragments with same dispatchDimension
-    /// - Return primitives unmodified
-    ///
-    /// - Parameter context: Device and model constraints for feasibility checks.
-    func optimizeFragment(
-        _ primitives: [CollectedPrimitive],
-        context: FusionContext
-    ) -> [OptimizedEntry]
-
-    /// Optimize the complete dispatch list after IR walk.
-    ///
-    /// Uses greedy largest-first algorithm: patterns sorted by size descending,
-    /// each checked for structural match AND device feasibility.
-    /// For non-overlapping, monotonically-better patterns this is provably optimal.
-    ///
-    /// - Parameter context: Device and model constraints for feasibility checks.
-    func optimizeGraph(
-        _ entries: [DispatchEntry],
-        context: FusionContext
-    ) -> [DispatchEntry]
-}
-
 // MARK: - Collected Primitive
 
 /// A primitive fragment collected during fragment tree walk, before emission.
 ///
 /// The compiler collects all primitives from a composite fragment's tree,
-/// passes them to the optimizer, then emits the optimized result.
+/// then emits them as dispatch entries.
 public struct CollectedPrimitive: Sendable {
     /// The primitive fragment (carries dispatchDimension, isFusable, isInPlace, etc.).
     public let fragment: any PrimitiveMetalKernelFragment
@@ -71,31 +23,12 @@ public struct CollectedPrimitive: Sendable {
     }
 }
 
-// MARK: - Optimized Entry
-
-/// Result of fragment-level optimization.
-///
-/// The optimizer returns a sequence of these, which the compiler
-/// translates into `DispatchEntry` values.
-public enum OptimizedEntry: Sendable {
-    /// Single dispatch — no optimization applied.
-    case single(CollectedPrimitive)
-    /// Fused MLP front half — gate_proj + up_proj + SwiGLU.
-    case fusedSwiGLUProjection(FusedSwiGLUProjection, parameterBindings: [ParameterBinding], layerIndex: Int?)
-    /// Batched projections — N non-output GEMV in one dispatch.
-    case batchedProjection(BatchedProjection, parameterBindings: [ParameterBinding], layerIndex: Int?)
-    /// Batched same-dimension fragments — N in-place operations in one dispatch.
-    case batchedFragment(BatchedFragment, parameterBindings: [ParameterBinding], layerIndex: Int?)
-}
-
 // MARK: - Optimization Report
 
-/// Diagnostic report from an optimization pass.
+/// Diagnostic report from the cross-component fusion pass.
 ///
-/// Used for benchmarking: compare dispatch counts and pattern breakdowns
-/// across different optimizer implementations.
+/// Compares dispatch counts before and after fusion, with pattern breakdown.
 public struct OptimizationReport: Sendable {
-    public let optimizerName: String
     public let unfusedCount: Int
     public let optimizedCount: Int
     public let patterns: [PatternMatch]
@@ -113,8 +46,7 @@ public struct OptimizationReport: Sendable {
         }
     }
 
-    public init(optimizerName: String, unfusedCount: Int, optimizedCount: Int, patterns: [PatternMatch]) {
-        self.optimizerName = optimizerName
+    public init(unfusedCount: Int, optimizedCount: Int, patterns: [PatternMatch]) {
         self.unfusedCount = unfusedCount
         self.optimizedCount = optimizedCount
         self.patterns = patterns
@@ -122,7 +54,7 @@ public struct OptimizationReport: Sendable {
 
     /// Print a formatted report to stdout.
     public func printReport() {
-        print("[Optimizer: \(optimizerName)] \(unfusedCount) → \(optimizedCount) dispatches (saved \(totalSaved))")
+        print("[Fusion] \(unfusedCount) → \(optimizedCount) dispatches (saved \(totalSaved))")
         for p in patterns {
             print("  \(p.name): \(p.count)× saves \(p.savedDispatches)")
         }

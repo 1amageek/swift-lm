@@ -114,7 +114,7 @@ enum BenchmarkSupport {
             }
             guard context.schemeIdentifier == .bf16RowMajor,
                   context.role == "in_proj",
-                  case .projection(let projection, _) = context.entry.kind,
+                  let projection = context.entry.fragment as? LinearFragment,
                   projection.inputDimension == 2_048,
                   projection.outputDimension == 6_144 else {
                 return nil
@@ -130,7 +130,7 @@ enum BenchmarkSupport {
             }
             guard context.schemeIdentifier == .bf16RowMajor,
                   context.role == "in_proj",
-                  case .projection(let projection, _) = context.entry.kind,
+                  let projection = context.entry.fragment as? LinearFragment,
                   projection.inputDimension == 2_048,
                   projection.outputDimension == 6_144 else {
                 return nil
@@ -145,7 +145,7 @@ enum BenchmarkSupport {
                 return nil
             }
             guard context.schemeIdentifier == .bf16RowMajor,
-                  case .projection(let projection, _) = context.entry.kind,
+                  let projection = context.entry.fragment as? LinearFragment,
                   projection.inputDimension == 2_048,
                   projection.outputDimension == 2_048 else {
                 return nil
@@ -161,7 +161,7 @@ enum BenchmarkSupport {
             }
             guard context.schemeIdentifier == .bf16RowMajor,
                   context.role == "q_proj",
-                  case .projection(let projection, _) = context.entry.kind,
+                  let projection = context.entry.fragment as? LinearFragment,
                   projection.inputDimension == 2_048,
                   projection.outputDimension == 2_048 else {
                 return nil
@@ -204,7 +204,6 @@ enum BenchmarkSupport {
     }
 
     static func setupOrSkip(
-        optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         decodeBufferPrecisionOverride: BufferPrecision? = nil,
         useCachedStore: Bool = true
@@ -221,17 +220,15 @@ enum BenchmarkSupport {
             let compiler: MetalInferenceCompiler
             if let weightAccessPolicyOverride {
                 compiler = MetalInferenceCompiler(
-                    optimizer: optimizer,
                     weightAccessPolicyOverride: weightAccessPolicyOverride,
                     decodeBufferPrecisionOverride: decodeBufferPrecisionOverride
                 )
             } else if let decodeBufferPrecisionOverride {
                 compiler = MetalInferenceCompiler(
-                    optimizer: optimizer,
                     decodeBufferPrecisionOverride: decodeBufferPrecisionOverride
                 )
             } else {
-                compiler = MetalInferenceCompiler(optimizer: optimizer)
+                compiler = MetalInferenceCompiler()
             }
             let decodePlan = try compiler.compile(
                 graph: spec.resolved,
@@ -261,7 +258,6 @@ enum BenchmarkSupport {
     }
 
     static func collectPrefillEntriesOrSkip(
-        optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         decodeBufferPrecisionOverride: BufferPrecision? = nil,
         useCachedStore: Bool = true
@@ -295,7 +291,7 @@ enum BenchmarkSupport {
                     override: weightAccessPolicyOverride
                 )
             )
-            let collector = MetalEntryCollector(optimizer: optimizer ?? AggressiveOptimizer())
+            let collector = MetalEntryCollector()
             let optimization = collector.collect(
                 using: context,
                 kernelContext: context.prefillKernelContext
@@ -312,7 +308,6 @@ enum BenchmarkSupport {
     }
 
     static func setupWithCollectedPrefillEntriesOrSkip(
-        optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         decodeBufferPrecisionOverride: BufferPrecision? = nil,
         useCachedStore: Bool = true
@@ -329,17 +324,15 @@ enum BenchmarkSupport {
             let compiler: MetalInferenceCompiler
             if let weightAccessPolicyOverride {
                 compiler = MetalInferenceCompiler(
-                    optimizer: optimizer,
                     weightAccessPolicyOverride: weightAccessPolicyOverride,
                     decodeBufferPrecisionOverride: decodeBufferPrecisionOverride
                 )
             } else if let decodeBufferPrecisionOverride {
                 compiler = MetalInferenceCompiler(
-                    optimizer: optimizer,
                     decodeBufferPrecisionOverride: decodeBufferPrecisionOverride
                 )
             } else {
-                compiler = MetalInferenceCompiler(optimizer: optimizer)
+                compiler = MetalInferenceCompiler()
             }
             let decodePlan = try compiler.compile(
                 graph: spec.resolved,
@@ -384,7 +377,7 @@ enum BenchmarkSupport {
                     override: weightAccessPolicyOverride
                 )
             )
-            let collector = MetalEntryCollector(optimizer: optimizer ?? AggressiveOptimizer())
+            let collector = MetalEntryCollector()
             let optimization = collector.collect(
                 using: context,
                 kernelContext: context.prefillKernelContext
@@ -587,20 +580,17 @@ enum BenchmarkSupport {
     /// loads/converts STAF weights, and compiles decode + prefill plans.
     static func setupFromBundle(
         bundlePath: String,
-        optimizer: (any DispatchOptimizer)? = nil,
         maximumPrefillLength: Int = 64
     ) throws -> (MetalInferenceModel, STAFWeightStore, String) {
         try setupFromBundle(
             bundlePath: bundlePath,
-            inferencePolicy: InferencePolicy(maximumSequenceLength: maximumPrefillLength),
-            optimizer: optimizer
+            inferencePolicy: InferencePolicy(maximumSequenceLength: maximumPrefillLength)
         )
     }
 
     static func setupFromBundle(
         bundlePath: String,
-        inferencePolicy: InferencePolicy,
-        optimizer: (any DispatchOptimizer)? = nil
+        inferencePolicy: InferencePolicy
     ) throws -> (MetalInferenceModel, STAFWeightStore, String) {
         let (device, store) = try loadBundleStoreOrSkip(bundlePath: bundlePath)
 
@@ -615,7 +605,7 @@ enum BenchmarkSupport {
         let convention = resolver.namingConvention(for: modelType)
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
-        let compiler = MetalInferenceCompiler(optimizer: optimizer)
+        let compiler = MetalInferenceCompiler()
         let compiled = try compiler.compile(
             graph: resolved,
             hiddenSize: config.hiddenSize,

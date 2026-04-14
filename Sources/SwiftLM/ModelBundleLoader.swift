@@ -361,28 +361,7 @@ public struct ModelBundleLoader: Sendable {
     }
 
     private static func makeInferenceCompiler() -> MetalInferenceCompiler {
-        let environment = ProcessInfo.processInfo.environment
-        guard let rawValue = environment["SWIFTLM_METAL_OPTIMIZER"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased(),
-            !rawValue.isEmpty else {
-            return MetalInferenceCompiler(optimizer: AggressiveOptimizer())
-        }
-
-        let optimizer: any DispatchOptimizer
-        switch rawValue {
-        case "aggressive":
-            optimizer = AggressiveOptimizer()
-        case "standard":
-            optimizer = StandardOptimizer()
-        case "none":
-            optimizer = NoOptimizer()
-        default:
-            print("[ModelBundleLoader] unknown SWIFTLM_METAL_OPTIMIZER=\(rawValue); using aggressive")
-            optimizer = AggressiveOptimizer()
-        }
-        print("[ModelBundleLoader] optimizer override: \(optimizer.name)")
-        return MetalInferenceCompiler(optimizer: optimizer)
+        MetalInferenceCompiler()
     }
 }
 

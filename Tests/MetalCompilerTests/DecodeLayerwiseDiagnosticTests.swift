@@ -70,7 +70,7 @@ struct DecodeLayerwiseDiagnosticTests {
                 print("[DecodeLayerwise] layer=\(currentLayer) phase=mlp_out kind=\(entry.kind) maxErr=\(String(format: "%.4f", err))")
             }
 
-            if entry.kind.contains("fusedResidualAddCopyNorm") || entry.kind.contains("structuralAdd") {
+            if entry.kind.contains("ResidualAddFragment") || entry.kind.contains("synthesized_3way") {
                 if waitingForOperatorResidual {
                     waitingForOperatorResidual = false
                 } else {
@@ -117,7 +117,7 @@ struct DecodeLayerwiseDiagnosticTests {
                 waitingForOperatorResidual = true
             }
 
-            guard currentLayer == 13, waitingForOperatorResidual, entry.kind.contains("fusedResidualAddCopyNorm") else {
+            guard currentLayer == 13, waitingForOperatorResidual, entry.kind.contains("ResidualAddFragment") || entry.kind.contains("synthesized_3way") else {
                 try submission.withCompute { encoder, argumentTable in
                     MetalDecodeEncoder.encodeStep(
                         step: step,
@@ -125,7 +125,7 @@ struct DecodeLayerwiseDiagnosticTests {
                         argumentTable: argumentTable
                     )
                 }
-                if entry.kind.contains("fusedResidualAddCopyNorm") || entry.kind.contains("structuralAdd") {
+                if entry.kind.contains("ResidualAddFragment") || entry.kind.contains("synthesized_3way") {
                     if waitingForOperatorResidual {
                         waitingForOperatorResidual = false
                     } else {
@@ -173,7 +173,7 @@ struct DecodeLayerwiseDiagnosticTests {
             return
         }
 
-        Issue.record("Could not locate layer13 fusedResidualAddCopyNorm step")
+        Issue.record("Could not locate layer13 residual add step")
     }
 
     private static func buildEnvironment() throws -> TestEnvironment {

@@ -397,13 +397,11 @@ struct OptimizerAttentionProbeTests {
     }
 
     private func withFreshProbeSetup<T>(
-        optimizer: (any DispatchOptimizer)? = StandardOptimizer(),
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         body: (inout MetalInferenceModel, BenchmarkSupport.CollectedPrefillEntries) throws -> T
     ) throws -> T {
         try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             let setup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: optimizer,
                 weightAccessPolicyOverride: weightAccessPolicyOverride,
                 useCachedStore: false
             )
@@ -697,7 +695,7 @@ struct OptimizerAttentionProbeTests {
         let resolver = ProjectionWeightAccessPolicyResolver()
         return collected.fusedEntries.compactMap { entry -> (entry: DispatchEntry, tensorName: String, access: STAFWeightBufferAccess, schemeIdentifier: QuantizationSchemeIdentifier)? in
             guard
-                case .projection = entry.kind,
+                entry.fragment is LinearFragment,
                 let binding = entry.parameterBindings.first(where: {
                     $0.tensorName.contains(layerPrefix) && $0.tensorName.hasSuffix(tensorNameSuffix)
                 }),
@@ -718,9 +716,8 @@ struct OptimizerAttentionProbeTests {
         }.first
     }
 
-    private func projectionKind(from entry: DispatchEntry) -> MetalProjection? {
-        guard case .projection(let projection, _) = entry.kind else { return nil }
-        return projection
+    private func projectionKind(from entry: DispatchEntry) -> LinearFragment? {
+        entry.fragment as? LinearFragment
     }
 
     private func matchingProjectionStepIndex(
@@ -728,7 +725,7 @@ struct OptimizerAttentionProbeTests {
         entryIndex: Int,
         tensorName: String,
         access: STAFWeightBufferAccess,
-        projection: MetalProjection
+        projection: LinearFragment
     ) -> Int? {
         let exactMatch = plan.steps.enumerated().first { _, step in
             step.metadata.entryIndex == entryIndex
@@ -756,7 +753,7 @@ struct OptimizerAttentionProbeTests {
         _ step: MetalPrefillStep,
         tensorName: String,
         access: STAFWeightBufferAccess,
-        projection: MetalProjection
+        projection: LinearFragment
     ) -> Bool {
         guard step.metadata.weightTensorName == tensorName else {
             return false

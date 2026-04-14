@@ -119,8 +119,8 @@ private func normalizeComponent<C: ModelComponent>(
     }
 
     // 2. Primitive operations (MLP, Attention, RMSNorm, etc.)
-    if let primitive = component as? any PrimitiveComponent {
-        return try normalizePrimitive(primitive, upstream: upstream, ctx: &ctx)
+    if C.Attributes.self != Never.self {
+        return try normalizePrimitive(component, upstream: upstream, ctx: &ctx)
     }
 
     // 3. User-defined composite — recurse into body
@@ -129,13 +129,13 @@ private func normalizeComponent<C: ModelComponent>(
 
 // MARK: - Primitive
 
-private func normalizePrimitive(
-    _ primitive: any PrimitiveComponent,
+private func normalizePrimitive<C: ModelComponent>(
+    _ component: C,
     upstream: [ValueID],
     ctx: inout NormalizationContext
 ) throws -> NormalizedRegionFragment {
-    let kind = primitive.operationKind
-    let signature = primitive.operationSignature
+    let kind = OperationKind.primitive(component.attributes)
+    let signature = component.operationSignature
     let key = ctx.freshKey()
     let operands = upstream.map { Operand(value: $0) }
     let resultCount = resolveArity(signature.resultArity, fallback: upstream.count)

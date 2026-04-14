@@ -77,26 +77,25 @@ struct Gemma4DecoderLayer: ModelComponent {
     var body: some ModelComponent {
         Residual {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)
-            Attention(
+            Gemma4Attention(
                 hiddenSize: config.hiddenSize,
                 headCount: config.attentionHeads,
                 kvHeadCount: attentionKVHeads,
                 headDimension: attentionHeadDimension,
-                attentionScale: 1.0,
                 bias: config.attentionBias,
+                attentionScale: 1.0,
                 rope: RoPEAttributes(
                     dimension: ropeDimension,
                     base: ropeBase,
                     scaling: ropeScaling
                 ),
                 qkNorm: .rmsNorm,
-                valueNorm: .rmsNormNoScale,
-                valueProjectionSource: isFullAttention && config.attentionKEqualsV
-                    ? .keyProjection
-                    : .dedicatedProjection,
                 window: isFullAttention ? nil : config.slidingWindow.map {
                     AttentionWindow(left: $0, right: 0)
                 },
+                valueProjectionSource: isFullAttention && config.attentionKEqualsV
+                    ? .keyProjection
+                    : .dedicatedProjection,
                 sharedKeyValueSourceLayerIndex: sharedKeyValueSourceLayerIndex
             )
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps)

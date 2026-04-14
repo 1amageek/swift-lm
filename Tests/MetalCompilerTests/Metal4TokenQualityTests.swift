@@ -17,7 +17,7 @@ struct Metal4TokenQualityTests {
         defer { gpuLock.release() }
         BenchmarkSupport.settleGPU()
 
-        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
+        let (model, _) = try BenchmarkSupport.setupOrSkip()
         var m = model
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let decodeSteps = 30

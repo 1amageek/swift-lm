@@ -71,37 +71,6 @@ struct Gemma4BenchmarkTests {
         print("[Benchmark/\(Self.modelLabel)] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
     }
 
-    @Test("Aggressive optimizer: decode throughput")
-    func aggressiveDecodeBenchmark() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        BenchmarkSupport.settleGPU()
-
-        let (model, _, _) = try BenchmarkSupport.setupFromBundle(
-            bundlePath: Self.bundlePath,
-            optimizer: AggressiveOptimizer()
-        )
-        var inferenceModel = model
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        var currentToken = inferenceModel.prefill(tokens: promptTokens)
-        for _ in 0..<3 {
-            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
-        }
-
-        let decodeSteps = 50
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<decodeSteps {
-            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let tokPerSec = Double(decodeSteps) / elapsed
-        let msPerToken = elapsed / Double(decodeSteps) * 1000
-        print("[Benchmark/\(Self.modelLabel)/aggressive] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
-        print("[Benchmark/\(Self.modelLabel)/aggressive] dispatches: \(inferenceModel.decodePlan.fusedEntryCount) (from \(inferenceModel.decodePlan.unfusedEntryCount))")
-    }
-
     @Test("End-to-end: prefill + decode with memory diagnostics")
     func endToEndBenchmark() throws {
         let gpuLock = try GPUTestExclusion.acquire()
@@ -186,8 +155,7 @@ struct Gemma4BenchmarkTests {
         BenchmarkSupport.settleGPU()
 
         let (model, _, _) = try BenchmarkSupport.setupFromBundle(
-            bundlePath: Self.bundlePath,
-            optimizer: AggressiveOptimizer()
+            bundlePath: Self.bundlePath
         )
         var inferenceModel = model
 

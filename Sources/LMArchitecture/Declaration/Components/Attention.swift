@@ -1,34 +1,63 @@
 /// Multi-head attention component.
 ///
-/// Represents the full attention operation as a single semantic unit.
+/// Composes the full attention operation: Q/K/V projections, optional QK normalization,
+/// optional rotary position encoding, scaled dot-product attention, and output projection.
+///
+/// Properties directly determine the fragment tree structure:
+/// - `headCount`, `kvHeadCount`, `headDimension` → projection sizing and GQA ratio
+/// - `rope` → rotary position encoding (RoPE) when present
+/// - `qkNorm` → QK normalization before attention scores when present
+/// - `causal`, `window` → attention masking behavior
 ///
 /// ```swift
 /// Attention(
 ///     hiddenSize: 4096,
 ///     headCount: 32,
 ///     kvHeadCount: 8,
-///     headDimension: 128
+///     rope: RoPEAttributes(dimension: 128, base: 500_000)
 /// )
 /// ```
 public struct Attention: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = AttentionAttributes
 
+    // MARK: - Projection geometry
+
+    /// Model hidden dimension. Determines Q and O projection input/output sizes.
     public let hiddenSize: Int
+
+    /// Number of query attention heads. Each head computes an independent attention pattern.
     public let headCount: Int
+
+    /// Number of key/value heads. When less than `headCount`, enables grouped-query attention (GQA).
     public let kvHeadCount: Int
+
+    /// Dimension of each attention head. Determines the dot-product space.
     public let headDimension: Int
-    public let attentionScale: Float?
+
+    /// Whether Q/K/V/O projections include bias terms.
     public let bias: Bool
+
+    // MARK: - Attention computation
+
+    /// Override for attention score scaling. Default: `1 / sqrt(headDimension)`.
+    public let attentionScale: Float?
+
+    /// Whether attention is causal (autoregressive). Masks future positions.
     public let causal: Bool
-    public let rope: RoPEAttributes?
-    public let qkNorm: QKNormKind?
-    public let valueNorm: AttentionValueNormKind?
-    public let valueProjectionSource: AttentionValueProjectionSource
+
+    /// Sliding window configuration. Limits the attention range per position.
     public let window: AttentionWindow?
-    public let implementationHint: AttentionImplementationHint?
-    public let outputGate: AttentionGateKind?
-    public let sharedKeyValueSourceLayerIndex: Int?
+
+    // MARK: - Position encoding
+
+    /// Rotary position embedding configuration. When present, RoPE is applied to Q and K.
+    public let rope: RoPEAttributes?
+
+    // MARK: - Normalization
+
+    /// QK normalization strategy applied before attention score computation.
+    public let qkNorm: QKNormKind?
 
     public init(
         hiddenSize: Int,
@@ -40,12 +69,7 @@ public struct Attention: ModelComponent {
         causal: Bool = true,
         rope: RoPEAttributes? = nil,
         qkNorm: QKNormKind? = nil,
-        valueNorm: AttentionValueNormKind? = nil,
-        valueProjectionSource: AttentionValueProjectionSource = .dedicatedProjection,
-        window: AttentionWindow? = nil,
-        implementationHint: AttentionImplementationHint? = nil,
-        outputGate: AttentionGateKind? = nil,
-        sharedKeyValueSourceLayerIndex: Int? = nil
+        window: AttentionWindow? = nil
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
         precondition(headCount > 0, "headCount must be positive")
@@ -66,19 +90,11 @@ public struct Attention: ModelComponent {
         self.causal = causal
         self.rope = rope
         self.qkNorm = qkNorm
-        self.valueNorm = valueNorm
-        self.valueProjectionSource = valueProjectionSource
         self.window = window
-        self.implementationHint = implementationHint
-        self.outputGate = outputGate
-        self.sharedKeyValueSourceLayerIndex = sharedKeyValueSourceLayerIndex
     }
-}
 
-extension Attention: PrimitiveComponent {
-
-    package var operationKind: OperationKind {
-        .primitive(AttentionAttributes(
+    public var attributes: AttentionAttributes {
+        AttentionAttributes(
             hiddenSize: hiddenSize,
             headCount: headCount,
             kvHeadCount: kvHeadCount,
@@ -87,17 +103,7 @@ extension Attention: PrimitiveComponent {
             bias: bias,
             causal: causal,
             rope: rope,
-            qkNorm: qkNorm,
-            valueNorm: valueNorm,
-            valueProjectionSource: valueProjectionSource,
-            window: window,
-            implementationHint: implementationHint,
-            outputGate: outputGate,
-            sharedKeyValueSourceLayerIndex: sharedKeyValueSourceLayerIndex
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+            qkNorm: qkNorm
+        )
     }
 }

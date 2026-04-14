@@ -8,7 +8,7 @@
 /// ```
 public struct StateSpace: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = StateSpaceAttributes
 
     public let hiddenSize: Int
     public let numHeads: Int
@@ -40,10 +40,10 @@ public struct StateSpace: ModelComponent {
     }
 }
 
-extension StateSpace: PrimitiveComponent {
+extension StateSpace {
 
-    package var operationKind: OperationKind {
-        .primitive(StateSpaceAttributes(
+    public var attributes: StateSpaceAttributes {
+        StateSpaceAttributes(
             hiddenSize: hiddenSize,
             numHeads: numHeads,
             groupCount: groupCount,
@@ -51,10 +51,6 @@ extension StateSpace: PrimitiveComponent {
             valueHeadDim: valueHeadDim,
             convKernelSize: convKernelSize,
             variant: variant
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

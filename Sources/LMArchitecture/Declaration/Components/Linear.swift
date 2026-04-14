@@ -8,7 +8,7 @@
 /// ```
 public struct Linear: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = LinearAttributes
 
     public let inputSize: Int
     public let outputSize: Int
@@ -23,13 +23,9 @@ public struct Linear: ModelComponent {
     }
 }
 
-extension Linear: PrimitiveComponent {
+extension Linear {
 
-    package var operationKind: OperationKind {
-        .primitive(LinearAttributes(inputSize: inputSize, outputSize: outputSize, bias: bias))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    public var attributes: LinearAttributes {
+        LinearAttributes(inputSize: inputSize, outputSize: outputSize, bias: bias)
     }
 }

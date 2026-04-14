@@ -5,7 +5,7 @@
 /// ```
 public struct RMSNorm: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = RMSNormAttributes
 
     public let dimension: Int
     public let epsilon: Float
@@ -20,14 +20,10 @@ public struct RMSNorm: ModelComponent {
     }
 }
 
-extension RMSNorm: PrimitiveComponent {
+extension RMSNorm {
 
-    package var operationKind: OperationKind {
-        .primitive(RMSNormAttributes(dimension: dimension, epsilon: epsilon, weightBias: weightBias))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    public var attributes: RMSNormAttributes {
+        RMSNormAttributes(dimension: dimension, epsilon: epsilon, weightBias: weightBias)
     }
 }
 
@@ -38,7 +34,7 @@ extension RMSNorm: PrimitiveComponent {
 /// ```
 public struct LayerNorm: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = LayerNormAttributes
 
     public let dimension: Int
     public let epsilon: Float
@@ -53,13 +49,9 @@ public struct LayerNorm: ModelComponent {
     }
 }
 
-extension LayerNorm: PrimitiveComponent {
+extension LayerNorm {
 
-    package var operationKind: OperationKind {
-        .primitive(LayerNormAttributes(dimension: dimension, epsilon: epsilon, affine: affine))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+    public var attributes: LayerNormAttributes {
+        LayerNormAttributes(dimension: dimension, epsilon: epsilon, affine: affine)
     }
 }

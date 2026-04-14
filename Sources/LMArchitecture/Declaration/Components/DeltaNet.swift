@@ -5,7 +5,7 @@
 /// to the same optimized kernel path.
 public struct DeltaNet: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = StateSpaceAttributes
 
     public enum Variant: String, Sendable, Equatable {
         case standard = "deltanet"
@@ -44,10 +44,10 @@ public struct DeltaNet: ModelComponent {
     }
 }
 
-extension DeltaNet: PrimitiveComponent {
+extension DeltaNet {
 
-    package var operationKind: OperationKind {
-        .primitive(StateSpaceAttributes(
+    public var attributes: StateSpaceAttributes {
+        StateSpaceAttributes(
             hiddenSize: hiddenSize,
             numHeads: numHeads,
             groupCount: groupCount,
@@ -55,10 +55,6 @@ extension DeltaNet: PrimitiveComponent {
             valueHeadDim: valueHeadDim,
             convKernelSize: convKernelSize,
             variant: variant.rawValue
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

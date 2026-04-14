@@ -3,87 +3,14 @@ import Darwin
 import Metal
 @testable import MetalCompiler
 
-@Suite("Optimizer Entry Contracts", .serialized)
+@Suite("Entry Contracts", .serialized)
 struct OptimizerEntryContractTests {
-    @Test("LFM layer14 MLP tail symbolic entries match between standard and aggressive")
-    func lfmLayer14MLPTailSymbolicEntriesMatchBetweenStandardAndAggressive() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-
-        let standard = try BenchmarkSupport.collectPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
-            useCachedStore: false
-        )
-        let aggressive = try BenchmarkSupport.collectPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
-        )
-
-        let standardLayer = entries(
-            in: standard.fusedEntries,
-            containingAnyTensorPrefix: [
-                "model.layers.14.ffn_norm.weight",
-                "model.layers.14.feed_forward."
-            ]
-        )
-        let aggressiveLayer = entries(
-            in: aggressive.fusedEntries,
-            containingAnyTensorPrefix: [
-                "model.layers.14.ffn_norm.weight",
-                "model.layers.14.feed_forward."
-            ]
-        )
-        let standardDescriptions = standardLayer.map(describeEntry)
-        let aggressiveDescriptions = aggressiveLayer.map(describeEntry)
-
-        #expect(
-            standardDescriptions == aggressiveDescriptions,
-            """
-            layer14 MLP tail symbolic entry mismatch
-            standard:
-            \(standardDescriptions.joined(separator: "\n"))
-            aggressive:
-            \(aggressiveDescriptions.joined(separator: "\n"))
-            """
-        )
-    }
-
-    @Test("LFM nil-layer down-proj weight access matches between standard and aggressive")
-    func lfmNilLayerDownProjWeightAccessMatchesBetweenStandardAndAggressive() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-
-        let standard = try BenchmarkSupport.collectPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
-            useCachedStore: false
-        )
-        let aggressive = try BenchmarkSupport.collectPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
-        )
-
-        let standardSummaries = try summarizeNilLayerDownProjAccesses(in: standard)
-        let aggressiveSummaries = try summarizeNilLayerDownProjAccesses(in: aggressive)
-
-        #expect(
-            standardSummaries == aggressiveSummaries,
-            """
-            nil-layer down-proj weight access mismatch
-            standard:
-            \(standardSummaries.map(\.description).joined(separator: "\n"))
-            aggressive:
-            \(aggressiveSummaries.map(\.description).joined(separator: "\n"))
-            """
-        )
-    }
-
     @Test("LFM nil-layer down-proj bindings resolve to concrete STAF accesses")
     func lfmNilLayerDownProjBindingsResolveToConcreteSTAFAccesses() throws {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
         let collected = try BenchmarkSupport.collectPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
             useCachedStore: false
         )
 
@@ -100,83 +27,72 @@ struct OptimizerEntryContractTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let standardSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
+        let setup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
             useCachedStore: false
         )
-        let aggressiveSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
+        let plan = try #require(setup.model.prefillPlan)
+        let collected = setup.collected
+
+        let w1 = try #require(
+            layerBatchedProjectionAccess(
+                in: collected,
+                layerPrefix: "model.layers.14.",
+                role: "gate_proj",
+                tensorNameSuffix: ".feed_forward.w1.weight"
+            )
+        )
+        let w3 = try #require(
+            layerBatchedProjectionAccess(
+                in: collected,
+                layerPrefix: "model.layers.14.",
+                role: "up_proj",
+                tensorNameSuffix: ".feed_forward.w3.weight"
+            )
+        )
+        let w1Projection = w1.projection
+        let w3Projection = w3.projection
+        let w1StepIndex = try #require(
+            matchingProjectionStepIndex(
+                in: plan,
+                entryIndex: w1.entry.index,
+                tensorName: w1.tensorName,
+                access: w1.access,
+                projection: w1Projection
+            )
+        )
+        let w3StepIndex = try #require(
+            matchingProjectionStepIndex(
+                in: plan,
+                entryIndex: w3.entry.index,
+                tensorName: w3.tensorName,
+                access: w3.access,
+                projection: w3Projection
+            )
         )
 
-        let standardPlan = try #require(standardSetup.model.prefillPlan)
-        let aggressivePlan = try #require(aggressiveSetup.model.prefillPlan)
+        let w1WeightBinding = try #require(plan.steps[w1StepIndex].bindings.buffers.first(where: { $0.index == 1 }))
+        let w3WeightBinding = try #require(plan.steps[w3StepIndex].bindings.buffers.first(where: { $0.index == 1 }))
 
-        for (label, collected, plan) in [
-            ("standard", standardSetup.collected, standardPlan),
-            ("aggressive", aggressiveSetup.collected, aggressivePlan),
-        ] {
-            let w1 = try #require(
-                layerFusedProjectionAccess(
-                    in: collected,
-                    layerPrefix: "model.layers.14.",
-                    role: "gate_proj",
-                    tensorNameSuffix: ".feed_forward.w1.weight"
-                )
-            )
-            let w3 = try #require(
-                layerFusedProjectionAccess(
-                    in: collected,
-                    layerPrefix: "model.layers.14.",
-                    role: "up_proj",
-                    tensorNameSuffix: ".feed_forward.w3.weight"
-                )
-            )
-            let w1Projection = w1.projection
-            let w3Projection = w3.projection
-            let w1StepIndex = try #require(
-                matchingProjectionStepIndex(
-                    in: plan,
-                    entryIndex: w1.entry.index,
-                    tensorName: w1.tensorName,
-                    access: w1.access,
-                    projection: w1Projection
-                )
-            )
-            let w3StepIndex = try #require(
-                matchingProjectionStepIndex(
-                    in: plan,
-                    entryIndex: w3.entry.index,
-                    tensorName: w3.tensorName,
-                    access: w3.access,
-                    projection: w3Projection
-                )
-            )
-
-            let w1WeightBinding = try #require(plan.steps[w1StepIndex].bindings.buffers.first(where: { $0.index == 1 }))
-            let w3WeightBinding = try #require(plan.steps[w3StepIndex].bindings.buffers.first(where: { $0.index == 1 }))
-
-            #expect(
-                w1WeightBinding.buffer === w1.access.buffer && w1WeightBinding.offset == w1.access.offset,
-                """
-                \(label) w1 step does not bind the resolved STAF access
-                step=\(w1StepIndex) tensor=\(w1.tensorName)
-                expectedOffset=\(w1.access.offset) actualOffset=\(w1WeightBinding.offset)
-                expectedLabel=\(w1.access.buffer.label ?? "(unlabeled)")
-                actualLabel=\(w1WeightBinding.buffer.label ?? "(unlabeled)")
-                """
-            )
-            #expect(
-                w3WeightBinding.buffer === w3.access.buffer && w3WeightBinding.offset == w3.access.offset,
-                """
-                \(label) w3 step does not bind the resolved STAF access
-                step=\(w3StepIndex) tensor=\(w3.tensorName)
-                expectedOffset=\(w3.access.offset) actualOffset=\(w3WeightBinding.offset)
-                expectedLabel=\(w3.access.buffer.label ?? "(unlabeled)")
-                actualLabel=\(w3WeightBinding.buffer.label ?? "(unlabeled)")
-                """
-            )
-        }
+        #expect(
+            w1WeightBinding.buffer === w1.access.buffer && w1WeightBinding.offset == w1.access.offset,
+            """
+            w1 step does not bind the resolved STAF access
+            step=\(w1StepIndex) tensor=\(w1.tensorName)
+            expectedOffset=\(w1.access.offset) actualOffset=\(w1WeightBinding.offset)
+            expectedLabel=\(w1.access.buffer.label ?? "(unlabeled)")
+            actualLabel=\(w1WeightBinding.buffer.label ?? "(unlabeled)")
+            """
+        )
+        #expect(
+            w3WeightBinding.buffer === w3.access.buffer && w3WeightBinding.offset == w3.access.offset,
+            """
+            w3 step does not bind the resolved STAF access
+            step=\(w3StepIndex) tensor=\(w3.tensorName)
+            expectedOffset=\(w3.access.offset) actualOffset=\(w3WeightBinding.offset)
+            expectedLabel=\(w3.access.buffer.label ?? "(unlabeled)")
+            actualLabel=\(w3WeightBinding.buffer.label ?? "(unlabeled)")
+            """
+        )
     }
 
     @Test("LFM layer15 conv in-proj binding and constants resolve correctly")
@@ -184,77 +100,69 @@ struct OptimizerEntryContractTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let standardSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
+        let setup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
             useCachedStore: false
         )
-        let aggressiveSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
+        let collected = setup.collected
+        let plan = try #require(setup.model.prefillPlan)
+
+        let access = try #require(
+            layerProjectionAccess(
+                in: collected,
+                layerPrefix: "model.layers.15.",
+                tensorNameSuffix: ".conv.in_proj.weight"
+            )
         )
-
-        for (label, collected, plan) in [
-            ("standard", standardSetup.collected, try #require(standardSetup.model.prefillPlan)),
-            ("aggressive", aggressiveSetup.collected, try #require(aggressiveSetup.model.prefillPlan)),
-        ] {
-            let access = try #require(
-                layerProjectionAccess(
-                    in: collected,
-                    layerPrefix: "model.layers.15.",
-                    tensorNameSuffix: ".conv.in_proj.weight"
-                )
-            )
-            let projection = try #require(projectionKind(from: access.entry))
-            let stepIndex = try #require(
-                matchingProjectionStepIndex(
-                    in: plan,
-                    entryIndex: access.entry.index,
-                    tensorName: access.tensorName,
-                    access: access.access,
-                    projection: projection
-                )
-            )
-            let step = plan.steps[stepIndex]
-            let weightBinding = try #require(step.bindings.buffers.first(where: { $0.index == 1 }))
-
-            #expect(
-                weightBinding.buffer === access.access.buffer && weightBinding.offset == access.access.offset,
-                """
-                \(label) conv.in_proj step does not bind the resolved STAF access
-                step=\(stepIndex) tensor=\(access.tensorName)
-                expectedOffset=\(access.access.offset) actualOffset=\(weightBinding.offset)
-                expectedLabel=\(access.access.buffer.label ?? "(unlabeled)")
-                actualLabel=\(weightBinding.buffer.label ?? "(unlabeled)")
-                """
-            )
-            #expect(
-                uint32BindingValue(in: step, at: 3) == projection.inputDimension,
-                "\(label) conv.in_proj inputDimension mismatch"
-            )
-            #expect(
-                uint32BindingValue(in: step, at: 4) == projection.outputDimension,
-                "\(label) conv.in_proj outputDimension mismatch"
-            )
-            let staticSequenceLength = uint32BindingValue(in: step, at: 5)
-            #expect(
-                staticSequenceLength == plan.maximumSequenceLength,
-                "\(label) conv.in_proj static sequenceLength mismatch: \(String(describing: staticSequenceLength))"
-            )
-
-            let sampleWeightMax = maxAbsoluteWeightSample(
+        let projection = try #require(projectionKind(from: access.entry))
+        let stepIndex = try #require(
+            matchingProjectionStepIndex(
+                in: plan,
+                entryIndex: access.entry.index,
+                tensorName: access.tensorName,
                 access: access.access,
-                schemeIdentifier: access.schemeIdentifier,
-                sampleCount: min(projection.inputDimension * 4, access.access.size / MemoryLayout<UInt16>.stride)
+                projection: projection
             )
-            #expect(
-                sampleWeightMax > 0,
-                """
-                \(label) conv.in_proj sampled weights are all zero
-                step=\(stepIndex) tensor=\(access.tensorName)
-                scheme=\(access.schemeIdentifier)
-                """
-            )
-        }
+        )
+        let step = plan.steps[stepIndex]
+        let weightBinding = try #require(step.bindings.buffers.first(where: { $0.index == 1 }))
+
+        #expect(
+            weightBinding.buffer === access.access.buffer && weightBinding.offset == access.access.offset,
+            """
+            conv.in_proj step does not bind the resolved STAF access
+            step=\(stepIndex) tensor=\(access.tensorName)
+            expectedOffset=\(access.access.offset) actualOffset=\(weightBinding.offset)
+            expectedLabel=\(access.access.buffer.label ?? "(unlabeled)")
+            actualLabel=\(weightBinding.buffer.label ?? "(unlabeled)")
+            """
+        )
+        #expect(
+            uint32BindingValue(in: step, at: 3) == projection.inputDimension,
+            "conv.in_proj inputDimension mismatch"
+        )
+        #expect(
+            uint32BindingValue(in: step, at: 4) == projection.outputDimension,
+            "conv.in_proj outputDimension mismatch"
+        )
+        let staticSequenceLength = uint32BindingValue(in: step, at: 5)
+        #expect(
+            staticSequenceLength == plan.maximumSequenceLength,
+            "conv.in_proj static sequenceLength mismatch: \(String(describing: staticSequenceLength))"
+        )
+
+        let sampleWeightMax = maxAbsoluteWeightSample(
+            access: access.access,
+            schemeIdentifier: access.schemeIdentifier,
+            sampleCount: min(projection.inputDimension * 4, access.access.size / MemoryLayout<UInt16>.stride)
+        )
+        #expect(
+            sampleWeightMax > 0,
+            """
+            conv.in_proj sampled weights are all zero
+            step=\(stepIndex) tensor=\(access.tensorName)
+            scheme=\(access.schemeIdentifier)
+            """
+        )
     }
 
     #if ENABLE_METAL_PROBES
@@ -267,7 +175,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -417,7 +325,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -538,485 +446,6 @@ struct OptimizerEntryContractTests {
         )
     }
 
-    @Test("LFM layer14 down_proj kernel output matches CPU reference for standard and aggressive")
-    func lfmLayer14DownProjKernelOutputMatchesCPUReferenceForStandardAndAggressive() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        BenchmarkSupport.settleGPU()
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        let standardSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
-            useCachedStore: false
-        )
-        let aggressiveSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
-        )
-
-        let standardCollected = standardSetup.collected
-        let aggressiveCollected = aggressiveSetup.collected
-        var standard = standardSetup.model
-        var aggressive = aggressiveSetup.model
-        let standardPlan = try #require(standard.prefillPlan)
-        let aggressivePlan = try #require(aggressive.prefillPlan)
-
-        let standardAccess = try #require(
-            layerDownProjAccesses(in: standardCollected, layerPrefix: "model.layers.14.").first
-        )
-        let aggressiveAccess = try #require(
-            layerDownProjAccesses(in: aggressiveCollected, layerPrefix: "model.layers.14.").first
-        )
-        let standardProjection = try #require(projectionKind(from: standardAccess.entry))
-        let aggressiveProjection = try #require(projectionKind(from: aggressiveAccess.entry))
-        let standardStepIndexCandidate = matchingProjectionStepIndex(
-            in: standardPlan,
-            entryIndex: standardAccess.entry.index,
-            tensorName: standardAccess.tensorName,
-            access: standardAccess.access,
-            projection: standardProjection
-        )
-        let aggressiveStepIndexCandidate = matchingProjectionStepIndex(
-            in: aggressivePlan,
-            entryIndex: aggressiveAccess.entry.index,
-            tensorName: aggressiveAccess.tensorName,
-            access: aggressiveAccess.access,
-            projection: aggressiveProjection
-        )
-        #expect(
-            standardStepIndexCandidate != nil,
-            """
-            could not locate standard layer14 down_proj step
-            tensor=\(standardAccess.tensorName)
-            candidates:
-            \(candidateProjectionStepSummaries(
-                in: standardPlan,
-                tensorName: standardAccess.tensorName,
-                projection: standardProjection
-            ).joined(separator: "\n"))
-            """
-        )
-        #expect(
-            aggressiveStepIndexCandidate != nil,
-            """
-            could not locate aggressive layer14 down_proj step
-            tensor=\(aggressiveAccess.tensorName)
-            candidates:
-            \(candidateProjectionStepSummaries(
-                in: aggressivePlan,
-                tensorName: aggressiveAccess.tensorName,
-                projection: aggressiveProjection
-            ).joined(separator: "\n"))
-            """
-        )
-        let standardStepIndex = try #require(standardStepIndexCandidate)
-        let aggressiveStepIndex = try #require(aggressiveStepIndexCandidate)
-        let standardWeightBinding = try #require(
-            standardPlan.steps[standardStepIndex].bindings.buffers.first(where: { $0.index == 1 })
-        )
-        let aggressiveWeightBinding = try #require(
-            aggressivePlan.steps[aggressiveStepIndex].bindings.buffers.first(where: { $0.index == 1 })
-        )
-        let standardInputBinding = try #require(
-            standardPlan.steps[standardStepIndex].bindings.buffers.first(where: { $0.index == 0 })
-        )
-        let aggressiveInputBinding = try #require(
-            aggressivePlan.steps[aggressiveStepIndex].bindings.buffers.first(where: { $0.index == 0 })
-        )
-        let standardInputSourceStep = try #require(
-            lastWriterStepIndex(
-                in: standardPlan.steps,
-                before: standardStepIndex,
-                target: standardInputBinding
-            )
-        )
-        let aggressiveInputSourceStep = try #require(
-            lastWriterStepIndex(
-                in: aggressivePlan.steps,
-                before: aggressiveStepIndex,
-                target: aggressiveInputBinding
-            )
-        )
-        let standardInputSourceDimension = uint32BindingValue(
-            in: standardPlan.steps[standardInputSourceStep],
-            at: 3
-        )
-        let aggressiveInputSourceDimension = uint32BindingValue(
-            in: aggressivePlan.steps[aggressiveInputSourceStep],
-            at: 3
-        )
-
-        #expect(standardWeightBinding.offset == standardAccess.access.offset)
-        #expect(aggressiveWeightBinding.offset == aggressiveAccess.access.offset)
-        #expect(standardWeightBinding.buffer === standardAccess.access.buffer)
-        #expect(aggressiveWeightBinding.buffer === aggressiveAccess.access.buffer)
-        #expect(
-            standardInputSourceDimension == standardProjection.inputDimension,
-            "standard source dimension mismatch: source=\(standardInputSourceDimension.map(String.init) ?? "nil") consumer=\(standardProjection.inputDimension)"
-        )
-        #expect(
-            aggressiveInputSourceDimension == aggressiveProjection.inputDimension,
-            "aggressive source dimension mismatch: source=\(aggressiveInputSourceDimension.map(String.init) ?? "nil") consumer=\(aggressiveProjection.inputDimension)"
-        )
-
-        let vectorChunkSize = 128
-        let inputRowSegmentCount = min(standardProjection.inputDimension, 32)
-        let outputRowSegmentCount = min(standardProjection.outputDimension, 32)
-
-        let standardProbe = try standard.debugPrefillBindingProbes(
-            tokens: promptTokens,
-            stepIndex: standardStepIndex,
-            probes: chunkedVectorProbes(
-                labelPrefix: "input-",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: standardInputSourceDimension ?? standardProjection.inputDimension,
-                count: standardProjection.inputDimension,
-                chunkSize: vectorChunkSize
-            ) + chunkedVectorProbes(
-                labelPrefix: "output-",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: standardProjection.outputDimension,
-                count: standardProjection.outputDimension,
-                chunkSize: vectorChunkSize
-            ) + rowProbes(
-                labelPrefix: "input-row",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: standardInputSourceDimension ?? standardProjection.inputDimension,
-                count: inputRowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "output-row",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: standardProjection.outputDimension,
-                count: outputRowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            )
-        )
-        let aggressiveProbe = try aggressive.debugPrefillBindingProbes(
-            tokens: promptTokens,
-            stepIndex: aggressiveStepIndex,
-            probes: chunkedVectorProbes(
-                labelPrefix: "input-",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: aggressiveInputSourceDimension ?? aggressiveProjection.inputDimension,
-                count: aggressiveProjection.inputDimension,
-                chunkSize: vectorChunkSize
-            ) + chunkedVectorProbes(
-                labelPrefix: "output-",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: aggressiveProjection.outputDimension,
-                count: aggressiveProjection.outputDimension,
-                chunkSize: vectorChunkSize
-            ) + rowProbes(
-                labelPrefix: "input-row",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: aggressiveInputSourceDimension ?? aggressiveProjection.inputDimension,
-                count: inputRowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "output-row",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: aggressiveProjection.outputDimension,
-                count: outputRowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            )
-        )
-        let standardInput = reconstructChunkedVector(
-            from: standardProbe,
-            prefix: "input-",
-            count: standardProjection.inputDimension,
-            chunkSize: vectorChunkSize
-        )
-        let aggressiveInput = reconstructChunkedVector(
-            from: aggressiveProbe,
-            prefix: "input-",
-            count: aggressiveProjection.inputDimension,
-            chunkSize: vectorChunkSize
-        )
-        let standardOutputBinding = try #require(
-            standardPlan.steps[standardStepIndex].bindings.buffers.first(where: { $0.index == 2 })
-        )
-        let aggressiveOutputBinding = try #require(
-            aggressivePlan.steps[aggressiveStepIndex].bindings.buffers.first(where: { $0.index == 2 })
-        )
-        _ = standardOutputBinding
-        _ = aggressiveOutputBinding
-        let standardOutput = reconstructChunkedVector(
-            from: standardProbe,
-            prefix: "output-",
-            count: standardProjection.outputDimension,
-            chunkSize: vectorChunkSize
-        )
-        let aggressiveOutput = reconstructChunkedVector(
-            from: aggressiveProbe,
-            prefix: "output-",
-            count: aggressiveProjection.outputDimension,
-            chunkSize: vectorChunkSize
-        )
-
-        let standardReference = try manualRowMajorDenseProjection(
-            input: standardInput,
-            access: standardAccess.access,
-            schemeIdentifier: standardAccess.schemeIdentifier,
-            outputDimension: standardProjection.outputDimension,
-            inputDimension: standardProjection.inputDimension
-        )
-        let aggressiveReference = try manualRowMajorDenseProjection(
-            input: aggressiveInput,
-            access: aggressiveAccess.access,
-            schemeIdentifier: aggressiveAccess.schemeIdentifier,
-            outputDimension: aggressiveProjection.outputDimension,
-            inputDimension: aggressiveProjection.inputDimension
-        )
-        let standardTransposeReference = try manualColumnMajorDenseProjection(
-            input: standardInput,
-            access: standardAccess.access,
-            schemeIdentifier: standardAccess.schemeIdentifier,
-            outputDimension: standardProjection.outputDimension,
-            inputDimension: standardProjection.inputDimension
-        )
-        let aggressiveTransposeReference = try manualColumnMajorDenseProjection(
-            input: aggressiveInput,
-            access: aggressiveAccess.access,
-            schemeIdentifier: aggressiveAccess.schemeIdentifier,
-            outputDimension: aggressiveProjection.outputDimension,
-            inputDimension: aggressiveProjection.inputDimension
-        )
-
-        let standardError = maxAbsoluteError(standardReference, standardOutput)
-        let aggressiveError = maxAbsoluteError(aggressiveReference, aggressiveOutput)
-        let standardTransposeError = maxAbsoluteError(standardTransposeReference, standardOutput)
-        let aggressiveTransposeError = maxAbsoluteError(aggressiveTransposeReference, aggressiveOutput)
-        let standardInputMax = maxAbsoluteValue(standardInput)
-        let aggressiveInputMax = maxAbsoluteValue(aggressiveInput)
-        let standardReferenceMax = maxAbsoluteValue(standardReference)
-        let aggressiveReferenceMax = maxAbsoluteValue(aggressiveReference)
-        let standardOutputMax = maxAbsoluteValue(standardOutput)
-        let aggressiveOutputMax = maxAbsoluteValue(aggressiveOutput)
-        let standardSourceKernel = standardPlan.steps[standardInputSourceStep].pipeline.label ?? "unlabeled"
-        let aggressiveSourceKernel = aggressivePlan.steps[aggressiveInputSourceStep].pipeline.label ?? "unlabeled"
-        let standardConsumerKernel = standardPlan.steps[standardStepIndex].pipeline.label ?? "unlabeled"
-        let aggressiveConsumerKernel = aggressivePlan.steps[aggressiveStepIndex].pipeline.label ?? "unlabeled"
-        let standardInputRowMaxima = rowMaxima(
-            from: standardProbe,
-            prefix: "input-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let aggressiveInputRowMaxima = rowMaxima(
-            from: aggressiveProbe,
-            prefix: "input-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let standardOutputRowMaxima = rowMaxima(
-            from: standardProbe,
-            prefix: "output-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let aggressiveOutputRowMaxima = rowMaxima(
-            from: aggressiveProbe,
-            prefix: "output-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-
-        let projectionTolerance: Float = 1e-6
-        #expect(
-            standardError < projectionTolerance && aggressiveError < projectionTolerance,
-            """
-            layer14 down_proj CPU reference mismatch
-            standard maxErr=\(standardError)
-            aggressive maxErr=\(aggressiveError)
-            standard transposeErr=\(standardTransposeError)
-            aggressive transposeErr=\(aggressiveTransposeError)
-            standard inputMax=\(standardInputMax) refMax=\(standardReferenceMax) gpuMax=\(standardOutputMax)
-            aggressive inputMax=\(aggressiveInputMax) refMax=\(aggressiveReferenceMax) gpuMax=\(aggressiveOutputMax)
-            standard first4 input=\(standardInput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            aggressive first4 input=\(aggressiveInput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            standard first4 ref=\(standardReference.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            standard first4 gpu=\(standardOutput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            aggressive first4 ref=\(aggressiveReference.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            aggressive first4 gpu=\(aggressiveOutput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            standard input row maxima=\(formatRowMaxima(standardInputRowMaxima))
-            standard output row maxima=\(formatRowMaxima(standardOutputRowMaxima))
-            aggressive input row maxima=\(formatRowMaxima(aggressiveInputRowMaxima))
-            aggressive output row maxima=\(formatRowMaxima(aggressiveOutputRowMaxima))
-            standard sourceStep=\(standardInputSourceStep) kernel=\(standardSourceKernel) sourceDim=\(standardInputSourceDimension.map(String.init) ?? "nil") inputOffset=\(standardInputBinding.offset) consumerStep=\(standardStepIndex) kernel=\(standardConsumerKernel) consumerDim=\(standardProjection.inputDimension)
-            aggressive sourceStep=\(aggressiveInputSourceStep) kernel=\(aggressiveSourceKernel) sourceDim=\(aggressiveInputSourceDimension.map(String.init) ?? "nil") inputOffset=\(aggressiveInputBinding.offset) consumerStep=\(aggressiveStepIndex) kernel=\(aggressiveConsumerKernel) consumerDim=\(aggressiveProjection.inputDimension)
-            standard nearby:
-            \(nearbyStepSummaries(
-                in: standardPlan.steps,
-                center: standardStepIndex,
-                target: standardInputBinding
-            ).joined(separator: "\n"))
-            aggressive nearby:
-            \(nearbyStepSummaries(
-                in: aggressivePlan.steps,
-                center: aggressiveStepIndex,
-                target: aggressiveInputBinding
-            ).joined(separator: "\n"))
-            """
-        )
-    }
-
-    @Test("LFM layer14 SwiGLU output matches CPU reference for standard and aggressive")
-    func lfmLayer14SwiGLUOutputMatchesCPUReferenceForStandardAndAggressive() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        BenchmarkSupport.settleGPU()
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        let standardSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: StandardOptimizer(),
-            useCachedStore: false
-        )
-        let aggressiveSetup = try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-            optimizer: AggressiveOptimizer(),
-            useCachedStore: false
-        )
-
-        var standard = standardSetup.model
-        var aggressive = aggressiveSetup.model
-        let standardPlan = try #require(standard.prefillPlan)
-        let aggressivePlan = try #require(aggressive.prefillPlan)
-
-        let standardStep = try #require(layer14SwiGLUStepIndex(in: standardPlan))
-        let aggressiveStep = try #require(layer14SwiGLUStepIndex(in: aggressivePlan))
-        let standardDimension = try #require(uint32BindingValue(in: standardPlan.steps[standardStep], at: 3))
-        let aggressiveDimension = try #require(uint32BindingValue(in: aggressivePlan.steps[aggressiveStep], at: 3))
-        let rowSegmentCount = min(standardDimension, 32)
-
-        let standardProbe = try standard.debugPrefillBindingProbes(
-            tokens: promptTokens,
-            stepIndex: standardStep,
-            probes: rowProbes(
-                labelPrefix: "gate-row",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: standardDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "up-row",
-                bindingIndex: 1,
-                phase: .beforeStep,
-                rowStride: standardDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "output-row",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: standardDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            )
-        )
-        let aggressiveProbe = try aggressive.debugPrefillBindingProbes(
-            tokens: promptTokens,
-            stepIndex: aggressiveStep,
-            probes: rowProbes(
-                labelPrefix: "gate-row",
-                bindingIndex: 0,
-                phase: .beforeStep,
-                rowStride: aggressiveDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "up-row",
-                bindingIndex: 1,
-                phase: .beforeStep,
-                rowStride: aggressiveDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            ) + rowProbes(
-                labelPrefix: "output-row",
-                bindingIndex: 2,
-                phase: .afterStep,
-                rowStride: aggressiveDimension,
-                count: rowSegmentCount,
-                rowIndices: Array(promptTokens.indices)
-            )
-        )
-        let lastRowIndex = try #require(promptTokens.indices.last)
-        let standardGate = try #require(standardProbe["gate-row\(lastRowIndex)"])
-        let standardUp = try #require(standardProbe["up-row\(lastRowIndex)"])
-        let standardOutput = try #require(standardProbe["output-row\(lastRowIndex)"])
-        let aggressiveGate = try #require(aggressiveProbe["gate-row\(lastRowIndex)"])
-        let aggressiveUp = try #require(aggressiveProbe["up-row\(lastRowIndex)"])
-        let aggressiveOutput = try #require(aggressiveProbe["output-row\(lastRowIndex)"])
-
-        let standardReference = manualSwiGLU(gate: standardGate, up: standardUp)
-        let aggressiveReference = manualSwiGLU(gate: aggressiveGate, up: aggressiveUp)
-        let standardError = maxAbsoluteError(standardReference, standardOutput)
-        let aggressiveError = maxAbsoluteError(aggressiveReference, aggressiveOutput)
-        let standardGateMax = maxAbsoluteValue(standardGate)
-        let standardUpMax = maxAbsoluteValue(standardUp)
-        let standardOutputMax = maxAbsoluteValue(standardOutput)
-        let aggressiveGateMax = maxAbsoluteValue(aggressiveGate)
-        let aggressiveUpMax = maxAbsoluteValue(aggressiveUp)
-        let aggressiveOutputMax = maxAbsoluteValue(aggressiveOutput)
-        let standardGateRowMaxima = rowMaxima(
-            from: standardProbe,
-            prefix: "gate-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let standardUpRowMaxima = rowMaxima(
-            from: standardProbe,
-            prefix: "up-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let standardOutputRowMaxima = rowMaxima(
-            from: standardProbe,
-            prefix: "output-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let aggressiveGateRowMaxima = rowMaxima(
-            from: aggressiveProbe,
-            prefix: "gate-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let aggressiveUpRowMaxima = rowMaxima(
-            from: aggressiveProbe,
-            prefix: "up-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let aggressiveOutputRowMaxima = rowMaxima(
-            from: aggressiveProbe,
-            prefix: "output-row",
-            rowIndices: Array(promptTokens.indices)
-        )
-        let swigluTolerance: Float = 1e-6
-
-        #expect(
-            standardGateMax > 0 && standardUpMax > 0 && standardOutputMax > 0,
-            "standard swiglu probe was vacuous: gateMax=\(standardGateMax) upMax=\(standardUpMax) outMax=\(standardOutputMax) gateRows=\(formatRowMaxima(standardGateRowMaxima)) upRows=\(formatRowMaxima(standardUpRowMaxima)) outRows=\(formatRowMaxima(standardOutputRowMaxima))"
-        )
-        #expect(
-            aggressiveGateMax > 0 && aggressiveUpMax > 0 && aggressiveOutputMax > 0,
-            "aggressive swiglu probe was vacuous: gateMax=\(aggressiveGateMax) upMax=\(aggressiveUpMax) outMax=\(aggressiveOutputMax) gateRows=\(formatRowMaxima(aggressiveGateRowMaxima)) upRows=\(formatRowMaxima(aggressiveUpRowMaxima)) outRows=\(formatRowMaxima(aggressiveOutputRowMaxima))"
-        )
-
-        #expect(
-            standardError < swigluTolerance && aggressiveError < swigluTolerance,
-            """
-            layer14 swiglu CPU reference mismatch
-            standard maxErr=\(standardError) gateMax=\(standardGateMax) upMax=\(standardUpMax) outMax=\(standardOutputMax)
-            aggressive maxErr=\(aggressiveError) gateMax=\(aggressiveGateMax) upMax=\(aggressiveUpMax) outMax=\(aggressiveOutputMax)
-            standard first4 ref=\(standardReference.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            standard first4 gpu=\(standardOutput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            aggressive first4 ref=\(aggressiveReference.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            aggressive first4 gpu=\(aggressiveOutput.prefix(4).map { String(format: "%.4f", $0) }.joined(separator: ", "))
-            """
-        )
-    }
-
     @Test("LFM layer14 SwiGLU probes become non-zero when MPP is disabled")
     func lfmLayer14SwiGLUProbesBecomeNonZeroWhenMPPIsDisabled() throws {
         let gpuLock = try GPUTestExclusion.acquire()
@@ -1026,7 +455,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1169,7 +598,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1524,13 +953,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1618,13 +1047,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1716,13 +1145,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1797,13 +1226,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -1892,13 +1321,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2033,13 +1462,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2196,13 +1625,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2299,13 +1728,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2409,13 +1838,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2564,13 +1993,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2730,13 +2159,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -2910,13 +2339,13 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let firstSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
         let secondSetup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -3165,7 +2594,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -3305,7 +2734,7 @@ struct OptimizerEntryContractTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let setup = try withTemporaryEnvironment("SWIFTLM_DISABLE_MPP", "1") {
             try BenchmarkSupport.setupWithCollectedPrefillEntriesOrSkip(
-                optimizer: StandardOptimizer(),
+    
                 useCachedStore: false
             )
         }
@@ -3426,7 +2855,7 @@ struct OptimizerEntryContractTests {
         in collected: BenchmarkSupport.CollectedPrefillEntries
     ) throws -> [WeightAccessSummary] {
         let downProjEntries = collected.fusedEntries.compactMap { entry -> DispatchEntry? in
-            guard case .projection(let projection, _) = entry.kind, projection.field == "down_proj" else {
+            guard let projection = entry.fragment as? LinearFragment, projection.field == "down_proj" else {
                 return nil
             }
             return entry
@@ -3468,7 +2897,7 @@ struct OptimizerEntryContractTests {
         let resolver = ProjectionWeightAccessPolicyResolver()
         return collected.fusedEntries.compactMap { entry in
             guard
-                case .projection(let projection, _) = entry.kind,
+                let projection = entry.fragment as? LinearFragment,
                 projection.field == "down_proj",
                 let binding = entry.parameterBindings.first(where: {
                     $0.role == "down_proj" && $0.tensorName.contains(layerPrefix)
@@ -3498,7 +2927,7 @@ struct OptimizerEntryContractTests {
         let resolver = ProjectionWeightAccessPolicyResolver()
         return collected.fusedEntries.compactMap { entry -> (entry: DispatchEntry, tensorName: String, access: STAFWeightBufferAccess, schemeIdentifier: QuantizationSchemeIdentifier)? in
             guard
-                case .projection = entry.kind,
+                entry.fragment is LinearFragment,
                 let binding = entry.parameterBindings.first(where: {
                     $0.tensorName.contains(layerPrefix) && $0.tensorName.hasSuffix(tensorNameSuffix)
                 }),
@@ -3519,14 +2948,14 @@ struct OptimizerEntryContractTests {
         }.first
     }
 
-    private func layerFusedProjectionAccess(
+    private func layerBatchedProjectionAccess(
         in collected: BenchmarkSupport.CollectedPrefillEntries,
         layerPrefix: String,
         role: String,
         tensorNameSuffix: String
     ) -> (
         entry: DispatchEntry,
-        projection: MetalProjection,
+        projection: BatchedProjection.Entry,
         tensorName: String,
         access: STAFWeightBufferAccess,
         schemeIdentifier: QuantizationSchemeIdentifier
@@ -3534,15 +2963,15 @@ struct OptimizerEntryContractTests {
         let resolver = ProjectionWeightAccessPolicyResolver()
         return collected.fusedEntries.compactMap { entry -> (
             entry: DispatchEntry,
-            projection: MetalProjection,
+            projection: BatchedProjection.Entry,
             tensorName: String,
             access: STAFWeightBufferAccess,
             schemeIdentifier: QuantizationSchemeIdentifier
         )? in
-            guard case .fusedSwiGLUProjection(let fused) = entry.kind else {
+            guard let batched = entry.fragment as? BatchedProjection else {
                 return nil
             }
-            guard role == fused.gateField || role == fused.upField else {
+            guard batched.projections.contains(where: { $0.field == role }) else {
                 return nil
             }
             guard let binding = entry.parameterBindings.first(where: {
@@ -3550,6 +2979,9 @@ struct OptimizerEntryContractTests {
                     && $0.tensorName.contains(layerPrefix)
                     && $0.tensorName.hasSuffix(tensorNameSuffix)
             }) else {
+                return nil
+            }
+            guard let matchedProjection = batched.projections.first(where: { $0.field == role }) else {
                 return nil
             }
             guard let access = collected.store.resolvedBufferAccess(
@@ -3566,7 +2998,7 @@ struct OptimizerEntryContractTests {
             }
             return (
                 entry,
-                .init(field: role, inputDimension: fused.inputDimension, outputDimension: fused.outputDimension),
+                matchedProjection,
                 binding.tensorName,
                 access,
                 tensor.format.schemeIdentifier
@@ -3574,9 +3006,8 @@ struct OptimizerEntryContractTests {
         }.first
     }
 
-    private func projectionKind(from entry: DispatchEntry) -> MetalProjection? {
-        guard case .projection(let projection, _) = entry.kind else { return nil }
-        return projection
+    private func projectionKind(from entry: DispatchEntry) -> LinearFragment? {
+        entry.fragment as? LinearFragment
     }
 
     private func layer14SwiGLUStepIndex(in plan: MetalPrefillPlan) -> Int? {
@@ -3702,7 +3133,7 @@ struct OptimizerEntryContractTests {
         entryIndex: Int,
         tensorName: String,
         access: STAFWeightBufferAccess,
-        projection: MetalProjection
+        projection: some ProjectionDimensions
     ) -> Int? {
         let exactMatch = plan.steps.enumerated().first { _, step in
             step.metadata.entryIndex == entryIndex
@@ -3752,7 +3183,7 @@ struct OptimizerEntryContractTests {
         _ step: MetalPrefillStep,
         tensorName: String,
         access: STAFWeightBufferAccess,
-        projection: MetalProjection
+        projection: some ProjectionDimensions
     ) -> Bool {
         guard step.metadata.weightTensorName == tensorName else {
             return false
@@ -3771,7 +3202,7 @@ struct OptimizerEntryContractTests {
     private func candidateProjectionStepSummaries(
         in plan: MetalPrefillPlan,
         tensorName: String,
-        projection: MetalProjection
+        projection: some ProjectionDimensions
     ) -> [String] {
         plan.steps.enumerated().compactMap { index, step in
             let inputDimension = uint32BindingValue(in: step, at: 3)
@@ -4696,30 +4127,10 @@ struct OptimizerEntryContractTests {
     private func describeEntry(_ entry: DispatchEntry) -> String {
         let layer = entry.layerIndex.map(String.init) ?? "-"
         let kind: String
-        switch entry.kind {
-        case .projection(let projection, let isOutput):
-            kind = "projection(field=\(projection.field),in=\(projection.inputDimension),out=\(projection.outputDimension),isOutput=\(isOutput))"
-        case .batchedProjection(let batch):
-            let projections = batch.projections
-                .map { "\($0.field):\($0.inputDimension)->\($0.outputDimension)" }
-                .joined(separator: ",")
-            kind = "batchedProjection(\(projections))"
-        case .fusedSwiGLUProjection(let fused):
-            kind = "fusedSwiGLUProjection(gate=\(fused.gateField),up=\(fused.upField),in=\(fused.inputDimension),out=\(fused.outputDimension))"
-        case .fragment(let fragment):
-            kind = "fragment(\(type(of: fragment)))"
-        case .batchedFragment(let batch):
-            kind = "batchedFragment(count=\(batch.fragments.count))"
-        case .structuralCopy(let dimension):
-            kind = "structuralCopy(dim=\(dimension))"
-        case .structuralAdd(let dimension):
-            kind = "structuralAdd(dim=\(dimension))"
-        case .fusedCopyNorm(let fused):
-            kind = "fusedCopyNorm(dim=\(fused.dimension),eps=\(fused.epsilon))"
-        case .fusedResidualAddCopyNorm(let fused):
-            kind = "fusedResidualAddCopyNorm(dim=\(fused.dimension),eps=\(fused.epsilon))"
-        case .fusedResidualAddNorm(let fused):
-            kind = "fusedResidualAddNorm(dim=\(fused.dimension),eps=\(fused.epsilon))"
+        if let linear = entry.fragment as? LinearFragment {
+            kind = "projection(field=\(linear.field),in=\(linear.inputDimension),out=\(linear.outputDimension),isOutput=\(linear.isOutput))"
+        } else {
+            kind = "fragment(\(type(of: entry.fragment)))"
         }
         let bindings = entry.parameterBindings
             .map { "\($0.role)=\($0.tensorName)" }
@@ -4727,6 +4138,13 @@ struct OptimizerEntryContractTests {
         return "layer=\(layer) \(kind) bindings=[\(bindings)]"
     }
 }
+
+private protocol ProjectionDimensions {
+    var inputDimension: Int { get }
+    var outputDimension: Int { get }
+}
+extension LinearFragment: ProjectionDimensions {}
+extension BatchedProjection.Entry: ProjectionDimensions {}
 
 private enum ManualProjectionError: Error {
     case unsupportedLayout

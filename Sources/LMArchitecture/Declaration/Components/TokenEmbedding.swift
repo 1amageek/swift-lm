@@ -7,7 +7,7 @@
 /// ```
 public struct TokenEmbedding: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = TokenEmbeddingAttributes
 
     public let vocabSize: Int
     public let embeddingSize: Int
@@ -29,18 +29,18 @@ public struct TokenEmbedding: ModelComponent {
     }
 }
 
-extension TokenEmbedding: PrimitiveComponent {
+extension TokenEmbedding {
 
-    package var operationKind: OperationKind {
-        .primitive(TokenEmbeddingAttributes(
+    public var attributes: TokenEmbeddingAttributes {
+        TokenEmbeddingAttributes(
             vocabSize: vocabSize,
             embeddingSize: embeddingSize,
             dtypeHint: dtypeHint,
             embeddingScale: embeddingScale
-        ))
+        )
     }
 
-    package var operationSignature: OperationSignature {
+    public var operationSignature: OperationSignature {
         OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
     }
 }

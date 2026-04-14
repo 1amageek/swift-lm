@@ -855,7 +855,7 @@ struct ReferenceComparisonTests {
                 print("[RefComp] Layer \(currentLayer) mlp_out maxErr=\(String(format: "%.4f", err)) kind=\(entry.kind)")
             }
 
-            if entry.kind.contains("fusedResidualAddCopyNorm") || entry.kind.contains("structuralAdd") {
+            if entry.kind.contains("ResidualAddFragment") || entry.kind.contains("synthesized_3way") {
                 if waitingForOperatorResidual {
                     waitingForOperatorResidual = false
                 } else {

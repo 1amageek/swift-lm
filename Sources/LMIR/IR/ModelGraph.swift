@@ -58,6 +58,8 @@ public struct OperationKey: Hashable, Codable, Sendable {
 /// IR does not interpret these — backend compilers read them via their own protocols.
 public protocol OperationAttributes: Sendable {}
 
+extension Never: OperationAttributes {}
+
 /// Canonical, region-bearing, value-explicit structural representation
 /// of a language model.
 ///

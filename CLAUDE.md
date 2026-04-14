@@ -4,6 +4,8 @@
 
 swift-lm は Apple Silicon 上での最速 LLM 推論パッケージ。[AnyFoundationModels](https://github.com/1amageek) の `MLXFoundationModels` バックエンドとして消費される。
 
+**核心命題: IR グラフを解析し、最適化された Metal kernel を出力するコンパイラを構築する。** MetalCompilable が IR のデータを問い合わせ、Fragment を部品として使い、最適化済みの dispatch plan を返す。Component 内の最適化は MetalCompilable の責務、Component 跨ぎの最適化は Compiler の責務。
+
 入力は **config.json + safetensors + tokenizer.json** のみ。モデル固有の Swift 型は不要。消費者が指定するのは **HuggingFace repo ID だけ**。
 
 ## Architecture
@@ -22,11 +24,11 @@ LMIR (IR モジュール — backend 非依存)
     │   └── Transformer, Qwen35, LFM2, Cohere
     │
     ├── MetalCompiler (depends: LMIR only — no MLX)
+    │   ├── MetalCompilable protocol (IR → Metal bridge: query interface)
+    │   ├── PrimitiveMetalKernelFragment (Metal kernel の再利用可能な部品)
     │   ├── InferencePolicy (deployment intent: KV cache quantization, max sequence length)
-    │   ├── MetalComponent protocol (dispatchDeclarations)
-    │   ├── MetalComputeOperation protocol (kernelName, isFusable, dispatchDimension)
-    │   ├── MetalKernelSource (compiler 所有の全 kernel MSL source)
-    │   ├── MetalInferenceCompiler (IR walk → fusion → dispatch plan)
+    │   ├── DispatchOptimizer protocol (Component 跨ぎの graph-level 最適化)
+    │   ├── MetalInferenceCompiler (IR walk → MetalCompilable query → dispatch plan)
     │   ├── MetalInferenceModel (dispatch plan 実行)
     │   ├── STAF (STAFConverter, STAFLoader, QuantizationFormat, ParameterResolver)
     │   └── KVCacheSpecification (compiler internal: resolved K/V cache layout)
@@ -89,51 +91,166 @@ ModelGraph.rootRegion:
   ]
 ```
 
-構造操作 (residual, repeating, conditional) は compiler が walk 時に処理する。primitive 操作の attributes は MetalKernelFragment として Metal backend に橋渡しされる。
+構造操作 (residual, repeating, conditional) は compiler が walk 時に処理する。primitive 操作の attributes は `MetalCompilable` protocol を通じて Metal fragment tree に変換される。
 
-### MetalKernelFragment — SwiftUI 風 fragment tree
+### MetalCompilable — IR への問い合わせ interface
 
-**OperationAttributes → MetalKernelFragment** : IR の各計算ノードを Metal kernel の組み合わせに展開する。
+`MetalCompilable` は IR と Metal 実装を繋ぐ問い合わせ protocol。IR のデータを読み、Fragment を部品として使い、**最適化済みの結果を返す**。
+
+IR は Metal を知らない。Metal 側が IR を知っている。Swift の retroactive conformance（別モジュールで protocol conformance を追加する機能）で接続する。
 
 ```swift
-// MetalCompiler モジュール内で extension
-extension AttentionAttributes: MetalKernelFragment {
-    @MetalKernelFragmentBuilder
+// LMIR モジュール — Metal を知らない
+struct AttentionAttributes: OperationAttributes {
+    let hiddenSize: Int
+    let headCount: Int
+    let kvHeadCount: Int
+    let headDimension: Int
+    // ... パラメータだけ。実装方法は知らない
+}
+
+// MetalCompiler モジュール — IR のデータを問い合わせて最適化済みの結果を返す
+extension AttentionAttributes: MetalCompilable {
     func fragment(context: KernelContext) -> some MetalKernelFragment {
-        LinearFragment(field: "q_proj", ...)     // Q 射影
-        LinearFragment(field: "k_proj", ...)     // K 射影
-        LinearFragment(field: "v_proj", ...)     // V 射影
-        if qkNorm != nil {
-            QKNormFragment(headCount: headCount, ...)
-            QKNormFragment(headCount: kvHeadCount, ...)
-        }
-        if let rope = rope {
-            RoPEFragment(...)
-        }
-        FlashAttentionFragment(...)              // attention 本体
-        LinearFragment(field: "o_proj", ...)     // 出力射影
+        // self.headCount, self.hiddenSize を問い合わせて最適な Metal 実装を返す
+        BatchedProjection(entries: [q_proj, k_proj, v_proj])  // 3→1 dispatch
+        BatchedFragment([QKNormFragment(q), QKNormFragment(k)])  // 2→1 dispatch
+        FlashAttentionFragment(...)
+        LinearFragment(field: "o_proj", ...)
     }
 }
 ```
 
-Fragment tree のレイヤー:
+Compiler は `as? any MetalCompilable` で capability query する:
+
+```swift
+guard let compilable = attributes as? any MetalCompilable else {
+    fatalError("... does not conform to MetalCompilable")
+}
+let fragment = compilable.fragment(context: kernelContext)
+```
+
+#### MetalCompilable の責務
+
+- IR のパラメータ（hiddenSize, headCount 等）を読む
+- Fragment を部品として使い、Metal 実装を組み立てる
+- **Component 内の最適化はここの責務**: Q/K/V batch 化、SwiGLU fusion 等
+- Compilable ファイル（`AttentionFragment.swift` 等）に 1 OperationAttributes : 1 ファイルで定義
+
+MetalCompilable は「naive な tree を返して optimizer に任せる」のではなく、**最初から最適化済みの結果を返す**。最適化の判断は Compilable ファイルが行う。
+
+#### Multi-backend 拡張
+
+他の backend は同じ retroactive conformance パターンで独自の protocol を定義する:
+
+```swift
+// 仮に MLX backend があれば
+protocol MLXCompilable {
+    func mlxOperation(context: MLXContext) -> MLXOp
+}
+extension AttentionAttributes: MLXCompilable { ... }
+```
+
+LMIR は backend を知らない。各 backend が自分の protocol を定義し、OperationAttributes への conformance を提供する。Fragment は Metal 固有の概念であり、MLX 等の他 backend には関係しない。
+
+### Fragment — Metal kernel の再利用可能な部品
+
+Fragment は Metal kernel の MSL source を生成する再利用可能な部品。MetalCompilable と Compiler が使う**道具**であり、最適化対象の宣言ではない。
+
+同じ Fragment（LinearFragment 等）を Attention, MLP, StateSpace, OutputHead が再利用する。Buffer precision（F16/F32）や weight format（F16/BF16/Q4）の差異を吸収する。
 
 ```
-MetalKernelFragment (protocol)
-├── PrimitiveMetalKernelFragment    // 1 kernel に対応する leaf
-│   ├── Reduction                   // RMSNorm, LayerNorm
-│   ├── LinearFragment              // GEMV/GEMM 射影
-│   ├── ElementwiseFragment         // SwiGLU, sigmoid gate
-│   ├── FlashAttentionFragment      // QKV attention + KV cache
-│   ├── Conv1dFragment              // temporal conv + conv_state
-│   ├── RoPEFragment                // rotary position encoding
-│   ├── QKNormFragment              // per-head RMS norm
-│   ├── GatherFragment              // embedding lookup
-│   └── ArgmaxFragment              // argmax for token selection
-│
-├── TupleFragment                   // 複数 fragment の直列結合
-├── OptionalFragment                // 条件付き fragment
-└── ConditionalFragment             // if-else 分岐
+PrimitiveMetalKernelFragment (部品)
+├── Reduction                        // RMSNorm, LayerNorm
+├── LinearFragment                   // GEMV/GEMM projection
+├── ElementwiseFragment              // SwiGLU activation
+├── FlashAttentionFragment           // QKV attention + KV cache
+├── Conv1dFragment                   // temporal conv + conv_state
+├── RoPEFragment                     // rotary position encoding
+├── QKNormFragment                   // per-head RMS norm
+├── GatherFragment                   // embedding lookup
+├── ArgmaxFragment                   // argmax for token selection
+├── ScalarMultiplyFragment           // per-element scalar multiply
+├── SSMRecurrenceFragment            // state-space model recurrence
+└── ...
+
+MetalCompilable conformances (IR → 最適化済み Metal 実装)
+├── AttentionAttributes              // → BatchedProjection(Q,K,V) + FlashAttn + o_proj
+├── MLPAttributes                    // → BatchedProjection(gate,up) + SwiGLU + down_proj
+├── StateSpaceAttributes             // → SSM projections + recurrence
+├── ShortConvAttributes              // → conv1d + activation
+├── TokenEmbeddingAttributes         // → gather
+├── OutputHeadAttributes             // → norm + projection + argmax
+├── RMSNormAttributes                // → Reduction
+├── LinearAttributes                 // → LinearFragment
+├── PerLayerInputAttributes          // → modulation
+├── LayerScaleAttributes             // → scalar multiply
+└── MoEAttributes                    // → expert routing + MLP
+```
+
+### Fragment Design Principles
+
+**Fragment is self-describing. Compiler is generic.**
+
+Fragment は自分自身を完全に記述する。Compiler は fragment の具体的な型を知らずに、fragment が宣言する contract のみに基づいて kernel 合成・buffer routing・dispatch 構成を行う。新しい fragment を追加しても compiler のコードは 1 行も変わらない。
+
+#### Open-Closed Principle
+
+- **Fragment を追加するために compiler (MetalSourceGenerator, MetalKernelSourceCatalog, MetalPrefillStepBuilder) を変更してはならない**
+- compiler が fragment を名前や型で switch/case するコードを書いてはならない — fragment の protocol properties のみで判断する
+- fusion パターンを追加するために `DispatchKind` に case を追加してはならない — compiler が `FusionContract` から機械的に fusion を判定する
+
+#### Fragment が提供する 3 つの宣言
+
+1. **`kernelBody()`** — 合成可能な MSL コード片。標準化された変数名 (dispatch dimension ごとに規定) を使い、kernel signature・buffer 宣言・dispatch routing を含まない。compiler がこれを素材として fused kernel を合成する。
+2. **`FusionContract`** — 合成可能性の宣言的仕様。入出力ポート (名前・型・アクセスパターン)、parallelism pattern、threadgroup memory 要件、barrier 要件を記述。compiler はこの contract のみを見て隣接 fragment の fusion 可否を機械的に判定する。
+3. **`kernelSource()`** — 非合成 fragment のフォールバック。FlashAttention のような複雑な kernel は `kernelBody()` から nil を返し、`kernelSource()` で完成品 MSL を提供する。全てを合成可能にする必要はない。
+
+#### Fusable / Non-fusable の境界
+
+| Fragment | Fusable | Reason |
+|---|---|---|
+| Reduction (RMSNorm) | Yes | threadgroup reduction, standard pattern |
+| ElementwiseFragment (SwiGLU) | Yes | pure per-element, no dependency |
+| ScalarMultiplyFragment | Yes | pure per-element |
+| QKNormFragment | Yes | per-head reduction |
+| RoPEFragment | Yes | per-head elementwise |
+| structuralAdd / Copy | Yes | per-element |
+| GatherFragment | No | irregular access pattern |
+| LinearFragment (GEMV/GEMM) | No | fundamentally different parallelism (matrix multiply) |
+| FlashAttentionFragment | No | complex multi-pass, KV cache management |
+| SSMRecurrenceFragment | No | sequential recurrence |
+| Conv1dFragment | No | temporal dependency |
+
+#### Prohibition: hand-written fused kernels
+
+- `MetalSourceGenerator` に `generateFusedXxx()` 系の手書き fused kernel generator を追加してはならない
+- fused kernel は compiler が `kernelBody()` の合成で自動出力する
+- 既存の `generateFusedCopyRMSNorm`, `generateFusedResidualAddCopyRMSNorm` 等は `kernelBody()` 合成への移行後に削除する
+
+#### Compiler の kernel 合成パイプライン
+
+```
+Phase 1: Fragment collection
+  IR walk → fragment tree flatten → [CollectedPrimitive]
+
+Phase 2: Fusion analysis
+  隣接 fragment の FusionContract を比較:
+  - parallelism compatible? (.perRow(dim) ↔ .perElement(count) if same dimension)
+  - output port → input port connection? (name matching + type compatibility)
+  - combined threadgroup memory ≤ limit?
+  → fusable group or barrier boundary
+
+Phase 3: Kernel synthesis
+  Fusable group に対して:
+  1. Variable renaming: Fragment A output → Fragment B input
+  2. Body concatenation: kernelBody() を順に結合
+  3. Intermediate elimination: device memory R/W → register variable
+  4. Signature generation: グループ全体の外部 input/output から buffer 宣言を生成
+  → 合成 MSL source
+
+Phase 4: Buffer routing (existing)
+  合成 kernel の外部 input/output に対してのみ BufferRoutingState で割当
 ```
 
 ### Fragment Correctness Contract
@@ -146,7 +263,7 @@ MetalKernelFragment (protocol)
 - dispatch entry の並び順をそのままデータ依存とみなしてはいけない。compiler が元の IR 意味論を保持する。
 - `isOutput` や最終出力マークは「最後に emit された projection」ではなく「意味的に hidden へ戻る projection」に対して付与する。
 - prefill と decode の routing state は別物として検証する。片方が正しくてももう片方は壊れうる。
-- fragment 追加時は kernel 本体だけでなく、入力 source、出力 destination、write set、barrier 要件まで contract として定義する。
+- fragment 追加時は `kernelBody()` と `FusionContract` で計算ロジック・合成可能性を宣言する。buffer routing は compiler に委ねる。
 
 破損時の調査順序:
 
@@ -163,6 +280,12 @@ MetalKernelFragment (protocol)
 - 不安定な suite は [`scripts/xcodebuild-test-timeout.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild-test-timeout.sh) または [`scripts/xcodebuild-test-hang-guard.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild-test-hang-guard.sh) で再現性を確認する。
 - suite-level filter で切り分けられるように、重い smoke tests は output / prompt-state / capability などの関心ごとごとに分割する。
 
+### Compiler — Optimizing Kernel Compiler
+
+Compiler の責務は IR グラフから**最適化された GPU dispatch plan を自動生成**すること。
+
+**Compiler は fragment の具象型を知らない。** `FusionContract` と `kernelBody()` という protocol interface のみで全ての判断を行う。新しい計算パターンを追加するとき、compiler のコード変更はゼロ。fragment が自分自身を宣言すれば、compiler は自動的にそれを検出・合成・最適化する。
+
 ### Compiler の IR walk → dispatch plan 生成
 
 #### Phase 1: IR walk (walkRegion)
@@ -175,8 +298,9 @@ walkRegion(region):
     switch operation.kind:
 
     case .primitive(attributes):
-      fragment = attributes as? MetalKernelFragment
-      primitives = collectPrimitives(fragment)    // tree を flatten
+      compilable = attributes as? MetalCompilable  // capability query
+      fragment = compilable.fragment(context)       // witness table dispatch
+      primitives = collectPrimitives(fragment)      // tree を flatten
       optimized = optimizer.optimizeFragment(primitives)
       for entry in optimized: emit(entry)
       markLastProjectionAsOutput()                // o_proj, down_proj → isOutput
@@ -194,14 +318,17 @@ walkRegion(region):
       walkRegion(selectedBody)  // compile-time 分岐
 ```
 
-#### Phase 2: Graph-level optimization
+#### Phase 2: Graph-level optimization (DispatchOptimizer)
 
-StandardOptimizer が隣接 entries をパターンマッチで fusion:
+Compiler は `DispatchOptimizer` protocol を通じて dispatch entries を最適化する。
 
-```
-structuralAdd + structuralCopy + Reduction → fusedResidualAddCopyNorm
-structuralCopy + Reduction                → fusedCopyNorm
-```
+**設計**: Compiler は fragment の `FusionContract` を機械的に比較し、fusable な隣接 fragment を自動判定して `kernelBody()` を合成する。Compiler のコードに fragment 固有の pattern-matching は存在しない。
+
+1. **Fusion eligibility analysis**: 隣接 fragment の `FusionContract` で parallelism 互換性、port 接続可能性、threadgroup memory 上限を判定
+2. **Kernel synthesis**: fusable group の `kernelBody()` を連結し、中間バッファをレジスタ変数に置換した単一 MSL source を合成
+3. **Pipeline cache**: 合成された kernel source から compute pipeline を生成・キャッシュ
+
+dispatch 数の削減が barrier overhead の根本的解決策。Metal 3 では barrier 1 回 ~30μs のため、kernel fusion は直接的にレイテンシ削減に寄与する。Metal 4 でも dispatch + encode コスト削減の効果がある。
 
 #### Phase 3: Prefill dispatch plan 生成 (buildPrefillSteps)
 
@@ -417,9 +544,15 @@ Random rotation provides measurable quality improvement for Q8. Q4 information l
 
 1. LMIR に新 Attributes 型を追加 (`OperationAttributes` 準拠、backend 非依存)
 2. IR の変更は不要 — `any OperationAttributes` として opaque に格納される
-3. MetalCompiler で extension: `NewAttributes: MetalComponent` — `computeOps` で計算種別を宣言
-4. もし新しい kernel が必要なら compiler の kernel source に追加
-5. compiler 本体の変更は不要 (graph walk + `as? MetalComponent` で自動検出)
+3. MetalCompiler で extension: `NewAttributes: MetalCompilable` — `fragment(context:)` で primitive fragment tree を構築
+4. 必要なら新しい `PrimitiveMetalKernelFragment` を追加:
+   - `kernelBody()` で合成可能な MSL コード片を返す (fusable な場合)
+   - `FusionContract` で入出力ポート・parallelism・threadgroup memory 要件を宣言する
+   - `kernelSource()` で完成品 MSL を返す (non-fusable な場合のフォールバック)
+   - `decodeBindings()` で `writeBufferIndices` を必ず宣言する — 省略は conservative barrier fallback を引き起こす
+5. **compiler 本体 (MetalSourceGenerator, MetalKernelSourceCatalog, MetalPrefillStepBuilder) の変更は不要** — `MetalCompilable` conformance で自動取得、`FusionContract` で自動 fusion 判定、`kernelBody()` で自動合成
+6. MetalSourceGenerator に `generateXxx()` や `generateFusedXxx()` を追加してはならない — fragment が `kernelBody()` で自分自身を記述する
+7. `MetalCompilable` に対応しない OperationAttributes は fatalError — silent fallback 禁止
 
 ## Module Dependencies
 
@@ -473,7 +606,8 @@ swift build
 - HF ディレクトリ (config.json + safetensors + tokenizer.json) が正規ソース
 - config.json に必須項目が欠けていたら補完せずエラー
 - IR はランタイム非依存。Metal/MLX/TPU 固有の型を IR に持ち込まない
-- MetalComponent は MetalCompiler モジュール内。SwiftLM/LMIR に属さない
+- `MetalCompilable` / MetalKernelFragment / PrimitiveMetalKernelFragment は MetalCompiler モジュール内。SwiftLM/LMIR に属さない
+- OperationAttributes → fragment の bridge は `MetalCompilable` protocol conformance で行う。compiler が具象型を switch/case してはならない
 - 全 public 型は `Sendable`
 - デプロイメント判断（KV cache 量子化、最大シーケンス長）は `InferencePolicy` で外部化。compiler 内部にハードコードしない
 - `KVCacheSpecification` の `maximumSequenceLength` にデフォルト値を持たせない — silent fallback 防止
@@ -513,6 +647,8 @@ Vision encoder と text decoder は独立したモデル。IR に vision encoder
 - Decode GEMV は memory bandwidth bound (~516 GB/s)。kernel 最適化 (threadgroup cache, vectorized load) は Apple Silicon の L2 cache により逆効果
 - Prefill GEMM は Metal 4 `matmul2d` への置換で AMX 最適化パスが期待できる
 - Weight quantization (Q4/Q8) が decode 高速化の最大レバー (帯域 2-4x 削減)
+- **Dispatch overhead が支配的**: decode で GPU 時間の ~85% が barrier 同期 (528 × ~30μs)、prefill で ~500 dispatches × ~45μs。個別 kernel の計算時間ではなく dispatch 数がボトルネック
+- **MLX graph compilation との差**: EmbeddingGemma prefill で swift-lm 44.3 emb/s vs MLX 62.0 emb/s — MLX はグラフ全体を compiled kernel にまとめて dispatch overhead を排除している
 
 ### Barrier Optimization — Decode Path
 
@@ -562,7 +698,15 @@ scratch buffer は単一 MTLBuffer に複数 slot を offset で配置する。`
 
 #### 残存する barrier overhead
 
-528 barriers × ~30μs = ~15.8ms が GPU 時間の ~85% を占める。これらは全て genuine な RAW 依存（線形計算チェーン）。Metal 4 の `MTL4VisibilityOptionNone` barrier でコスト削減、または kernel fusion で step 数を削減する。
+528 barriers × ~30μs = ~15.8ms が GPU 時間の ~85% を占める。これらは全て genuine な RAW 依存（線形計算チェーン）。
+
+**barrier overhead は個別の barrier を最適化しても解決しない。** dispatch 数そのものを削減する必要がある。これは compiler による自動 kernel fusion の動機そのものである:
+
+- Metal 3: barrier 1 回 ~30μs → dispatch 半減で ~8ms 削減
+- Metal 4: barrier コスト ~0μs でも dispatch + encode コスト削減の効果あり
+- Prefill: EmbeddingGemma で ~500 dispatches × ~45μs = ~22.5ms overhead（MLX graph compilation に負ける原因）
+
+根本解決策は DispatchOptimizer が fragment graph を解析し、fusible な隣接 dispatch を自動的に単一 kernel に合成すること。
 
 ## Qwen3.5 = VLM（Vision Language Model）
 

@@ -87,7 +87,7 @@ struct Gemma4CompilerTests {
         )
         let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let compiler = MetalInferenceCompiler()
         var compiled = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,
@@ -236,7 +236,7 @@ struct Gemma4CompilerTests {
         )
         let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let compiler = MetalInferenceCompiler()
         let compiled = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,

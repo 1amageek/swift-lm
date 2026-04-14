@@ -116,6 +116,35 @@ struct Qwen35DeltaNetDecoderLayer: ModelComponent {
     }
 }
 
+/// Qwen 3.5 attention with sigmoid output gate packed in Q projection.
+///
+/// The Q projection outputs `2 * headCount * headDimension` values.
+/// The first half is queries, the second half is sigmoid gate values
+/// applied to the attention output.
+struct Qwen35Attention: ModelComponent {
+
+    typealias Attributes = AttentionAttributes
+
+    let hiddenSize: Int
+    let headCount: Int
+    let kvHeadCount: Int
+    let headDimension: Int
+    let rope: RoPEAttributes
+    let qkNorm: QKNormKind
+
+    var attributes: AttentionAttributes {
+        AttentionAttributes(
+            hiddenSize: hiddenSize,
+            headCount: headCount,
+            kvHeadCount: kvHeadCount,
+            headDimension: headDimension,
+            rope: rope,
+            qkNorm: qkNorm,
+            outputGate: .sigmoidPackedInQProj
+        )
+    }
+}
+
 /// Full attention decoder layer: RMSNorm + GQA residual, then RMSNorm + MLP residual.
 ///
 /// Standard GQA with partial RoPE (M-RoPE for VLM, standard for text-only),
@@ -129,7 +158,7 @@ struct Qwen35AttnDecoderLayer: ModelComponent {
     var body: some ModelComponent {
         Residual {
             RMSNorm(dimension: config.hiddenSize, epsilon: config.normEps, weightBias: 1)
-            Attention(
+            Qwen35Attention(
                 hiddenSize: config.hiddenSize,
                 headCount: config.attentionHeads,
                 kvHeadCount: config.kvHeads,
@@ -140,8 +169,7 @@ struct Qwen35AttnDecoderLayer: ModelComponent {
                     scaling: config.ropeScaling,
                     mropeAxes: config.mropeAxes
                 ),
-                qkNorm: .rmsNormUnitOffset,
-                outputGate: .sigmoidPackedInQProj
+                qkNorm: .rmsNormUnitOffset
             )
         }
         Residual {

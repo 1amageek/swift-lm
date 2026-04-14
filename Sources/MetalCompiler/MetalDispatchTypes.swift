@@ -3,7 +3,7 @@ import Metal
 
 /// Metal dispatch types used by the compiler.
 ///
-/// Shared types: MetalDispatchDimension, MetalProjection, MetalWeightSlot,
+/// Shared types: MetalDispatchDimension, MetalWeightSlot,
 /// MetalCacheSlot, fused operation structs, SynchronizationKind,
 /// BufferPrecision, WeightFormat.
 
@@ -123,11 +123,15 @@ public struct BufferBindingContext: @unchecked Sendable {
     public let kvCacheIndex: Int
     public let convLayerIndex: Int
     public let recurrentLayerIndex: Int
+    /// Current projection index for scratch slot allocation.
+    /// Projection outputs use scratch slot `projectionIndex + 1`.
+    public let projectionIndex: Int
     public let resolveWeight: (String) -> (buffer: MTLBuffer, offset: Int)
 
     public init(bufferSet: MetalBufferSet, slotDimension: Int, elementSize: Int,
                 currentInputBuffer: MTLBuffer, currentInputOffset: Int,
                 layerIndex: Int?, kvCacheIndex: Int, convLayerIndex: Int, recurrentLayerIndex: Int,
+                projectionIndex: Int = 0,
                 resolveWeight: @escaping (String) -> (buffer: MTLBuffer, offset: Int)) {
         self.bufferSet = bufferSet
         self.slotDimension = slotDimension
@@ -138,6 +142,7 @@ public struct BufferBindingContext: @unchecked Sendable {
         self.kvCacheIndex = kvCacheIndex
         self.convLayerIndex = convLayerIndex
         self.recurrentLayerIndex = recurrentLayerIndex
+        self.projectionIndex = projectionIndex
         self.resolveWeight = resolveWeight
     }
 }
@@ -163,6 +168,11 @@ public struct FragmentBindings: @unchecked Sendable {
     /// When nil, the barrier optimizer falls back to conservative (all read+write).
     public let writeBufferIndices: Set<Int>?
 
+    /// Number of projection scratch slots consumed by this fragment.
+    /// The routing planner advances projectionIndex by this amount.
+    /// Default 0 for non-projection fragments.
+    public let projectionSlotsConsumed: Int
+
     public init(buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
                 bytes: [(index: Int, value: [UInt8])],
                 outputIsHidden: Bool,
@@ -170,7 +180,8 @@ public struct FragmentBindings: @unchecked Sendable {
                 consumesKVCacheLayer: Bool = false,
                 consumesConvLayer: Bool = false,
                 consumesRecurrentLayer: Bool = false,
-                writeBufferIndices: Set<Int>? = nil) {
+                writeBufferIndices: Set<Int>? = nil,
+                projectionSlotsConsumed: Int = 0) {
         self.buffers = buffers
         self.bytes = bytes
         self.outputIsHidden = outputIsHidden
@@ -179,6 +190,7 @@ public struct FragmentBindings: @unchecked Sendable {
         self.consumesConvLayer = consumesConvLayer
         self.consumesRecurrentLayer = consumesRecurrentLayer
         self.writeBufferIndices = writeBufferIndices
+        self.projectionSlotsConsumed = projectionSlotsConsumed
     }
 }
 
@@ -197,6 +209,8 @@ public struct PrefillBindingContext: @unchecked Sendable {
     public let kvCacheIndex: Int
     public let convLayerIndex: Int
     public let recurrentLayerIndex: Int
+    /// Current projection index for scratch slot allocation.
+    public let projectionIndex: Int
     public let kernelContext: KernelContext
     public let resolveWeight: (String) -> (buffer: MTLBuffer, offset: Int)
     public let getPipeline: (String) throws -> MTLComputePipelineState
@@ -204,6 +218,7 @@ public struct PrefillBindingContext: @unchecked Sendable {
     public init(buffers: PrefillBufferSet, slotDimension: Int, scratchElementSize: Int,
                 maximumSequenceLength: Int, currentInputBuffer: MTLBuffer, currentInputOffset: Int,
                 layerIndex: Int?, kvCacheIndex: Int, convLayerIndex: Int, recurrentLayerIndex: Int,
+                projectionIndex: Int = 0,
                 kernelContext: KernelContext,
                 resolveWeight: @escaping (String) -> (buffer: MTLBuffer, offset: Int),
                 getPipeline: @escaping (String) throws -> MTLComputePipelineState) {
@@ -217,6 +232,7 @@ public struct PrefillBindingContext: @unchecked Sendable {
         self.kvCacheIndex = kvCacheIndex
         self.convLayerIndex = convLayerIndex
         self.recurrentLayerIndex = recurrentLayerIndex
+        self.projectionIndex = projectionIndex
         self.kernelContext = kernelContext
         self.resolveWeight = resolveWeight
         self.getPipeline = getPipeline
@@ -233,17 +249,23 @@ public struct FragmentPrefillSteps: @unchecked Sendable {
     public let consumesConvLayer: Bool
     public let consumesRecurrentLayer: Bool
 
+    /// Number of projection scratch slots consumed by this fragment.
+    /// The prefill routing planner advances projectionIndex by this amount.
+    public let projectionSlotsConsumed: Int
+
     public init(steps: [MetalPrefillStep], outputIsHidden: Bool,
                 resetsProjectionIndex: Bool = false,
                 consumesKVCacheLayer: Bool = false,
                 consumesConvLayer: Bool = false,
-                consumesRecurrentLayer: Bool = false) {
+                consumesRecurrentLayer: Bool = false,
+                projectionSlotsConsumed: Int = 0) {
         self.steps = steps
         self.outputIsHidden = outputIsHidden
         self.resetsProjectionIndex = resetsProjectionIndex
         self.consumesKVCacheLayer = consumesKVCacheLayer
         self.consumesConvLayer = consumesConvLayer
         self.consumesRecurrentLayer = consumesRecurrentLayer
+        self.projectionSlotsConsumed = projectionSlotsConsumed
     }
 }
 
@@ -275,90 +297,7 @@ public enum MetalDispatchDimension: Sendable, Equatable {
     case gemv(outputDimension: Int, inputDimension: Int)
 }
 
-// MARK: - Fused Operations
-
-/// Fused operation: [optional preNorm] + residualAdd + copy + RMSNorm → single dispatch.
-///
-/// When `preNorm` is non-nil, the kernel applies an in-place RMS norm to hidden
-/// before the residual add. This absorbs the post-norm from the preceding residual
-/// body (e.g., post_attn_norm + add + copy + pre_mlp_norm → 4→1).
-public struct FusedResidualAddCopyNorm: Sendable {
-    public let dimension: Int
-    public let epsilon: Float
-    public let weightBias: Float
-    /// Optional pre-norm applied in-place to hidden before the residual add.
-    public let preNorm: PreNorm?
-
-    /// Parameters for an in-place pre-norm applied before the residual add.
-    public struct PreNorm: Sendable {
-        public let epsilon: Float
-        public let weightBias: Float
-        public let parameterBindings: [ParameterBinding]
-    }
-
-    public init(dimension: Int, epsilon: Float, weightBias: Float = 0, preNorm: PreNorm? = nil) {
-        self.dimension = dimension
-        self.epsilon = epsilon
-        self.weightBias = weightBias
-        self.preNorm = preNorm
-    }
-}
-
-/// Fused operation: copy + RMSNorm → single dispatch.
-public struct FusedCopyNorm: Sendable {
-    public let dimension: Int
-    public let epsilon: Float
-    public let weightBias: Float
-    public init(dimension: Int, epsilon: Float, weightBias: Float = 0) {
-        self.dimension = dimension
-        self.epsilon = epsilon
-        self.weightBias = weightBias
-    }
-}
-
-/// Fused operation: [optional preNorm] + residualAdd + RMSNorm → single dispatch (no copy).
-/// Used at model end where no next residual is needed.
-public struct FusedResidualAddNorm: Sendable {
-    public let dimension: Int
-    public let epsilon: Float
-    public let weightBias: Float
-    /// Optional pre-norm applied in-place to hidden before the residual add.
-    public let preNorm: FusedResidualAddCopyNorm.PreNorm?
-
-    public init(dimension: Int, epsilon: Float, weightBias: Float = 0, preNorm: FusedResidualAddCopyNorm.PreNorm? = nil) {
-        self.dimension = dimension
-        self.epsilon = epsilon
-        self.weightBias = weightBias
-        self.preNorm = preNorm
-    }
-}
-
-/// Fused operation: gate_proj + up_proj + SwiGLU → single decode dispatch.
-///
-/// This avoids materializing the two MLP branch projections into separate
-/// scratch buffers before activation, which reduces both launch overhead and
-/// activation rounding on the decode hot path.
-public struct FusedSwiGLUProjection: Sendable {
-    public let inputDimension: Int
-    public let outputDimension: Int
-    public let gateField: String
-    public let upField: String
-    public let activation: MetalSourceGenerator.GatedActivation
-
-    public init(
-        inputDimension: Int,
-        outputDimension: Int,
-        gateField: String,
-        upField: String,
-        activation: MetalSourceGenerator.GatedActivation = .silu
-    ) {
-        self.inputDimension = inputDimension
-        self.outputDimension = outputDimension
-        self.gateField = gateField
-        self.upField = upField
-        self.activation = activation
-    }
-}
+// MARK: - Batched Operations
 
 /// Batched projection: multiple GEMV projections in a single dispatch.
 /// All projections share the same input but have different weights and outputs.
@@ -398,20 +337,6 @@ public struct BatchedFragment: Sendable {
     public init(fragments: [any PrimitiveMetalKernelFragment], dispatchDimension: MetalDispatchDimension) {
         self.fragments = fragments
         self.dispatchDimension = dispatchDimension
-    }
-}
-
-// MARK: - Projection
-
-public struct MetalProjection: Sendable {
-    public let field: String
-    public let inputDimension: Int
-    public let outputDimension: Int
-
-    public init(field: String, inputDimension: Int, outputDimension: Int) {
-        self.field = field
-        self.inputDimension = inputDimension
-        self.outputDimension = outputDimension
     }
 }
 

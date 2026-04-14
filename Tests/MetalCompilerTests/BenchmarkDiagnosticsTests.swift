@@ -19,13 +19,11 @@ struct BenchmarkDiagnosticsTests {
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         let syncResult = try measureDecodeThroughput(
             mode: .sync,
-            optimizer: AggressiveOptimizer(),
             decodeSteps: decodeSteps,
             promptTokens: promptTokens
         )
         let pipelinedResult = try measureDecodeThroughput(
             mode: .pipelined,
-            optimizer: AggressiveOptimizer(),
             decodeSteps: decodeSteps,
             promptTokens: promptTokens
         )
@@ -46,7 +44,7 @@ struct BenchmarkDiagnosticsTests {
         defer { gpuLock.release() }
         BenchmarkSupport.settleGPU()
 
-        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
+        let (model, _) = try BenchmarkSupport.setupOrSkip()
         var inferenceModel = model
         let iterations = 50
         let breakdown = try BenchmarkSupport.measureDecodeSyncBreakdown(
@@ -71,41 +69,6 @@ struct BenchmarkDiagnosticsTests {
         print("readback:      \(String(format: "%.1f", breakdown.readbackMicroseconds)) us/token")
         print("host overhead: \(String(format: "%.1f", hostOverhead)) us/token (\(String(format: "%.1f", hostPct))%)")
         print("wait share:    \(String(format: "%.1f", waitPct))%")
-    }
-
-    @Test("Optimizer decode token trace comparison")
-    func optimizerDecodeTokenTraceComparison() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        BenchmarkSupport.settleGPU()
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        let variants: [(String, any DispatchOptimizer)] = [
-            ("none", NoOptimizer()),
-            ("standard", StandardOptimizer()),
-            ("aggressive", AggressiveOptimizer()),
-        ]
-
-        var traces: [(String, [Int32])] = []
-        for (name, optimizer) in variants {
-            let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: optimizer)
-            var inferenceModel = model
-            let trace = BenchmarkSupport.decodeTokenTrace(
-                model: &inferenceModel,
-                promptTokens: promptTokens,
-                predecodeSteps: 3,
-                decodeSteps: 5
-            )
-            traces.append((name, trace))
-        }
-
-        print("\n=== Optimizer Decode Token Trace ===")
-        for (name, trace) in traces {
-            print("\(name): \(trace)")
-        }
-
-        #expect(traces.count == 3)
-        #expect(traces[1].1 == traces[2].1, "standard and aggressive traces should match")
     }
 
     @Test("Compilation time (IR → dispatch plan)")
@@ -147,17 +110,8 @@ struct BenchmarkDiagnosticsTests {
         print("  decode plan: \(decodePlan.fusedEntryCount) dispatches, \(String(format: "%.0f", compileTime * 1000))ms")
         print("  prefill plan: \(prefillPlan.stepCount) steps, \(String(format: "%.0f", prefillCompileTime * 1000))ms")
 
-        let optimizers: [any DispatchOptimizer] = [
-            NoOptimizer(),
-            StandardOptimizer(),
-            AggressiveOptimizer(),
-        ]
-        print("\n[Benchmark] optimizer comparison:")
-        for opt in optimizers {
-            let comp = MetalInferenceCompiler(optimizer: opt)
-            let report = comp.analyzeOptimization(graph: resolved, hiddenSize: 2048)
-            report.printReport()
-        }
+        let report = compiler.analyzeOptimization(graph: resolved, hiddenSize: 2048)
+        report.printReport()
     }
 
     @Test("Per-step decode profiling")
@@ -634,7 +588,7 @@ struct BenchmarkDiagnosticsTests {
         defer { gpuLock.release() }
         BenchmarkSupport.settleGPU()
 
-        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
+        let (model, _) = try BenchmarkSupport.setupOrSkip()
         var m = model
         let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
         var tok = m.prefill(tokens: promptTokens)
@@ -689,11 +643,10 @@ struct BenchmarkDiagnosticsTests {
 
     private func measureDecodeThroughput(
         mode: DecodeMode,
-        optimizer: (any DispatchOptimizer)? = nil,
         decodeSteps: Int,
         promptTokens: [Int32]
     ) throws -> DecodeThroughputResult {
-        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: optimizer)
+        let (model, _) = try BenchmarkSupport.setupOrSkip()
         var inference = model
         defer {
             inference.resetState()

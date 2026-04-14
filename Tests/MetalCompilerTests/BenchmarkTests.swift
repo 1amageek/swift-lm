@@ -9,68 +9,6 @@ import Testing
 /// reported tok/s is not contaminated by earlier GPU-heavy diagnostics.
 @Suite("Benchmark", .serialized)
 struct BenchmarkTests {
-    @Test("Optimizer comparison: prefill + decode throughput")
-    func optimizerComparisonBenchmark() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        let optimizers: [(any DispatchOptimizer, String)] = [
-            (NoOptimizer(), "none"),
-            (StandardOptimizer(), "standard"),
-            (AggressiveOptimizer(), "aggressive"),
-        ]
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        let prefillLength = 64
-        let decodeSteps = 50
-        let iterations = 5
-
-        print("\n=== Optimizer Comparison: LFM2.5-1.2B (\(iterations) iterations) ===")
-        print("Optimizer     Decode Pfill  Dec tok/s Pfl tok/s Dec ms/tk Pfl ms/tk")
-        print(String(repeating: "-", count: 72))
-
-        for (opt, name) in optimizers {
-            let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: opt)
-            var m = model
-
-            var decResults: [Double] = []
-            var pfResults: [Double] = []
-            BenchmarkSupport.settleGPU()
-
-            for _ in 0..<iterations {
-                m.resetState()
-                let prefillTokens = [Int32](repeating: 1, count: prefillLength)
-                let pfStart = CFAbsoluteTimeGetCurrent()
-                _ = m.prefill(tokens: prefillTokens)
-                let pfTime = CFAbsoluteTimeGetCurrent() - pfStart
-                pfResults.append(pfTime)
-
-                m.resetState()
-                var currentToken = m.prefill(tokens: promptTokens)
-                for _ in 0..<3 { currentToken = m.decodeSync(tokenID: currentToken) }
-
-                let decStart = CFAbsoluteTimeGetCurrent()
-                for _ in 0..<decodeSteps { currentToken = m.decodeSync(tokenID: currentToken) }
-                let decTime = CFAbsoluteTimeGetCurrent() - decStart
-                decResults.append(decTime)
-            }
-
-            let decMedian = decResults.sorted()[iterations / 2]
-            let pfMedian = pfResults.sorted()[iterations / 2]
-
-            let decTokPerSec = Double(decodeSteps) / decMedian
-            let pfTokPerSec = Double(prefillLength) / pfMedian
-            let decMsPerTok = decMedian / Double(decodeSteps) * 1000
-            let pfMsPerTok = pfMedian / Double(prefillLength) * 1000
-            let decDispatches = m.decodePlan.fusedEntryCount
-            let pfSteps = m.prefillPlan?.stepCount ?? 0
-
-            let pad = name.padding(toLength: 12, withPad: " ", startingAt: 0)
-            print("\(pad) \(String(format: "%6d %5d %9.1f %9.1f %9.2f %9.2f", decDispatches, pfSteps, decTokPerSec, pfTokPerSec, decMsPerTok, pfMsPerTok))")
-
-            BenchmarkSupport.settleGPU()
-        }
-    }
-
     @Test("Prefill throughput (tok/s)")
     func prefillBenchmark() throws {
         let gpuLock = try GPUTestExclusion.acquire()
@@ -122,34 +60,6 @@ struct BenchmarkTests {
         let tokPerSec = Double(decodeSteps) / elapsed
         let msPerToken = elapsed / Double(decodeSteps) * 1000
         print("[Benchmark] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
-    }
-
-    @Test("Aggressive optimizer: decode throughput")
-    func aggressiveDecodeBenchmark() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-        BenchmarkSupport.settleGPU()
-        let (model, _) = try BenchmarkSupport.setupOrSkip(optimizer: AggressiveOptimizer())
-        var inferenceModel = model
-
-        let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
-        var currentToken = inferenceModel.prefill(tokens: promptTokens)
-
-        for _ in 0..<3 {
-            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
-        }
-
-        let decodeSteps = 50
-        let start = CFAbsoluteTimeGetCurrent()
-        for _ in 0..<decodeSteps {
-            currentToken = inferenceModel.decodeSync(tokenID: currentToken)
-        }
-        let elapsed = CFAbsoluteTimeGetCurrent() - start
-
-        let tokPerSec = Double(decodeSteps) / elapsed
-        let msPerToken = elapsed / Double(decodeSteps) * 1000
-        print("[Benchmark/aggressive] decode \(decodeSteps) tokens: \(String(format: "%.1f", tokPerSec)) tok/s (\(String(format: "%.2f", msPerToken)) ms/tok)")
-        print("[Benchmark/aggressive] dispatches: \(inferenceModel.decodePlan.fusedEntryCount) (from \(inferenceModel.decodePlan.unfusedEntryCount))")
     }
 
     @Test("End-to-end: prefill + decode with memory diagnostics")

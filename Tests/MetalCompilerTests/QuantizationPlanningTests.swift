@@ -20,12 +20,12 @@ struct QuantizationPlanningTests {
         let target = try firstPrefillProjection(in: graph, device: device)
         let store = try makeWeightStore(
             device: device,
-            tensorName: target.binding.tensorName,
-            shape: [target.projection.outputDimension, target.projection.inputDimension],
+            tensorName: target.tensorName,
+            shape: [target.outputDimension, target.inputDimension],
             schemeIdentifier: .q4Group64ScaleF16
         )
 
-        let plan = try MetalInferenceCompiler(optimizer: NoOptimizer()).compilePrefill(
+        let plan = try MetalInferenceCompiler().compilePrefill(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -36,12 +36,12 @@ struct QuantizationPlanningTests {
         )
 
         let quantizedEntry = try #require(
-            plan.quantizationPlan.entries.first(where: { $0.tensorName == target.binding.tensorName })
+            plan.quantizationPlan.entries.first(where: { $0.tensorName == target.tensorName })
         )
         #expect(quantizedEntry.path == .prefillProjection)
         #expect(quantizedEntry.schemeIdentifier == .q4Group64ScaleF16)
-        #expect(quantizedEntry.kernelFamily == .q4G64GEMM)
-        #expect(!quantizedEntry.usedFallback)
+        // Q4 prefill uses dequant→AMX matmul2d pipeline (commit 33beb7d)
+        #expect(quantizedEntry.kernelFamily == .mppGEMM)
     }
 
     @Test("dense prefill projection records disabled environment fallback when MPP is off")
@@ -56,15 +56,15 @@ struct QuantizationPlanningTests {
         let target = try firstPrefillProjection(in: graph, device: device)
         let store = try makeWeightStore(
             device: device,
-            tensorName: target.binding.tensorName,
-            shape: [target.projection.outputDimension, target.projection.inputDimension],
+            tensorName: target.tensorName,
+            shape: [target.outputDimension, target.inputDimension],
             schemeIdentifier: .fp16RowMajor
         )
 
         setenv("SWIFTLM_DISABLE_MPP", "1", 1)
         defer { unsetenv("SWIFTLM_DISABLE_MPP") }
 
-        let plan = try MetalInferenceCompiler(optimizer: NoOptimizer()).compilePrefill(
+        let plan = try MetalInferenceCompiler().compilePrefill(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -75,7 +75,7 @@ struct QuantizationPlanningTests {
         )
 
         let denseEntry = try #require(
-            plan.quantizationPlan.entries.first(where: { $0.tensorName == target.binding.tensorName })
+            plan.quantizationPlan.entries.first(where: { $0.tensorName == target.tensorName })
         )
         #expect(denseEntry.schemeIdentifier == .fp16RowMajor)
         #expect(denseEntry.kernelFamily == .naiveGEMM)
@@ -92,7 +92,7 @@ struct QuantizationPlanningTests {
 
         let config = makeConfig()
         let graph = try resolvedGraph(config: config)
-        let diagnostics = try MetalInferenceCompiler(optimizer: NoOptimizer()).dumpCompiledPrefillPlan(
+        let diagnostics = try MetalInferenceCompiler().dumpCompiledPrefillPlan(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -123,7 +123,7 @@ struct QuantizationPlanningTests {
             schemeIdentifier: .q4Group64ScaleF16
         )
 
-        let plan = try MetalInferenceCompiler(optimizer: NoOptimizer()).compilePrefill(
+        let plan = try MetalInferenceCompiler().compilePrefill(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -161,7 +161,7 @@ struct QuantizationPlanningTests {
             schemeIdentifier: .q8Group32ScaleF16
         )
 
-        let compiled = try MetalInferenceCompiler(optimizer: NoOptimizer()).compile(
+        let compiled = try MetalInferenceCompiler().compile(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -189,7 +189,7 @@ struct QuantizationPlanningTests {
 
         let config = makeConfig()
         let graph = try resolvedGraph(config: config)
-        let diagnostics = try MetalInferenceCompiler(optimizer: NoOptimizer()).dumpCompiledDecodePlan(
+        let diagnostics = try MetalInferenceCompiler().dumpCompiledDecodePlan(
             graph: graph,
             hiddenSize: config.hiddenSize,
             intermediateSize: config.intermediateSize,
@@ -235,10 +235,17 @@ struct QuantizationPlanningTests {
         return ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
     }
 
+    private struct ProjectionTarget {
+        let entry: DispatchEntry
+        let tensorName: String
+        let inputDimension: Int
+        let outputDimension: Int
+    }
+
     private func firstPrefillProjection(
         in graph: ModelGraph,
         device: MTLDevice
-    ) throws -> (entry: DispatchEntry, projection: MetalProjection, binding: ParameterBinding) {
+    ) throws -> ProjectionTarget {
         let context = CompileContext(
             graph: graph,
             hiddenSize: 128,
@@ -251,32 +258,21 @@ struct QuantizationPlanningTests {
             decodeBufferPrecision: .float16,
             accessPolicyResolver: ProjectionWeightAccessPolicyResolver()
         )
-        let entries = MetalEntryCollector(optimizer: NoOptimizer()).collect(
+        let entries = MetalEntryCollector().collect(
             using: context,
             kernelContext: context.prefillKernelContext
         ).fusedEntries
 
         for entry in entries {
-            switch entry.kind {
-            case .projection(let projection, let isOutput):
-                guard !isOutput,
-                      let binding = entry.parameterBindings.first(where: { $0.role == projection.field }) else {
-                    continue
-                }
-                return (entry, projection, binding)
-            case .batchedProjection(let batched):
-                guard let batchedProjection = batched.projections.first,
-                      let binding = entry.parameterBindings.first(where: { $0.role == batchedProjection.field }) else {
-                    continue
-                }
-                let projection = MetalProjection(
-                    field: batchedProjection.field,
-                    inputDimension: batchedProjection.inputDimension,
-                    outputDimension: batchedProjection.outputDimension
+            // Find standalone LinearFragment (e.g. o_proj, down_proj)
+            if let projection = entry.fragment as? LinearFragment,
+               let binding = entry.parameterBindings.first(where: { $0.role == projection.field }) {
+                return ProjectionTarget(
+                    entry: entry,
+                    tensorName: binding.tensorName,
+                    inputDimension: projection.inputDimension,
+                    outputDimension: projection.outputDimension
                 )
-                return (entry, projection, binding)
-            default:
-                continue
             }
         }
 
@@ -307,13 +303,13 @@ struct QuantizationPlanningTests {
         case .prefill:
             kernelContext = context.prefillKernelContext
         }
-        let entries = MetalEntryCollector(optimizer: NoOptimizer()).collect(
+        let entries = MetalEntryCollector().collect(
             using: context,
             kernelContext: kernelContext
         ).fusedEntries
 
         for entry in entries {
-            guard case .fragment(let fragment) = entry.kind, fragment is GatherFragment else {
+            guard entry.fragment is GatherFragment else {
                 continue
             }
             return entry.parameterBindings.first(where: { $0.role == "embedding_table" })

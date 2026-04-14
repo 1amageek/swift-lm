@@ -459,13 +459,6 @@ private func validatePrimitiveAttributes(
         try validateRoPEInvariants(a, headDimension: nil, key: key)
         return currentDim
 
-    case is PositionalEmbeddingAttributes:
-        return currentDim
-
-    case is CustomNodeAttributes:
-        // Cannot validate custom operations dimensionally
-        return currentDim
-
     default:
         return currentDim
     }

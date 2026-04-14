@@ -377,7 +377,7 @@ private actor Gemma4SyntheticContainerCache {
         let config = Gemma4TestSupport.syntheticConfig()
         let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let compiler = MetalInferenceCompiler()
         var compiledModel = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,

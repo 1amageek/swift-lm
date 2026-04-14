@@ -19,8 +19,6 @@ struct GeneratedLibraryTests {
 
         // Verify critical decode kernels
         for name in ["gemv_bf16", "rms_norm_bf16", "rms_norm_bf16_argbuf", "swiglu", "argmax", "argmax_argbuf",
-                      "fused_copy_rms_norm_bf16", "fused_residual_add_copy_rms_norm_bf16",
-                      "fused_swiglu_projection_bf16",
                       "qk_rms_norm_bf16", "qk_rms_norm_bf16_argbuf", "rope", "conv_state_update_bf16",
                       "flash_attn_decode", "gemv_q4_g64", "sigmoid_gate", "ssm_recurrence_bf16"] {
             #expect(library.makeFunction(name: name) != nil, "Missing: \(name)")
@@ -63,8 +61,8 @@ struct GeneratedLibraryTests {
         )
         let entry = DispatchEntry(
             index: 0,
-            kind: .projection(
-                .init(field: "weight", inputDimension: 768, outputDimension: 3072)
+            fragment: LinearFragment(
+                field: "weight", inputDimension: 768, outputDimension: 3072
             ),
             parameterBindings: [
                 .init(role: "weight", tensorName: "dense.0.weight")

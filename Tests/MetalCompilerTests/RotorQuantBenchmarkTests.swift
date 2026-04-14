@@ -17,8 +17,7 @@ struct RotorQuantBenchmarkTests {
 
     /// Compile a model with a specific KV cache quantization policy.
     private static func setupWithPolicy(
-        inferencePolicy: InferencePolicy,
-        optimizer: (any DispatchOptimizer)? = nil
+        inferencePolicy: InferencePolicy
     ) throws -> (MetalInferenceModel, STAFWeightStore) {
         let (device, store) = try BenchmarkSupport.loadStoreOrSkip()
 
@@ -39,7 +38,7 @@ struct RotorQuantBenchmarkTests {
         let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
-        let compiler = MetalInferenceCompiler(optimizer: optimizer)
+        let compiler = MetalInferenceCompiler()
         let decodePlan = try compiler.compile(
             graph: resolved, hiddenSize: 2048, intermediateSize: 8192,
             vocabSize: 65536, inferencePolicy: inferencePolicy,

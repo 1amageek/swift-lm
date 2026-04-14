@@ -76,50 +76,6 @@ struct DecodeBarrierDiagnosticTests {
         #expect(baseline.refArgmax == forcedBarriersDevice.refArgmax)
     }
 
-    @Test("Decode step 1 optimizer variants diagnostic")
-    func decodeStep1OptimizerVariantsDiagnostic() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-
-        let aggressive = try runDecodeDiagnostic(
-            step: 1,
-            tag: "aggressive",
-            optimizer: AggressiveOptimizer()
-        )
-        let standard = try runDecodeDiagnostic(
-            step: 1,
-            tag: "standard",
-            optimizer: StandardOptimizer()
-        )
-
-        print("[DecodeOptimizer] step=1 aggressive argmax=\(aggressive.argmax) ref=\(aggressive.refArgmax) logitsErr=\(String(format: "%.4f", aggressive.logitsMaxErr)) finalHiddenErr=\(String(format: "%.4f", aggressive.finalHiddenMaxErr))")
-        print("[DecodeOptimizer] step=1 standard argmax=\(standard.argmax) ref=\(standard.refArgmax) logitsErr=\(String(format: "%.4f", standard.logitsMaxErr)) finalHiddenErr=\(String(format: "%.4f", standard.finalHiddenMaxErr))")
-
-        #expect(aggressive.refArgmax == standard.refArgmax)
-    }
-
-    @Test("Decode step 2 optimizer variants diagnostic")
-    func decodeStep2OptimizerVariantsDiagnostic() throws {
-        let gpuLock = try GPUTestExclusion.acquire()
-        defer { gpuLock.release() }
-
-        let aggressive = try runDecodeDiagnostic(
-            step: 2,
-            tag: "aggressive",
-            optimizer: AggressiveOptimizer()
-        )
-        let standard = try runDecodeDiagnostic(
-            step: 2,
-            tag: "standard",
-            optimizer: StandardOptimizer()
-        )
-
-        print("[DecodeOptimizer] step=2 aggressive argmax=\(aggressive.argmax) ref=\(aggressive.refArgmax) logitsErr=\(String(format: "%.4f", aggressive.logitsMaxErr)) finalHiddenErr=\(String(format: "%.4f", aggressive.finalHiddenMaxErr))")
-        print("[DecodeOptimizer] step=2 standard argmax=\(standard.argmax) ref=\(standard.refArgmax) logitsErr=\(String(format: "%.4f", standard.logitsMaxErr)) finalHiddenErr=\(String(format: "%.4f", standard.finalHiddenMaxErr))")
-
-        #expect(aggressive.refArgmax == standard.refArgmax)
-    }
-
     @Test("Decode step 1 weight layout variants diagnostic")
     func decodeStep1WeightLayoutVariantsDiagnostic() throws {
         let gpuLock = try GPUTestExclusion.acquire()
@@ -199,14 +155,12 @@ struct DecodeBarrierDiagnosticTests {
     private func runDecodeDiagnostic(
         step: Int,
         tag: String,
-        optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         beforeFinalStep: ((inout MetalInferenceModel, MetalWeightFile) throws -> Void)? = nil,
         mutatePlan: ((MetalDispatchPlan) -> MetalDispatchPlan)? = nil,
         visibilityOptions: MTL4VisibilityOptions = []
     ) throws -> StepDiagnostic {
         let env = try Self.buildEnvironment(
-            optimizer: optimizer,
             weightAccessPolicyOverride: weightAccessPolicyOverride
         )
         var model = env.model
@@ -307,7 +261,6 @@ struct DecodeBarrierDiagnosticTests {
     }
 
     private static func buildEnvironment(
-        optimizer: (any DispatchOptimizer)? = nil,
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil
     ) throws -> TestEnvironment {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -328,7 +281,6 @@ struct DecodeBarrierDiagnosticTests {
         let store = try STAFLoader().load(at: stafURL, device: device)
         let spec = try BenchmarkSupport.loadLFM25ModelSpec()
         let compiler = MetalInferenceCompiler(
-            optimizer: optimizer,
             weightAccessPolicyOverride: weightAccessPolicyOverride
         )
         let decodePlan = try compiler.compile(
@@ -470,7 +422,7 @@ struct DecodeBarrierDiagnosticTests {
             guard context.executionPhase == .decode else {
                 return nil
             }
-            guard case .projection = context.entry.kind else {
+            guard context.entry.fragment is LinearFragment else {
                 return nil
             }
             return .canonicalRowMajor

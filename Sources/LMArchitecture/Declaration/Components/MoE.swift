@@ -12,7 +12,7 @@
 /// ```
 public struct MoE: ModelComponent {
 
-    public typealias Body = Never
+    public typealias Attributes = MoEAttributes
 
     public let expertCount: Int
     public let expertsPerToken: Int
@@ -54,10 +54,10 @@ public struct MoE: ModelComponent {
     }
 }
 
-extension MoE: PrimitiveComponent {
+extension MoE {
 
-    package var operationKind: OperationKind {
-        .primitive(MoEAttributes(
+    public var attributes: MoEAttributes {
+        MoEAttributes(
             expertCount: expertCount,
             expertsPerToken: expertsPerToken,
             gateKind: gateKind,
@@ -69,10 +69,6 @@ extension MoE: PrimitiveComponent {
                 gating: expertGating,
                 bias: expertBias
             )
-        ))
-    }
-
-    package var operationSignature: OperationSignature {
-        OperationSignature(operandArity: .exact(1), resultArity: .exact(1))
+        )
     }
 }

@@ -1,0 +1,105 @@
+import LMIR
+
+extension AttentionAttributes: MetalCompilable {
+
+    /// Fragment expansion for Attention: batched Q/K/V projections, optional QKNorm/RoPE,
+    /// scaled dot-product attention, optional output gate, and O projection.
+    @MetalKernelFragmentBuilder
+    package func fragment(context: KernelContext) -> some MetalKernelFragment {
+        let attentionDimension = headCount * headDimension
+        let qProjectionDimension = outputGate == .sigmoidPackedInQProj
+            ? attentionDimension * 2
+            : attentionDimension
+        let qkWeightBias: Float = qkNorm == .rmsNormUnitOffset ? 1 : 0
+        let queryScratchSlotIndex = outputGate == .sigmoidPackedInQProj ? 4 : 1
+        let usesSharedKV = sharedKeyValueSourceLayerIndex != nil
+
+        // Batched Q/K/V projections (component-internal optimization)
+        if usesSharedKV {
+            LinearFragment(field: "q_proj", inputDimension: hiddenSize, outputDimension: qProjectionDimension)
+        } else {
+            BatchedProjection(projections: [
+                .init(field: "q_proj", inputDimension: hiddenSize, outputDimension: qProjectionDimension),
+                .init(field: "k_proj", inputDimension: hiddenSize, outputDimension: kvHeadCount * headDimension),
+                .init(
+                    field: valueProjectionSource == .keyProjection ? "k_proj" : "v_proj",
+                    inputDimension: hiddenSize,
+                    outputDimension: kvHeadCount * headDimension
+                ),
+            ])
+        }
+        if outputGate == .sigmoidPackedInQProj {
+            PackedQueryExtractFragment(
+                headCount: headCount,
+                headDimension: headDimension,
+                packedSourceSlotIndex: 1,
+                outputSlotIndex: queryScratchSlotIndex
+            )
+        }
+        if let qkNorm = qkNorm, qkNorm != .none {
+            if usesSharedKV {
+                QKNormFragment(
+                    headCount: headCount,
+                    headDimension: headDimension,
+                    epsilon: 1e-6,
+                    weightRole: "q_layernorm",
+                    weightBias: qkWeightBias,
+                    scratchSlotIndex: queryScratchSlotIndex
+                )
+            } else {
+                // Batched QK norm (component-internal optimization)
+                BatchedFragment(
+                    fragments: [
+                        QKNormFragment(
+                            headCount: headCount,
+                            headDimension: headDimension,
+                            epsilon: 1e-6,
+                            weightRole: "q_layernorm",
+                            weightBias: qkWeightBias,
+                            scratchSlotIndex: queryScratchSlotIndex
+                        ),
+                        QKNormFragment(
+                            headCount: kvHeadCount,
+                            headDimension: headDimension,
+                            epsilon: 1e-6,
+                            weightRole: "k_layernorm",
+                            weightBias: qkWeightBias
+                        ),
+                    ],
+                    dispatchDimension: .perHead(headCount: headCount + kvHeadCount)
+                )
+            }
+        }
+        if !usesSharedKV, valueNorm == .rmsNormNoScale {
+            PerHeadRMSNormFragment(
+                headCount: kvHeadCount,
+                headDimension: headDimension,
+                epsilon: 1e-6,
+                scratchSlotIndex: 3
+            )
+        }
+        FlashAttentionFragment(
+            headCount: headCount, kvHeadCount: kvHeadCount,
+            headDimension: headDimension,
+            attentionScale: attentionScale,
+            ropeDimension: rope?.dimension ?? 0,
+            ropeBase: rope?.base ?? 0,
+            ropeScaling: rope?.scaling,
+            mropeAxes: rope?.mropeAxes,
+            querySlotIndex: queryScratchSlotIndex,
+            causal: causal,
+            windowLeft: window?.left,
+            windowRight: window?.right,
+            sharedKVSourceLayerIndex: sharedKeyValueSourceLayerIndex)
+        if outputGate == .sigmoidPackedInQProj {
+            PackedSigmoidGateFragment(
+                dimension: attentionDimension,
+                headDimension: headDimension,
+                packedSourceSlotIndex: 1,
+                packedHeadStride: headDimension * 2,
+                gateHeadOffset: headDimension
+            )
+        }
+        LinearFragment(field: "o_proj", inputDimension: attentionDimension, outputDimension: hiddenSize)
+    }
+}

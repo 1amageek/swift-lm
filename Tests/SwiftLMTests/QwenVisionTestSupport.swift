@@ -460,7 +460,7 @@ private actor QwenVisionSyntheticContainerCache {
         )
         let graph = try ModelGraph(Transformer(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .llamaFamily)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let compiler = MetalInferenceCompiler()
         var compiledModel = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: config.hiddenSize,

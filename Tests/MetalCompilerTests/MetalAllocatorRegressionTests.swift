@@ -62,7 +62,7 @@ struct MetalAllocatorRegressionTests {
 
         let graph = try ModelGraph(Qwen35(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .qwen35Family)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
+        let compiler = MetalInferenceCompiler()
         let maxSequenceLength = 8
         let plan = try compiler.compilePrefill(
             graph: resolved,

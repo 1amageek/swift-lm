@@ -137,62 +137,6 @@ struct GenerationThroughputBenchmarkTests {
         #expect(rawTokens.count == generateCount)
     }
 
-    @Test("Request-level optimizer comparison", .timeLimit(.minutes(2)))
-    func requestLevelOptimizerComparison() async throws {
-        let promptTokens = [1, 1, 6, 6423, 708]
-        let generateCount = 50
-
-        let standardResult: GenerationPipelineBenchmarkSupport.ThroughputResult = try await {
-            var resources = try await GenerationPipelineBenchmarkSupport.makeResources(
-                optimizer: StandardOptimizer(),
-                maximumSequenceLength: promptTokens.count
-            )
-            defer { resources.release() }
-            return try GenerationPipelineBenchmarkSupport.measureMedian(
-                name: "standard",
-                iterations: 5,
-                warmup: 1
-            ) {
-                try GenerationPipelineBenchmarkSupport.runSynchronousLoopNoTokenizer(
-                    model: &resources.syncModel,
-                    promptTokens: promptTokens,
-                    generateCount: generateCount
-                )
-            }
-        }()
-
-        let aggressiveResult: GenerationPipelineBenchmarkSupport.ThroughputResult = try await {
-            var resources = try await GenerationPipelineBenchmarkSupport.makeResources(
-                optimizer: AggressiveOptimizer(),
-                maximumSequenceLength: promptTokens.count
-            )
-            defer { resources.release() }
-            return try GenerationPipelineBenchmarkSupport.measureMedian(
-                name: "aggressive",
-                iterations: 5,
-                warmup: 1
-            ) {
-                try GenerationPipelineBenchmarkSupport.runSynchronousLoopNoTokenizer(
-                    model: &resources.syncModel,
-                    promptTokens: promptTokens,
-                    generateCount: generateCount
-                )
-            }
-        }()
-
-        print("")
-        print("=== Request-Level Optimizer Comparison: LFM2.5-1.2B ===")
-        print("Optimizer               tok/s   ms/tok  generated")
-        print("------------------------------------------------------")
-        print(GenerationPipelineBenchmarkSupport.format(standardResult))
-        print(GenerationPipelineBenchmarkSupport.format(aggressiveResult))
-
-        let aggressiveGain = ((aggressiveResult.tokensPerSecond / standardResult.tokensPerSecond) - 1.0) * 100.0
-        print(String(format: "[Benchmark] aggressive vs standard: %+0.1f%%", aggressiveGain))
-
-        #expect(standardResult.generatedTokenCount == generateCount)
-        #expect(aggressiveResult.generatedTokenCount == generateCount)
-    }
 }
 
 @Suite("Performance: Generation Scaling", .tags(.performance), .serialized, .heartbeat)
@@ -218,7 +162,6 @@ struct GenerationScalingBenchmarkTests {
         let iterations = generateCount >= 512 ? 2 : 3
         let warmup = generateCount >= 512 ? 0 : 1
         var resources = try await GenerationPipelineBenchmarkSupport.makeResources(
-            optimizer: AggressiveOptimizer(),
             maximumSequenceLength: promptTokens.count
         )
         defer { resources.release() }
@@ -288,7 +231,6 @@ struct GenerationStreamingBenchmarkTests {
         for chunkSize in chunkSizes {
             let result: GenerationPipelineBenchmarkSupport.StreamResult = try await {
                 var resources = try await GenerationPipelineBenchmarkSupport.makeResources(
-                    optimizer: AggressiveOptimizer(),
                     maximumSequenceLength: promptTokens.count
                 )
                 defer { resources.release() }
@@ -322,7 +264,6 @@ struct GenerationStreamingBenchmarkTests {
         let promptTokens = [Int](repeating: 1, count: 256)
         let generateCount = 50
         var resources = try await GenerationPipelineBenchmarkSupport.makeResources(
-            optimizer: AggressiveOptimizer(),
             maximumSequenceLength: promptTokens.count
         )
         defer { resources.release() }
@@ -375,7 +316,6 @@ struct GenerationStreamingBenchmarkTests {
 
 private enum GenerationPipelineBenchmarkSupport {
     static func makeResources(
-        optimizer: any DispatchOptimizer = AggressiveOptimizer(),
         maximumSequenceLength: Int = 256
     ) async throws -> BenchmarkResources {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -403,7 +343,7 @@ private enum GenerationPipelineBenchmarkSupport {
         )
         let prefillPolicy = resolvePrefillPolicy(for: decodePolicy)
 
-        let compiler = MetalInferenceCompiler(optimizer: optimizer)
+        let compiler = MetalInferenceCompiler()
         let decodePlan = try compiler.compile(
             graph: resolved,
             hiddenSize: bundleResources.config.hiddenSize,

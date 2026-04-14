@@ -5,36 +5,31 @@ import LMIR
 /// A single kernel dispatch in the plan (IR → fusion → steps).
 public struct DispatchEntry: Sendable {
     public let index: Int
-    public let kind: DispatchKind
+    public let fragment: any PrimitiveMetalKernelFragment
     public let parameterBindings: [ParameterBinding]
     public let layerIndex: Int?
     public let compositeID: Int?
 
     public init(
         index: Int,
-        kind: DispatchKind,
+        fragment: any PrimitiveMetalKernelFragment,
         parameterBindings: [ParameterBinding] = [],
         layerIndex: Int? = nil,
         compositeID: Int? = nil
     ) {
         self.index = index
-        self.kind = kind
+        self.fragment = fragment
         self.parameterBindings = parameterBindings
         self.layerIndex = layerIndex
         self.compositeID = compositeID
     }
-}
 
-/// Kind of dispatch: projection, fragment, fused, batched, or structural.
-public enum DispatchKind: Sendable {
-    case projection(MetalProjection, isOutput: Bool = false)
-    case fragment(any PrimitiveMetalKernelFragment)
-    case fusedCopyNorm(FusedCopyNorm)
-    case fusedResidualAddCopyNorm(FusedResidualAddCopyNorm)
-    case fusedResidualAddNorm(FusedResidualAddNorm)
-    case fusedSwiGLUProjection(FusedSwiGLUProjection)
-    case batchedProjection(BatchedProjection)
-    case batchedFragment(BatchedFragment)
-    case structuralCopy(dimension: Int)
-    case structuralAdd(dimension: Int)
+    /// Human-readable description of the fragment for diagnostics and logging.
+    public var fragmentDescription: String {
+        if let projection = fragment as? ProjectionDescribing {
+            let fields = projection.projectionFields.map(\.field).joined(separator: ",")
+            return "projection(\(fields), isOutput: \(projection.isOutputProjection))"
+        }
+        return String(describing: type(of: fragment))
+    }
 }

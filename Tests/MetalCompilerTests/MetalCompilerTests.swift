@@ -28,10 +28,11 @@ struct FragmentProtocolTests {
     }
 
     @Test
-    func structuralOpsReturnNilFragment() {
+    func structuralOpsAreNotPrimitive() {
         let r = OperationKind.residual(strategy: .add, body: Region())
-        let op = Operation(key: OperationKey(rawValue: 0), kind: r, operands: [], results: [])
-        #expect(op.kernelFragment == nil)
+        if case .primitive = r {
+            Issue.record("Residual should not be primitive")
+        }
     }
 }
 
@@ -61,33 +62,6 @@ struct DispatchPlanCompilationTests {
     }
 
     @Test
-    func standardOptimizerFusesMlpFrontHalfInDispatchDump() throws {
-        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
-        let compiler = MetalInferenceCompiler()
-        let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
-
-        #expect(dump.contains("fusedSwiGLUProjection("), "Standard optimizer should fuse MLP front half:\n\(dump)")
-    }
-
-    @Test
-    func standardOptimizerDoesNotBatchAttentionProjections() throws {
-        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
-        let compiler = MetalInferenceCompiler()
-        let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
-
-        #expect(!dump.contains("batchedProjection("), "Standard optimizer should not batch projections:\n\(dump)")
-    }
-
-    @Test
-    func aggressiveOptimizerBatchesAttentionProjectionsInDispatchDump() throws {
-        let graph = try ModelGraph(TinyTransformer(hiddenSize: 64, layers: 1, vocabSize: 100))
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
-        let dump = compiler.dumpDispatchEntries(graph: graph, hiddenSize: 64)
-
-        #expect(dump.contains("batchedProjection(q_proj,k_proj,v_proj)"), "Aggressive optimizer should batch attention projections:\n\(dump)")
-    }
-
-    @Test
     func threadgroupSizesRespectPipelineLimits() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
         let graph = try ModelGraph(TinyTestModel(hiddenSize: 64, vocabSize: 100))
@@ -106,78 +80,6 @@ struct DispatchPlanCompilationTests {
         }
     }
 
-    @Test
-    func specializedFusedSwiGLUArgumentTableRetainsOutputDimensionConstant() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let model = SpecializedSwiGLUTestModel(
-            hiddenSize: 2048,
-            intermediateSize: 6144,
-            vocabSize: 128
-        )
-        let graph = try ModelGraph(model)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
-        let plan = try compiler.compile(
-            graph: graph,
-            hiddenSize: 2048,
-            intermediateSize: 6144,
-            vocabSize: 128,
-            device: device
-        )
-
-        let step = try #require(plan.steps.first { step in
-            (step.pipeline.label ?? "").hasPrefix("fused_swiglu_projection_2048")
-        })
-        #expect(step.bindings.argumentPolicy == .argumentTable)
-
-        let outputDimensionBinding = try #require(
-            step.bindings.constants.first(where: { $0.index == 4 })
-        )
-        #expect(decodeUInt32(outputDimensionBinding) == 6144)
-    }
-
-    @Test
-    func fusedSwiGLUDecodeRoutingKeepsFollowingProjectionOutOfPlace() throws {
-        guard let device = MTLCreateSystemDefaultDevice() else { return }
-        let model = SpecializedSwiGLUTestModel(
-            hiddenSize: 2048,
-            intermediateSize: 6144,
-            vocabSize: 128
-        )
-        let graph = try ModelGraph(model)
-        let compiler = MetalInferenceCompiler(optimizer: AggressiveOptimizer())
-        let plan = try compiler.compile(
-            graph: graph,
-            hiddenSize: 2048,
-            intermediateSize: 6144,
-            vocabSize: 128,
-            device: device
-        )
-
-        let fusedIndex = try #require(plan.steps.firstIndex { step in
-            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
-            return name.hasPrefix("fused_swiglu_projection_2048")
-        })
-        let fusedStep = plan.steps[fusedIndex]
-        let fusedOutput = try #require(fusedStep.bindings.buffers.first(where: { $0.index == 3 }))
-
-        let nextStepIndex = fusedIndex + 1
-        #expect(nextStepIndex < plan.steps.count)
-        let downProjection = plan.steps[nextStepIndex]
-        let nextKernelName = downProjection.metadata.kernelName ?? downProjection.pipeline.label ?? ""
-        #expect(
-            nextKernelName.hasPrefix("gemv"),
-            "Expected the step after fused SwiGLU to be the following projection, got \(nextKernelName)"
-        )
-        let downInput = try #require(downProjection.bindings.buffers.first(where: { $0.index == 0 }))
-        let downOutput = try #require(downProjection.bindings.buffers.first(where: { $0.index == 2 }))
-
-        #expect(downInput.buffer === fusedOutput.buffer)
-        #expect(downInput.offset == fusedOutput.offset)
-        #expect(
-            !(downOutput.buffer === downInput.buffer && downOutput.offset == downInput.offset),
-            "Decode down projection must not alias fused SwiGLU output in place"
-        )
-    }
 }
 
 @Suite
@@ -224,47 +126,6 @@ struct TinyTransformer: ModelComponent {
         RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
         OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
     }
-}
-
-struct SpecializedSwiGLUTestModel: ModelComponent {
-    let hiddenSize: Int
-    let intermediateSize: Int
-    let vocabSize: Int
-
-    var body: some ModelComponent {
-        TokenEmbedding(vocabSize: vocabSize, embeddingSize: hiddenSize)
-        Residual {
-            RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
-            MLP(inputSize: hiddenSize, intermediateSize: intermediateSize)
-        }
-        RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
-        OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
-    }
-}
-
-private func decodeUInt32(_ binding: MetalConstantBinding) -> UInt32 {
-    switch binding {
-    case .inline(let bytes):
-        return decodeUInt32(bytes.value)
-    case .buffer(let bytes):
-        let start = bytes.offset
-        let end = start + bytes.length
-        guard bytes.length == 4 else {
-            return 0
-        }
-        let contents = bytes.buffer.contents()
-        let pointer = contents.bindMemory(to: UInt8.self, capacity: end)
-        let value = Array(UnsafeBufferPointer(start: pointer.advanced(by: start), count: bytes.length))
-        return decodeUInt32(value)
-    }
-}
-
-private func decodeUInt32(_ bytes: [UInt8]) -> UInt32 {
-    guard bytes.count == 4 else { return 0 }
-    return UInt32(bytes[0])
-        | (UInt32(bytes[1]) << 8)
-        | (UInt32(bytes[2]) << 16)
-        | (UInt32(bytes[3]) << 24)
 }
 
 // MARK: - Kernel Completeness Tests
