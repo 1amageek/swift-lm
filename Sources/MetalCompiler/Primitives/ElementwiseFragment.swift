@@ -1,7 +1,7 @@
 import Metal
 
 /// Elementwise: one thread per element, trivially parallel.
-/// Used by: SwiGLU, GEGLU, SigmoidGate.
+/// Used by: SwiGLU, GEGLU.
 public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     public let count: Int
     public let kind: ElementwiseKind
@@ -11,7 +11,6 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
         case swiglu
         /// gelu_tanh(gate) * up — GELU-gated (Gemma4)
         case geluGated
-        case sigmoidGate
     }
 
     public init(count: Int, kind: ElementwiseKind = .swiglu) {
@@ -19,24 +18,47 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
         self.kind = kind
     }
 
-    /// Whether this elementwise operation uses a gated activation pattern
-    /// (two input buffers: gate and up).
-    public var isGatedActivation: Bool {
+    public var isFusable: Bool { true }
+
+    /// Fusion contract with two buffer inputs.
+    ///
+    /// Note: SynthesizedFragment.decodeBindings binds all `.dataFlow` input
+    /// ports to `currentInputBuffer`. With two buffer inputs, the non-primary
+    /// input would be bound incorrectly if this fragment were fused as a
+    /// consumer. In practice, neighbors are LinearFragment (non-fusable),
+    /// so this fragment is never fused.
+    public var fusionContract: FusionContract? {
+        FusionContract(
+            ports: [
+                FusionPort(name: "gate", direction: .input, role: .buffer, accessPattern: .singlePass),
+                FusionPort(name: "up", direction: .input, role: .buffer, accessPattern: .singlePass),
+                FusionPort(name: "output", direction: .output, role: .buffer),
+            ],
+            parallelism: .perElement(count: count)
+        )
+    }
+
+    public func kernelBody(bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String? {
         switch kind {
-        case .swiglu, .geluGated: return true
-        case .sigmoidGate: return false
+        case .swiglu:
+            return """
+            float g = float(gate[idx]);
+            output[idx] = g * (1.0f / (1.0f + exp(-g))) * float(up[idx]);
+            """
+        case .geluGated:
+            return """
+            float g = float(gate[idx]);
+            output[idx] = 0.5f * g * (1.0f + precise::tanh(0.7978845608f * (g + 0.044715f * g * g * g))) * float(up[idx]);
+            """
         }
     }
 
-    public var isFusable: Bool { true }
     public func kernelName(context: KernelContext) -> String {
         switch kind {
         case .swiglu:
             return context.bufferPrecision == .float32 ? "swiglu_seq_f32" : "swiglu"
         case .geluGated:
             return context.bufferPrecision == .float32 ? "geglu_seq_f32" : "geglu"
-        case .sigmoidGate:
-            return "sigmoid_gate"
         }
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: count) }
@@ -50,7 +72,7 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     /// The activation function used by this elementwise operation.
     public var gatedActivation: MetalSourceGenerator.GatedActivation {
         switch kind {
-        case .swiglu, .sigmoidGate: return .silu
+        case .swiglu: return .silu
         case .geluGated: return .geluTanh
         }
     }

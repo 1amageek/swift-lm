@@ -481,6 +481,249 @@ struct FusionSynthesizerTests {
         #expect(msl.contains("uint16_t*"))
     }
 
+    // MARK: - ElementwiseFragment Fusion
+
+    @Test("ElementwiseFragment provides fusionContract with gate/up/output ports")
+    func elementwiseFusionContract() throws {
+        let frag = ElementwiseFragment(count: 2048, kind: .swiglu)
+        let contract = try #require(frag.fusionContract)
+
+        #expect(contract.ports.count == 3)
+        #expect(contract.ports[0].name == "gate")
+        #expect(contract.ports[0].direction == .input)
+        #expect(contract.ports[1].name == "up")
+        #expect(contract.ports[1].direction == .input)
+        #expect(contract.ports[2].name == "output")
+        #expect(contract.ports[2].direction == .output)
+        #expect(contract.parallelism == .perElement(count: 2048))
+        #expect(contract.requiresSIMDReduction == false)
+        #expect(contract.threadgroupMemoryBytes == 0)
+    }
+
+    @Test("SwiGLU kernelBody contains SiLU activation")
+    func swigluKernelBody() throws {
+        let frag = ElementwiseFragment(count: 1024, kind: .swiglu)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .float16))
+
+        #expect(body.contains("gate[idx]"))
+        #expect(body.contains("up[idx]"))
+        #expect(body.contains("output[idx]"))
+        #expect(body.contains("exp(-g)"))
+    }
+
+    @Test("GEGLU kernelBody contains GELU tanh activation")
+    func geluGatedKernelBody() throws {
+        let frag = ElementwiseFragment(count: 1024, kind: .geluGated)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .float16))
+
+        #expect(body.contains("precise::tanh"))
+        #expect(body.contains("0.7978845608f"))
+        #expect(body.contains("gate[idx]"))
+        #expect(body.contains("up[idx]"))
+    }
+
+    @Test("ElementwiseFragment produces valid MSL via KernelScaffold")
+    func elementwiseScaffoldMSL() throws {
+        let frag = ElementwiseFragment(count: 512, kind: .swiglu)
+        let contract = try #require(frag.fusionContract)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float32, weightFormat: .float16))
+
+        let msl = KernelScaffold.generate(
+            name: "swiglu_scaffold_test",
+            body: body,
+            contract: contract,
+            bufferPrecision: .float32,
+            weightFormats: [:],
+            isSequence: true
+        )
+
+        #expect(msl.contains("kernel void swiglu_scaffold_test"))
+        #expect(msl.contains("gate"))
+        #expect(msl.contains("up"))
+        #expect(msl.contains("output"))
+        #expect(msl.contains("sequenceLength"))
+        #expect(msl.contains("dimension"))
+    }
+
+    // MARK: - QKNormFragment Fusion
+
+    @Test("QKNormFragment provides fusionContract with perHead parallelism")
+    func qkNormFusionContract() throws {
+        let frag = QKNormFragment(
+            headCount: 8, headDimension: 64,
+            epsilon: 1e-6, weightRole: "q_layernorm"
+        )
+        let contract = try #require(frag.fusionContract)
+
+        #expect(contract.ports.count == 3)
+        #expect(contract.ports[0].name == "data")
+        #expect(contract.ports[0].direction == .input)
+        #expect(contract.ports[0].accessPattern == .multiPass)
+        #expect(contract.ports[1].name == "weight")
+        #expect(contract.ports[2].name == "output")
+        #expect(contract.ports[2].direction == .output)
+        #expect(contract.parallelism == .perHead(headCount: 8, headDimension: 64))
+        #expect(contract.requiresSIMDReduction == true)
+        #expect(contract.threadgroupMemoryBytes == 32 * MemoryLayout<Float>.size)
+        #expect(contract.scalarConstants.count == 2)
+        #expect(contract.scalarConstants[0].name == "epsilon")
+        #expect(contract.scalarConstants[1].name == "weightBias")
+    }
+
+    @Test("QKNormFragment kernelBody contains RMS norm pattern")
+    func qkNormKernelBody() throws {
+        let frag = QKNormFragment(
+            headCount: 8, headDimension: 64,
+            epsilon: 1e-6, weightRole: "q_layernorm"
+        )
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .float16))
+
+        // SIMD reduction pattern
+        #expect(body.contains("simd_sum(sumSq)"))
+        #expect(body.contains("shared[simdIndex]"))
+        #expect(body.contains("threadgroup_barrier"))
+        #expect(body.contains("rsqrt(total / float(dimension) + epsilon)"))
+
+        // Uses head-local pointers (no offset computation in body)
+        #expect(body.contains("data[i]"))
+        #expect(body.contains("output[i]"))
+
+        // Weight read
+        #expect(body.contains("weight[i]"))
+    }
+
+    @Test("QKNormFragment scalarConstantValues match contract")
+    func qkNormScalarConstants() {
+        let frag = QKNormFragment(
+            headCount: 8, headDimension: 64,
+            epsilon: 1e-5, weightRole: "k_layernorm",
+            weightBias: 1.0
+        )
+        let values = frag.scalarConstantValues
+
+        if case .float(let eps) = values["epsilon"] {
+            #expect(abs(eps - 1e-5) < 1e-10)
+        } else {
+            Issue.record("epsilon should be .float")
+        }
+        if case .float(let bias) = values["weightBias"] {
+            #expect(bias == 1.0)
+        } else {
+            Issue.record("weightBias should be .float")
+        }
+    }
+
+    @Test("QKNormFragment BF16 kernelBody uses bf16_to_float")
+    func qkNormBF16KernelBody() throws {
+        let frag = QKNormFragment(
+            headCount: 8, headDimension: 64,
+            epsilon: 1e-6, weightRole: "q_layernorm"
+        )
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .bfloat16))
+
+        #expect(body.contains("bf16_to_float"))
+    }
+
+    // MARK: - SigmoidGateFragment Fusion
+
+    @Test("SigmoidGateFragment provides fusionContract with input/gate/output ports")
+    func sigmoidGateFusionContract() throws {
+        let frag = SigmoidGateFragment(dimension: 1024)
+        let contract = try #require(frag.fusionContract)
+
+        #expect(contract.ports.count == 3)
+        #expect(contract.ports[0].name == "input")
+        #expect(contract.ports[0].direction == .input)
+        #expect(contract.ports[1].name == "gate")
+        #expect(contract.ports[1].direction == .input)
+        #expect(contract.ports[2].name == "output")
+        #expect(contract.ports[2].direction == .output)
+
+        if case .perElement(let count) = contract.parallelism {
+            #expect(count == 1024)
+        } else {
+            Issue.record("Expected perElement parallelism")
+        }
+    }
+
+    @Test("SigmoidGateFragment kernelBody applies sigmoid to gate signal")
+    func sigmoidGateFragmentKernelBody() throws {
+        let frag = SigmoidGateFragment(dimension: 512)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .float16))
+
+        #expect(body.contains("gate[idx]"))
+        #expect(body.contains("input[idx]"))
+        #expect(body.contains("output[idx]"))
+        #expect(body.contains("exp(-g)"))
+    }
+
+    // MARK: - Per-Head Scaffold
+
+    @Test("Per-head scaffold generates decode mode MSL with head-offset pointers")
+    func perHeadScaffoldDecode() throws {
+        let frag = QKNormFragment(
+            headCount: 4, headDimension: 32,
+            epsilon: 1e-6, weightRole: "test_norm"
+        )
+        let contract = try #require(frag.fusionContract)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float16, weightFormat: .float16))
+
+        let msl = KernelScaffold.generate(
+            name: "qknorm_decode_test",
+            body: body,
+            contract: contract,
+            bufferPrecision: .float16,
+            weightFormats: ["test_norm": .float16],
+            isSequence: false
+        )
+
+        #expect(msl.contains("kernel void qknorm_decode_test"))
+        // Head-offset pointer computation
+        #expect(msl.contains("data_base"))
+        #expect(msl.contains("output_base"))
+        #expect(msl.contains("headIndex * dimension"))
+        // Grid attribute
+        #expect(msl.contains("threadgroup_position_in_grid"))
+        // Bounds check with embedded headCount
+        #expect(msl.contains("headIndex >= 4"))
+        // Shared memory for SIMD reduction
+        #expect(msl.contains("threadgroup float shared[32]"))
+        // Weight port has no _base suffix
+        #expect(msl.contains("device const half* weight"))
+        #expect(!msl.contains("weight_base"))
+    }
+
+    @Test("Per-head scaffold generates sequence mode MSL")
+    func perHeadScaffoldSequence() throws {
+        let frag = QKNormFragment(
+            headCount: 8, headDimension: 64,
+            epsilon: 1e-6, weightRole: "test_norm"
+        )
+        let contract = try #require(frag.fusionContract)
+        let body = try #require(frag.kernelBody(bufferPrecision: .float32, weightFormat: .float16))
+
+        let msl = KernelScaffold.generate(
+            name: "qknorm_seq_test",
+            body: body,
+            contract: contract,
+            bufferPrecision: .float32,
+            weightFormats: ["test_norm": .float16],
+            isSequence: true
+        )
+
+        #expect(msl.contains("kernel void qknorm_seq_test"))
+        // Sequence mode markers
+        #expect(msl.contains("sequenceLength"))
+        #expect(msl.contains("seqPos"))
+        #expect(msl.contains("uint2 gid"))
+        #expect(msl.contains("headIndex = gid.x"))
+        #expect(msl.contains("seqPos = gid.y"))
+        // Head+seq offset computation
+        #expect(msl.contains("seqPos * 8 * dimension + headIndex * dimension"))
+        // Bounds check
+        #expect(msl.contains("headIndex >= 8"))
+    }
+
     // MARK: - Sequence Mode Fusion
 
     @Test("Register fusion works in sequence mode (F32 prefill)")

@@ -22,7 +22,10 @@ public struct PackedQueryExtractFragment: PrimitiveMetalKernelFragment {
         self.outputSlotIndex = outputSlotIndex
     }
 
-    public var isFusable: Bool { true }
+    /// Not fusable: packed-to-contiguous re-indexing (headIndex * 2 * headDimension + lane)
+    /// requires non-uniform buffer stride incompatible with perElement scaffold's
+    /// uniform element indexing.
+    public var isFusable: Bool { false }
 
     public func kernelName(context: KernelContext) -> String {
         context.bufferPrecision == .float32 ? "packed_query_extract_seq_f32" : "packed_query_extract"

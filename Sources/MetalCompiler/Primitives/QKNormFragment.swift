@@ -34,6 +34,59 @@ public struct QKNormFragment: PrimitiveMetalKernelFragment {
     }
     public var normEpsilon: Float? { epsilon }
     public var supportsInPlaceBatching: Bool { true }
+
+    // MARK: - Fusion Contract
+
+    public var fusionContract: FusionContract? {
+        FusionContract(
+            ports: [
+                FusionPort(name: "data", direction: .input, role: .buffer, accessPattern: .multiPass),
+                FusionPort(name: "weight", direction: .input, role: .weight(field: weightRole)),
+                FusionPort(name: "output", direction: .output, role: .buffer),
+            ],
+            scalarConstants: [
+                ScalarConstant(name: "epsilon", metalType: "float"),
+                ScalarConstant(name: "weightBias", metalType: "float"),
+            ],
+            parallelism: .perHead(headCount: headCount, headDimension: headDimension),
+            threadgroupMemoryBytes: 32 * MemoryLayout<Float>.size,
+            requiresSIMDReduction: true
+        )
+    }
+
+    public var scalarConstantValues: [String: ScalarConstantValue] {
+        ["epsilon": .float(epsilon), "weightBias": .float(weightBias)]
+    }
+
+    public func kernelBody(bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String? {
+        let readWeight = weightFormat.readExpression("weight[i]")
+        return """
+        float sumSq = 0.0f;
+        for (uint i = tid; i < dimension; i += threadgroupSize) {
+            float v = float(data[i]);
+            sumSq += v * v;
+        }
+        sumSq = simd_sum(sumSq);
+
+        uint simdIndex = tid / SIMD_WIDTH;
+        if (tid % SIMD_WIDTH == 0) shared[simdIndex] = sumSq;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float total = 0.0f;
+            uint sgCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+            for (uint s = 0; s < sgCount; s++) total += shared[s];
+            shared[0] = rsqrt(total / float(dimension) + epsilon);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float _rms_scale = shared[0];
+        for (uint i = tid; i < dimension; i += threadgroupSize) {
+            output[i] = float(data[i]) * _rms_scale * (\(readWeight) + weightBias);
+        }
+        """
+    }
+
     public func kernelName(context: KernelContext) -> String {
         if context.bufferPrecision == .float32 { return "qk_rms_norm_seq_f32" }
         return context.weightFormat == .bfloat16 ? "qk_rms_norm_bf16" : "qk_rms_norm"

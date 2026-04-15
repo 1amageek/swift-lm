@@ -253,8 +253,11 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
             threadgroupSize = MTLSize(width: tgSize, height: 1, depth: 1)
             threadgroupMemoryLength = 0
 
-        case .perHead:
-            fatalError("[SynthesizedFragment] Per-head prefill not yet supported")
+        case .perHead(let headCount, _):
+            let threads = min(32, pipeline.maxTotalThreadsPerThreadgroup)
+            gridSize = MTLSize(width: headCount, height: context.maximumSequenceLength, depth: 1)
+            threadgroupSize = MTLSize(width: threads, height: 1, depth: 1)
+            threadgroupMemoryLength = 0
         }
 
         // Routing state: derived from merged contract output structure
@@ -269,7 +272,7 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
         case .perElement:
             sequenceLengthPolicy = .bindAndAdjustGridHeight(index: seqLenIndex)
         case .perHead:
-            sequenceLengthPolicy = .bind(index: seqLenIndex)
+            sequenceLengthPolicy = .bindAndAdjustGridHeight(index: seqLenIndex)
         }
 
         return FragmentPrefillSteps(

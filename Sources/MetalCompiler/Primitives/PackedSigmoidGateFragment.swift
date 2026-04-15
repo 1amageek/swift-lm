@@ -23,7 +23,10 @@ public struct PackedSigmoidGateFragment: PrimitiveMetalKernelFragment {
         self.gateHeadOffset = gateHeadOffset
     }
 
-    public var isFusable: Bool { true }
+    /// Not fusable: packed head-interleaved layout requires non-uniform buffer
+    /// stride (packedHeadStride) incompatible with perElement scaffold's uniform
+    /// element indexing.
+    public var isFusable: Bool { false }
 
     public func kernelName(context: KernelContext) -> String {
         context.bufferPrecision == .float32 ? "packed_sigmoid_gate_seq_f32" : "packed_sigmoid_gate"

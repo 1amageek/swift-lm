@@ -255,8 +255,113 @@ public struct KernelScaffold {
         weightFormats: [String: WeightFormat],
         isSequence: Bool
     ) -> String {
-        // Per-head scaffold — deferred until QKNormFragment/RoPEFragment are migrated
-        fatalError("Per-head scaffold not yet implemented")
+        let bt = bufferPrecision.metalType
+        let sharedDecl = contract.requiresSIMDReduction ? "threadgroup float shared[32];" : ""
+
+        let indentedBody = body.split(separator: "\n", omittingEmptySubsequences: false)
+            .map { "        \($0)" }
+            .joined(separator: "\n")
+
+        if isSequence {
+            // Sequence mode: grid = (headCount, seqLen), one threadgroup per (head, position)
+            var bufferDecls: [String] = []
+            var bufferIndex = 0
+            var pointerLines: [String] = []
+
+            for port in contract.ports {
+                switch port.role {
+                case .buffer:
+                    let constQualifier = port.direction == .input ? "const " : ""
+                    bufferDecls.append("    device \(constQualifier)\(bt)* \(port.name)_base [[buffer(\(bufferIndex))]]")
+                    pointerLines.append("        device \(constQualifier)\(bt)* \(port.name) = \(port.name)_base + seqPos * \(headCount) * dimension + headIndex * dimension;")
+                    bufferIndex += 1
+                case .weight(let field):
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
+                    bufferIndex += 1
+                }
+            }
+
+            let dimensionIndex = bufferIndex
+            var nextIndex = dimensionIndex + 1
+            var scalarDecls: [String] = []
+            for sc in contract.scalarConstants {
+                scalarDecls.append("    constant \(sc.metalType)& \(sc.name)       [[buffer(\(nextIndex))]]")
+                nextIndex += 1
+            }
+            let seqLenIndex = nextIndex
+
+            let allDecls = bufferDecls + [
+                "    constant uint& dimension        [[buffer(\(dimensionIndex))]]"
+            ] + scalarDecls + [
+                "    constant uint& sequenceLength   [[buffer(\(seqLenIndex))]]"
+            ]
+
+            return """
+            kernel void \(name)(
+            \(allDecls.joined(separator: ",\n")),
+                uint2 gid                       [[threadgroup_position_in_grid]],
+                uint tid                        [[thread_index_in_threadgroup]],
+                uint threadgroupSize            [[threads_per_threadgroup]]
+            ) {
+                uint headIndex = gid.x;
+                uint seqPos = gid.y;
+                if (headIndex >= \(headCount) || seqPos >= sequenceLength) return;
+
+            \(pointerLines.joined(separator: "\n"))
+                \(sharedDecl)
+
+            \(indentedBody)
+            }
+            """
+        } else {
+            // Decode mode: grid = (headCount), one threadgroup per head
+            var bufferDecls: [String] = []
+            var bufferIndex = 0
+            var pointerLines: [String] = []
+
+            for port in contract.ports {
+                switch port.role {
+                case .buffer:
+                    let constQualifier = port.direction == .input ? "const " : ""
+                    bufferDecls.append("    device \(constQualifier)\(bt)* \(port.name)_base [[buffer(\(bufferIndex))]]")
+                    pointerLines.append("        device \(constQualifier)\(bt)* \(port.name) = \(port.name)_base + headIndex * dimension;")
+                    bufferIndex += 1
+                case .weight(let field):
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
+                    bufferIndex += 1
+                }
+            }
+
+            let dimensionIndex = bufferIndex
+            var nextIndex = dimensionIndex + 1
+            var scalarDecls: [String] = []
+            for sc in contract.scalarConstants {
+                scalarDecls.append("    constant \(sc.metalType)& \(sc.name)       [[buffer(\(nextIndex))]]")
+                nextIndex += 1
+            }
+
+            let allDecls = bufferDecls + [
+                "    constant uint& dimension        [[buffer(\(dimensionIndex))]]"
+            ] + scalarDecls
+
+            return """
+            kernel void \(name)(
+            \(allDecls.joined(separator: ",\n")),
+                uint headIndex                  [[threadgroup_position_in_grid]],
+                uint tid                        [[thread_index_in_threadgroup]],
+                uint threadgroupSize            [[threads_per_threadgroup]]
+            ) {
+                if (headIndex >= \(headCount)) return;
+
+            \(pointerLines.joined(separator: "\n"))
+                \(sharedDecl)
+
+            \(indentedBody)
+            }
+            """
+        }
     }
 
     // MARK: - Buffer Parameter Generation
