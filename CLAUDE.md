@@ -660,7 +660,8 @@ Vision encoder と text decoder は独立したモデル。IR に vision encoder
 - Weight quantization (Q4/Q8) が decode 高速化の最大レバー (帯域 2-4x 削減)
 - **Dispatch overhead が支配的**: decode で GPU 時間の ~85% が barrier 同期 (528 × ~30μs)、prefill で ~500 dispatches × ~45μs。個別 kernel の計算時間ではなく dispatch 数がボトルネック
 - **最適化の焦点は dispatch 数の削減**: compiler による自動 kernel fusion が唯一の根本解決策。fusable な隣接 fragment を単一 kernel に合成し、barrier 数を直接削減する
-- **MLX graph compilation との差**: EmbeddingGemma prefill で swift-lm 44.3 emb/s vs MLX 62.0 emb/s — MLX はグラフ全体を compiled kernel にまとめて dispatch overhead を排除している
+- **MLX graph compilation との比較**: EmbeddingGemma prefill で swift-lm BF16 66.2 emb/s vs MLX 62.0 emb/s — 自動 kernel fusion により MLX を逆転 (旧: swift-lm 44.3 emb/s, +49.4% 改善)
+- **Prefill は compute-bound**: Q4 (54.0 emb/s) が BF16 (66.2 emb/s) より遅い。GEMM は計算密度が高く weight 帯域がボトルネックにならない。Q4 の dequant dispatch overhead (projection あたり +1 dispatch) が純損失。Q4 の帯域削減が活きるのは decode (GEMV, bandwidth-bound) のみ
 
 ### Barrier Optimization — Decode Path
 
@@ -719,6 +720,20 @@ fusion 前: 528 barriers × ~30μs = ~15.8ms が GPU 時間の ~85% を占める
 - Transformer 1 layer あたり ~4 dispatch 削減 (28.6%)
 - Gemma4-E2B (35 layers) 外挿: ~528 → ~388 barriers, ~15.8ms → ~11.6ms (~4.2ms 削減)
 - Metal 4 concurrent dispatch との組み合わせで更なる削減が可能
+
+#### EmbeddingGemma Prefill Benchmark
+
+EmbeddingGemma-300M (24 layers, hiddenSize=768, sandwich norms) の embedding throughput:
+
+| Variant | Steps | Throughput | vs MLX |
+|---|---|---|---|
+| BF16 (community-bf16) | 314 | **66.2 emb/s** | **+6.8%** (MLX: 62.0 emb/s) |
+| Q4 (community-4bit) | 242 | **54.0 emb/s** | — |
+| swift-lm (旧, fusion 前) | ~500 | 44.3 emb/s | -28.5% |
+
+自動 kernel fusion により MLX を逆転。sandwich norm パターン (RMSNorm+ResidualAdd+Copy+RMSNorm) の 4-way fusion で dispatch 数を大幅に削減。
+
+Q4 が BF16 より遅い理由: prefill は GEMM (compute-bound) であり、Q4 の weight 帯域削減が活きない。かつ Q4 は projection ごとに dequant dispatch (+1) が必要で純粋な overhead になる。Q4 の帯域削減が有効なのは decode (GEMV, bandwidth-bound) のみ。
 
 ## Qwen3.5 = VLM（Vision Language Model）
 
