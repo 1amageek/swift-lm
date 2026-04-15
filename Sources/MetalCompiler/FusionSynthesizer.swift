@@ -80,13 +80,20 @@ public struct FusionSynthesizer {
             resolvedParallelism = resolvedParallelism.resolved(with: next)
         }
 
+        // Phase 1.5: Deduplicate weight ports and scalar constants across entries.
+        //
+        // When multiple entries have the same port name (e.g., two Reduction fragments
+        // both have "weight", "epsilon", "weightBias"), the generated MSL would have
+        // duplicate parameter declarations. Rename colliding names with entry index suffix.
+        let (deduplicatedEntries, deduplicationRenames) = deduplicateNonDataNames(entries)
+
         // Phase 2: Split entries into LoopGroups.
         //
         // A LoopGroup is a maximal contiguous run of entries connected by register
         // intermediates. Threadgroup memory intermediates create group boundaries.
         // Within a group, bodies are concatenated into a single loop so register
         // variables are read in the same iteration that wrote them.
-        let groups = buildLoopGroups(entries: entries, resolvedParallelism: resolvedParallelism)
+        let groups = buildLoopGroups(entries: deduplicatedEntries, resolvedParallelism: resolvedParallelism)
 
         // Phase 3: Process each LoopGroup — rename variables and concatenate bodies.
         //
@@ -102,7 +109,7 @@ public struct FusionSynthesizer {
             var registerDeclarations: [String] = []
 
             for (localIdx, entryIdx) in group.entryIndices.enumerated() {
-                var body = entries[entryIdx].body
+                var body = deduplicatedEntries[entryIdx].body
 
                 // Apply inter-group renames (threadgroup intermediates from previous groups)
                 body = applyRenames(body, interGroupRenames)
@@ -113,8 +120,8 @@ public struct FusionSynthesizer {
                 // Register intermediate to next entry within this group
                 if localIdx < group.entryIndices.count - 1 {
                     let nextEntryIdx = group.entryIndices[localIdx + 1]
-                    guard let producerOutput = entries[entryIdx].contract.primaryOutput,
-                          let consumerInput = entries[nextEntryIdx].contract.primaryInput else {
+                    guard let producerOutput = deduplicatedEntries[entryIdx].contract.primaryOutput,
+                          let consumerInput = deduplicatedEntries[nextEntryIdx].contract.primaryInput else {
                         throw SynthesisError.noConnectablePort(
                             producerIndex: entryIdx, consumerIndex: nextEntryIdx)
                     }
@@ -128,6 +135,11 @@ public struct FusionSynthesizer {
                     registerDeclarations.append("    float \(intermediateName);")
                 }
 
+                // Wrap each entry body in a scope block to prevent local variable
+                // name collisions between entries (e.g., two Reduction fragments
+                // both declare sumSquared, simdIndex, _rms_scale).
+                body = "    {\n" + body + "\n    }"
+
                 groupBodyParts.append(body)
             }
 
@@ -138,8 +150,8 @@ public struct FusionSynthesizer {
             if groupIdx < groups.count - 1 {
                 let lastEntryIdx = group.entryIndices.last!
                 let nextGroupFirstIdx = groups[groupIdx + 1].entryIndices.first!
-                guard let producerOutput = entries[lastEntryIdx].contract.primaryOutput,
-                      let consumerInput = entries[nextGroupFirstIdx].contract.primaryInput else {
+                guard let producerOutput = deduplicatedEntries[lastEntryIdx].contract.primaryOutput,
+                      let consumerInput = deduplicatedEntries[nextGroupFirstIdx].contract.primaryInput else {
                     throw SynthesisError.noConnectablePort(
                         producerIndex: lastEntryIdx, consumerIndex: nextGroupFirstIdx)
                 }
@@ -151,8 +163,8 @@ public struct FusionSynthesizer {
                 )
                 interGroupRenames.append((consumerInput.name, tgName, .array))
 
-                let storage = entries[lastEntryIdx].contract.intermediateStorage(
-                    to: entries[nextGroupFirstIdx].contract)
+                let storage = deduplicatedEntries[lastEntryIdx].contract.intermediateStorage(
+                    to: deduplicatedEntries[nextGroupFirstIdx].contract)
                 if case .threadgroupMemory(let dimension) = storage {
                     threadgroupDeclarations.append(
                         "    threadgroup float \(tgName)[\(dimension)];")
@@ -190,16 +202,18 @@ public struct FusionSynthesizer {
 
         // Phase 5: Build merged contract
         let mergedContract = mergeContracts(
-            entries: entries,
+            entries: deduplicatedEntries,
             resolvedParallelism: resolvedParallelism,
             intermediateNames: Set<String>()
         )
 
         // Phase 6: Combine weight formats
         var combinedWeightFormats: [String: WeightFormat] = [:]
-        for entry in entries {
+        for (entryIdx, entry) in deduplicatedEntries.enumerated() {
+            let renames = deduplicationRenames[entryIdx]
             for (key, value) in entry.weightFormats {
-                combinedWeightFormats[key] = value
+                let renamedKey = renames[key] ?? key
+                combinedWeightFormats[renamedKey] = value
             }
         }
 
@@ -298,20 +312,23 @@ public struct FusionSynthesizer {
     /// happens lazily in kernelSource().
     ///
     /// Handles arbitrary entry counts — computes intermediate storage for each
-    /// adjacent pair automatically.
+    /// adjacent pair automatically. Deduplicates colliding weight port names and
+    /// scalar constant names across entries.
     public static func mergeContracts(
         entries: [Entry],
         resolvedParallelism: KernelParallelism
     ) -> FusionContract {
+        let (deduplicatedEntries, _) = deduplicateNonDataNames(entries)
         var intermediateTGMemory = 0
-        for i in 0..<(entries.count - 1) {
-            let storage = entries[i].contract.intermediateStorage(to: entries[i + 1].contract)
+        for i in 0..<(deduplicatedEntries.count - 1) {
+            let storage = deduplicatedEntries[i].contract.intermediateStorage(
+                to: deduplicatedEntries[i + 1].contract)
             if case .threadgroupMemory(let dim) = storage {
                 intermediateTGMemory += dim * MemoryLayout<Float>.size
             }
         }
         return mergeContractsInternal(
-            entries: entries,
+            entries: deduplicatedEntries,
             resolvedParallelism: resolvedParallelism,
             intermediateTGMemory: intermediateTGMemory
         )
@@ -456,6 +473,133 @@ public struct FusionSynthesizer {
     /// Apply accumulated renames to a port name.
     private static func applyRenames(_ name: String, _ renames: [String: String]) -> String {
         renames[name] ?? name
+    }
+
+    // MARK: - Name Deduplication
+
+    /// Detect and rename colliding weight port names and scalar constant names
+    /// across entries to prevent MSL parameter redefinition errors.
+    ///
+    /// When multiple entries have the same non-data port name (e.g., two Reduction
+    /// fragments both have "weight") or scalar constant name (e.g., "epsilon"),
+    /// the merged contract would produce duplicate parameter declarations.
+    ///
+    /// For each collision, the second (and subsequent) occurrence is suffixed with
+    /// `_N` where N is the entry index. The body is renamed accordingly.
+    ///
+    /// Returns the deduplicated entries and a per-entry rename map for weight formats.
+    private static func deduplicateNonDataNames(
+        _ entries: [Entry]
+    ) -> (entries: [Entry], renames: [[String: String]]) {
+        // Count occurrences of each weight port name and scalar name across entries
+        var weightPortNameCounts: [String: Int] = [:]
+        var scalarNameCounts: [String: Int] = [:]
+
+        for entry in entries {
+            for port in entry.contract.ports {
+                if case .weight = port.role {
+                    weightPortNameCounts[port.name, default: 0] += 1
+                }
+            }
+            for sc in entry.contract.scalarConstants {
+                scalarNameCounts[sc.name, default: 0] += 1
+            }
+        }
+
+        let collidingWeightNames = Set(weightPortNameCounts.filter { $0.value > 1 }.map(\.key))
+        let collidingScalarNames = Set(scalarNameCounts.filter { $0.value > 1 }.map(\.key))
+
+        // No collisions — return entries unchanged
+        if collidingWeightNames.isEmpty && collidingScalarNames.isEmpty {
+            return (entries, Array(repeating: [:], count: entries.count))
+        }
+
+        // Track how many times each colliding name has been seen to build unique suffixes
+        var weightNameSeenCount: [String: Int] = [:]
+        var scalarNameSeenCount: [String: Int] = [:]
+
+        var deduplicatedEntries: [Entry] = []
+        var allRenames: [[String: String]] = []
+
+        for (entryIdx, entry) in entries.enumerated() {
+            var bodyRenames: [(oldName: String, newName: String)] = []
+            var portRenames: [String: String] = [:]
+            var scalarRenames: [String: String] = [:]
+
+            // Rename colliding weight ports
+            for port in entry.contract.ports {
+                if case .weight = port.role, collidingWeightNames.contains(port.name) {
+                    let seenCount = weightNameSeenCount[port.name, default: 0]
+                    weightNameSeenCount[port.name] = seenCount + 1
+                    if seenCount > 0 {
+                        let newName = "\(port.name)_\(entryIdx)"
+                        portRenames[port.name] = newName
+                        bodyRenames.append((port.name, newName))
+                    }
+                }
+            }
+
+            // Rename colliding scalar constants
+            for sc in entry.contract.scalarConstants {
+                if collidingScalarNames.contains(sc.name) {
+                    let seenCount = scalarNameSeenCount[sc.name, default: 0]
+                    scalarNameSeenCount[sc.name] = seenCount + 1
+                    if seenCount > 0 {
+                        let newName = "\(sc.name)_\(entryIdx)"
+                        scalarRenames[sc.name] = newName
+                        bodyRenames.append((sc.name, newName))
+                    }
+                }
+            }
+
+            // Apply renames to body and contract
+            if bodyRenames.isEmpty {
+                deduplicatedEntries.append(entry)
+                allRenames.append([:])
+            } else {
+                var renamedBody = entry.body
+                for (oldName, newName) in bodyRenames {
+                    renamedBody = replaceVariableName(in: renamedBody, oldName: oldName, newName: newName)
+                }
+
+                let renamedPorts = entry.contract.ports.map { port -> FusionPort in
+                    if let newName = portRenames[port.name] {
+                        return FusionPort(
+                            name: newName,
+                            direction: port.direction,
+                            role: port.role,
+                            accessPattern: port.accessPattern,
+                            bufferIntent: port.bufferIntent
+                        )
+                    }
+                    return port
+                }
+
+                let renamedScalars = entry.contract.scalarConstants.map { sc -> ScalarConstant in
+                    if let newName = scalarRenames[sc.name] {
+                        return ScalarConstant(name: newName, metalType: sc.metalType)
+                    }
+                    return sc
+                }
+
+                let renamedContract = FusionContract(
+                    ports: renamedPorts,
+                    scalarConstants: renamedScalars,
+                    parallelism: entry.contract.parallelism,
+                    threadgroupMemoryBytes: entry.contract.threadgroupMemoryBytes,
+                    requiresSIMDReduction: entry.contract.requiresSIMDReduction
+                )
+
+                deduplicatedEntries.append(Entry(
+                    contract: renamedContract,
+                    body: renamedBody,
+                    weightFormats: entry.weightFormats
+                ))
+                allRenames.append(portRenames)
+            }
+        }
+
+        return (deduplicatedEntries, allRenames)
     }
 
     // MARK: - Parallelism Adaptation

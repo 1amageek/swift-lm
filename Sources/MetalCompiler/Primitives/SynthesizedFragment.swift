@@ -102,12 +102,40 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
 
     // MARK: - Scalar Constant Values
 
-    /// Collect scalar constant values from all constituent fragments.
+    /// Collect scalar constant values from all constituent fragments, deduplicating
+    /// names to match the merged contract's scalar constants.
+    ///
+    /// When multiple fragments have the same scalar constant name (e.g., two
+    /// Reduction fragments both have "epsilon"), the merged contract renames
+    /// the second occurrence to "epsilon_N". This property rebuilds the value map
+    /// using the same deduplication logic so that lookup by renamed name succeeds.
     public var scalarConstantValues: [String: ScalarConstantValue] {
         var values: [String: ScalarConstantValue] = [:]
+        var nameCounts: [String: Int] = [:]
+
+        // Count occurrences of each scalar name across fragments
         for fragment in fragments {
+            for key in fragment.scalarConstantValues.keys {
+                nameCounts[key, default: 0] += 1
+            }
+        }
+
+        let collidingNames = Set(nameCounts.filter { $0.value > 1 }.map(\.key))
+        var seenCounts: [String: Int] = [:]
+
+        for (fragmentIndex, fragment) in fragments.enumerated() {
             for (key, value) in fragment.scalarConstantValues {
-                values[key] = value
+                if collidingNames.contains(key) {
+                    let seen = seenCounts[key, default: 0]
+                    seenCounts[key] = seen + 1
+                    if seen > 0 {
+                        values["\(key)_\(fragmentIndex)"] = value
+                    } else {
+                        values[key] = value
+                    }
+                } else {
+                    values[key] = value
+                }
             }
         }
         return values

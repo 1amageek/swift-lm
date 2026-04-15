@@ -50,11 +50,10 @@ struct ModelGraphResolver {
         switch modelType.lowercased() {
         case "gemma3_text":
             do {
-                try Gemma3Text.validate(config)
+                return try ModelGraph(EmbeddingGemma(config: config))
             } catch let error as ModelGraphBuildError {
                 throw ModelBundleLoaderError.invalidConfig(error.description)
             }
-            return try ModelGraph(Gemma3TextBackbone(config: config))
         default:
             throw ModelBundleLoaderError.invalidConfig(
                 "Text embedding backbone is not supported for model_type: \(modelType)"
