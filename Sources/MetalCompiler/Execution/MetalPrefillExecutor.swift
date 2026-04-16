@@ -4,6 +4,25 @@ import Metal
 private let prefillSplitCopyNormPassesEnabled =
     ProcessInfo.processInfo.environment["SWIFTLM_METAL_SPLIT_COPY_NORM_PASSES"] == "1"
 
+/// Split prefill into separate encoder passes at every layer boundary.
+///
+/// When enabled, each layer (or group of steps sharing the same layerIndex)
+/// gets its own MTL4CommandBuffer + compute encoder. This adds a full GPU
+/// synchronization point at each layer boundary, bypassing any potential
+/// intra-encoder barrier issues with concurrent dispatch.
+private let prefillSplitLayerPassesEnabled =
+    ProcessInfo.processInfo.environment["SWIFTLM_METAL_SPLIT_LAYER_PASSES"] == "1"
+
+/// Split prefill into a separate encoder pass for every single step.
+///
+/// When enabled, each step gets its own MTL4CommandBuffer + compute encoder +
+/// fresh argument table + commit+waitUntilCompleted. This is the most
+/// conservative execution mode, equivalent to the step-by-step probe.
+/// Used to diagnose whether intra-encoder argument table aliasing or
+/// concurrent dispatch issues cause correctness failures.
+private let prefillSplitPerStepEnabled =
+    ProcessInfo.processInfo.environment["SWIFTLM_METAL_SPLIT_PER_STEP"] == "1"
+
 func prefillHiddenOverrideReplayStartStepIndex(kernelNames: [String]) -> Int {
     kernelNames.prefix { kernelName in
         kernelName.hasPrefix("embedding_lookup_seq")
@@ -23,6 +42,9 @@ func prefillPassRanges(
     within range: Range<Int>
 ) -> [Range<Int>] {
     guard !range.isEmpty else { return [] }
+    if prefillSplitPerStepEnabled {
+        return range.map { $0..<($0 + 1) }
+    }
     var ranges: [Range<Int>] = []
     var lowerBound = range.lowerBound
     for index in (range.lowerBound + 1)..<range.upperBound {
@@ -39,6 +61,14 @@ private func shouldStartNewPrefillPass(
     before index: Int,
     steps: [MetalPrefillStep]
 ) -> Bool {
+    // Per-layer split: new pass whenever layerIndex changes
+    if prefillSplitLayerPassesEnabled, index > 0 {
+        let previousLayer = steps[index - 1].metadata.layerIndex
+        let currentLayer = steps[index].metadata.layerIndex
+        if previousLayer != currentLayer {
+            return true
+        }
+    }
     guard prefillSplitCopyNormPassesEnabled else { return false }
     guard index > 0 else { return false }
     let previousStep = steps[index - 1]

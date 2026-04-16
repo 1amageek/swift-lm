@@ -18,15 +18,22 @@ public struct PerLayerInputAttributes: OperationAttributes, Codable, Equatable {
     /// Activation used by the input gate.
     public let activation: ActivationKind
 
+    /// Weight bias for the post-per-layer-input RMSNorm.
+    ///
+    /// Gemma family uses `1 + weight` pattern (bias = 1).
+    public let normWeightBias: Float
+
     public init(
         hiddenSize: Int,
         perLayerInputSize: Int,
         vocabSize: Int,
-        activation: ActivationKind = .custom("gelu_pytorch_tanh")
+        activation: ActivationKind = .custom("gelu_pytorch_tanh"),
+        normWeightBias: Float = 0
     ) {
         self.hiddenSize = hiddenSize
         self.perLayerInputSize = perLayerInputSize
         self.vocabSize = vocabSize
         self.activation = activation
+        self.normWeightBias = normWeightBias
     }
 }

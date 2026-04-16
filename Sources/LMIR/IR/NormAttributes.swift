@@ -13,10 +13,17 @@ public struct RMSNormAttributes: OperationAttributes, Codable, Equatable {
     /// weights and apply `1 + weight` at runtime.
     public let weightBias: Float
 
-    public init(dimension: Int, epsilon: Float = 1e-6, weightBias: Float = 0) {
+    /// Whether a learnable scale weight is applied after normalization.
+    ///
+    /// When `false`, the operation only divides by RMS without applying a
+    /// learned per-element scale. Used by Gemma4 vision multi-modal embedder.
+    public let withScale: Bool
+
+    public init(dimension: Int, epsilon: Float = 1e-6, weightBias: Float = 0, withScale: Bool = true) {
         self.dimension = dimension
         self.epsilon = epsilon
         self.weightBias = weightBias
+        self.withScale = withScale
     }
 }
 

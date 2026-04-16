@@ -280,13 +280,22 @@ Buffer routing (MetalPrefillStepBuilder / decode bindings)
 - prefill と decode の routing state は別物として検証する。片方が正しくてももう片方は壊れうる。
 - fragment 追加時は `kernelBody()` と `FusionContract` で計算ロジック・合成可能性を宣言する。buffer routing は compiler に委ねる。
 
-破損時の調査順序:
+破損時の調査順序 — Probe First:
 
-1. declaration が正しい graph を作っているか
-2. fragment expansion が期待どおりか
-3. dispatch entries が意味的依存を保っているか
-4. prefill/decode step builder の buffer routing が一致しているか
-5. optimizer の有無で出力が変わらないか
+**出力が壊れたら、まず Probe で壊れた場所を特定する。コードの静的解析や機能の無効化で原因を推測してはならない。**
+
+1. **Layer Probe で障害層を特定する**: `debugPrefillLastTokenHiddenSnapshots` で全層の hidden を検査し、最初にゼロ/異常値になる層を見つける
+2. **障害層の step を精査する**: `debugPrefillStepSummaries` と `debugDescribePrefillSteps` で障害層内の各 dispatch step の kernel 名・buffer routing を確認する
+3. **HuggingFace Python の中間値と比較する**: Python で同一入力の各層・各 step の中間値を取得し、swift-lm の値と並べて乖離箇所を特定する。swift-lm 内部の「正常層」との比較は参考にしない — 全層が壊れている可能性がある
+4. **中間値を Probe する**: 障害層内の各 step 後の hidden/residual/scratch 値を snapshot して、どの step で値が壊れるか絞り込む
+5. **壊れた step の kernel source を検査する**: 特定された kernel の MSL source を `kernelSource()` / `kernelBody()` で確認し、HuggingFace の該当 forward() コードとの差異を探す
+
+禁止事項:
+
+- **機能を無効化して切り分けてはならない** — fusion の無効化、optimizer のバイパス等は禁止。正常な動作パスを壊す変更は診断ではない
+- **コードの静的解析だけで原因を推測してはならない** — 実行時の値を観測してから仮説を立てる
+- **一度に複数の仮説を検証してはならない** — Probe で 1 つの仮説を確認し、結果を見てから次に進む
+- **swift-lm 内部の比較だけで正しいと判断してはならない** — HuggingFace Python の参照値と一致して初めて正しいとする
 
 ### Test Execution Stability
 
@@ -592,17 +601,18 @@ swift build
 性能測定の前に、次の順で検証する:
 
 1. fragment / planner の contract test
-2. focused real-model output test
-3. optimizer-mode regression test
-4. benchmark
+2. **Layer Probe で全層の hidden state を検査** — 障害層を特定
+3. 障害層内の step-by-step probe で壊れた kernel を特定
+4. focused real-model output test (token IDs, HuggingFace Python 参照値との比較)
+5. benchmark
 
 追加ルール:
 
 - 出力が壊れている状態で benchmark を進めない。
+- **Probe で壊れた層・step を特定してからコードを読む** — コードの静的解析から始めない。
 - sampling 経路と argmax 経路は別に確認する。`temperature` が変わるだけで壊れる場合、sampling path の所有権や CPU 読み出し前提を疑う。
 - `storageModePrivate` のバッファを host sampling に渡してはいけない。CPU readable な logits source を明示的に使う。
-- 比較時は `none` / `standard` / `aggressive` の実効 optimizer を確認する。ラベルではなく実際に有効な plan を基準にする。
-- end-to-end の弱い文字列一致だけで合格にしない。可能なら token IDs、先頭トークン列、reference 実装との一致を取る。
+- end-to-end の弱い文字列一致だけで合格にしない。可能なら token IDs、先頭トークン列、HuggingFace Python 実装との一致を取る。
 
 ### Crash-Resistant Real-Model Test Procedure
 
@@ -614,6 +624,16 @@ swift build
 
 ## Design Rules
 
+### HuggingFace が唯一の正 (Single Source of Truth)
+
+- **各モデルの計算ロジックは HuggingFace `modeling_*.py` の `forward()` を正とする** — swift-lm の既存実装・テストを正しいと仮定してはならない
+- **モデルごとに独立して HuggingFace 実装を検証する** — 別のモデルの実装を参考にしてはならない（例: Gemma2 の RMSNorm 式を Gemma4 に適用しない。Qwen3.5 のパラメータを Gemma4 に流用しない）
+- **新しいモデルの実装手順**: (1) HuggingFace `modeling_*.py` の forward() を読む → (2) Python で参照値を取得する → (3) swift-lm で実装する → (4) Python の参照値と比較して検証する
+- **バグ調査手順**: (1) Python で正しい中間値を取得する → (2) swift-lm の中間値と比較する → (3) 乖離箇所を特定する → (4) HuggingFace の該当コードと swift-lm の該当コードを比較する
+- **swift-lm のコードから「正しいはず」と推測してはならない** — HuggingFace と比較して初めて正しいと判断する
+
+### その他
+
 - HF ディレクトリ (config.json + safetensors + tokenizer.json) が正規ソース
 - config.json に必須項目が欠けていたら補完せずエラー
 - IR はランタイム非依存。Metal/MLX/TPU 固有の型を IR に持ち込まない
@@ -622,14 +642,15 @@ swift build
 - 全 public 型は `Sendable`
 - デプロイメント判断（KV cache 量子化、最大シーケンス長）は `InferencePolicy` で外部化。compiler 内部にハードコードしない
 - `KVCacheSpecification` の `maximumSequenceLength` にデフォルト値を持たせない — silent fallback 防止
+- **全てのモデル計算は ModelComponent → IR → MetalCompiler → Metal GPU で実装する** — CPU 純 Swift での計算実装は禁止
 
 ## Vision Encoder
 
-Vision encoder と text decoder は独立したモデル。IR に vision encoder を含めない。
+Vision encoder と text decoder は独立したモデル。それぞれ独立した ModelGraph を持つ。
 
 ### アーキテクチャ概要
 
-Vision encoder は CPU 上で実行する純粋な Swift 実装。Metal kernel は使わない。画像を patch embedding → transformer layers → pooling → text space projection の順で処理し、text decoder の embedding 空間に射影する。
+Vision encoder は text decoder と同様に ModelComponent → IR → MetalCompiler → Metal GPU で実行する。
 
 ### Gemma4 Vision Encoder
 

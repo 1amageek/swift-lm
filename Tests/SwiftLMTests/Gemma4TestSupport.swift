@@ -234,6 +234,10 @@ enum Gemma4TestSupport {
                 values: Array(repeating: 1, count: 16),
                 shape: [16]
             )
+            tensors["\(prefix).self_attn.v_norm.weight"] = .init(
+                values: Array(repeating: Float(0), count: 16),
+                shape: [16]
+            )
             tensors["\(prefix).self_attn.q_proj.weight"] = .init(
                 values: repeatingRamp(count: hiddenSize * hiddenSize, scale: 0.0002),
                 shape: [hiddenSize, hiddenSize]

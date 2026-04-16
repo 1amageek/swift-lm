@@ -70,13 +70,25 @@ extension AttentionAttributes: MetalCompilable {
                 )
             }
         }
-        if !usesSharedKV, valueNorm == .rmsNormNoScale {
-            PerHeadRMSNormFragment(
-                headCount: kvHeadCount,
-                headDimension: headDimension,
-                epsilon: 1e-6,
-                scratchSlotIndex: 3
-            )
+        if !usesSharedKV, let valueNorm {
+            switch valueNorm {
+            case .rmsNormNoScale:
+                PerHeadRMSNormFragment(
+                    headCount: kvHeadCount,
+                    headDimension: headDimension,
+                    epsilon: 1e-6,
+                    scratchSlotIndex: 3
+                )
+            case .rmsNormUnitOffset:
+                QKNormFragment(
+                    headCount: kvHeadCount,
+                    headDimension: headDimension,
+                    epsilon: 1e-6,
+                    weightRole: "v_layernorm",
+                    weightBias: 1,
+                    scratchSlotIndex: 3
+                )
+            }
         }
         FlashAttentionFragment(
             headCount: headCount, kvHeadCount: kvHeadCount,

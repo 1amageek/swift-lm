@@ -608,6 +608,165 @@ struct ModelDeclarationTests {
         #expect(graph.rootRegion.operations.isEmpty == false)
         #expect(graph.rootRegion.results.count == 1)
     }
+
+    // MARK: - Gemma4 Vision
+
+    @Test("Gemma4Vision produces valid ModelGraph")
+    func gemma4VisionGraph() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 27,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+        #expect(graph.rootRegion.operations.isEmpty == false)
+        #expect(graph.rootRegion.results.count == 1)
+    }
+
+    @Test("Gemma4Vision first operation is PatchEmbedding")
+    func gemma4VisionPatchEmbedding() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+
+        let firstOp = graph.rootRegion.operations[0]
+        guard case .primitive(let attrs) = firstOp.kind,
+              let patchAttrs = attrs as? PatchEmbeddingAttributes else {
+            Issue.record("Expected PatchEmbeddingAttributes as first op")
+            return
+        }
+        #expect(patchAttrs.patchPixelDimension == 14 * 14 * 3)
+        #expect(patchAttrs.hiddenSize == 1152)
+    }
+
+    @Test("Gemma4Vision has no OutputHead (embedding-only)")
+    func gemma4VisionNoOutputHead() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+
+        let hasOutputHead = findFirstOperation(in: graph.rootRegion) {
+            $0 is OutputHeadAttributes
+        }
+        #expect(hasOutputHead == nil)
+    }
+
+    @Test("Gemma4Vision attention is non-causal with MRoPE and QKNorm")
+    func gemma4VisionAttention() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+
+        let attnOp = findFirstOperation(in: graph.rootRegion) {
+            $0 is AttentionAttributes
+        }
+        guard case .primitive(let rawAttrs) = attnOp?.kind,
+              let attrs = rawAttrs as? AttentionAttributes else {
+            Issue.record("No attention operation found")
+            return
+        }
+        #expect(attrs.causal == false)
+        #expect(attrs.qkNorm == .rmsNorm)
+        #expect(attrs.rope != nil)
+        #expect(attrs.rope?.base == 100.0)
+        #expect(attrs.rope?.mropeAxes != nil)
+        #expect(attrs.rope?.mropeAxes?.sections == [18, 18])
+        #expect(attrs.headCount == 16)
+        #expect(attrs.kvHeadCount == 16)
+    }
+
+    @Test("Gemma4Vision contains Pooling operation")
+    func gemma4VisionPooling() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+
+        let poolOp = findFirstOperation(in: graph.rootRegion) {
+            $0 is PoolingAttributes
+        }
+        guard case .primitive(let rawAttrs) = poolOp?.kind,
+              let attrs = rawAttrs as? PoolingAttributes else {
+            Issue.record("No pooling operation found")
+            return
+        }
+        #expect(attrs.kernelSize == 4)
+        #expect(attrs.hiddenSize == 1152)
+        #expect(attrs.rescale != nil)
+    }
+
+    @Test("Gemma4Vision last operation is Linear projection to text space")
+    func gemma4VisionProjection() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 1152,
+            intermediateSize: 4304,
+            headCount: 16,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 1536
+        )
+        let graph = try ModelGraph(model)
+
+        let ops = graph.rootRegion.operations
+        let lastOp = ops[ops.count - 1]
+        guard case .primitive(let attrs) = lastOp.kind,
+              let linearAttrs = attrs as? LinearAttributes else {
+            Issue.record("Expected LinearAttributes as last op, got \(lastOp.kind)")
+            return
+        }
+        #expect(linearAttrs.inputSize == 1152)
+        #expect(linearAttrs.outputSize == 1536)
+    }
 }
 
 // MARK: - Test Configurations

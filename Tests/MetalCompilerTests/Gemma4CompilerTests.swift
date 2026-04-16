@@ -5,6 +5,8 @@ import Testing
 @testable import MetalCompiler
 @testable import ModelDeclarations
 
+// MARK: - Shared Helpers
+
 private func findFirstOperation(
     in region: Region,
     matching predicate: (any OperationAttributes) -> Bool
@@ -38,127 +40,130 @@ private func findFirstOperation(
     return nil
 }
 
-@Suite("Gemma4 Compiler", .serialized)
-struct Gemma4CompilerTests {
-    @Test("Gemma4 compile allocates per-layer input buffers", .timeLimit(.minutes(2)))
+private func collectTensorNames(in region: Region, into names: inout [String]) {
+    for operation in region.operations {
+        for binding in operation.parameterBindings {
+            names.append(binding.tensorName)
+        }
+        switch operation.kind {
+        case .residual(_, let body):
+            collectTensorNames(in: body, into: &names)
+        case .repeating(let count, let body):
+            _ = count
+            collectTensorNames(in: body, into: &names)
+        case .parallel(_, let branches):
+            for branch in branches {
+                collectTensorNames(in: branch, into: &names)
+            }
+        case .conditional(_, let thenBody, let elseBody):
+            collectTensorNames(in: thenBody, into: &names)
+            collectTensorNames(in: elseBody, into: &names)
+        default:
+            break
+        }
+    }
+}
+
+private func makeGemma4TextConfig(numKVSharedLayers: Int = 1) -> ModelConfig {
+    ModelConfig(
+        hiddenSize: 64,
+        layerCount: 2,
+        intermediateSize: 128,
+        vocabSize: 4096,
+        attentionHeads: 4,
+        kvHeads: 1,
+        headDim: 16,
+        attentionBias: false,
+        mlpBias: false,
+        normEps: 1e-6,
+        normKind: .rmsNorm,
+        ropeTheta: 10_000.0,
+        ropeDimension: 16,
+        ropeScaling: nil,
+        tiedEmbeddings: true,
+        expertCount: nil,
+        expertsPerToken: nil,
+        qkNorm: true,
+        fullAttentionInterval: nil,
+        ssmNumHeads: nil,
+        ssmKeyHeadDim: nil,
+        ssmValueHeadDim: nil,
+        convKernelSize: nil,
+        partialRotaryFactor: nil,
+        slidingWindow: 32,
+        layerTypes: ["sliding_attention", "full_attention"],
+        hiddenSizePerLayerInput: 8,
+        vocabSizePerLayerInput: 4096,
+        globalHeadDim: 16,
+        globalKVHeads: nil,
+        numKVSharedLayers: numKVSharedLayers,
+        useDoubleWideMLP: false,
+        attentionKEqualsV: true,
+        fullAttentionRopeTheta: 1_000_000.0,
+        fullAttentionPartialRotaryFactor: 0.25,
+        fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
+    )
+}
+
+// MARK: - Gemma4 Text Decoder Compiler Tests
+
+@Suite("Gemma4 Text Compiler", .serialized)
+struct Gemma4TextCompilerTests {
+    @Test("Allocates per-layer input buffers", .timeLimit(.minutes(2)))
     func compileAllocatesPerLayerInputs() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
-            print("[Skip] No Metal device available for Gemma4 compiler tests")
+            print("[Skip] No Metal device available")
             return
         }
 
-        let config = ModelConfig(
-            hiddenSize: 64,
-            layerCount: 2,
-            intermediateSize: 128,
-            vocabSize: 4096,
-            attentionHeads: 4,
-            kvHeads: 1,
-            headDim: 16,
-            attentionBias: false,
-            mlpBias: false,
-            normEps: 1e-6,
-            normKind: .rmsNorm,
-            ropeTheta: 10_000.0,
-            ropeDimension: 16,
-            ropeScaling: nil,
-            tiedEmbeddings: true,
-            expertCount: nil,
-            expertsPerToken: nil,
-            qkNorm: true,
-            fullAttentionInterval: nil,
-            ssmNumHeads: nil,
-            ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil,
-            convKernelSize: nil,
-            partialRotaryFactor: nil,
-            slidingWindow: 32,
-            layerTypes: ["sliding_attention", "full_attention"],
-            hiddenSizePerLayerInput: 8,
-            vocabSizePerLayerInput: 4096,
-            globalHeadDim: 16,
-            globalKVHeads: nil,
-            numKVSharedLayers: 1,
-            useDoubleWideMLP: false,
-            attentionKEqualsV: true,
-            fullAttentionRopeTheta: 1_000_000.0,
-            fullAttentionPartialRotaryFactor: 0.25,
-            fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
-        )
-        let graph = try ModelGraph(Gemma4(config: config))
-        let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
-        let compiler = MetalInferenceCompiler()
-        var compiled = try compiler.compile(
-            graph: resolvedGraph,
-            hiddenSize: config.hiddenSize,
-            intermediateSize: config.intermediateSize,
-            vocabSize: config.vocabSize,
-            device: device
-        )
-        let prefillPlan = try compiler.compilePrefill(
-            graph: resolvedGraph,
-            hiddenSize: config.hiddenSize,
-            intermediateSize: config.intermediateSize,
-            vocabSize: config.vocabSize,
-            inferencePolicy: InferencePolicy(maximumSequenceLength: 128),
-            sharedKVCache: compiled.buffers.kvCache,
-            sharedConvState: compiled.buffers.convState,
-            sharedConvStateDimension: compiled.buffers.convStateDimension,
-            sharedConvStateKernelSize: compiled.buffers.convStateKernelSize,
-            sharedRecurrentState: compiled.buffers.recurrentState,
-            sharedRecurrentStateBytesPerLayer: compiled.buffers.recurrentStateBytesPerLayer,
-            device: device
-        )
-        compiled = compiled.withPrefillPlan(prefillPlan)
+        let result = try autoreleasepool {
+            let config = makeGemma4TextConfig()
+            let graph = try ModelGraph(Gemma4(config: config))
+            let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
+            let compiler = MetalInferenceCompiler()
+            var compiled = try compiler.compile(
+                graph: resolvedGraph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                device: device
+            )
+            let prefillPlan = try compiler.compilePrefill(
+                graph: resolvedGraph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                inferencePolicy: InferencePolicy(maximumSequenceLength: 128),
+                sharedKVCache: compiled.buffers.kvCache,
+                sharedConvState: compiled.buffers.convState,
+                sharedConvStateDimension: compiled.buffers.convStateDimension,
+                sharedConvStateKernelSize: compiled.buffers.convStateKernelSize,
+                sharedRecurrentState: compiled.buffers.recurrentState,
+                sharedRecurrentStateBytesPerLayer: compiled.buffers.recurrentStateBytesPerLayer,
+                device: device
+            )
+            compiled = compiled.withPrefillPlan(prefillPlan)
+            return (
+                hasPerLayerInputs: compiled.buffers.perLayerInputs != nil,
+                perLayerInputDimension: compiled.buffers.perLayerInputDimension,
+                perLayerInputLayerCount: compiled.buffers.perLayerInputLayerCount,
+                prefillHasPerLayerInputs: prefillPlan.buffers.perLayerInputs != nil,
+                prefillPerLayerInputDimension: prefillPlan.buffers.perLayerInputDimension,
+                prefillPerLayerInputLayerCount: prefillPlan.buffers.perLayerInputLayerCount
+            )
+        }
 
-        #expect(compiled.buffers.perLayerInputs != nil)
-        #expect(compiled.buffers.perLayerInputDimension == 8)
-        #expect(compiled.buffers.perLayerInputLayerCount == 2)
-        #expect(prefillPlan.buffers.perLayerInputs != nil)
-        #expect(prefillPlan.buffers.perLayerInputDimension == 8)
-        #expect(prefillPlan.buffers.perLayerInputLayerCount == 2)
+        #expect(result.hasPerLayerInputs)
+        #expect(result.perLayerInputDimension == 8)
+        #expect(result.perLayerInputLayerCount == 2)
+        #expect(result.prefillHasPerLayerInputs)
+        #expect(result.prefillPerLayerInputDimension == 8)
+        #expect(result.prefillPerLayerInputLayerCount == 2)
     }
 
-    @Test("Gemma4 full-attention omits dedicated v_proj binding when K=V", .timeLimit(.minutes(2)))
+    @Test("Full-attention omits dedicated v_proj binding when K=V", .timeLimit(.minutes(2)))
     func fullAttentionOmitsDedicatedVProjectionBinding() throws {
-        let config = ModelConfig(
-            hiddenSize: 64,
-            layerCount: 2,
-            intermediateSize: 128,
-            vocabSize: 4096,
-            attentionHeads: 4,
-            kvHeads: 1,
-            headDim: 16,
-            attentionBias: false,
-            mlpBias: false,
-            normEps: 1e-6,
-            normKind: .rmsNorm,
-            ropeTheta: 10_000.0,
-            ropeDimension: 16,
-            ropeScaling: nil,
-            tiedEmbeddings: true,
-            expertCount: nil,
-            expertsPerToken: nil,
-            qkNorm: true,
-            fullAttentionInterval: nil,
-            ssmNumHeads: nil,
-            ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil,
-            convKernelSize: nil,
-            partialRotaryFactor: nil,
-            slidingWindow: 32,
-            layerTypes: ["sliding_attention", "full_attention"],
-            hiddenSizePerLayerInput: 8,
-            vocabSizePerLayerInput: 4096,
-            globalHeadDim: 16,
-            globalKVHeads: nil,
-            numKVSharedLayers: 0,
-            useDoubleWideMLP: false,
-            attentionKEqualsV: true,
-            fullAttentionRopeTheta: 1_000_000.0,
-            fullAttentionPartialRotaryFactor: 0.25,
-            fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
-        )
+        let config = makeGemma4TextConfig(numKVSharedLayers: 0)
 
         let graph = try ModelGraph(Gemma4(config: config))
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
@@ -189,99 +194,218 @@ struct Gemma4CompilerTests {
         )
     }
 
-    @Test("Gemma4 prefill captures residual only for residual-entry norms", .timeLimit(.minutes(2)))
+    @Test("Prefill captures residual only for residual-entry norms", .timeLimit(.minutes(2)))
     func prefillCapturesResidualOnlyForResidualEntryNorms() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
-            print("[Skip] No Metal device available for Gemma4 compiler tests")
+            print("[Skip] No Metal device available")
             return
         }
 
-        let config = ModelConfig(
-            hiddenSize: 64,
-            layerCount: 2,
-            intermediateSize: 128,
-            vocabSize: 4096,
-            attentionHeads: 4,
-            kvHeads: 1,
-            headDim: 16,
-            attentionBias: false,
-            mlpBias: false,
-            normEps: 1e-6,
-            normKind: .rmsNorm,
-            ropeTheta: 10_000.0,
-            ropeDimension: 16,
-            ropeScaling: nil,
-            tiedEmbeddings: true,
-            expertCount: nil,
-            expertsPerToken: nil,
-            qkNorm: true,
-            fullAttentionInterval: nil,
-            ssmNumHeads: nil,
-            ssmKeyHeadDim: nil,
-            ssmValueHeadDim: nil,
-            convKernelSize: nil,
-            partialRotaryFactor: nil,
-            slidingWindow: 32,
-            layerTypes: ["sliding_attention", "full_attention"],
-            hiddenSizePerLayerInput: 8,
-            vocabSizePerLayerInput: 4096,
-            globalHeadDim: 16,
-            globalKVHeads: nil,
-            numKVSharedLayers: 1,
-            useDoubleWideMLP: false,
-            attentionKEqualsV: true,
-            fullAttentionRopeTheta: 1_000_000.0,
-            fullAttentionPartialRotaryFactor: 0.25,
-            fullAttentionRoPEScaling: RoPEScaling(kind: .custom("proportional"), factor: 1.0)
-        )
-        let graph = try ModelGraph(Gemma4(config: config))
-        let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
-        let compiler = MetalInferenceCompiler()
-        let compiled = try compiler.compile(
-            graph: resolvedGraph,
-            hiddenSize: config.hiddenSize,
-            intermediateSize: config.intermediateSize,
-            vocabSize: config.vocabSize,
-            device: device
-        )
-        let prefillPlan = try compiler.compilePrefill(
-            graph: resolvedGraph,
-            hiddenSize: config.hiddenSize,
-            intermediateSize: config.intermediateSize,
-            vocabSize: config.vocabSize,
-            inferencePolicy: InferencePolicy(maximumSequenceLength: 128),
-            sharedKVCache: compiled.buffers.kvCache,
-            sharedConvState: compiled.buffers.convState,
-            sharedConvStateDimension: compiled.buffers.convStateDimension,
-            sharedConvStateKernelSize: compiled.buffers.convStateKernelSize,
-            sharedRecurrentState: compiled.buffers.recurrentState,
-            sharedRecurrentStateBytesPerLayer: compiled.buffers.recurrentStateBytesPerLayer,
-            device: device
-        )
+        let config = makeGemma4TextConfig()
+        let layerCount = config.layerCount
+        let residualCounts = try autoreleasepool {
+            let graph = try ModelGraph(Gemma4(config: config))
+            let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
+            let compiler = MetalInferenceCompiler()
+            let compiled = try compiler.compile(
+                graph: resolvedGraph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                device: device
+            )
+            let prefillPlan = try compiler.compilePrefill(
+                graph: resolvedGraph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                inferencePolicy: InferencePolicy(maximumSequenceLength: 128),
+                sharedKVCache: compiled.buffers.kvCache,
+                sharedConvState: compiled.buffers.convState,
+                sharedConvStateDimension: compiled.buffers.convStateDimension,
+                sharedConvStateKernelSize: compiled.buffers.convStateKernelSize,
+                sharedRecurrentState: compiled.buffers.recurrentState,
+                sharedRecurrentStateBytesPerLayer: compiled.buffers.recurrentStateBytesPerLayer,
+                device: device
+            )
 
-        for layerIndex in 0..<config.layerCount {
-            let layerSteps = prefillPlan.steps.enumerated().filter { _, step in
-                step.metadata.layerIndex == layerIndex
-            }
+            var counts: [Int: Int] = [:]
+            for layerIndex in 0..<layerCount {
+                let layerSteps = prefillPlan.steps.enumerated().filter { _, step in
+                    step.metadata.layerIndex == layerIndex
+                }
 
-            // Residual capture steps: standalone copy_buffer OR fused synthesized
-            // fragments that include copy logic (Copy+RMSNorm fusion).
-            let standaloneCopySteps = layerSteps.filter { _, step in
-                step.pipeline.label == "copy_buffer_seq_f32"
-            }
-            let synthesizedSteps = layerSteps.filter { _, step in
-                step.pipeline.label?.hasPrefix("synthesized_") == true
-            }
+                let standaloneCopySteps = layerSteps.filter { _, step in
+                    step.pipeline.label == "copy_buffer_seq_f32"
+                }
+                let synthesizedSteps = layerSteps.filter { _, step in
+                    step.pipeline.label?.hasPrefix("synthesized_") == true
+                }
 
-            // With automatic fusion, Copy+RMSNorm are merged into synthesized
-            // fragments. The residual capture still happens inside the fused kernel.
-            // Verify that at least 2 residual-handling dispatches exist per layer
-            // (one for attention block, one for MLP block), regardless of fusion.
-            let residualHandlingCount = standaloneCopySteps.count + synthesizedSteps.count
+                counts[layerIndex] = standaloneCopySteps.count + synthesizedSteps.count
+            }
+            return counts
+        }
+
+        for layerIndex in 0..<layerCount {
+            let residualHandlingCount = residualCounts[layerIndex, default: 0]
             #expect(
                 residualHandlingCount >= 2,
                 "Gemma4 layer \(layerIndex) should have at least 2 residual-handling dispatches (standalone or fused)"
             )
         }
+    }
+
+    @Test("Embedding fragment carries scale and kernel name includes _scaled", .timeLimit(.minutes(1)))
+    func embeddingFragmentCarriesScale() throws {
+        let config = makeGemma4TextConfig()
+        let graph = try ModelGraph(Gemma4(config: config))
+        let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: .gemma4Family)
+
+        // Find TokenEmbeddingAttributes in the IR
+        let embeddingOperation = findFirstOperation(in: resolvedGraph.rootRegion) {
+            $0 is TokenEmbeddingAttributes
+        }
+        let embeddingAttributes = try #require(
+            embeddingOperation.flatMap { op -> TokenEmbeddingAttributes? in
+                if case .primitive(let attrs) = op.kind { return attrs as? TokenEmbeddingAttributes }
+                return nil
+            },
+            "Graph must contain a TokenEmbeddingAttributes operation"
+        )
+
+        // Verify IR attributes carry embeddingScale
+        let expectedScale = Float(config.hiddenSize).squareRoot()
+        let irScale = try #require(embeddingAttributes.embeddingScale, "embeddingScale must not be nil")
+        #expect(abs(irScale - expectedScale) < 0.01, "IR embeddingScale \(irScale) should equal sqrt(\(config.hiddenSize))=\(expectedScale)")
+
+        // Verify MetalCompilable produces GatherFragment with embeddingScale
+        let kernelContext = KernelContext(bufferPrecision: .float32, weightFormat: .float16)
+        let fragment = embeddingAttributes.fragment(context: kernelContext)
+        let fragmentScale = try #require(fragment.embeddingScale, "GatherFragment.embeddingScale must not be nil")
+        #expect(abs(fragmentScale - expectedScale) < 0.01)
+
+        // Verify kernel name includes _scaled
+        let kernelName = fragment.kernelName(context: kernelContext)
+        print("[Embedding] kernelName=\(kernelName) embeddingScale=\(fragmentScale)")
+        #expect(kernelName.contains("_scaled"), "Kernel name '\(kernelName)' should include '_scaled'")
+
+        // Verify kernel source includes scale parameter at buffer(5) for sequence mode
+        let kernelSource = fragment.kernelSource(
+            name: kernelName,
+            bufferPrecision: .float32,
+            weightFormat: .float16
+        )
+        #expect(kernelSource.contains("buffer(5)"), "Kernel source should have scale at buffer(5)")
+        #expect(kernelSource.contains("* scale"), "Kernel source should apply '* scale'")
+    }
+}
+
+// MARK: - Gemma4 Vision Compiler Tests
+
+
+@Suite("Gemma4 Vision Compiler", .serialized)
+struct Gemma4VisionCompilerTests {
+    @Test("Resolves weight bindings with vision tower paths", .timeLimit(.minutes(1)))
+    func visionWeightBindings() throws {
+        let model = Gemma4Vision(
+            hiddenSize: 64,
+            intermediateSize: 128,
+            headCount: 4,
+            layerCount: 2,
+            patchSize: 14,
+            inChannels: 3,
+            poolingKernelSize: 4,
+            positionEmbeddingSize: 8,
+            gridWidth: 4,
+            ropeTheta: 100.0,
+            hiddenAct: "gelu_pytorch_tanh",
+            textHiddenSize: 96,
+            standardize: true
+        )
+        let graph = try ModelGraph(model)
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .gemma4VisionFamily)
+
+        var allTensorNames: [String] = []
+        collectTensorNames(in: resolved.rootRegion, into: &allTensorNames)
+
+        // Patch embedding
+        #expect(allTensorNames.contains("model.vision_tower.patch_embedder.input_proj.weight"))
+
+        // Position embedding table
+        #expect(allTensorNames.contains("model.vision_tower.patch_embedder.position_embedding_table"))
+
+        // Layer 0 sandwich norms
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.input_layernorm.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.post_attention_layernorm.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.pre_feedforward_layernorm.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.post_feedforward_layernorm.weight"))
+
+        // Layer 0 attention with .linear.weight suffix
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.k_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.v_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.o_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.q_norm.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.self_attn.k_norm.weight"))
+
+        // Layer 0 MLP with .linear.weight suffix
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.mlp.gate_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.mlp.up_proj.linear.weight"))
+        #expect(allTensorNames.contains("model.vision_tower.encoder.layers.0.mlp.down_proj.linear.weight"))
+
+        // Standardize weights
+        #expect(allTensorNames.contains("model.vision_tower.std_bias"))
+        #expect(allTensorNames.contains("model.vision_tower.std_scale"))
+
+        // Root-level norm (post-pooling) has withScale=false, so no weight binding.
+        #expect(allTensorNames.contains("model.vision_tower.norm.weight") == false)
+
+        // Vision-to-text projection
+        #expect(allTensorNames.contains("model.embed_vision.embedding_projection.weight"))
+    }
+
+    @Test("compilePrefill succeeds for embedding-only graph", .timeLimit(.minutes(2)))
+    func visionCompilePrefill() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            print("[Skip] No Metal device available")
+            return
+        }
+
+        let hasSteps = try autoreleasepool {
+            let model = Gemma4Vision(
+                hiddenSize: 64,
+                intermediateSize: 128,
+                headCount: 4,
+                layerCount: 2,
+                patchSize: 14,
+                inChannels: 3,
+                poolingKernelSize: 4,
+                positionEmbeddingSize: 8,
+                gridWidth: 4,
+                ropeTheta: 100.0,
+                hiddenAct: "gelu_pytorch_tanh",
+                textHiddenSize: 96
+            )
+            let graph = try ModelGraph(model)
+            let resolved = ParameterResolver().resolve(graph: graph, convention: .gemma4VisionFamily)
+            let compiler = MetalInferenceCompiler()
+            let prefillPlan = try compiler.compilePrefill(
+                graph: resolved,
+                hiddenSize: 64,
+                intermediateSize: 128,
+                vocabSize: 0,
+                inferencePolicy: InferencePolicy(maximumSequenceLength: 256),
+                sharedKVCache: nil,
+                sharedConvState: nil,
+                sharedConvStateDimension: 0,
+                sharedConvStateKernelSize: 0,
+                sharedRecurrentState: nil,
+                sharedRecurrentStateBytesPerLayer: 0,
+                device: device
+            )
+            return !prefillPlan.steps.isEmpty
+        }
+        #expect(hasSteps)
     }
 }

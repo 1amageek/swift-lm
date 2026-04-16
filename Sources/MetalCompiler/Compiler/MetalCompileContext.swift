@@ -178,10 +178,6 @@ struct CompileContext {
 struct WeightResolver {
     let entry: DispatchEntry
     let stafWeightStore: STAFWeightStore?
-    let fallbackBuffer: MTLBuffer
-    let fallbackWeightFormat: WeightFormat
-    let minimumFallbackLength: Int
-    let logsMisses: Bool
     let executionPhase: STAFWeightExecutionPhase
     let accessPolicyResolver: ProjectionWeightAccessPolicyResolver
 
@@ -198,42 +194,13 @@ struct WeightResolver {
             return (access.buffer, access.offset)
         }
 
-        if logsMisses {
-            let bindingName = entry.parameterBindings.first(where: { $0.role == role })?.tensorName ?? "(no binding)"
-            print("[Compiler] WEIGHT MISS: role='\(role)' tensorName='\(bindingName)' bindings=\(entry.parameterBindings.map(\.role))")
-        }
-
-        return (makeFallbackBuffer(for: role), 0)
+        let bindingName = entry.parameterBindings.first(where: { $0.role == role })?.tensorName ?? "(no binding)"
+        let allRoles = entry.parameterBindings.map(\.role).joined(separator: ", ")
+        let fragmentType = String(describing: type(of: entry.fragment))
+        let layerInfo = entry.layerIndex.map { "layer=\($0)" } ?? "layer=nil"
+        fatalError("[Compiler] WEIGHT MISS: role='\(role)' tensorName='\(bindingName)' fragment=\(fragmentType) \(layerInfo) availableRoles=[\(allRoles)] — silent fallback to zero buffer is prohibited")
     }
 
-    private func makeFallbackBuffer(for role: String) -> MTLBuffer {
-        let length = max(requiredFallbackLength(for: role), minimumFallbackLength, 1)
-        guard let buffer = fallbackBuffer.device.makeBuffer(length: length, options: [.storageModeShared]) else {
-            return fallbackBuffer
-        }
-        memset(buffer.contents(), 0, length)
-        if role == "layer_scalar" {
-            switch fallbackWeightFormat {
-            case .float16:
-                buffer.contents().bindMemory(to: Float16.self, capacity: 1).pointee = 1
-            case .bfloat16:
-                buffer.contents().bindMemory(to: UInt16.self, capacity: 1).pointee = 0x3f80
-            case .float32:
-                buffer.contents().bindMemory(to: Float.self, capacity: 1).pointee = 1
-            case .quantized4Bit, .quantized8Bit:
-                break
-            }
-        }
-        buffer.label = "swift-lm.missing-weight.\(role)"
-        return buffer
-    }
-
-    private func requiredFallbackLength(for role: String) -> Int {
-        let bytesPerScalar = fallbackWeightFormat.storageByteSize
-        let minimumBytes = max(bytesPerScalar, 1)
-        let size = entry.fragment.requiredFallbackBufferSize(for: role, bytesPerScalar: bytesPerScalar)
-        return max(size, minimumBytes)
-    }
 }
 
 struct PlanBuildContext {

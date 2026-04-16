@@ -758,4 +758,111 @@ struct FusionSynthesizerTests {
         // Kernel function
         #expect(msl.contains("kernel void fused_seq_test"))
     }
+
+    // MARK: - 4-Way Sandwich Norm Fusion (3 LoopGroups)
+
+    @Test("Reduction+ResidualAdd+Copy+Reduction produces correct 3-LoopGroup body")
+    func sandwichNormFourWayFusion() throws {
+        // Exact pattern from Gemma4 sandwich norms:
+        // Group 0: Reduction (post_attn_norm) → TG → barrier
+        // Group 1: ResidualAdd + CopyFragment → TG → barrier
+        // Group 2: Reduction (pre_ff_norm)
+        let dim = 1536
+
+        let norm1 = Reduction(dimension: dim, epsilon: 1e-6, weightRole: "norm1_weight")
+        let residualAdd = ResidualAddFragment(dimension: dim)
+        let copy = CopyFragment(dimension: dim)
+        let norm2 = Reduction(dimension: dim, epsilon: 1e-6, weightRole: "norm2_weight")
+
+        let contractNorm1 = try #require(norm1.fusionContract)
+        let contractResAdd = try #require(residualAdd.fusionContract)
+        let contractCopy = try #require(copy.fusionContract)
+        let contractNorm2 = try #require(norm2.fusionContract)
+
+        let bodyNorm1 = try #require(norm1.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+        let bodyResAdd = try #require(residualAdd.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+        let bodyCopy = try #require(copy.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+        let bodyNorm2 = try #require(norm2.kernelBody(bufferPrecision: .float32, weightFormat: .bfloat16))
+
+        // Verify intermediate storage types
+        let storage01 = contractNorm1.intermediateStorage(to: contractResAdd)
+        #expect(storage01 == .threadgroupMemory(dimension: dim), "Reduction→ResidualAdd should be threadgroup")
+
+        let storage12 = contractResAdd.intermediateStorage(to: contractCopy)
+        #expect(storage12 == .register, "ResidualAdd→Copy should be register")
+
+        let storage23 = contractCopy.intermediateStorage(to: contractNorm2)
+        #expect(storage23 == .threadgroupMemory(dimension: dim), "Copy→Reduction should be threadgroup")
+
+        let result = try FusionSynthesizer.synthesize([
+            .init(contract: contractNorm1, body: bodyNorm1, weightFormats: ["norm1_weight": .bfloat16]),
+            .init(contract: contractResAdd, body: bodyResAdd),
+            .init(contract: contractCopy, body: bodyCopy),
+            .init(contract: contractNorm2, body: bodyNorm2, weightFormats: ["norm2_weight": .bfloat16]),
+        ])
+
+        let body = result.body
+
+        // --- Structural assertions ---
+
+        // Two threadgroup intermediates declared
+        #expect(body.contains("threadgroup float _tg_fused_0[\(dim)];"), "Group 0→1 TG intermediate")
+        #expect(body.contains("threadgroup float _tg_fused_1[\(dim)];"), "Group 1→2 TG intermediate")
+
+        // Two threadgroup barriers (between 3 groups)
+        let barrierCount = body.components(separatedBy: "threadgroup_barrier(mem_flags::mem_threadgroup)").count - 1
+        // Note: Reduction bodies contain internal barriers too, so at least 2 inter-group barriers
+        #expect(barrierCount >= 2, "At least 2 inter-group barriers expected, got \(barrierCount)")
+
+        // Register intermediate in Group 1
+        #expect(body.contains("float _fused_1;"), "Register intermediate between ResidualAdd and Copy")
+
+        // --- Group 0: Reduction writes to _tg_fused_0 ---
+        #expect(body.contains("_tg_fused_0[i]"), "Group 0 Reduction writes to _tg_fused_0")
+        // Group 0 should NOT reference _tg_fused_1
+        let group0EndMarker = "_tg_fused_0[i]"
+        let firstTG0 = body.range(of: group0EndMarker)
+        #expect(firstTG0 != nil, "Group 0 must write to _tg_fused_0")
+
+        // --- Group 1: ResidualAdd reads _tg_fused_0, Copy writes to _tg_fused_1 ---
+        // ResidualAdd should read from _tg_fused_0 (not data, not _tg_fused_1)
+        #expect(body.contains("float(_tg_fused_0[idx])"), "ResidualAdd reads from _tg_fused_0")
+        // CopyFragment should write to _tg_fused_1 (renamed from output)
+        #expect(body.contains("_tg_fused_1[idx]"), "Copy writes to _tg_fused_1")
+
+        // --- Group 2: Reduction reads from _tg_fused_1 ---
+        // The second Reduction must read _tg_fused_1, NOT _tg_fused_0
+        #expect(body.contains("float(_tg_fused_1[i])"), "Group 2 Reduction reads from _tg_fused_1")
+
+        // Group 2 must NOT read from _tg_fused_0
+        // Find the second Reduction's body (after the second inter-group barrier)
+        // Split by barriers and check the last group
+        let interGroupBarrierPattern = "threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+        let sections = body.components(separatedBy: interGroupBarrierPattern)
+        // The body has internal Reduction barriers too, but the last section should be Group 2
+        if let lastSection = sections.last {
+            // Last section should be Group 2 (second Reduction)
+            // It should read from _tg_fused_1, NOT _tg_fused_0
+            if lastSection.contains("float v = float(") {
+                #expect(lastSection.contains("_tg_fused_1[i]"), "Group 2 reads _tg_fused_1")
+                #expect(!lastSection.contains("_tg_fused_0"), "Group 2 must NOT reference _tg_fused_0")
+            }
+        }
+
+        // --- Merged contract ---
+        let mc = result.contract
+        #expect(mc.parallelism == .perRow(dimension: dim))
+        #expect(mc.requiresSIMDReduction == true)
+
+        // External ports: data(in), residual(merged out), norm1_weight(in), norm2_weight(in), output(out)
+        let inputs = mc.ports.filter { $0.direction == .input }
+        let outputs = mc.ports.filter { $0.direction == .output }
+        #expect(inputs.count >= 2, "At least data + 2 weights = 3 inputs")
+        #expect(outputs.count >= 1, "At least output port")
+
+        // Print body for manual inspection in test output
+        print("=== 4-Way Fused Body ===")
+        print(body)
+        print("========================")
+    }
 }

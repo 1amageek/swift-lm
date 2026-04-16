@@ -14,27 +14,20 @@ struct Gemma4OutputHeadDiagnosticsTests {
         }
 
         container.resetState()
-        let prepared = try await container.prepare( ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
+        let prepared = try await container.prepare(
+            ModelInput(prompt: RealOutputAssertionSupport.strictCapitalPrompt)
         )
-        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
-        let diagnostics = try container.debugPrefillOutputHeadDiagnostics(prompt: prompt, topK: 10)
+        let prompt = try autoreleasepool {
+            try ExecutablePrompt(preparedPrompt: prepared, using: container)
+        }
+        let diagnostics = try autoreleasepool {
+            try container.debugPrefillOutputHeadDiagnostics(prompt: prompt, topK: 10)
+        }
 
         guard let directory = try Gemma4TestSupport.optionalRealGemma4Directory(),
               let device = MTLCreateSystemDefaultDevice()
         else {
             Issue.record("Gemma4 diagnostics require a local model directory and Metal device")
-            return
-        }
-
-        let safetensorURLs = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        )
-        .filter { $0.pathExtension == "safetensors" }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
-        guard let embeddingTensor = weights.tensor(for: "model.language_model.embed_tokens.weight") else {
-            Issue.record("Missing Gemma4 embedding tensor")
             return
         }
 
@@ -48,27 +41,43 @@ struct Gemma4OutputHeadDiagnosticsTests {
             print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: entry.decoded))")
         }
 
-        print("[Gemma4 manual logits from transferred final hidden]")
-        var ranked: [(tokenID: Int, logit: Float, decoded: String)] = []
-        for tokenID in candidateTokenIDs {
-            let logit = dotEmbeddingRow(
-                tokenID: tokenID,
-                hidden: diagnostics.transferDestination,
-                tensor: embeddingTensor
+        // Load embedding weights in autoreleasepool to free MTLBuffers after extracting logits
+        let ranked: [(tokenID: Int, logit: Float, decoded: String)] = try autoreleasepool {
+            let safetensorURLs = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
             )
-            let decoded = container.tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false)
-            ranked.append((tokenID: tokenID, logit: logit, decoded: decoded))
-            print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
+            guard let embeddingTensor = weights.tensor(for: "model.language_model.embed_tokens.weight") else {
+                Issue.record("Missing Gemma4 embedding tensor")
+                return []
+            }
+
+            var results: [(tokenID: Int, logit: Float, decoded: String)] = []
+            for tokenID in candidateTokenIDs {
+                let logit = dotEmbeddingRow(
+                    tokenID: tokenID,
+                    hidden: diagnostics.transferDestination,
+                    tensor: embeddingTensor
+                )
+                let decoded = container.tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false)
+                results.append((tokenID: tokenID, logit: logit, decoded: decoded))
+                print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
+            }
+            return results
         }
 
-        ranked.sort {
+        print("[Gemma4 manual logits from transferred final hidden]")
+        let sorted = ranked.sorted {
             if $0.logit == $1.logit {
                 return $0.tokenID < $1.tokenID
             }
             return $0.logit > $1.logit
         }
         print("[Gemma4 manual candidate ranking]")
-        for entry in ranked.prefix(10) {
+        for entry in sorted.prefix(10) {
             print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: entry.decoded))")
         }
     }

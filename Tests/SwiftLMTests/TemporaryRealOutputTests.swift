@@ -667,10 +667,12 @@ struct TemporaryRealOutputTests {
             .filter { _, summary in summary.kernelName.contains("residual_add_seq") }
             .map(\.offset)
         let captureSteps = Set(residualSteps)
-        let snapshots = try container.debugPrefillLastTokenHiddenSnapshots(
-            prompt: prompt,
-            stepIndices: captureSteps
-        )
+        let snapshots = try autoreleasepool {
+            try container.debugPrefillLastTokenHiddenSnapshots(
+                prompt: prompt,
+                stepIndices: captureSteps
+            )
+        }
         print("[Qwen layerwise hidden snapshots]")
         for (residualIndex, stepIndex) in residualSteps.enumerated() where residualIndex % 2 == 1 {
             guard let snapshot = snapshots[stepIndex] else { continue }
@@ -680,77 +682,53 @@ struct TemporaryRealOutputTests {
         }
 
         let device = try #require(MTLCreateSystemDefaultDevice())
-        let safetensorURLs = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        )
-        .filter { $0.pathExtension == "safetensors" }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
-        let stafURL = directory.appendingPathComponent("model.staf")
-        let stafWeights = try STAFLoader().load(at: stafURL, device: device)
-        let tensorName = "model.language_model.embed_tokens.weight"
-        let tensor = try #require(weights.tensor(for: tensorName))
-        let finalNormTensor = try #require(weights.tensor(for: "model.language_model.norm.weight"))
         let hiddenSize = finalHidden.count
         let candidateTokenIDs = [271, 198, 220, 51076, 74482, 25358, 59441, 57666]
-        let specialTokenIDs = [248045, 248046, 248068, 248069, 3710]
+        let preFinalHidden = residualSteps.last.flatMap { snapshots[$0] }
 
-        print("[Qwen STAF embedding row diffs]")
-        for tokenID in specialTokenIDs {
-            let safetensorsRow = readTensorRow(
-                tokenID: tokenID,
-                tensor: tensor,
-                hiddenSize: hiddenSize
+        // Load safetensors + STAF in autoreleasepool; all tensor access must be inside
+        try autoreleasepool {
+            let safetensorURLs = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
             )
-            let stafRow = try readSTAFRow(
-                tokenID: tokenID,
-                tensorName: tensorName,
-                hiddenSize: hiddenSize,
-                store: stafWeights
-            )
-            let maxDiff = zip(safetensorsRow, stafRow).reduce(Float.zero) { partial, pair in
-                max(partial, abs(pair.0 - pair.1))
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
+            let stafURL = directory.appendingPathComponent("model.staf")
+            let stafWeights = try STAFLoader().load(at: stafURL, device: device)
+            let tensorName = "model.language_model.embed_tokens.weight"
+            let tensor = try #require(weights.tensor(for: tensorName))
+            let finalNormTensor = try #require(weights.tensor(for: "model.language_model.norm.weight"))
+            let specialTokenIDs = [248045, 248046, 248068, 248069, 3710]
+
+            print("[Qwen STAF embedding row diffs]")
+            for tokenID in specialTokenIDs {
+                let safetensorsRow = readTensorRow(
+                    tokenID: tokenID,
+                    tensor: tensor,
+                    hiddenSize: hiddenSize
+                )
+                let stafRow = try readSTAFRow(
+                    tokenID: tokenID,
+                    tensorName: tensorName,
+                    hiddenSize: hiddenSize,
+                    store: stafWeights
+                )
+                let maxDiff = zip(safetensorsRow, stafRow).reduce(Float.zero) { partial, pair in
+                    max(partial, abs(pair.0 - pair.1))
+                }
+                let sample = zip(safetensorsRow.prefix(4), stafRow.prefix(4)).map { lhs, rhs in
+                    "\(String(format: "%.4f", lhs))/\(String(format: "%.4f", rhs))"
+                }
+                print("  id=\(tokenID) maxDiff=\(String(format: "%.6f", maxDiff)) sample=\(sample)")
             }
-            let sample = zip(safetensorsRow.prefix(4), stafRow.prefix(4)).map { lhs, rhs in
-                "\(String(format: "%.4f", lhs))/\(String(format: "%.4f", rhs))"
-            }
-            print("  id=\(tokenID) maxDiff=\(String(format: "%.6f", maxDiff)) sample=\(sample)")
-        }
 
-        print("[Qwen embedding logits from Metal final hidden]")
-        for tokenID in candidateTokenIDs {
-            let logit = dotEmbeddingRow(
-                tokenID: tokenID,
-                hidden: finalHidden,
-                tensor: tensor,
-                hiddenSize: hiddenSize
-            )
-            let decoded = container.tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false)
-            print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
-        }
-
-        let manualTopLogits = topEmbeddingLogits(
-            hidden: finalHidden,
-            tensor: tensor,
-            topK: 10
-        )
-        print("[Qwen manual top logits from Metal final hidden]")
-        for entry in manualTopLogits {
-            let decoded = container.tokenizer.decode(tokens: [entry.tokenID], skipSpecialTokens: false)
-            print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: decoded))")
-        }
-
-        if let lastStepIndex = residualSteps.last, let preFinalHidden = snapshots[lastStepIndex] {
-            let cpuNormalized = applyQwenFinalRMSNorm(
-                hidden: preFinalHidden,
-                weightTensor: finalNormTensor
-            )
-            print("[Qwen CPU final norm logits from last decoder hidden]")
+            print("[Qwen embedding logits from Metal final hidden]")
             for tokenID in candidateTokenIDs {
                 let logit = dotEmbeddingRow(
                     tokenID: tokenID,
-                    hidden: cpuNormalized,
+                    hidden: finalHidden,
                     tensor: tensor,
                     hiddenSize: hiddenSize
                 )
@@ -758,15 +736,44 @@ struct TemporaryRealOutputTests {
                 print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
             }
 
-            let manualNormalizedTopLogits = topEmbeddingLogits(
-                hidden: cpuNormalized,
+            let manualTopLogits = topEmbeddingLogits(
+                hidden: finalHidden,
                 tensor: tensor,
                 topK: 10
             )
-            print("[Qwen manual top logits from CPU final norm]")
-            for entry in manualNormalizedTopLogits {
+            print("[Qwen manual top logits from Metal final hidden]")
+            for entry in manualTopLogits {
                 let decoded = container.tokenizer.decode(tokens: [entry.tokenID], skipSpecialTokens: false)
                 print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: decoded))")
+            }
+
+            if let preFinalHidden {
+                let cpuNormalized = applyQwenFinalRMSNorm(
+                    hidden: preFinalHidden,
+                    weightTensor: finalNormTensor
+                )
+                print("[Qwen CPU final norm logits from last decoder hidden]")
+                for tokenID in candidateTokenIDs {
+                    let logit = dotEmbeddingRow(
+                        tokenID: tokenID,
+                        hidden: cpuNormalized,
+                        tensor: tensor,
+                        hiddenSize: hiddenSize
+                    )
+                    let decoded = container.tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false)
+                    print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
+                }
+
+                let manualNormalizedTopLogits = topEmbeddingLogits(
+                    hidden: cpuNormalized,
+                    tensor: tensor,
+                    topK: 10
+                )
+                print("[Qwen manual top logits from CPU final norm]")
+                for entry in manualNormalizedTopLogits {
+                    let decoded = container.tokenizer.decode(tokens: [entry.tokenID], skipSpecialTokens: false)
+                    print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: decoded))")
+                }
             }
         }
     }
@@ -824,16 +831,6 @@ struct TemporaryRealOutputTests {
               let device = MTLCreateSystemDefaultDevice() else {
             return
         }
-        let safetensorURLs = try FileManager.default.contentsOfDirectory(
-            at: directory,
-            includingPropertiesForKeys: nil
-        )
-        .filter { $0.pathExtension == "safetensors" }
-        .sorted { $0.lastPathComponent < $1.lastPathComponent }
-        let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
-        guard let tensor = weights.tensor(for: "model.language_model.embed_tokens.weight") else {
-            return
-        }
 
         var candidateTokenIDs = diagnostics.topLogits.map(\.tokenID)
         let tokyoTokenIDs = [
@@ -843,16 +840,33 @@ struct TemporaryRealOutputTests {
         candidateTokenIDs.append(contentsOf: tokyoTokenIDs)
         candidateTokenIDs = Array(Set(candidateTokenIDs)).sorted()
 
-        print("[Gemma manual logits from Metal final hidden]")
-        for tokenID in candidateTokenIDs {
-            let logit = dotEmbeddingRow(
-                tokenID: tokenID,
-                hidden: finalHidden,
-                tensor: tensor,
-                hiddenSize: finalHidden.count
+        // Load safetensors in autoreleasepool to free MTLBuffers after extracting logits
+        let manualLogits: [(tokenID: Int, logit: Float)] = try autoreleasepool {
+            let safetensorURLs = try FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
             )
-            let decoded = container.tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false)
-            print("  id=\(tokenID) logit=\(String(format: "%.4f", logit)) token=\(String(reflecting: decoded))")
+            .filter { $0.pathExtension == "safetensors" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            let weights = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
+            guard let tensor = weights.tensor(for: "model.language_model.embed_tokens.weight") else {
+                return []
+            }
+            return candidateTokenIDs.map { tokenID in
+                let logit = dotEmbeddingRow(
+                    tokenID: tokenID,
+                    hidden: finalHidden,
+                    tensor: tensor,
+                    hiddenSize: finalHidden.count
+                )
+                return (tokenID: tokenID, logit: logit)
+            }
+        }
+
+        print("[Gemma manual logits from Metal final hidden]")
+        for entry in manualLogits {
+            let decoded = container.tokenizer.decode(tokens: [entry.tokenID], skipSpecialTokens: false)
+            print("  id=\(entry.tokenID) logit=\(String(format: "%.4f", entry.logit)) token=\(String(reflecting: decoded))")
         }
     }
 
@@ -1229,63 +1243,65 @@ struct TemporaryRealOutputTests {
 
             if let directory = try Gemma4TestSupport.optionalRealGemma4Directory() {
                 let device = try #require(MTLCreateSystemDefaultDevice())
-                let safetensorURLs = try FileManager.default.contentsOfDirectory(
-                    at: directory,
-                    includingPropertiesForKeys: nil
-                )
-                .filter { $0.pathExtension == "safetensors" }
-                .sorted { $0.lastPathComponent < $1.lastPathComponent }
-                let safetensors = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
-                let stafStore = try STAFLoader().load(
-                    at: directory.appendingPathComponent("model.staf"),
-                    device: device
-                )
-                if let tensorName = outProjStep.metadata.weightTensorName {
-                    let safetensorsTensor = try #require(safetensors.tensor(for: tensorName))
-                    let stafEntry = try #require(stafStore.entries[tensorName])
-                    let stafAccess = try #require(stafStore.bufferAccess(for: tensorName, layout: .rowMajor))
-                    let safetensorsRowMajor = computeTensorProjectionHead(
-                        input: outProjInputFull,
-                        tensor: safetensorsTensor,
-                        inputDimension: outProjInputDimension,
-                        outputCount: 8,
-                        transpose: false
+                try autoreleasepool {
+                    let safetensorURLs = try FileManager.default.contentsOfDirectory(
+                        at: directory,
+                        includingPropertiesForKeys: nil
                     )
-                    let safetensorsTransposed = computeTensorProjectionHead(
-                        input: outProjInputFull,
-                        tensor: safetensorsTensor,
-                        inputDimension: outProjInputDimension,
-                        outputCount: 8,
-                        transpose: true
+                    .filter { $0.pathExtension == "safetensors" }
+                    .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                    let safetensors = try SafetensorsLoader().loadAll(urls: safetensorURLs, device: device)
+                    let stafStore = try STAFLoader().load(
+                        at: directory.appendingPathComponent("model.staf"),
+                        device: device
                     )
-                    let stafRowMajor = computeBufferAccessProjectionHead(
-                        input: outProjInputFull,
-                        access: stafAccess,
-                        scheme: stafEntry.schemeIdentifier,
-                        inputDimension: outProjInputDimension,
-                        outputCount: 8
-                    )
-                    let safetensorsWeightSample = readTensorSample(
-                        tensor: safetensorsTensor,
-                        count: 8
-                    ).map { String(format: "%.4f", $0) }
-                    let stafRowSample = readBufferAccessSample(
-                        access: stafAccess,
-                        scheme: stafEntry.schemeIdentifier,
-                        count: 8
-                    ).map { String(format: "%.4f", $0) }
-                    let safetensorsRowMajorSample = safetensorsRowMajor.map { String(format: "%.4f", $0) }
-                    let safetensorsTransposedSample = safetensorsTransposed.map { String(format: "%.4f", $0) }
-                    let stafRowMajorSample = stafRowMajor.map { String(format: "%.4f", $0) }
-                    print("  out-proj-safetensors-shape=\(safetensorsTensor.shape) dtype=\(safetensorsTensor.dtype)")
-                    print(
-                        "  out-proj-staf-shape=\(stafEntry.shape) scheme=\(stafEntry.schemeIdentifier) bufferOffset=\(stafEntry.bufferOffset) accessOffset=\(stafAccess.offset)"
-                    )
-                    print("  out-proj-safetensors-weight-sample=\(safetensorsWeightSample)")
-                    print("  out-proj-staf-row-weight-sample=\(stafRowSample)")
-                    print("  out-proj-safetensors-row-major-head=\(safetensorsRowMajorSample)")
-                    print("  out-proj-safetensors-transposed-head=\(safetensorsTransposedSample)")
-                    print("  out-proj-staf-row-major-head=\(stafRowMajorSample)")
+                    if let tensorName = outProjStep.metadata.weightTensorName {
+                        let safetensorsTensor = try #require(safetensors.tensor(for: tensorName))
+                        let stafEntry = try #require(stafStore.entries[tensorName])
+                        let stafAccess = try #require(stafStore.bufferAccess(for: tensorName, layout: .rowMajor))
+                        let safetensorsRowMajor = computeTensorProjectionHead(
+                            input: outProjInputFull,
+                            tensor: safetensorsTensor,
+                            inputDimension: outProjInputDimension,
+                            outputCount: 8,
+                            transpose: false
+                        )
+                        let safetensorsTransposed = computeTensorProjectionHead(
+                            input: outProjInputFull,
+                            tensor: safetensorsTensor,
+                            inputDimension: outProjInputDimension,
+                            outputCount: 8,
+                            transpose: true
+                        )
+                        let stafRowMajor = computeBufferAccessProjectionHead(
+                            input: outProjInputFull,
+                            access: stafAccess,
+                            scheme: stafEntry.schemeIdentifier,
+                            inputDimension: outProjInputDimension,
+                            outputCount: 8
+                        )
+                        let safetensorsWeightSample = readTensorSample(
+                            tensor: safetensorsTensor,
+                            count: 8
+                        ).map { String(format: "%.4f", $0) }
+                        let stafRowSample = readBufferAccessSample(
+                            access: stafAccess,
+                            scheme: stafEntry.schemeIdentifier,
+                            count: 8
+                        ).map { String(format: "%.4f", $0) }
+                        let safetensorsRowMajorSample = safetensorsRowMajor.map { String(format: "%.4f", $0) }
+                        let safetensorsTransposedSample = safetensorsTransposed.map { String(format: "%.4f", $0) }
+                        let stafRowMajorSample = stafRowMajor.map { String(format: "%.4f", $0) }
+                        print("  out-proj-safetensors-shape=\(safetensorsTensor.shape) dtype=\(safetensorsTensor.dtype)")
+                        print(
+                            "  out-proj-staf-shape=\(stafEntry.shape) scheme=\(stafEntry.schemeIdentifier) bufferOffset=\(stafEntry.bufferOffset) accessOffset=\(stafAccess.offset)"
+                        )
+                        print("  out-proj-safetensors-weight-sample=\(safetensorsWeightSample)")
+                        print("  out-proj-staf-row-weight-sample=\(stafRowSample)")
+                        print("  out-proj-safetensors-row-major-head=\(safetensorsRowMajorSample)")
+                        print("  out-proj-safetensors-transposed-head=\(safetensorsTransposedSample)")
+                        print("  out-proj-staf-row-major-head=\(stafRowMajorSample)")
+                    }
                 }
             }
         } else {

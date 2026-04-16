@@ -60,6 +60,29 @@ struct OptimizationReportBuilder {
     }
 }
 
+/// Result of `dumpKernels`: per-kernel MSL source with layer mapping and collision detection.
+public struct KernelReport: Sendable {
+    /// A unique kernel with its MSL source and layer usage.
+    public struct Kernel: Sendable {
+        public let name: String
+        public let source: String
+        public let components: [String]
+        public var layers: [Int?]
+    }
+
+    /// Two entries share a kernel name but produce different MSL.
+    public struct Collision: Sendable {
+        public let kernelName: String
+        public let firstLayer: Int?
+        public let secondLayer: Int?
+        public let firstComponents: [String]
+        public let secondComponents: [String]
+    }
+
+    public let kernels: [Kernel]
+    public let collisions: [Collision]
+}
+
 struct DecodeProjectionCostReportBuilder {
     private struct FamilyKey: Hashable {
         let kernelName: String

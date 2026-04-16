@@ -447,6 +447,71 @@ public struct MetalInferenceCompiler: Sendable {
         return sourceCatalog.format(generated)
     }
 
+    /// Dump kernel details for the prefill path.
+    ///
+    /// For each unique kernel, reports MSL source, constituent components,
+    /// and which layers use it. Detects name collisions where entries share
+    /// a name but produce different MSL.
+    public func dumpKernels(
+        graph: ModelGraph,
+        hiddenSize: Int,
+        stafWeightStore: STAFWeightStore? = nil
+    ) -> KernelReport {
+        let context = makeCompileContext(
+            graph: graph,
+            hiddenSize: hiddenSize,
+            intermediateSize: 0,
+            vocabSize: 0,
+            stafWeightStore: stafWeightStore,
+            device: MTLCreateSystemDefaultDevice()!)
+        let kernelContext = context.prefillKernelContext
+        let optimization = entryCollector.collect(
+            using: context,
+            kernelContext: kernelContext
+        )
+
+        var kernelsByName: [String: KernelReport.Kernel] = [:]
+        var collisions: [KernelReport.Collision] = []
+
+        for entry in optimization.fusedEntries {
+            guard let synth = entry.fragment as? SynthesizedFragment else { continue }
+
+            let name = synth.kernelName(context: kernelContext)
+            let source = synth.kernelSource(
+                name: name,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16
+            )
+            let components = synth.fragments.map { String(describing: type(of: $0)) }
+
+            if var existing = kernelsByName[name] {
+                existing.layers.append(entry.layerIndex)
+                kernelsByName[name] = existing
+                if existing.source != source {
+                    collisions.append(KernelReport.Collision(
+                        kernelName: name,
+                        firstLayer: existing.layers.first ?? nil,
+                        secondLayer: entry.layerIndex,
+                        firstComponents: existing.components,
+                        secondComponents: components
+                    ))
+                }
+            } else {
+                kernelsByName[name] = KernelReport.Kernel(
+                    name: name,
+                    source: source,
+                    components: components,
+                    layers: [entry.layerIndex]
+                )
+            }
+        }
+
+        return KernelReport(
+            kernels: kernelsByName.values.sorted { $0.name < $1.name },
+            collisions: collisions
+        )
+    }
+
     public func compile(
         graph: ModelGraph,
         hiddenSize: Int,

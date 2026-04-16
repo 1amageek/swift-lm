@@ -44,7 +44,7 @@ public enum Arity: Sendable, Equatable {
 public func primitiveSignature(from kind: OperationKind) -> OperationSignature? {
     switch kind {
     case .primitive(let attrs):
-        if attrs is TokenEmbeddingAttributes {
+        if attrs is TokenEmbeddingAttributes || attrs is PatchEmbeddingAttributes {
             return OperationSignature(operandArity: .exact(0), resultArity: .exact(1))
         }
         // Default: unary primitive (1 operand, 1 result)

@@ -611,10 +611,6 @@ struct DecodeRoutingPlanner {
         let weightResolver = WeightResolver(
             entry: entry,
             stafWeightStore: stafWeightStore,
-            fallbackBuffer: bufferSet.hidden,
-            fallbackWeightFormat: fallbackWeightFormat,
-            minimumFallbackLength: minimumFallbackLength,
-            logsMisses: true,
             executionPhase: .decode,
             accessPolicyResolver: accessPolicyResolver
         )

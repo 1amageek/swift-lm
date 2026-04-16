@@ -69,6 +69,19 @@ struct Gemma4DecoderLayer: ModelComponent {
         isFullAttention ? config.fullAttentionRoPEScaling : config.ropeScaling
     }
 
+    /// Attention scale applied to QK dot products.
+    ///
+    /// Gemma4 uses QK norms (RMSNorm on Q and K projections), which normalize
+    /// the vectors independently of head dimension. HF reference hardcodes
+    /// `scaling = 1.0` — no traditional `1/sqrt(d)` scaling is needed.
+    /// If `query_pre_attn_scalar` is explicitly provided in config, use it.
+    private var attentionScale: Float {
+        if let scalar = config.queryPreAttentionScalar {
+            return 1.0 / scalar.squareRoot()
+        }
+        return 1.0
+    }
+
     private var mlpIntermediateSize: Int {
         usesDoubleWideMLP ? config.intermediateSize * 2 : config.intermediateSize
     }
@@ -83,7 +96,7 @@ struct Gemma4DecoderLayer: ModelComponent {
                 kvHeadCount: attentionKVHeads,
                 headDimension: attentionHeadDimension,
                 bias: config.attentionBias,
-                attentionScale: 1.0,
+                attentionScale: attentionScale,
                 rope: RoPEAttributes(
                     dimension: ropeDimension,
                     base: ropeBase,
@@ -120,7 +133,8 @@ struct Gemma4DecoderLayer: ModelComponent {
                     hiddenSize: config.hiddenSize,
                     perLayerInputSize: perLayerInputSize,
                     vocabSize: vocabSizePerLayerInput,
-                    activation: .custom("gelu_pytorch_tanh")
+                    activation: .custom("gelu_pytorch_tanh"),
+                    normWeightBias: 0
                 )
             }
         }

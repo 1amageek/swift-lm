@@ -110,6 +110,9 @@ final class Gemma4TextRuntime {
         return value
     }
 
+    /// Gemma4 RMSNorm: uses `weight` directly (PyTorch convention, weights ~10.67).
+    /// Unlike Gemma3 (JAX convention `1 + weight`), Gemma4 stores the full
+    /// scale factor in the weight tensor.
     private func rmsNorm(
         _ input: [Float],
         weight: [Float],

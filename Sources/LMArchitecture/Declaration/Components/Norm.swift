@@ -10,20 +10,22 @@ public struct RMSNorm: ModelComponent {
     public let dimension: Int
     public let epsilon: Float
     public let weightBias: Float
+    public let withScale: Bool
 
-    public init(dimension: Int, epsilon: Float = 1e-6, weightBias: Float = 0) {
+    public init(dimension: Int, epsilon: Float = 1e-6, weightBias: Float = 0, withScale: Bool = true) {
         precondition(dimension > 0, "dimension must be positive")
         precondition(epsilon > 0, "epsilon must be positive")
         self.dimension = dimension
         self.epsilon = epsilon
         self.weightBias = weightBias
+        self.withScale = withScale
     }
 }
 
 extension RMSNorm {
 
     public var attributes: RMSNormAttributes {
-        RMSNormAttributes(dimension: dimension, epsilon: epsilon, weightBias: weightBias)
+        RMSNormAttributes(dimension: dimension, epsilon: epsilon, weightBias: weightBias, withScale: withScale)
     }
 }
 

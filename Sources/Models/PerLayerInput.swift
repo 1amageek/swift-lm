@@ -12,12 +12,14 @@ public struct PerLayerInput: ModelComponent {
     public let perLayerInputSize: Int
     public let vocabSize: Int
     public let activation: ActivationKind
+    public let normWeightBias: Float
 
     public init(
         hiddenSize: Int,
         perLayerInputSize: Int,
         vocabSize: Int,
-        activation: ActivationKind = .custom("gelu_pytorch_tanh")
+        activation: ActivationKind = .custom("gelu_pytorch_tanh"),
+        normWeightBias: Float = 0
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
         precondition(perLayerInputSize > 0, "perLayerInputSize must be positive")
@@ -26,6 +28,7 @@ public struct PerLayerInput: ModelComponent {
         self.perLayerInputSize = perLayerInputSize
         self.vocabSize = vocabSize
         self.activation = activation
+        self.normWeightBias = normWeightBias
     }
 }
 
@@ -36,7 +39,8 @@ extension PerLayerInput {
             hiddenSize: hiddenSize,
             perLayerInputSize: perLayerInputSize,
             vocabSize: vocabSize,
-            activation: activation
+            activation: activation,
+            normWeightBias: normWeightBias
         )
     }
 }

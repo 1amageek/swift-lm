@@ -143,6 +143,8 @@ public enum AttentionGateKind: Codable, Equatable, Sendable {
 public enum AttentionValueNormKind: Codable, Equatable, Sendable {
     /// Per-head RMS normalization without a learned scale.
     case rmsNormNoScale
+    /// Per-head RMS normalization with a learned scale and unit offset (`1 + weight`).
+    case rmsNormUnitOffset
 }
 
 /// How the raw V path is produced before value normalization.

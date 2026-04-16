@@ -20,7 +20,8 @@ extension PerLayerInputAttributes: MetalCompilable {
         Reduction(
             dimension: hiddenSize,
             epsilon: 1e-6,
-            weightRole: "post_per_layer_input_norm"
+            weightRole: "post_per_layer_input_norm",
+            weightBias: normWeightBias
         )
     }
 }

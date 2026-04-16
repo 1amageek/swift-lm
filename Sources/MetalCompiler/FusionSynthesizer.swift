@@ -111,11 +111,21 @@ public struct FusionSynthesizer {
             for (localIdx, entryIdx) in group.entryIndices.enumerated() {
                 var body = deduplicatedEntries[entryIdx].body
 
+                // Apply intra-group renames FIRST so that register intermediates
+                // from earlier entries in this group take precedence over
+                // inter-group threadgroup intermediates from previous groups.
+                //
+                // Without this order, when two adjacent entries share the same
+                // primary input port name (e.g., "data"), the inter-group rename
+                // (data → _tg_fused_N) would clobber the name before the
+                // intra-group rename (data → _fused_M) can apply. This causes
+                // the second entry to read from the previous group's output
+                // instead of the register intermediate from the preceding entry,
+                // effectively skipping the preceding entry's computation.
+                body = applyRenames(body, intraGroupRenames)
+
                 // Apply inter-group renames (threadgroup intermediates from previous groups)
                 body = applyRenames(body, interGroupRenames)
-
-                // Apply intra-group renames (register intermediates from earlier in this group)
-                body = applyRenames(body, intraGroupRenames)
 
                 // Register intermediate to next entry within this group
                 if localIdx < group.entryIndices.count - 1 {
@@ -131,7 +141,19 @@ public struct FusionSynthesizer {
                         arrayName: producerOutput.name,
                         scalarName: intermediateName
                     )
-                    intraGroupRenames.append((consumerInput.name, intermediateName, .scalar))
+                    // Replace any existing rename for the same consumer input name.
+                    // When multiple entries in the same group produce register
+                    // intermediates for the same input name (e.g., "data"), only
+                    // the LATEST rename (from the immediately preceding entry)
+                    // should apply. Without replacement, applyRenames processes
+                    // sequentially and the first rename captures all occurrences,
+                    // so later renames never match — causing subsequent entries
+                    // to read stale values from an earlier entry.
+                    if let existingIdx = intraGroupRenames.firstIndex(where: { $0.oldName == consumerInput.name }) {
+                        intraGroupRenames[existingIdx] = (consumerInput.name, intermediateName, .scalar)
+                    } else {
+                        intraGroupRenames.append((consumerInput.name, intermediateName, .scalar))
+                    }
                     registerDeclarations.append("    float \(intermediateName);")
                 }
 
@@ -161,7 +183,18 @@ public struct FusionSynthesizer {
                     oldName: producerOutput.name,
                     newName: tgName
                 )
-                interGroupRenames.append((consumerInput.name, tgName, .array))
+                // Replace any existing rename for the same consumer input name.
+                // When multiple groups produce threadgroup intermediates for the
+                // same input name (e.g., "data"), only the LATEST rename (from the
+                // immediately preceding group) should apply. Without replacement,
+                // the first rename captures all occurrences and the later rename
+                // never matches, causing subsequent groups to read stale data
+                // from an earlier group instead of the immediately preceding one.
+                if let existingIdx = interGroupRenames.firstIndex(where: { $0.oldName == consumerInput.name }) {
+                    interGroupRenames[existingIdx] = (consumerInput.name, tgName, .array)
+                } else {
+                    interGroupRenames.append((consumerInput.name, tgName, .array))
+                }
 
                 let storage = deduplicatedEntries[lastEntryIdx].contract.intermediateStorage(
                     to: deduplicatedEntries[nextGroupFirstIdx].contract)

@@ -3,7 +3,7 @@ import LMArchitecture
 /// Gemma 4 attention with value normalization and optional KV sharing.
 ///
 /// Extends standard attention with:
-/// - Per-head RMS normalization on V projections (no learned scale)
+/// - Per-head RMS normalization on V projections with learned scale (GemmaRMSNorm: 1 + weight)
 /// - Optional K=V mode: reuses K projection as V source
 /// - Optional cross-layer KV cache sharing
 struct Gemma4Attention: ModelComponent {

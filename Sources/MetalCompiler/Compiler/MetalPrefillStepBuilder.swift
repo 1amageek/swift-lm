@@ -269,10 +269,6 @@ private struct PrefillStepPlanner {
         let weightResolver = WeightResolver(
             entry: entry,
             stafWeightStore: stafWeightStore,
-            fallbackBuffer: buffers.hidden,
-            fallbackWeightFormat: fallbackWeightFormat,
-            minimumFallbackLength: minimumFallbackLength,
-            logsMisses: false,
             executionPhase: .prefill,
             accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
         )
@@ -972,10 +968,6 @@ private struct PrefillStepPlanner {
         let weightResolver = WeightResolver(
             entry: entry,
             stafWeightStore: stafWeightStore,
-            fallbackBuffer: buffers.hidden,
-            fallbackWeightFormat: fallbackWeightFormat,
-            minimumFallbackLength: minimumFallbackLength,
-            logsMisses: false,
             executionPhase: .prefill,
             accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
         )
@@ -1096,10 +1088,6 @@ private struct PrefillStepPlanner {
         let qWeightResolver = WeightResolver(
             entry: entry,
             stafWeightStore: stafWeightStore,
-            fallbackBuffer: buffers.hidden,
-            fallbackWeightFormat: fallbackWeightFormat,
-            minimumFallbackLength: minimumFallbackLength,
-            logsMisses: false,
             executionPhase: .prefill,
             accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
         )

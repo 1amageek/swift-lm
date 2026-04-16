@@ -275,7 +275,11 @@ struct MetalEntryCollector {
                 let compositeID = context.nextCompositeID
                 context.nextCompositeID += 1
                 for primitive in primitives {
-                    context.emitPrimitive(primitive, compositeID: compositeID)
+                    let disambiguated = disambiguateWeightRoles(
+                        primitive,
+                        emissionIndex: context.nextIndex
+                    )
+                    context.emitPrimitive(disambiguated, compositeID: compositeID)
                 }
                 markLastProjectionAsOutput(entries: &context.entries, from: startIndex)
             }
@@ -360,6 +364,50 @@ struct MetalEntryCollector {
                 )
             }
         }
+    }
+
+    /// Disambiguate weight roles on Reduction fragments that default to "scale".
+    ///
+    /// Multiple RMSNorm operations (e.g., `input_layernorm`, `post_attention_layernorm`,
+    /// `pre_feedforward_layernorm`, `post_feedforward_layernorm` in Gemma sandwich norms)
+    /// all have ParameterBindings with `role: "scale"`. When cross-component fusion
+    /// concatenates bindings from two such operations into a single DispatchEntry,
+    /// `WeightResolver.resolve(role: "scale")` returns the first match both times,
+    /// causing both norms in the fused kernel to read the same weight buffer.
+    ///
+    /// Rewrite each Reduction's `weightRole` and its matching binding's role to a
+    /// globally unique token keyed on the emission index so that post-fusion
+    /// resolution remains unambiguous.
+    private func disambiguateWeightRoles(
+        _ primitive: CollectedPrimitive,
+        emissionIndex: Int
+    ) -> CollectedPrimitive {
+        guard let reduction = primitive.fragment as? Reduction,
+              reduction.withScale else {
+            return primitive
+        }
+        let originalRole = reduction.weightRole
+        let uniqueRole = "\(originalRole)#e\(emissionIndex)"
+        let renamedFragment = Reduction(
+            dimension: reduction.dimension,
+            epsilon: reduction.epsilon,
+            weightRole: uniqueRole,
+            weightBias: reduction.weightBias,
+            withScale: reduction.withScale
+        )
+        var didRenameBinding = false
+        let renamedBindings = primitive.parameterBindings.map { binding -> ParameterBinding in
+            if !didRenameBinding, binding.role == originalRole {
+                didRenameBinding = true
+                return ParameterBinding(role: uniqueRole, tensorName: binding.tensorName)
+            }
+            return binding
+        }
+        return CollectedPrimitive(
+            fragment: renamedFragment,
+            parameterBindings: renamedBindings,
+            layerIndex: primitive.layerIndex
+        )
     }
 
     private func markLastProjectionAsOutput(entries: inout [DispatchEntry], from startIndex: Int) {

@@ -4,7 +4,7 @@ extension RMSNormAttributes: MetalCompilable {
 
     /// Fragment expansion for RMSNorm.
     package func fragment(context: KernelContext) -> Reduction {
-        Reduction(dimension: dimension, epsilon: epsilon, weightBias: weightBias)
+        Reduction(dimension: dimension, epsilon: epsilon, weightBias: weightBias, withScale: withScale)
     }
 }
 

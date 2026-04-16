@@ -7,24 +7,30 @@ public struct Reduction: PrimitiveMetalKernelFragment {
     public let epsilon: Float
     public let weightRole: String
     public let weightBias: Float
+    public let withScale: Bool
 
     public init(
         dimension: Int,
         epsilon: Float = 0,
         weightRole: String = "scale",
-        weightBias: Float = 0
+        weightBias: Float = 0,
+        withScale: Bool = true
     ) {
         self.dimension = dimension
         self.epsilon = epsilon
         self.weightRole = weightRole
         self.weightBias = weightBias
+        self.withScale = withScale
     }
 
     public var isFusable: Bool { true }
     public var normEpsilon: Float? { epsilon }
-    public var normWeightBias: Float? { weightBias }
+    public var normWeightBias: Float? { withScale ? weightBias : nil }
     public var scalarConstantValues: [String: ScalarConstantValue] {
-        ["epsilon": .float(epsilon), "weightBias": .float(weightBias)]
+        if withScale {
+            return ["epsilon": .float(epsilon), "weightBias": .float(weightBias)]
+        }
+        return ["epsilon": .float(epsilon)]
     }
     public func kernelName(context: KernelContext) -> String {
         let bf16 = context.weightFormat == .bfloat16
@@ -34,23 +40,31 @@ public struct Reduction: PrimitiveMetalKernelFragment {
         return bf16 ? "rms_norm_bf16" : "rms_norm"
     }
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: dimension) }
-    public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: weightRole, role: .weight)] }
+    public var weightSlots: [MetalWeightSlot] {
+        withScale ? [MetalWeightSlot(field: weightRole, role: .weight)] : []
+    }
 
     public func requiredFallbackBufferSize(for role: String, bytesPerScalar: Int) -> Int {
-        dimension * bytesPerScalar
+        withScale ? dimension * bytesPerScalar : 0
     }
 
     public var fusionContract: FusionContract? {
-        FusionContract(
-            ports: [
-                FusionPort(name: "data", direction: .input, role: .buffer, accessPattern: .multiPass),
-                FusionPort(name: "weight", direction: .input, role: .weight(field: weightRole)),
-                FusionPort(name: "output", direction: .output, role: .buffer),
-            ],
-            scalarConstants: [
-                ScalarConstant(name: "epsilon", metalType: "float"),
-                ScalarConstant(name: "weightBias", metalType: "float"),
-            ],
+        var ports = [
+            FusionPort(name: "data", direction: .input, role: .buffer, accessPattern: .multiPass),
+        ]
+        if withScale {
+            ports.append(FusionPort(name: "weight", direction: .input, role: .weight(field: weightRole)))
+        }
+        ports.append(FusionPort(name: "output", direction: .output, role: .buffer))
+
+        var constants = [ScalarConstant(name: "epsilon", metalType: "float")]
+        if withScale {
+            constants.append(ScalarConstant(name: "weightBias", metalType: "float"))
+        }
+
+        return FusionContract(
+            ports: ports,
+            scalarConstants: constants,
             parallelism: .perRow(dimension: dimension),
             threadgroupMemoryBytes: 32 * MemoryLayout<Float>.size,
             requiresSIMDReduction: true
@@ -58,8 +72,15 @@ public struct Reduction: PrimitiveMetalKernelFragment {
     }
 
     public func kernelBody(bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String? {
-        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
         let bt = bufferPrecision.metalType
+
+        let outputExpression: String
+        if withScale {
+            let readWeight = weightFormat.readExpression("weight[i]")
+            outputExpression = "\(bt)(float(data[i]) * _rms_scale * (\(readWeight) + weightBias))"
+        } else {
+            outputExpression = "\(bt)(float(data[i]) * _rms_scale)"
+        }
 
         return """
         float sumSquared = 0.0f;
@@ -83,7 +104,7 @@ public struct Reduction: PrimitiveMetalKernelFragment {
 
         float _rms_scale = shared[0];
         for (uint i = tid; i < dimension; i += threadgroupSize) {
-            output[i] = \(bt)(float(data[i]) * _rms_scale * (\(readWeight("weight[i]")) + weightBias));
+            output[i] = \(outputExpression);
         }
         """
     }
@@ -93,63 +114,99 @@ public struct Reduction: PrimitiveMetalKernelFragment {
               let body = kernelBody(bufferPrecision: bufferPrecision, weightFormat: weightFormat) else {
             fatalError("Reduction must provide fusionContract and kernelBody")
         }
+        let formats: [String: WeightFormat] = withScale ? [weightRole: weightFormat] : [:]
         return KernelScaffold.generate(
             name: name,
             body: body,
             contract: contract,
             bufferPrecision: bufferPrecision,
-            weightFormats: [weightRole: weightFormat],
+            weightFormats: formats,
             isSequence: bufferPrecision == .float32
         )
     }
 
     public func decodeBindings(context: BufferBindingContext) -> FragmentBindings {
-        let (weightBuffer, weightOffset) = context.resolveWeight(weightRole)
-        return FragmentBindings(
-            buffers: [
-                (0, context.currentInputBuffer, context.currentInputOffset),
-                (1, weightBuffer, weightOffset),
-                (2, context.bufferSet.hidden, 0),
-            ],
-            bytes: [
-                uint32Binding(3, UInt32(dimension)),
-                floatBinding(4, epsilon),
-                floatBinding(5, weightBias),
-            ],
-            outputIsHidden: true,
-            resetsProjectionIndex: true,
-            writeBufferIndices: Set<Int>([2])
-        )
+        if withScale {
+            let (weightBuffer, weightOffset) = context.resolveWeight(weightRole)
+            return FragmentBindings(
+                buffers: [
+                    (0, context.currentInputBuffer, context.currentInputOffset),
+                    (1, weightBuffer, weightOffset),
+                    (2, context.bufferSet.hidden, 0),
+                ],
+                bytes: [
+                    uint32Binding(3, UInt32(dimension)),
+                    floatBinding(4, epsilon),
+                    floatBinding(5, weightBias),
+                ],
+                outputIsHidden: true,
+                resetsProjectionIndex: true,
+                writeBufferIndices: Set<Int>([2])
+            )
+        } else {
+            return FragmentBindings(
+                buffers: [
+                    (0, context.currentInputBuffer, context.currentInputOffset),
+                    (1, context.bufferSet.hidden, 0),
+                ],
+                bytes: [
+                    uint32Binding(2, UInt32(dimension)),
+                    floatBinding(3, epsilon),
+                ],
+                outputIsHidden: true,
+                resetsProjectionIndex: true,
+                writeBufferIndices: Set<Int>([1])
+            )
+        }
     }
 
     public func prefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
-        let (weightBuffer, weightOffset) = context.resolveWeight(weightRole)
         let kernelName = kernelName(context: context.kernelContext)
         let pipeline = try context.getPipeline(kernelName)
         let simdWidth = pipeline.threadExecutionWidth
         let clamped = min(max(dimension, 1), 1024)
         let rounded = ((clamped + simdWidth - 1) / simdWidth) * simdWidth
         let threads = min(rounded, pipeline.maxTotalThreadsPerThreadgroup)
+
+        let bufferBindings: [(Int, MTLBuffer, Int)]
+        let bytesBindings: [(index: Int, value: [UInt8])]
+
+        if withScale {
+            let (weightBuffer, weightOffset) = context.resolveWeight(weightRole)
+            bufferBindings = [
+                (0, context.currentInputBuffer, context.currentInputOffset),
+                (1, weightBuffer, weightOffset),
+                (2, context.buffers.hidden, 0),
+            ]
+            bytesBindings = [
+                uint32Binding(3, UInt32(dimension)),
+                floatBinding(4, epsilon),
+                floatBinding(5, weightBias),
+                uint32Binding(6, UInt32(context.maximumSequenceLength)),
+            ]
+        } else {
+            bufferBindings = [
+                (0, context.currentInputBuffer, context.currentInputOffset),
+                (1, context.buffers.hidden, 0),
+            ]
+            bytesBindings = [
+                uint32Binding(2, UInt32(dimension)),
+                floatBinding(3, epsilon),
+                uint32Binding(4, UInt32(context.maximumSequenceLength)),
+            ]
+        }
+
         return FragmentPrefillSteps(
             steps: [MetalPrefillStep(
                 pipeline: pipeline,
                 gridSize: MTLSize(width: context.maximumSequenceLength, height: 1, depth: 1),
                 threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
-                bufferBindings: [
-                    (0, context.currentInputBuffer, context.currentInputOffset),
-                    (1, weightBuffer, weightOffset),
-                    (2, context.buffers.hidden, 0),
-                ],
-                bytesBindings: [
-                    uint32Binding(3, UInt32(dimension)),
-                    floatBinding(4, epsilon),
-                    floatBinding(5, weightBias),
-                    uint32Binding(6, UInt32(context.maximumSequenceLength)),
-                ],
+                bufferBindings: bufferBindings,
+                bytesBindings: bytesBindings,
                 threadgroupMemoryLength: 0,
                 sync: .bufferBarrier,
                 mode: .batch,
-                sequenceLengthPolicy: .bind(index: 6),
+                sequenceLengthPolicy: .bind(index: withScale ? 6 : 4),
                 positionBufferIndex: nil,
                 perPositionStrides: [:]
             )],
