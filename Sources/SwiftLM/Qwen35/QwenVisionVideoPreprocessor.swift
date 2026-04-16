@@ -110,7 +110,7 @@ struct QwenVisionVideoPreprocessor {
                 do {
                     try FileManager.default.removeItem(at: temporaryURL)
                 } catch {
-                    print("[QwenVisionVideoPreprocessor] failed to remove temp file: \(error)")
+                    InternalLog.error("[QwenVisionVideoPreprocessor] failed to remove temp file: \(error)")
                 }
             }
             return try await decodeFrames(

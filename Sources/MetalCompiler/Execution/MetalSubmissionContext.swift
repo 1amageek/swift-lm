@@ -40,10 +40,13 @@ struct MetalSubmissionContext: @unchecked Sendable {
 
         let atDesc = MTL4ArgumentTableDescriptor()
         atDesc.maxBufferBindCount = Self.maxBufferBindCount
-        guard let argumentTable = try? device.makeArgumentTable(descriptor: atDesc) else {
-            throw MetalCompilerError.deviceSetupFailed("Cannot create MTL4ArgumentTable")
+        do {
+            self.argumentTable = try device.makeArgumentTable(descriptor: atDesc)
+        } catch {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Cannot create MTL4ArgumentTable: \(error)"
+            )
         }
-        self.argumentTable = argumentTable
     }
 
     /// Submit a compute pass using Metal 4 APIs.

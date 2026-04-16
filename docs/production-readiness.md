@@ -16,8 +16,10 @@ The release bar is:
 
 These suites must pass before a release:
 
-- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/ReleaseSmokeTests`
-- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/Gemma4RealBundleTests`
+- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/ReleaseSmokeOutputTests`
+- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/ReleaseSmokePromptStateTests`
+- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/ReleaseSmokeCapabilityTests`
+- `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/RotorQuantRealBundleBaselineTests`
 - `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/QwenVisionRealBundleTextTests`
 - `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:SwiftLMTests/RotorQuantRealBundleFullTests`
 - `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:MetalCompilerTests/PrefillTransferTests`
@@ -25,10 +27,10 @@ These suites must pass before a release:
 
 Required expectations:
 
-- LFM local smoke mentions `Tokyo`
-- Gemma4 real bundle first non-empty chunk starts with `Tokyo`
+- LFM local smoke mentions `Tokyo` (`ReleaseSmokeOutputTests`)
+- Gemma4 FP16 real bundle first non-empty chunk starts with `Tokyo` (`RotorQuantRealBundleBaselineTests`)
 - Qwen3.5 real bundle first non-empty chunk starts with `Tokyo`
-- RotorQuant Gemma4 paths preserve the same short factual answer shape
+- RotorQuant Gemma4 full K+V paths (RotorQ8, RotorQ4) preserve the same short factual answer shape (`RotorQuantRealBundleFullTests`)
 
 ## Performance Gates
 

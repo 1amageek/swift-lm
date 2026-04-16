@@ -114,9 +114,9 @@ public struct MetalInferenceCompiler: Sendable {
                 .filter { $0.contains("embedding_lookup") || $0.contains("gather") }
                 .sorted()
             if !relatedKernelNames.isEmpty {
-                print("[Compiler] missing kernel '\(resolvedKernelName)'; related compiled kernels: \(relatedKernelNames)")
+                InternalLog.error("[Compiler] missing kernel '\(resolvedKernelName)'; related compiled kernels: \(relatedKernelNames)")
             } else {
-                print("[Compiler] missing kernel '\(resolvedKernelName)'; no embedding-related kernels compiled")
+                InternalLog.error("[Compiler] missing kernel '\(resolvedKernelName)'; no embedding-related kernels compiled")
             }
             throw MetalCompilerError.kernelNotFound(resolvedKernelName)
         }
@@ -565,7 +565,7 @@ public struct MetalInferenceCompiler: Sendable {
             fusedEntries: fusedEntries)
         let bufferSet = allocation.bufferSet
         let decodeSlotDimension = allocation.slotDimension
-        print("[Compiler] \(fusedEntries.count) dispatch entries")
+        InternalLog.info("[Compiler] \(fusedEntries.count) dispatch entries")
         let decodePlan = try dispatchStepBuilder.buildDecodePlan(
             fusedEntries: fusedEntries,
             unfusedCount: unfusedCount,

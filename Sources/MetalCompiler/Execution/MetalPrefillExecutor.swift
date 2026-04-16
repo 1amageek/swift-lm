@@ -799,7 +799,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
                 )
             }
         } catch {
-            print("[MetalInference] PREFILL FAILED: \(error)")
+            InternalLog.error("[MetalInference] PREFILL FAILED: \(error)")
             return -1
         }
 

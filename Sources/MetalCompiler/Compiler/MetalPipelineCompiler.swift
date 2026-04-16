@@ -80,9 +80,19 @@ struct MetalPipelineCompiler {
         do {
             return try device.makeLibrary(source: source, options: options)
         } catch {
-            // Diagnostic: dump source on compilation failure
+            // Diagnostic: dump source on compilation failure. The dump is a
+            // best-effort debugging aid; if writing it also fails we surface
+            // the I/O error to stderr but still rethrow the original
+            // compilation error (which is what the caller actually asked
+            // about).
             let url = URL(fileURLWithPath: "/tmp/swiftlm_failed_msl.metal")
-            try? source.write(to: url, atomically: true, encoding: .utf8)
+            do {
+                try source.write(to: url, atomically: true, encoding: .utf8)
+            } catch let dumpError {
+                InternalLog.error(
+                    "[MetalPipelineCompiler] failed to dump MSL source to \(url.path): \(dumpError)"
+                )
+            }
             throw error
         }
     }
@@ -103,8 +113,8 @@ struct MetalPipelineCompiler {
         let available = Set(library.functionNames)
         let emitted = interestingNames.filter { generated.baseSource.contains("kernel void \($0)(") }
         let compiled = interestingNames.filter { available.contains($0) }
-        print("[MetalPipelineCompiler] emitted embedding kernels: \(emitted)")
-        print("[MetalPipelineCompiler] compiled embedding kernels: \(compiled)")
+        InternalLog.info("[MetalPipelineCompiler] emitted embedding kernels: \(emitted)")
+        InternalLog.info("[MetalPipelineCompiler] compiled embedding kernels: \(compiled)")
     }
 
     private func baseCompileOptions() -> MTLCompileOptions {

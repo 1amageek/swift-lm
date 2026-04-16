@@ -556,7 +556,7 @@ private struct PrefillStepPlanner {
                             }
                             .sorted()
                         if !relatedKernelNames.isEmpty {
-                            print("[Compiler] missing prefill kernel '\(name)'; related compiled kernels: \(relatedKernelNames)")
+                            InternalLog.error("[Compiler] missing prefill kernel '\(name)'; related compiled kernels: \(relatedKernelNames)")
                         }
                         throw MetalCompilerError.kernelNotFound(name)
                     }

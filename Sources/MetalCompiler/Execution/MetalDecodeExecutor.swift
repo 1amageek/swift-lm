@@ -31,7 +31,7 @@ struct MetalDecodeExecutor: Sendable {
             position += 1
             return buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
         } catch {
-            print("[MetalInference] GPU error: \(error)")
+            InternalLog.error("[MetalInference] GPU error: \(error)")
             return -1
         }
     }
@@ -65,7 +65,7 @@ struct MetalDecodeExecutor: Sendable {
             let token = buffers.tokenOut.contents().bindMemory(to: Int32.self, capacity: 1).pointee
             return (token, timing.gpuStartTime, timing.gpuEndTime)
         } catch {
-            print("[MetalInference] GPU error: \(error)")
+            InternalLog.error("[MetalInference] GPU error: \(error)")
             return (-1, 0, 0)
         }
     }

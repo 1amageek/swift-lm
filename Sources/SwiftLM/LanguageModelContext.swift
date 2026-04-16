@@ -560,7 +560,7 @@ public final class LanguageModelContext: @unchecked Sendable {
                     ropePositionOffset: ropePositionOffset
                 )
             } catch {
-                print("[LanguageModelContext] Failed to decode: \(error)")
+                InternalLog.error("[LanguageModelContext] Failed to decode: \(error)")
                 break
             }
 
@@ -618,7 +618,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         let totalTime = CFAbsoluteTimeGetCurrent() - requestStartTime
         let tokensPerSecond = totalTime > 0 ? Double(visibleTokenCount) / totalTime : 0
         let preparationTokPerSec = preparationTime > 0 ? Double(promptTokenCount) / preparationTime : 0
-        print("[LanguageModelContext] \(visibleTokenCount) tokens (\(String(format: "%.0f", preparationTokPerSec)) prefill, \(String(format: "%.1f", tokensPerSecond)) decode tok/s) [\(String(format: "%.1f", totalTime))s]")
+        InternalLog.info("[LanguageModelContext] \(visibleTokenCount) tokens (\(String(format: "%.0f", preparationTokPerSec)) prefill, \(String(format: "%.1f", tokensPerSecond)) decode tok/s) [\(String(format: "%.1f", totalTime))s]")
         continuation.yield(.completed(CompletionInfo(
             tokenCount: visibleTokenCount,
             tokensPerSecond: tokensPerSecond,
@@ -2780,9 +2780,21 @@ struct ThinkingTagPolicy {
 
 struct TemplateThinkingTagPolicyExtractor {
     private static let keywordCandidates = ["think", "reason", "thought"]
-    private static let openTagPattern = #"<([A-Za-z][A-Za-z0-9:_-]*)>"#
-    private static let closeTagPattern = #"</([A-Za-z][A-Za-z0-9:_-]*)>"#
-    private static let channelReasoningPattern = #"<\|channel\>([A-Za-z][A-Za-z0-9_-]*)\\n"#
+
+    // Hardcoded static patterns — compiled once at load. Invalid syntax would
+    // be a developer bug, so a fatal trap is the correct failure mode.
+    private static let openRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: #"<([A-Za-z][A-Za-z0-9:_-]*)>"#)
+    }()
+    private static let closeRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: #"</([A-Za-z][A-Za-z0-9:_-]*)>"#)
+    }()
+    private static let channelRegex: NSRegularExpression = {
+        // swiftlint:disable:next force_try
+        try! NSRegularExpression(pattern: #"<\|channel\>([A-Za-z][A-Za-z0-9_-]*)\\n"#)
+    }()
 
     static func extract(from chatTemplateSource: String?) -> (openTag: String, closeTag: String)? {
         guard let chatTemplateSource, !chatTemplateSource.isEmpty else {
@@ -2790,30 +2802,23 @@ struct TemplateThinkingTagPolicyExtractor {
         }
 
         let nsRange = NSRange(chatTemplateSource.startIndex..<chatTemplateSource.endIndex, in: chatTemplateSource)
-        if let channelRegex = try? NSRegularExpression(pattern: channelReasoningPattern) {
-            let channelMatches = channelRegex.matches(in: chatTemplateSource, options: [], range: nsRange)
-            for match in channelMatches {
-                guard match.numberOfRanges == 2,
-                      let labelRange = Range(match.range(at: 1), in: chatTemplateSource) else {
-                    continue
-                }
-
-                let channelLabel = String(chatTemplateSource[labelRange])
-                let lowered = channelLabel.lowercased()
-                guard keywordCandidates.contains(where: lowered.contains) else {
-                    continue
-                }
-                guard chatTemplateSource.contains("<channel|>") else {
-                    continue
-                }
-
-                return ("<|channel>\(channelLabel)\n", "<channel|>")
+        let channelMatches = channelRegex.matches(in: chatTemplateSource, options: [], range: nsRange)
+        for match in channelMatches {
+            guard match.numberOfRanges == 2,
+                  let labelRange = Range(match.range(at: 1), in: chatTemplateSource) else {
+                continue
             }
-        }
 
-        guard let openRegex = try? NSRegularExpression(pattern: openTagPattern),
-              let closeRegex = try? NSRegularExpression(pattern: closeTagPattern) else {
-            return nil
+            let channelLabel = String(chatTemplateSource[labelRange])
+            let lowered = channelLabel.lowercased()
+            guard keywordCandidates.contains(where: lowered.contains) else {
+                continue
+            }
+            guard chatTemplateSource.contains("<channel|>") else {
+                continue
+            }
+
+            return ("<|channel>\(channelLabel)\n", "<channel|>")
         }
 
         let openMatches = openRegex.matches(in: chatTemplateSource, options: [], range: nsRange)

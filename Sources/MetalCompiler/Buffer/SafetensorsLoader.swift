@@ -322,32 +322,57 @@ public struct MetalWeightStore: @unchecked Sendable {
 
         if let scalesEntry = tensorMap[scalesName],
            let biasesEntry = tensorMap[biasesName] {
-            // Quantized weight
+            // Quantized weight.
+            //
+            // MLX packs N quantized values into one uint32, with
+            //     elementsPerUInt32 = 32 / bits
+            // so the packed weight shape is [outFeatures, inFeatures / elementsPerUInt32]
+            // and the scales shape is  [outFeatures, numGroups]
+            //     where numGroups = inFeatures / groupSize.
+            //
+            // This loader currently assumes MLX-Q4 (the only format swift-lm
+            // ships end-to-end — see `STAFConversionPlanner` which also emits
+            // `.q4Group*` schemes only). We sanity-check that assumption by
+            // inferring the group size; if the result is not one of the
+            // standard MLX group sizes (32, 64, 128, 256), the tensor shape is
+            // inconsistent with Q4 and we refuse the load rather than silently
+            // producing wrong dequantization.
             let scalesFile = files[scalesEntry.fileIndex]
             let biasesFile = files[biasesEntry.fileIndex]
-
-            // Determine bits from element packing
-            // MLX packs into uint32: elements_per_int = 32 / bits
-            // packed shape [N, inFeatures / elements_per_int]
-            // scales shape [N, numGroups] where numGroups = inFeatures / groupSize
             let scalesInfo = scalesEntry.info
+
+            let bits = 4
+            let elementsPerUInt32 = 32 / bits
+            let validGroupSizes: Set<Int> = [32, 64, 128, 256]
+
             let groupSize: Int
-            if scalesInfo.shape.count >= 2 && info.shape.count >= 2 {
-                let numGroups = scalesInfo.shape[scalesInfo.shape.count - 1]
-                // inFeatures = packed_dim * elements_per_int
-                // groupSize = inFeatures / numGroups
-                // For now, estimate: common group sizes are 32, 64, 128
-                let packedDim = info.shape[info.shape.count - 1]
-                // Try bits = 4 first (most common)
-                let elementsPerInt = 8  // 32 bits / 4 bits
-                let inFeatures = packedDim * elementsPerInt
-                groupSize = numGroups > 0 ? inFeatures / numGroups : 64
-            } else {
-                groupSize = 64
+            guard scalesInfo.shape.count >= 2, info.shape.count >= 2 else {
+                InternalLog.error(
+                    "[SafetensorsLoader] quantized tensor '\(name)' has unexpected rank (weight=\(info.shape), scales=\(scalesInfo.shape)); skipping"
+                )
+                return nil
             }
+            let packedDim = info.shape[info.shape.count - 1]
+            let numGroups = scalesInfo.shape[scalesInfo.shape.count - 1]
+            guard numGroups > 0 else {
+                InternalLog.error(
+                    "[SafetensorsLoader] quantized tensor '\(name)' has zero-sized scales groups; skipping"
+                )
+                return nil
+            }
+            let inFeatures = packedDim * elementsPerUInt32
+            let inferredGroupSize = inFeatures / numGroups
+            guard validGroupSizes.contains(inferredGroupSize),
+                  inferredGroupSize * numGroups == inFeatures else {
+                InternalLog.error(
+                    "[SafetensorsLoader] quantized tensor '\(name)' shape not consistent with Q4 (packedDim=\(packedDim), numGroups=\(numGroups), inferred groupSize=\(inferredGroupSize)); only MLX-Q4 with groupSize in \(validGroupSizes.sorted()) is supported"
+                )
+                return nil
+            }
+            groupSize = inferredGroupSize
 
             let desc = QuantizationDescriptor(
-                bits: 4,  // TODO: detect from tensor shape ratio
+                bits: bits,
                 groupSize: groupSize,
                 scales: MetalTensorRef(buffer: scalesFile.buffer, offset: scalesFile.dataSectionOffset + scalesInfo.dataOffset),
                 zeros: MetalTensorRef(buffer: biasesFile.buffer, offset: biasesFile.dataSectionOffset + biasesEntry.info.dataOffset)

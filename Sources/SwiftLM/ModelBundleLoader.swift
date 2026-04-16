@@ -86,7 +86,7 @@ public struct ModelBundleLoader: Sendable {
         )
 
         let loadTime = CFAbsoluteTimeGetCurrent() - startTime
-        print("[ModelBundleLoader] loaded: tokenizer + STAF [\(String(format: "%.3f", loadTime))s]")
+        InternalLog.info("[ModelBundleLoader] loaded: tokenizer + STAF [\(String(format: "%.3f", loadTime))s]")
 
         // 3. Build IR + resolve parameter bindings
         let compileStart = CFAbsoluteTimeGetCurrent()
@@ -137,7 +137,7 @@ public struct ModelBundleLoader: Sendable {
         compiledModel = compiledModel.withPrefillPlan(prefillPlan)
 
         let compileTime = CFAbsoluteTimeGetCurrent() - compileStart
-        print("[ModelBundleLoader] compiled: \(compiledModel.fusedEntryCount) dispatches, prefill \(prefillPlan.stepCount) steps [\(String(format: "%.3f", compileTime))s]")
+        InternalLog.info("[ModelBundleLoader] compiled: \(compiledModel.fusedEntryCount) dispatches, prefill \(prefillPlan.stepCount) steps [\(String(format: "%.3f", compileTime))s]")
 
         // 5. Assemble LanguageModelContainer
         let inferenceModel = try MetalInferenceModel(plan: compiledModel, device: device)
@@ -192,7 +192,7 @@ public struct ModelBundleLoader: Sendable {
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-        print("[ModelBundleLoader] ready: \(modelConfig.name) [\(String(format: "%.3f", totalTime))s]")
+        InternalLog.info("[ModelBundleLoader] ready: \(modelConfig.name) [\(String(format: "%.3f", totalTime))s]")
 
         let prototypeContext = LanguageModelContext(
             inferenceModel: inferenceModel,
@@ -259,7 +259,7 @@ public struct ModelBundleLoader: Sendable {
             )
         } catch {
             // Log but fall back to CPU path if GPU post-processor compilation fails
-            print("[ModelBundleLoader] GPU embedding post-processor unavailable, using CPU fallback: \(error)")
+            InternalLog.error("[ModelBundleLoader] GPU embedding post-processor unavailable, using CPU fallback: \(error)")
             postProcessor = nil
         }
 
@@ -278,7 +278,7 @@ public struct ModelBundleLoader: Sendable {
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-        print("[ModelBundleLoader] embedding bundle ready: \(configuration.name) [\(String(format: "%.3f", totalTime))s]")
+        InternalLog.info("[ModelBundleLoader] embedding bundle ready: \(configuration.name) [\(String(format: "%.3f", totalTime))s]")
 
         return TextEmbeddingContainer(
             prefillPlan: prefillPlan,

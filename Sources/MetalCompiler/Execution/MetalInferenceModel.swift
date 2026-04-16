@@ -1730,7 +1730,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 try Self.zeroStateBuffers(prefillPlan.buffers, submission: &submission)
             }
         } catch {
-            print("[MetalInference] Failed to reset GPU state: \(error)")
+            InternalLog.error("[MetalInference] Failed to reset GPU state: \(error)")
         }
     }
 

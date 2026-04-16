@@ -436,20 +436,22 @@ Common causes:
 
 The current `Qwen3.5+` multimodal path is covered by focused suites under [`Tests/SwiftLMTests`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests). The release-facing set is:
 
-- [`LoadTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/LoadTests.swift)
-- [`ReleaseSmokeTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/ReleaseSmokeTests.swift)
-- [`QwenVisionCapabilityTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionCapabilityTests.swift)
-- [`QwenVisionPromptProcessorTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionPromptProcessorTests.swift)
-- [`QwenVisionExecutionLayoutTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionExecutionLayoutTests.swift)
-- [`QwenVisionEncoderTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionEncoderTests.swift)
-- [`QwenVisionExecutionTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionExecutionTests.swift)
-- [`QwenVisionIntegrationTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionIntegrationTests.swift)
+- [`LoadTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Core/LoadTests.swift)
+- [`ReleaseSmokeOutputTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Core/ReleaseSmokeOutputTests.swift)
+- [`ReleaseSmokePromptStateTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Core/ReleaseSmokePromptStateTests.swift)
+- [`ReleaseSmokeCapabilityTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Core/ReleaseSmokeCapabilityTests.swift)
+- [`QwenVisionCapabilityTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionCapabilityTests.swift)
+- [`QwenVisionPromptProcessorTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionPromptProcessorTests.swift)
+- [`QwenVisionExecutionLayoutTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionExecutionLayoutTests.swift)
+- [`QwenVisionEncoderTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionEncoderTests.swift)
+- [`QwenVisionExecutionTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionExecutionTests.swift)
+- [`QwenVisionIntegrationTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionIntegrationTests.swift)
 
 The real-bundle suites are optional-local:
-[`QwenVisionRealBundleImageTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionRealBundleImageTests.swift),
-[`QwenVisionRealBundleVideoTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionRealBundleVideoTests.swift),
-[`QwenVisionRealBundleMixedTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionRealBundleMixedTests.swift),
-[`QwenVisionRealBundlePromptStateTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/QwenVisionRealBundlePromptStateTests.swift).
+[`QwenVisionRealBundleImageTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionRealBundleImageTests.swift),
+[`QwenVisionRealBundleVideoTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionRealBundleVideoTests.swift),
+[`QwenVisionRealBundleMixedTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionRealBundleMixedTests.swift),
+[`QwenVisionRealBundlePromptStateTests.swift`](/Users/1amageek/Desktop/swift-lm/Tests/SwiftLMTests/Models/Qwen35/QwenVisionRealBundlePromptStateTests.swift).
 Each skips cleanly when no local `Qwen3.5/VL` snapshot is available.
 
 When running the Qwen3.5+ multimodal matrix on a developer machine, prefer [`scripts/benchmarks/run-qwen35-vision-tests.sh`](/Users/1amageek/Desktop/swift-lm/scripts/benchmarks/run-qwen35-vision-tests.sh). It builds once and executes each suite with `test-without-building`, which reduces peak memory usage compared to one large `xcodebuild test` process.
