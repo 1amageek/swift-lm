@@ -1,4 +1,5 @@
 import LMArchitecture
+import LMIR
 import MetalCompiler
 import ModelDeclarations
 
@@ -61,18 +62,18 @@ struct ModelGraphResolver {
         }
     }
 
-    func namingConvention(for modelType: String) -> ParameterResolver.WeightNamingConvention {
+    func namingConvention(for modelType: String) -> any WeightNamingConvention {
         switch modelType.lowercased() {
         case "gemma3_text":
-            return .gemma3TextFamily
+            return Gemma3TextFamilyNaming()
         case "gemma4", "gemma4_text":
-            return .gemma4Family
+            return Gemma4FamilyNaming()
         case "qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl":
-            return .qwen35Family
+            return Qwen35FamilyNaming()
         case "lfm2", "lfm2_moe":
-            return .lfm2Family
+            return LFM2FamilyNaming()
         default:
-            return .llamaFamily
+            return LlamaFamilyNaming()
         }
     }
 }

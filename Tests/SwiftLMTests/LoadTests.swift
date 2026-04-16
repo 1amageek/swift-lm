@@ -281,7 +281,7 @@ struct LoadTests {
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
         let graph = try ModelGraph(Transformer(config: config))
-        let convention: ParameterResolver.WeightNamingConvention = modelType == "lfm2" ? .lfm2Family : .llamaFamily
+        let convention: any WeightNamingConvention = modelType == "lfm2" ? LFM2FamilyNaming() : LlamaFamilyNaming()
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
         // Check that primitive operations have parameterBindings
@@ -306,7 +306,7 @@ struct LoadTests {
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
         let graph = try ModelGraph(Transformer(config: config))
-        let convention: ParameterResolver.WeightNamingConvention = modelType == "lfm2" ? .lfm2Family : .llamaFamily
+        let convention: any WeightNamingConvention = modelType == "lfm2" ? LFM2FamilyNaming() : LlamaFamilyNaming()
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
         let compiler = MetalInferenceCompiler()

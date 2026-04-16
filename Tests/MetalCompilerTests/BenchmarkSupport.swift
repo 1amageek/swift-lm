@@ -81,7 +81,7 @@ enum BenchmarkSupport {
         let modelType: String
         let config: ModelConfig
         let resolved: ModelGraph
-        let convention: ParameterResolver.WeightNamingConvention
+        let convention: any WeightNamingConvention
     }
 
     static func isHotExactShapeGEMVKernel(_ name: String) -> Bool {
