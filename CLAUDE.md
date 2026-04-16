@@ -688,7 +688,7 @@ Image → PatchEmbedding → PositionEmbedding(additive, learnable table)
 
 ### QwenVision Encoder
 
-Qwen3.5 の vision encoder は画像・動画の両方をサポートし、temporal/spatial grid で管理する。deepstack visual indexes による multi-scale feature 抽出を含む。詳細は `Sources/SwiftLM/QwenVision/` を参照。
+Qwen3.5 の vision encoder は画像・動画の両方をサポートし、temporal/spatial grid で管理する。deepstack visual indexes による multi-scale feature 抽出を含む。詳細は `Sources/SwiftLM/Qwen35/` を参照。
 
 ## Metal 4 (Primary Target)
 
