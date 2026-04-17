@@ -267,6 +267,16 @@ struct DispatchHeuristics {
                 0
             )
 
+        case .partitionedReduction(let partitionCount, let threadsPerPartition):
+            let clampedPartitions = max(partitionCount, 1)
+            let desired = max(threadsPerPartition, 1)
+            let threads = min(desired, maxThreads)
+            return (
+                MTLSize(width: clampedPartitions, height: 1, depth: 1),
+                MTLSize(width: threads, height: 1, depth: 1),
+                0
+            )
+
         case .gather(let count):
             let clampedCount = max(count, 1)
             let threadgroupSize = min(256, maxThreads)

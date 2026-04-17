@@ -295,6 +295,11 @@ public enum MetalDispatchDimension: Sendable, Equatable {
     case gather(count: Int)
     /// GEMV/GEMM projection.
     case gemv(outputDimension: Int, inputDimension: Int)
+    /// Multiple independent threadgroups, each reducing over its own partition
+    /// (SSM recurrence: one threadgroup per key-group, disjoint conv channels
+    /// and recurrent state slices). `threadsPerPartition` is clamped to the
+    /// pipeline's maxTotalThreadsPerThreadgroup at dispatch time.
+    case partitionedReduction(partitionCount: Int, threadsPerPartition: Int)
 }
 
 // MARK: - Batched Operations

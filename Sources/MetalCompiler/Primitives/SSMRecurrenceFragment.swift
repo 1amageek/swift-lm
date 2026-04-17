@@ -30,7 +30,19 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         )
     }
     public var dispatchDimension: MetalDispatchDimension {
-        .reduction(dimension: convDimension)
+        // Partition work by key-group: each threadgroup owns disjoint Q/K/V
+        // conv channels and the recurrent state slice of its heads — no
+        // cross-threadgroup synchronization required.
+        let safeGroupCount = max(groupCount, 1)
+        let headsPerGroup = max(1, headCount / safeGroupCount)
+        let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
+        let phase2Threads = headsPerGroup * min(valueHeadDimension, 256)
+        let desiredThreads = max(localDim, phase2Threads)
+        let clamped = min(Self.maxThreadgroupSize, max(desiredThreads, 1))
+        return .partitionedReduction(
+            partitionCount: safeGroupCount,
+            threadsPerPartition: clamped
+        )
     }
     public var weightSlots: [MetalWeightSlot] {
         [
@@ -91,7 +103,11 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             bufferPrecision: bufferPrecision,
             weightFormat: weightFormat,
             convDimension: convDimension,
-            maxThreadgroupSize: Self.maxThreadgroupSize
+            maxThreadgroupSize: Self.maxThreadgroupSize,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyHeadDimension: keyHeadDimension,
+            valueHeadDimension: valueHeadDimension
         )
     }
 
