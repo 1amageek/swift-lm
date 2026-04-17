@@ -7,6 +7,12 @@ This document describes the intended quantization architecture for `swift-lm`.
 It is a design document, not a claim that every piece described here is already
 implemented.
 
+For the **ground-truth catalog of what is actually supported today** — which
+weight formats and KV cache schemes are validated per model family — see
+[`supported-quantizations.md`](supported-quantizations.md). That document is
+the authoritative source for answering "does this model support Q4?"; this
+document is the architectural direction.
+
 ## Why
 
 `swift-lm` has two strong constraints:
