@@ -2129,7 +2129,10 @@ public final class LanguageModelContext: @unchecked Sendable {
         let shouldSampleOnHost =
             parameters.temperature > 0
             || parameters.topP < 1
+            || parameters.topK != nil
+            || parameters.minP > 0
             || parameters.repetitionPenalty != nil
+            || parameters.presencePenalty != nil
             || needsGreedyRepair
             || requiresHostLogitPostprocessing
 
