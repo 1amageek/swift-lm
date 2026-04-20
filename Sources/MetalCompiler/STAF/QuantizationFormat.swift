@@ -342,6 +342,91 @@ public struct AffineQ2Group32Format: QuantizationFormat {
     public init() {}
 }
 
+// MARK: - 6-bit Affine Formats (non-aligned)
+
+/// 6-bit affine quantization with group size 16.
+///
+/// Non-aligned packing: 4 weights share 3 bytes.
+/// ```
+/// ┌──────────┬──────────┬────────────────────┐
+/// │scale (2B)│ zero (2B)│ packed quants (12B)│
+/// └──────────┴──────────┴────────────────────┘
+/// 16 bytes per block, 16 weights
+/// ```
+/// MLX packing (see mlx/backend/cpu/quantized.cpp `extract_bits<6>`):
+/// - w[0] = b0 & 0x3f
+/// - w[1] = ((b0 >> 6) & 0x03) | ((b1 & 0x0f) << 2)
+/// - w[2] = ((b1 >> 4) & 0x0f) | ((b2 & 0x03) << 4)
+/// - w[3] = b2 >> 2
+public struct AffineQ6Group16Format: QuantizationFormat {
+    public var schemeIdentifier: QuantizationSchemeIdentifier { .q6Group16ScaleF16 }
+    public var blockStructName: String { "BlockQ6Affine16" }
+    public var gemvKernelName: String { "gemv_q6_g16" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q6_g16_f32s" : "gemm_q6_g16"
+    }
+    public var weightsPerBlock: Int { 16 }
+    public var bytesPerBlock: Int { 4 + 12 }
+    public var bits: Int { 6 }
+    public var groupSize: Int { 16 }
+
+    public var isQuantized: Bool { true }
+    public var bufferElementType: String { "uchar" }
+    public var mslDeclarations: String {
+        Q6AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
+    }
+
+    public func emitGroupDequant(
+        blocksVar: String,
+        blockIndexVar: String,
+        outputArrayVar: String
+    ) -> String? {
+        Q6AffineMSL.groupDequant(
+            blocksVar: blocksVar,
+            outputArrayVar: outputArrayVar,
+            weightsPerBlock: weightsPerBlock
+        )
+    }
+
+    public init() {}
+}
+
+/// 6-bit affine quantization with group size 32.
+///
+/// Non-aligned packing: 4 weights share 3 bytes, 8 groups of 4 per block.
+public struct AffineQ6Group32Format: QuantizationFormat {
+    public var schemeIdentifier: QuantizationSchemeIdentifier { .q6Group32ScaleF16 }
+    public var blockStructName: String { "BlockQ6Affine32" }
+    public var gemvKernelName: String { "gemv_q6_g32" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q6_g32_f32s" : "gemm_q6_g32"
+    }
+    public var weightsPerBlock: Int { 32 }
+    public var bytesPerBlock: Int { 4 + 24 }
+    public var bits: Int { 6 }
+    public var groupSize: Int { 32 }
+
+    public var isQuantized: Bool { true }
+    public var bufferElementType: String { "uchar" }
+    public var mslDeclarations: String {
+        Q6AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
+    }
+
+    public func emitGroupDequant(
+        blocksVar: String,
+        blockIndexVar: String,
+        outputArrayVar: String
+    ) -> String? {
+        Q6AffineMSL.groupDequant(
+            blocksVar: blocksVar,
+            outputArrayVar: outputArrayVar,
+            weightsPerBlock: weightsPerBlock
+        )
+    }
+
+    public init() {}
+}
+
 // MARK: - INT8 Affine Formats
 
 public struct AffineQ8Group32Format: QuantizationFormat {
@@ -450,6 +535,48 @@ enum Q4AffineMSL {
     }
 }
 
+/// MSL source fragments for Q6 affine block formats.
+///
+/// Non-aligned packing: 4 weights share 3 bytes (see MLX
+/// `mlx/backend/cpu/quantized.cpp` `extract_bits<6>`). This helper emits a
+/// group-level dequant statement that populates a thread-local float array
+/// for the unified GEMV kernel.
+enum Q6AffineMSL {
+    /// Block struct definition. Packed bytes = (weightsPerBlock / 4) * 3.
+    static func blockStruct(name: String, weightsPerBlock: Int) -> String {
+        let packedBytes = (weightsPerBlock / 4) * 3
+        return """
+        struct \(name) {
+            half scale;
+            half zero;
+            uchar qs[\(packedBytes)];
+        };
+        """
+    }
+
+    /// Emits a loop that expands one block's `weightsPerBlock` weights into
+    /// `outputArrayVar[0..<weightsPerBlock]` as float. Assumes `scale` and
+    /// `zero` are captured as `float` locals by the caller.
+    static func groupDequant(
+        blocksVar: String,
+        outputArrayVar: String,
+        weightsPerBlock: Int
+    ) -> String {
+        let numGroups = weightsPerBlock / 4
+        return """
+        for (uint g = 0; g < \(numGroups); g++) {
+                            uchar b0 = \(blocksVar)[g * 3 + 0];
+                            uchar b1 = \(blocksVar)[g * 3 + 1];
+                            uchar b2 = \(blocksVar)[g * 3 + 2];
+                            \(outputArrayVar)[g * 4 + 0] = scale * float(b0 & 0x3f) + zero;
+                            \(outputArrayVar)[g * 4 + 1] = scale * float(((b0 >> 6) & 0x03) | ((b1 & 0x0f) << 2)) + zero;
+                            \(outputArrayVar)[g * 4 + 2] = scale * float(((b1 >> 4) & 0x0f) | ((b2 & 0x03) << 4)) + zero;
+                            \(outputArrayVar)[g * 4 + 3] = scale * float(b2 >> 2) + zero;
+                        }
+        """
+    }
+}
+
 /// MSL source fragments for Q8 affine block formats.
 enum Q8AffineMSL {
     /// Block struct definition. One byte per quant.
@@ -487,6 +614,8 @@ public enum QuantizationFormatRegistry {
         case .q2Group32ScaleF16: return AffineQ2Group32Format()
         case .q4Group64ScaleF16: return AffineQ4Group64Format()
         case .q4Group128ScaleF16: return AffineQ4Group128Format()
+        case .q6Group16ScaleF16: return AffineQ6Group16Format()
+        case .q6Group32ScaleF16: return AffineQ6Group32Format()
         case .q8Group32ScaleF16: return AffineQ8Group32Format()
         case .q8Group64ScaleF16: return AffineQ8Group64Format()
         case .passthrough: return Float16Format()
@@ -503,6 +632,8 @@ public enum QuantizationFormatRegistry {
         case (2, 32): return AffineQ2Group32Format()
         case (4, 64): return AffineQ4Group64Format()
         case (4, 128): return AffineQ4Group128Format()
+        case (6, 16): return AffineQ6Group16Format()
+        case (6, 32): return AffineQ6Group32Format()
         case (8, 32): return AffineQ8Group32Format()
         case (8, 64): return AffineQ8Group64Format()
         default: return nil
