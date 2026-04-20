@@ -451,6 +451,56 @@ struct MetalSourceGeneratorTests {
         #expect(SSMRecurrenceFragment.sequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32")
     }
 
+    @Test("Unified quantized GEMV emits MLX-compatible Q6 bit extraction")
+    func unifiedQuantizedGEMVQ6EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ6Group16Format(),
+            AffineQ6Group32Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // MLX extract_bits<6>: 4 weights span 3 bytes
+            #expect(source.contains("b0 & 0x3f"), "Missing w[0] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b0 >> 6) & 0x03) | ((b1 & 0x0f) << 2)"),
+                "Missing w[1] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b1 >> 4) & 0x0f) | ((b2 & 0x03) << 4)"),
+                "Missing w[2] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("b2 >> 2"), "Missing w[3] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("weights_f32[\(format.weightsPerBlock)]"),
+                "Missing weights_f32 array for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV compiles for Q6 group16 and group32")
+    func unifiedQuantizedGEMVQ6Compiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let formats: [any QuantizationFormat] = [
+            AffineQ6Group16Format(),
+            AffineQ6Group32Format(),
+        ]
+        for format in formats {
+            for precision in [MetalSourceGenerator.BufferPrecision.float16, .float32] {
+                let name = "test_q6_g\(format.groupSize)_\(precision)"
+                let source = MetalSourceGenerator.commonHeader + "\n\n"
+                    + MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                        name: name,
+                        format: format,
+                        bufferPrecision: precision
+                    )
+                let options = MTLCompileOptions()
+                options.languageVersion = .version4_0
+                let library = try device.makeLibrary(source: source, options: options)
+                #expect(library.makeFunction(name: name) != nil,
+                    "Failed to compile \(name)")
+            }
+        }
+    }
+
     @Test("Generated complete library includes BF16 SSM kernels")
     func completeLibraryIncludesBF16SSMVariants() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
