@@ -263,6 +263,85 @@ public struct AffineQ4Group128Format: QuantizationFormat {
     public init() {}
 }
 
+// MARK: - INT2 Affine Formats
+
+/// 2-bit affine quantization with group size 16.
+///
+/// Block layout (4 weights per byte):
+/// ```
+/// ┌──────────┬──────────┬───────────────────┐
+/// │scale (2B)│ zero (2B)│ packed quants (4B)│
+/// └──────────┴──────────┴───────────────────┘
+/// 8 bytes per block, 16 weights
+/// ```
+///
+/// Dequantization: `w = scale * q + zero` where q ∈ [0, 3].
+///
+/// - Note: catalog wiring (GEMV/GEMM dispatch) is deferred to Phase 5
+///   (WeightFormat enum migration). The format struct and unified GEMV
+///   generator are available via the protocol registry for Phase 5 to
+///   hook up without further protocol changes.
+public struct AffineQ2Group16Format: QuantizationFormat {
+    public var schemeIdentifier: QuantizationSchemeIdentifier { .q2Group16ScaleF16 }
+    public var blockStructName: String { "BlockQ2Affine16" }
+    public var gemvKernelName: String { "gemv_q2_g16" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q2_g16_f32s" : "gemm_q2_g16"
+    }
+    public var weightsPerBlock: Int { 16 }
+    public var bytesPerBlock: Int { 4 + 4 }  // scale(2) + zero(2) + 16*2bit/8
+    public var bits: Int { 2 }
+    public var groupSize: Int { 16 }
+
+    public var isQuantized: Bool { true }
+    public var bufferElementType: String { "uchar" }
+    public var mslDeclarations: String { Q2AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock) }
+
+    public func perWeightReadExpression(
+        blocksVar: String,
+        weightIndexVar: String
+    ) -> String? {
+        Q2AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
+    }
+
+    public init() {}
+}
+
+/// 2-bit affine quantization with group size 32.
+///
+/// Block layout (4 weights per byte):
+/// ```
+/// ┌──────────┬──────────┬───────────────────┐
+/// │scale (2B)│ zero (2B)│ packed quants (8B)│
+/// └──────────┴──────────┴───────────────────┘
+/// 12 bytes per block, 32 weights
+/// ```
+public struct AffineQ2Group32Format: QuantizationFormat {
+    public var schemeIdentifier: QuantizationSchemeIdentifier { .q2Group32ScaleF16 }
+    public var blockStructName: String { "BlockQ2Affine32" }
+    public var gemvKernelName: String { "gemv_q2_g32" }
+    public func gemmKernelName(bufferPrecision: BufferPrecision) -> String {
+        bufferPrecision == .float32 ? "gemm_q2_g32_f32s" : "gemm_q2_g32"
+    }
+    public var weightsPerBlock: Int { 32 }
+    public var bytesPerBlock: Int { 4 + 8 }
+    public var bits: Int { 2 }
+    public var groupSize: Int { 32 }
+
+    public var isQuantized: Bool { true }
+    public var bufferElementType: String { "uchar" }
+    public var mslDeclarations: String { Q2AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock) }
+
+    public func perWeightReadExpression(
+        blocksVar: String,
+        weightIndexVar: String
+    ) -> String? {
+        Q2AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
+    }
+
+    public init() {}
+}
+
 // MARK: - INT8 Affine Formats
 
 public struct AffineQ8Group32Format: QuantizationFormat {
@@ -318,6 +397,31 @@ public struct AffineQ8Group64Format: QuantizationFormat {
 }
 
 // MARK: - MSL Fragment Helpers
+
+/// MSL source fragments for Q2 affine block formats.
+///
+/// 2-bit packing: 4 weights per byte, weight `k` occupies bits `(k & 3) * 2 ..< (k & 3) * 2 + 2`
+/// of byte `k >> 2`.
+enum Q2AffineMSL {
+    /// Block struct definition. `weightsPerBlock` controls the packed array size
+    /// (weightsPerBlock / 4 bytes since each byte holds 4 2-bit quants).
+    static func blockStruct(name: String, weightsPerBlock: Int) -> String {
+        let packedBytes = weightsPerBlock / 4
+        return """
+        struct \(name) {
+            half scale;
+            half zero;
+            uchar qs[\(packedBytes)];
+        };
+        """
+    }
+
+    /// Per-weight dequant expression assuming `scale` and `zero` are captured as
+    /// `float` locals by the caller.
+    static func perWeightExpression(blocksVar: String, weightIndexVar: String) -> String {
+        "(scale * float((\(blocksVar)[(\(weightIndexVar)) >> 2] >> (((\(weightIndexVar)) & 3) * 2)) & 0x3) + zero)"
+    }
+}
 
 /// MSL source fragments for Q4 affine block formats.
 ///
@@ -379,6 +483,8 @@ public enum QuantizationFormatRegistry {
         case .fp16RowMajor: return Float16Format()
         case .bf16RowMajor: return BFloat16Format()
         case .fp32RowMajor: return Float32Format()
+        case .q2Group16ScaleF16: return AffineQ2Group16Format()
+        case .q2Group32ScaleF16: return AffineQ2Group32Format()
         case .q4Group64ScaleF16: return AffineQ4Group64Format()
         case .q4Group128ScaleF16: return AffineQ4Group128Format()
         case .q8Group32ScaleF16: return AffineQ8Group32Format()
@@ -393,6 +499,8 @@ public enum QuantizationFormatRegistry {
         bits: Int, groupSize: Int
     ) -> (any QuantizationFormat)? {
         switch (bits, groupSize) {
+        case (2, 16): return AffineQ2Group16Format()
+        case (2, 32): return AffineQ2Group32Format()
         case (4, 64): return AffineQ4Group64Format()
         case (4, 128): return AffineQ4Group128Format()
         case (8, 32): return AffineQ8Group32Format()
