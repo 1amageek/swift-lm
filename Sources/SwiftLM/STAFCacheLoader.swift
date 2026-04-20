@@ -30,9 +30,11 @@ struct STAFCacheLoader {
         }
 
         if needsConversion {
+            let quantization = try HFConfigDecoder().quantizationHint(from: resources.configData)
             try converter.convert(
                 safetensorsURLs: resources.safetensorsURLs,
                 outputURL: stafURL,
+                quantization: quantization,
                 metadata: metadata
             )
         }

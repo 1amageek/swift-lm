@@ -26,9 +26,13 @@ public struct STAFConverter: Sendable {
     public func convert(
         safetensorsURLs: [URL],
         outputURL: URL,
+        quantization: MLXQuantizationHint? = nil,
         metadata: STAFFileMetadata = .empty
     ) throws {
-        let plan = try planner.plan(safetensorsURLs: safetensorsURLs)
+        let plan = try planner.plan(
+            safetensorsURLs: safetensorsURLs,
+            quantization: quantization
+        )
         let fileMetadata = STAFFileMetadata.defaultCacheMetadata(sourceShardCount: plan.sortedURLs.count)
             .merged(with: metadata)
         try writer.write(plan: plan, outputURL: outputURL, metadata: fileMetadata)
@@ -59,12 +63,21 @@ public enum STAFConversionError: Error, CustomStringConvertible {
     case readFailed(String)
     case tensorNotFound(String)
     case unsupportedFormat(UInt8)
+    case missingQuantizationHint(String)
+    case unsupportedQuantization(bits: Int, groupSize: Int)
+    case inconsistentQuantizationShape(name: String, reason: String)
 
     public var description: String {
         switch self {
         case .readFailed(let name): return "STAFConversionError: failed to read tensor '\(name)'"
         case .tensorNotFound(let name): return "STAFConversionError: tensor '\(name)' not found"
         case .unsupportedFormat(let id): return "STAFConversionError: unsupported format 0x\(String(id, radix: 16))"
+        case .missingQuantizationHint(let name):
+            return "STAFConversionError: quantized companion tensors exist for '\(name)' but no MLXQuantizationHint was provided. Supply config.json `quantization` metadata."
+        case .unsupportedQuantization(let bits, let groupSize):
+            return "STAFConversionError: unsupported MLX quantization (bits=\(bits), group_size=\(groupSize))"
+        case .inconsistentQuantizationShape(let name, let reason):
+            return "STAFConversionError: inconsistent quantization shape for '\(name)': \(reason)"
         }
     }
 }

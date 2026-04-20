@@ -2,7 +2,10 @@ import Foundation
 
 struct STAFConversionPlanner: Sendable {
 
-    func plan(safetensorsURLs: [URL]) throws -> STAFConversionPlan {
+    func plan(
+        safetensorsURLs: [URL],
+        quantization: MLXQuantizationHint?
+    ) throws -> STAFConversionPlan {
         let sortedURLs = safetensorsURLs.sorted { $0.lastPathComponent < $1.lastPathComponent }
 
         let loader = SafetensorsLoader()
@@ -30,7 +33,12 @@ struct STAFConversionPlanner: Sendable {
                     info: info,
                     shardIndex: shardIndex,
                     shardURL: shardURL,
-                    schemeIdentifier: determineScheme(name: name, info: info, allTensors: allTensors),
+                    schemeIdentifier: try determineScheme(
+                        name: name,
+                        info: info,
+                        allTensors: allTensors,
+                        quantization: quantization
+                    ),
                     semanticRole: inferSemanticRole(name: name),
                     originalDType: mapOriginalDType(info.dtype)
                 )
@@ -60,27 +68,34 @@ struct STAFConversionPlanner: Sendable {
     private func determineScheme(
         name: String,
         info: SafetensorsTensorInfo,
-        allTensors: [(name: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)]
-    ) -> QuantizationSchemeIdentifier {
+        allTensors: [(name: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)],
+        quantization: MLXQuantizationHint?
+    ) throws -> QuantizationSchemeIdentifier {
         if name.hasSuffix(".weight") {
             let modulePath = String(name.dropLast(".weight".count))
             let hasScales = allTensors.contains { $0.name == modulePath + ".scales" }
             let hasBiases = allTensors.contains { $0.name == modulePath + ".biases" }
 
             if hasScales && hasBiases {
-                if let scalesInfo = allTensors.first(where: { $0.name == modulePath + ".scales" })?.info {
-                    let groupSize = estimateGroupSize(
-                        weightShape: info.shape,
-                        scalesShape: scalesInfo.shape,
-                        bits: 4
-                    )
-                    switch groupSize {
-                    case 64: return .q4Group64ScaleF16
-                    case 128: return .q4Group128ScaleF16
-                    default: return .q4Group64ScaleF16
-                    }
+                guard let hint = quantization else {
+                    throw STAFConversionError.missingQuantizationHint(name)
                 }
-                return .q4Group64ScaleF16
+                guard let format = QuantizationFormatRegistry.formatForMLXQuantization(
+                    bits: hint.bits,
+                    groupSize: hint.groupSize
+                ) else {
+                    throw STAFConversionError.unsupportedQuantization(
+                        bits: hint.bits,
+                        groupSize: hint.groupSize
+                    )
+                }
+                try verifyTensorShape(
+                    name: name,
+                    weightShape: info.shape,
+                    scalesInfo: allTensors.first { $0.name == modulePath + ".scales" }?.info,
+                    hint: hint
+                )
+                return format.schemeIdentifier
             }
         }
 
@@ -96,15 +111,49 @@ struct STAFConversionPlanner: Sendable {
         }
     }
 
-    private func estimateGroupSize(weightShape: [Int], scalesShape: [Int], bits: Int) -> Int {
-        guard weightShape.count >= 2, scalesShape.count >= 2 else {
-            return 64
+    /// Confirm that the tensor shapes are consistent with the quantization hint.
+    ///
+    /// `input_dim = packed_dim × (32 / bits) = num_groups × group_size`. Any
+    /// mismatch indicates a corrupt bundle or wrong hint — fail loudly instead
+    /// of silently mislabeling the scheme.
+    private func verifyTensorShape(
+        name: String,
+        weightShape: [Int],
+        scalesInfo: SafetensorsTensorInfo?,
+        hint: MLXQuantizationHint
+    ) throws {
+        guard weightShape.count >= 2 else {
+            throw STAFConversionError.inconsistentQuantizationShape(
+                name: name,
+                reason: "weight shape has <2 dims: \(weightShape)"
+            )
         }
         let packedDimension = weightShape[weightShape.count - 1]
-        let numberOfGroups = scalesShape[scalesShape.count - 1]
-        let elementsPerUInt32 = 32 / bits
-        let inputDimension = packedDimension * elementsPerUInt32
-        return numberOfGroups > 0 ? inputDimension / numberOfGroups : 64
+        let inputDimFromWeight = packedDimension * 32 / hint.bits
+        if (packedDimension * 32) % hint.bits != 0 {
+            throw STAFConversionError.inconsistentQuantizationShape(
+                name: name,
+                reason: "packed_dim=\(packedDimension) is not divisible by bits=\(hint.bits)"
+            )
+        }
+        if inputDimFromWeight % hint.groupSize != 0 {
+            throw STAFConversionError.inconsistentQuantizationShape(
+                name: name,
+                reason: "input_dim=\(inputDimFromWeight) is not divisible by group_size=\(hint.groupSize)"
+            )
+        }
+        if let scalesShape = scalesInfo?.shape, scalesShape.count >= 2 {
+            let numberOfGroups = scalesShape[scalesShape.count - 1]
+            let inputDimFromScales = numberOfGroups * hint.groupSize
+            if inputDimFromScales != inputDimFromWeight {
+                throw STAFConversionError.inconsistentQuantizationShape(
+                    name: name,
+                    reason: "input_dim from weight=\(inputDimFromWeight) " +
+                            "!= input_dim from scales=\(inputDimFromScales) " +
+                            "(bits=\(hint.bits), group_size=\(hint.groupSize))"
+                )
+            }
+        }
     }
 
     private func inferSemanticRole(name: String) -> SemanticRole {

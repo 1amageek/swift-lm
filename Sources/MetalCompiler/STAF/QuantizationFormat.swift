@@ -597,6 +597,25 @@ enum Q8AffineMSL {
     }
 }
 
+// MARK: - MLX Quantization Hint
+
+/// Explicit MLX quantization metadata read from `config.json`.
+///
+/// Safetensors shape alone cannot disambiguate some format pairs
+/// (e.g. Q4G64 vs Q8G32 both satisfy `bits × group_size = 256`), so the
+/// planner requires this hint whenever quantized companions
+/// (`.scales` / `.biases`) are present. Silent defaults are forbidden
+/// — missing-but-required hints surface as explicit errors.
+public struct MLXQuantizationHint: Sendable, Hashable {
+    public let bits: Int
+    public let groupSize: Int
+
+    public init(bits: Int, groupSize: Int) {
+        self.bits = bits
+        self.groupSize = groupSize
+    }
+}
+
 // MARK: - Format Registry
 
 /// Resolves a `QuantizationSchemeIdentifier` to its corresponding `QuantizationFormat`.

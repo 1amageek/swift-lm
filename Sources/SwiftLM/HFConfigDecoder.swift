@@ -1,7 +1,24 @@
 import Foundation
 import LMArchitecture
+import MetalCompiler
 
 struct HFConfigDecoder {
+    func quantizationHint(from data: Data) throws -> MLXQuantizationHint? {
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw ModelBundleLoaderError.invalidConfig("config.json is not a JSON object")
+        }
+        let candidates: [[String: Any]] = [
+            json["quantization"] as? [String: Any],
+            (json["text_config"] as? [String: Any])?["quantization"] as? [String: Any]
+        ].compactMap { $0 }
+        guard let dict = candidates.first,
+              let bits = dict["bits"] as? Int,
+              let groupSize = dict["group_size"] as? Int else {
+            return nil
+        }
+        return MLXQuantizationHint(bits: bits, groupSize: groupSize)
+    }
+
     func modelType(from data: Data) throws -> String {
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let modelType = json["model_type"] as? String else {

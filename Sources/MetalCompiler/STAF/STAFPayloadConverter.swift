@@ -8,11 +8,12 @@ struct STAFPayloadConverter: Sendable {
         switch entry.schemeIdentifier {
         case .fp16RowMajor, .passthrough:
             return try convertDensePayload(entry: entry, tensorData: tensorData)
-        case .bf16RowMajor:
+        case .bf16RowMajor, .fp32RowMajor:
             return tensorData
-        case .fp32RowMajor:
-            return tensorData
-        case .q4Group64ScaleF16, .q4Group128ScaleF16:
+        case .q2Group16ScaleF16, .q2Group32ScaleF16,
+             .q4Group64ScaleF16, .q4Group128ScaleF16,
+             .q6Group16ScaleF16, .q6Group32ScaleF16,
+             .q8Group32ScaleF16, .q8Group64ScaleF16:
             return try repackMLXQuantized(entry: entry, weightData: tensorData)
         default:
             return tensorData
@@ -76,24 +77,35 @@ struct STAFPayloadConverter: Sendable {
 
         let outputDimension = entry.info.shape[0]
         let packedDimension = entry.info.shape.count >= 2 ? entry.info.shape[1] : 1
-        let elementsPerUInt32 = 32 / format.bits
-        let inputDimension = packedDimension * elementsPerUInt32
+        let bytesPerRow = packedDimension * MemoryLayout<UInt32>.size
+        let inputDimension = bytesPerRow * 8 / format.bits
         let blocksPerRow = inputDimension / format.groupSize
         let totalBlocks = outputDimension * blocksPerRow
+        let bytesPerGroup = format.groupSize * format.bits / 8
+
+        guard bytesPerGroup * 8 == format.groupSize * format.bits else {
+            throw STAFConversionError.inconsistentQuantizationShape(
+                name: entry.name,
+                reason: "group_size=\(format.groupSize) × bits=\(format.bits) is not a whole number of bytes"
+            )
+        }
 
         var output = Data(count: totalBlocks * format.bytesPerBlock)
         weightData.withUnsafeBytes { weightBuffer in
             scalesData.withUnsafeBytes { scalesBuffer in
                 biasesData.withUnsafeBytes { biasesBuffer in
                     output.withUnsafeMutableBytes { outputBuffer in
-                        let weights = weightBuffer.bindMemory(to: UInt32.self)
+                        let weightBytes = weightBuffer.bindMemory(to: UInt8.self)
                         let scales = scalesBuffer.bindMemory(to: Float16.self)
                         let biases = biasesBuffer.bindMemory(to: Float16.self)
+                        let outputBase = outputBuffer.baseAddress!
+                        let weightBase = weightBytes.baseAddress!
 
                         for row in 0..<outputDimension {
+                            let rowByteOffset = row * bytesPerRow
                             for block in 0..<blocksPerRow {
                                 let blockOffset = (row * blocksPerRow + block) * format.bytesPerBlock
-                                let destination = outputBuffer.baseAddress! + blockOffset
+                                let destination = outputBase + blockOffset
 
                                 var scale = scales[row * blocksPerRow + block]
                                 memcpy(destination, &scale, 2)
@@ -101,24 +113,13 @@ struct STAFPayloadConverter: Sendable {
                                 var zero = biases[row * blocksPerRow + block]
                                 memcpy(destination + 2, &zero, 2)
 
-                                let qDestination = destination + 4
-                                let weightsPerGroup = format.groupSize
-                                let uint32PerGroup = weightsPerGroup / elementsPerUInt32
-
-                                for packedIndexOffset in 0..<uint32PerGroup {
-                                    let packedIndex = row * packedDimension + block * uint32PerGroup + packedIndexOffset
-                                    let packed = weights[packedIndex]
-                                    for nibblePair in 0..<4 {
-                                        let lowNibble = UInt8((packed >> (nibblePair * 8)) & 0xF)
-                                        let highNibble = UInt8((packed >> (nibblePair * 8 + 4)) & 0xF)
-                                        let byte = lowNibble | (highNibble << 4)
-                                        qDestination.storeBytes(
-                                            of: byte,
-                                            toByteOffset: packedIndexOffset * 4 + nibblePair,
-                                            as: UInt8.self
-                                        )
-                                    }
-                                }
+                                // MLX stores quantized weights as a contiguous
+                                // LSB-first bit-stream packed into uint32 words.
+                                // STAF uses the same bit-stream layout for the qs
+                                // region, so a byte-level copy preserves the
+                                // packing for every supported bit width.
+                                let srcOffset = rowByteOffset + block * bytesPerGroup
+                                memcpy(destination + 4, weightBase + srcOffset, bytesPerGroup)
                             }
                         }
                     }
@@ -164,11 +165,12 @@ struct STAFPayloadConverter: Sendable {
     ///
     /// MLX affine quantization stores `scales` and `biases` in the same dtype
     /// as the original model. For BF16 models (e.g. Gemma3/4), these arrive as
-    /// BF16 bytes even though the packed-weight kernel consumes them as Float16.
+    /// BF16 bytes even though packed-weight kernels consume them as Float16.
     /// Reading BF16 bytes as Float16 produces catastrophically wrong scales and
-    /// biases, which is why prior Q4 bundles dequantized to near-identity layers
-    /// (hidden collapses to the input embedding, argmax echoes the last prompt
-    /// token). Normalize here so the kernel input is always F16.
+    /// biases, which previously caused quantized bundles to dequantize to
+    /// near-identity layers (hidden collapses to the input embedding, argmax
+    /// echoes the last prompt token). Normalize here so the kernel input is
+    /// always F16.
     private func normalizeScaleToFloat16(_ data: Data, dtype: SafetensorsDType) throws -> Data {
         switch dtype {
         case .float16:
@@ -208,7 +210,7 @@ struct STAFPayloadConverter: Sendable {
             // other dtype indicates a malformed bundle — fail loudly rather
             // than silently producing bogus Q4 blocks.
             fatalError(
-                "Unsupported scale/bias dtype for Q4 block packing: \(dtype.rawValue). " +
+                "Unsupported scale/bias dtype for quantized block packing: \(dtype.rawValue). " +
                 "Expected F16, BF16, or F32.")
         }
     }
