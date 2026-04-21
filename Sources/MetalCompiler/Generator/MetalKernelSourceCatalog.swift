@@ -8,20 +8,30 @@ struct KernelWeightFormatResolver {
               let binding = entry.parameterBindings.first(where: { $0.role == role }),
               let info = staf.tensor(for: binding.tensorName) else { return .float16 }
         switch info.format.schemeIdentifier {
+        case .fp16RowMajor, .passthrough:
+            return .float16
         case .bf16RowMajor:
             return .bfloat16
         case .fp32RowMajor:
             return .float32
+        case .q2Group16ScaleF16:
+            return .quantized2Bit(groupSize: 16)
+        case .q2Group32ScaleF16:
+            return .quantized2Bit(groupSize: 32)
         case .q4Group64ScaleF16:
             return .quantized4Bit(groupSize: 64)
         case .q4Group128ScaleF16:
             return .quantized4Bit(groupSize: 128)
+        case .q6Group16ScaleF16:
+            return .quantized6Bit(groupSize: 16)
+        case .q6Group32ScaleF16:
+            return .quantized6Bit(groupSize: 32)
         case .q8Group32ScaleF16:
             return .quantized8Bit(groupSize: 32)
         case .q8Group64ScaleF16:
             return .quantized8Bit(groupSize: 64)
         default:
-            return .float16
+            fatalError("KernelWeightFormatResolver: unsupported STAF scheme 0x\(String(info.format.schemeIdentifier.rawValue, radix: 16)) for tensor '\(binding.tensorName)'. Silent fallback to float16 has been removed — add explicit handling for this scheme or extend WeightFormat.")
         }
     }
 
@@ -774,7 +784,7 @@ struct MetalKernelSourceCatalog {
             return "batched_gemm_f16_f32s_\(count)"
         case .float32:
             return "batched_gemm_f32_f32s_\(count)"
-        case .quantized4Bit, .quantized8Bit:
+        case .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
             return nil
         }
     }

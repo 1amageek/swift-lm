@@ -64,7 +64,9 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
         case .float16: weightTag = "wf16"
         case .bfloat16: weightTag = "wbf16"
         case .float32: weightTag = "wf32"
+        case .quantized2Bit(let gs): weightTag = "wq2g\(gs)"
         case .quantized4Bit(let gs): weightTag = "wq4g\(gs)"
+        case .quantized6Bit(let gs): weightTag = "wq6g\(gs)"
         case .quantized8Bit(let gs): weightTag = "wq8g\(gs)"
         }
         // Composition tag: distinct compositions must produce distinct kernel names

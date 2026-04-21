@@ -45,9 +45,13 @@ public enum WeightFormat: Sendable, Equatable {
     case bfloat16
     /// Float32 — direct read as float.
     case float32
-    /// Quantized 4-bit with group size.
+    /// Quantized 2-bit (aligned) with group size.
+    case quantized2Bit(groupSize: Int)
+    /// Quantized 4-bit (aligned) with group size.
     case quantized4Bit(groupSize: Int)
-    /// Quantized 8-bit with group size.
+    /// Quantized 6-bit (non-aligned: 4 weights per 3 bytes) with group size.
+    case quantized6Bit(groupSize: Int)
+    /// Quantized 8-bit (aligned) with group size.
     case quantized8Bit(groupSize: Int)
 
     /// MSL type for the weight buffer parameter.
@@ -56,36 +60,33 @@ public enum WeightFormat: Sendable, Equatable {
         case .float16: return "half"
         case .bfloat16: return "uint16_t"
         case .float32: return "float"
-        case .quantized4Bit, .quantized8Bit: return "uchar"
+        case .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
+            return "uchar"
         }
     }
 
     /// MSL expression to convert a weight value to float.
     ///
     /// Only valid for dense formats (float16 / bfloat16 / float32). Block-packed
-    /// quantized formats (Q4, Q8, ...) cannot produce a single-element read
-    /// expression because they require per-block scale/zero lookup; they must
-    /// be routed to dedicated quantized kernels (`gemv_q4_*`, `gemv_q8_*`, etc.).
-    ///
-    /// Calling this on a quantized format indicates a routing bug — the caller
-    /// should have dispatched the work to a quantized kernel path instead of a
-    /// dense GEMV/GEMM template. We trap loudly rather than emit undefined MSL
-    /// (`dequantize(...)`) that would fail at shader compile time with a
-    /// confusing diagnostic.
+    /// quantized formats cannot produce a single-element read expression because
+    /// they require per-block scale/zero lookup; they must be routed to dedicated
+    /// quantized kernels (`gemv_q*`), not a dense GEMV/GEMM template.
     public func readExpression(_ expr: String) -> String {
         switch self {
         case .float16: return "float(\(expr))"
         case .bfloat16: return "bf16_to_float(\(expr))"
         case .float32: return "(\(expr))"
-        case .quantized4Bit, .quantized8Bit:
-            fatalError("WeightFormat.readExpression called with quantized format \(self); quantized weights must be routed to a dedicated quantized kernel (gemv_q4_*, gemv_q8_*), not a dense GEMV/GEMM template. This indicates a routing bug — the caller should pass `effectiveWeightFormat` (post dequant→BF16 substitution) rather than the original quantized `weightFormat`.")
+        case .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
+            fatalError("WeightFormat.readExpression called with quantized format \(self); quantized weights must be routed to a dedicated quantized kernel, not a dense GEMV/GEMM template. The caller should pass `effectiveWeightFormat` (post dequant→BF16 substitution) rather than the original quantized `weightFormat`.")
         }
     }
 
     var isQuantized: Bool {
         switch self {
-        case .quantized4Bit, .quantized8Bit: return true
-        case .float16, .bfloat16, .float32: return false
+        case .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
+            return true
+        case .float16, .bfloat16, .float32:
+            return false
         }
     }
 
@@ -95,8 +96,29 @@ public enum WeightFormat: Sendable, Equatable {
             return MemoryLayout<UInt16>.stride
         case .float32:
             return MemoryLayout<Float>.stride
-        case .quantized4Bit, .quantized8Bit:
+        case .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
             return MemoryLayout<UInt8>.stride
+        }
+    }
+
+    /// Bit width for quantized formats (nil for dense).
+    var quantizationBits: Int? {
+        switch self {
+        case .quantized2Bit: return 2
+        case .quantized4Bit: return 4
+        case .quantized6Bit: return 6
+        case .quantized8Bit: return 8
+        case .float16, .bfloat16, .float32: return nil
+        }
+    }
+
+    /// Group size for quantized formats (nil for dense).
+    var quantizationGroupSize: Int? {
+        switch self {
+        case .quantized2Bit(let g), .quantized4Bit(let g),
+             .quantized6Bit(let g), .quantized8Bit(let g):
+            return g
+        case .float16, .bfloat16, .float32: return nil
         }
     }
 }

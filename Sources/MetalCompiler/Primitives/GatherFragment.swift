@@ -36,6 +36,8 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
             return context.bufferPrecision == .float32
                 ? "embedding_lookup_seq_f32\(scaled)"
                 : "embedding_lookup\(scaled)"
+        case (_, .quantized2Bit), (_, .quantized6Bit):
+            fatalError("GatherFragment.kernelName: embedding lookup kernel for \(context.weightFormat) is not implemented. Quantized embedding tables currently support Q4 and Q8 only; Q2/Q6 requires a dedicated embedding_lookup_q2_* / _q6_* kernel.")
         }
     }
     public var dispatchDimension: MetalDispatchDimension { .gather(count: embeddingDimension) }

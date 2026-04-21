@@ -29,7 +29,8 @@ struct MetalKernelNameResolver {
             return .bfloat16
         case .float32:
             return .float32
-        case .float16, .quantized4Bit, .quantized8Bit:
+        case .float16,
+             .quantized2Bit, .quantized4Bit, .quantized6Bit, .quantized8Bit:
             return .float16
         }
     }

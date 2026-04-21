@@ -1514,34 +1514,7 @@ private struct PrefillStepPlanner {
     }
 
     private var fallbackSchemeIdentifier: QuantizationSchemeIdentifier {
-        switch fallbackWeightFormat {
-        case .float16:
-            return .fp16RowMajor
-        case .bfloat16:
-            return .bf16RowMajor
-        case .float32:
-            return .fp32RowMajor
-        case .quantized4Bit(let groupSize):
-            switch groupSize {
-            case 64:
-                return .q4Group64ScaleF16
-            case 128:
-                return .q4Group128ScaleF16
-            default:
-                return .passthrough
-            }
-        case .quantized8Bit(let groupSize):
-            switch groupSize {
-            case 32:
-                return .q8Group32ScaleF16
-            case 64:
-                return .q8Group64ScaleF16
-            case 128:
-                return .q8Group128ScaleF16
-            default:
-                return .passthrough
-            }
-        }
+        fallbackWeightFormat.quantizationSchemeIdentifier
     }
 }
 

@@ -254,12 +254,30 @@ extension WeightFormat {
             return .bf16RowMajor
         case .float32:
             return .fp32RowMajor
+        case .quantized2Bit(let groupSize):
+            switch groupSize {
+            case 16:
+                return .q2Group16ScaleF16
+            case 32:
+                return .q2Group32ScaleF16
+            default:
+                return .passthrough
+            }
         case .quantized4Bit(let groupSize):
             switch groupSize {
             case 64:
                 return .q4Group64ScaleF16
             case 128:
                 return .q4Group128ScaleF16
+            default:
+                return .passthrough
+            }
+        case .quantized6Bit(let groupSize):
+            switch groupSize {
+            case 16:
+                return .q6Group16ScaleF16
+            case 32:
+                return .q6Group32ScaleF16
             default:
                 return .passthrough
             }
