@@ -1,3 +1,22 @@
+/// Descriptor for a direct quantized GEMM kernel (register-resident weight unpacking).
+///
+/// Formats that implement a hand-tuned GEMM kernel that reads packed weights directly
+/// return a non-nil `DirectQuantizedGEMM` from `directGEMMKernel()` /
+/// `batchedGEMMKernel(count:)`. Formats without such a kernel return nil, and the
+/// compiler routes through the dequant→BF16→MPP GEMM pipeline instead.
+///
+/// This is a **capability declaration**, not an error fallback: both paths are
+/// correctness-preserving. The direct kernel is strictly a performance optimization.
+public struct DirectQuantizedGEMM: Sendable {
+    public let kernelName: String
+    public let threadgroupMemoryLength: Int
+
+    public init(kernelName: String, threadgroupMemoryLength: Int) {
+        self.kernelName = kernelName
+        self.threadgroupMemoryLength = threadgroupMemoryLength
+    }
+}
+
 /// Declares a quantization block format for GPU execution.
 ///
 /// Each concrete struct represents one quantization scheme.
@@ -75,6 +94,36 @@ public protocol QuantizationFormat: Sendable {
         blockIndexVar: String,
         outputArrayVar: String
     ) -> String?
+
+    // MARK: - Prefill dispatch capabilities
+
+    /// Name of the dequant-to-BFloat16 kernel for this format, used by the
+    /// prefill dequant→BF16→MPP GEMM pipeline.
+    ///
+    /// Returns nil for dense formats (no dequant needed). For quantized formats
+    /// the default implementation returns the unified
+    /// `dequant_q{bits}_g{group}_bf16` name; the same symbol is emitted by
+    /// `MetalKernelSourceCatalog` regardless of whether the source is produced
+    /// by the hand-tuned Q4 generator or the unified generator.
+    var dequantToBFloatKernelName: String? { get }
+
+    /// Direct prefill GEMM kernel that reads packed weights in registers,
+    /// bypassing the two-step dequant→AMX pipeline.
+    ///
+    /// Returns nil when the format has no hand-tuned direct GEMM kernel; the
+    /// compiler will route through the dequant→BF16→MPP GEMM pipeline instead.
+    /// Both paths are correctness-preserving; the direct kernel is strictly a
+    /// performance optimization that must match the prefill sequence-aware
+    /// buffer signature (see `DirectQuantizedGEMM`).
+    func directGEMMKernel() -> DirectQuantizedGEMM?
+
+    /// Batched prefill GEMM kernel that shares a single input across `count`
+    /// projections (Q/K/V, gate+up etc.), bypassing the dequant→AMX pipeline.
+    ///
+    /// Returns nil when no batched direct kernel exists for this (format, count)
+    /// combination; the compiler will fall through to per-projection direct
+    /// GEMM or the dequant→BF16 MPP path.
+    func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM?
 }
 
 // MARK: - Protocol default implementations
@@ -102,6 +151,34 @@ public extension QuantizationFormat {
         blocksVar: String,
         weightIndexVar: String
     ) -> String? { nil }
+
+    /// Default: quantized formats use the unified `dequant_q{bits}_g{group}_bf16`
+    /// symbol (matches both the hand-tuned Q4 generator output and the unified
+    /// generator output). Dense formats return nil — no dequant step is needed.
+    var dequantToBFloatKernelName: String? {
+        guard isQuantized else { return nil }
+        return "dequant_q\(bits)_g\(groupSize)_bf16"
+    }
+
+    /// Default: no direct GEMM kernel. Formats with a hand-tuned kernel
+    /// (Q4G64 / Q4G128 / Q8G32 / Q8G64) override this.
+    func directGEMMKernel() -> DirectQuantizedGEMM? { nil }
+
+    /// Default: no batched direct GEMM kernel. Q4G64 / Q4G128 override this.
+    func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM? { nil }
+}
+
+// MARK: - Threadgroup memory helper
+
+/// Thread-group memory length used by all hand-tuned direct quantized GEMM kernels.
+///
+/// All current direct kernels (`gemm_q{4,8}_g{group}_f32s`) allocate
+/// `max(groupSize * 2, 256) * sizeof(float)` bytes of TG memory, where the
+/// `groupSize * 2` term accounts for scale + zero cached per group and 256 is
+/// the lower bound tile width.
+@inlinable
+public func directQuantizedGEMMThreadgroupMemoryLength(groupSize: Int) -> Int {
+    max(groupSize * 2, 256) * MemoryLayout<Float>.size
 }
 
 // MARK: - Dense Formats
@@ -223,6 +300,20 @@ public struct AffineQ4Group64Format: QuantizationFormat {
         Q4AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
+    public func directGEMMKernel() -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "gemm_q4_g64_f32s",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
+    }
+
+    public func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "batched_gemm_q4_g64_\(count)",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
+    }
+
     public init() {}
 }
 
@@ -258,6 +349,20 @@ public struct AffineQ4Group128Format: QuantizationFormat {
         weightIndexVar: String
     ) -> String? {
         Q4AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
+    }
+
+    public func directGEMMKernel() -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "gemm_q4_g128_f32s",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
+    }
+
+    public func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "batched_gemm_q4_g128_\(count)",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
     }
 
     public init() {}
@@ -610,6 +715,13 @@ public struct AffineQ8Group32Format: QuantizationFormat {
         Q8AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
+    public func directGEMMKernel() -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "gemm_q8_g32_f32s",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
+    }
+
     public init() {}
 }
 
@@ -634,6 +746,13 @@ public struct AffineQ8Group64Format: QuantizationFormat {
         weightIndexVar: String
     ) -> String? {
         Q8AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
+    }
+
+    public func directGEMMKernel() -> DirectQuantizedGEMM? {
+        DirectQuantizedGEMM(
+            kernelName: "gemm_q8_g64_f32s",
+            threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
+        )
     }
 
     public init() {}

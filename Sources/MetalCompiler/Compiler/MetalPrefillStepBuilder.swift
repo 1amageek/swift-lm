@@ -1526,87 +1526,30 @@ private struct ProjectionWeightDescriptor {
     let fallbackReason: MetalQuantizationFallbackReason?
 }
 
-// MARK: - Quantized Dequant → AMX Helpers
+// MARK: - Quantized Dispatch Resolution
+//
+// Each capability (dequant kernel, direct GEMM, batched GEMM) is declared on
+// `QuantizationFormat` itself. These private helpers just forward a scheme
+// identifier to the corresponding format — no switch-over-format lives here.
+//
+// IMPORTANT: direct GEMM kernels MUST be multi-row GEMMs with `sequenceLength`
+// and `inputRowStride` parameters. Decode-only GEMV kernels
+// (`gemv_q4_g64` / `gemv_q4_g128` / `gemv_q8_g*`) must never be returned here
+// — they ignore `gid.y` and silently corrupt non-first positions in prefill.
 
-/// Dequant kernel name for the given quantization scheme.
-///
-/// Q4 keeps the historical `dequant_q4_g{group}_bf16` symbol emitted by the
-/// hand-tuned generator. All other quantized formats fall through to the
-/// generic `dequant_q{bits}_g{group}_bf16` emitted by
-/// `generateUnifiedDequantToBFloat`. Returns nil for dense schemes and for
-/// schemes that have no registered `QuantizationFormat`.
 private func dequantKernelName(for scheme: QuantizationSchemeIdentifier) -> String? {
-    switch scheme {
-    case .q4Group64ScaleF16: return "dequant_q4_g64_bf16"
-    case .q4Group128ScaleF16: return "dequant_q4_g128_bf16"
-    default:
-        guard let format = QuantizationFormatRegistry.format(for: scheme),
-              format.isQuantized else {
-            return nil
-        }
-        return MetalSourceGenerator.unifiedDequantKernelName(for: format)
-    }
+    QuantizationFormatRegistry.format(for: scheme)?.dequantToBFloatKernelName
 }
 
-/// Resolved direct quantized GEMM kernel — reads packed weights in registers,
-/// bypassing the dequant→AMX two-step pipeline.
-private struct DirectQuantizedGEMM {
-    let kernelName: String
-    let threadgroupMemoryLength: Int
-}
-
-/// Resolve the direct quantized GEMM kernel for a single projection.
-/// Returns nil when no direct kernel exists for this scheme (falls back to dequant→AMX).
-///
-/// IMPORTANT: The returned kernel MUST be a multi-row GEMM with `sequenceLength`
-/// and `inputRowStride` parameters. Decode-only GEMV kernels
-/// (`gemv_q4_g64` / `gemv_q4_g128` / `gemv_q8_g*`) must never be returned here
-/// — they ignore `gid.y` and silently corrupt non-first positions in prefill.
-///
-/// Buffer signature expected by dispatch builder:
-/// - Buffer 0: input, Buffer 1: weight, Buffer 2: output
-/// - Buffer 3: inputDim, Buffer 4: outputDim, Buffer 5: seqLen, Buffer 6: inputRowStride
 private func resolveDirectQuantizedGEMM(
     for scheme: QuantizationSchemeIdentifier
 ) -> DirectQuantizedGEMM? {
-    switch scheme {
-    case .q4Group64ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "gemm_q4_g64_f32s",
-            threadgroupMemoryLength: max(64 * 2, 256) * MemoryLayout<Float>.size)
-    case .q4Group128ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "gemm_q4_g128_f32s",
-            threadgroupMemoryLength: max(128 * 2, 256) * MemoryLayout<Float>.size)
-    case .q8Group32ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "gemm_q8_g32_f32s",
-            threadgroupMemoryLength: max(32 * 2, 256) * MemoryLayout<Float>.size)
-    case .q8Group64ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "gemm_q8_g64_f32s",
-            threadgroupMemoryLength: max(64 * 2, 256) * MemoryLayout<Float>.size)
-    default:
-        return nil
-    }
+    QuantizationFormatRegistry.format(for: scheme)?.directGEMMKernel()
 }
 
-/// Resolve the batched quantized GEMM kernel for multi-projection dispatch.
-/// Returns nil when no batched kernel exists for this scheme.
 private func resolveBatchedQuantizedGEMM(
     for scheme: QuantizationSchemeIdentifier,
     count: Int
 ) -> DirectQuantizedGEMM? {
-    switch scheme {
-    case .q4Group64ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "batched_gemm_q4_g64_\(count)",
-            threadgroupMemoryLength: max(64 * 2, 256) * MemoryLayout<Float>.size)
-    case .q4Group128ScaleF16:
-        return DirectQuantizedGEMM(
-            kernelName: "batched_gemm_q4_g128_\(count)",
-            threadgroupMemoryLength: max(128 * 2, 256) * MemoryLayout<Float>.size)
-    default:
-        return nil
-    }
+    QuantizationFormatRegistry.format(for: scheme)?.batchedGEMMKernel(count: count)
 }
