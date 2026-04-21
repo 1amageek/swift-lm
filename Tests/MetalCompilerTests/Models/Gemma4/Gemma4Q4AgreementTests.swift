@@ -23,8 +23,8 @@ import Testing
 @Suite("Gemma4 Q4 Agreement", .serialized)
 struct Gemma4Q4AgreementTests {
 
-    static let bf16BundlePath = "/Users/Shared/swift-lm-testdata/gemma-4-E2B-it"
-    static let q4BundlePath = "/Users/Shared/swift-lm-testdata/gemma-4-E2B-it-4bit"
+    static let bf16BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it"
+    static let q4BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it-4bit"
 
     @Test("Q4 vs BF16 token agreement (3 prompts × 100 decode steps)")
     func q4VersusBFloat16Agreement() throws {
