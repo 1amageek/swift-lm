@@ -25,19 +25,40 @@ deployment decision made by the consumer.
 Enumerated by `QuantizationSchemeIdentifier` and mapped to concrete GEMV/GEMM
 kernels via `QuantizationFormatRegistry`.
 
-| Scheme | ID | bits | groupSize | Swift `WeightFormat` |
+| Scheme | ID | bits | groupSize | Block struct |
 |---|---|---|---|---|
-| `fp16RowMajor` | 0x00 | 16 | — | `.float16` |
-| `bf16RowMajor` | 0x01 | 16 | — | `.bfloat16` |
-| `fp32RowMajor` | 0x02 | 32 | — | `.float32` |
-| `q8Group32ScaleF16` | 0x10 | 8 | 32 | `.quantized8Bit(32)` |
-| `q8Group64ScaleF16` | 0x11 | 8 | 64 | `.quantized8Bit(64)` |
-| `q4Group64ScaleF16` | 0x40 | 4 | 64 | `.quantized4Bit(64)` |
-| `q4Group128ScaleF16` | 0x41 | 4 | 128 | `.quantized4Bit(128)` |
+| `fp16RowMajor` | 0x00 | 16 | — | dense |
+| `bf16RowMajor` | 0x01 | 16 | — | dense |
+| `fp32RowMajor` | 0x02 | 32 | — | dense |
+| `q2Group16ScaleF16` | 0x60 | 2 | 16 | `AffineQ2Group16Block` |
+| `q2Group32ScaleF16` | 0x61 | 2 | 32 | `AffineQ2Group32Block` |
+| `q3Group16ScaleF16` | 0x50 | 3 | 16 | `AffineQ3Group16Block` |
+| `q3Group32ScaleF16` | 0x51 | 3 | 32 | `AffineQ3Group32Block` |
+| `q4Group64ScaleF16` | 0x40 | 4 | 64 | `AffineQ4Group64Block` |
+| `q4Group128ScaleF16` | 0x41 | 4 | 128 | `AffineQ4Group128Block` |
+| `q4Group128ScaleF16Zero` | 0x42 | 4 | 128 | alias → `AffineQ4Group128Block` |
+| `q5Group32ScaleF16` | 0x30 | 5 | 32 | `AffineQ5Group32Block` |
+| `q5Group64ScaleF16` | 0x31 | 5 | 64 | `AffineQ5Group64Block` |
+| `q6Group16ScaleF16` | 0x20 | 6 | 16 | `AffineQ6Group16Block` |
+| `q6Group32ScaleF16` | 0x21 | 6 | 32 | `AffineQ6Group32Block` |
+| `q8Group32ScaleF16` | 0x10 | 8 | 32 | `AffineQ8Group32Block` |
+| `q8Group64ScaleF16` | 0x11 | 8 | 64 | `AffineQ8Group64Block` |
+| `q8Group128ScaleF16` | 0x12 | 8 | 128 | `AffineQ8Group128Block` |
 
-Declared identifiers without a registry mapping (e.g., `q6_*`, `q5_*`,
-`q3_*`, `q2_*`, `q4Group128ScaleF16Zero`) are **not supported at runtime** —
-`QuantizationFormatRegistry.format(for:)` returns nil and loading fails loudly.
+Registry coverage: every block-quantized scheme in this table resolves to a
+concrete `QuantizationFormat` via `QuantizationFormatRegistry.format(for:)`.
+GEMV/GEMM kernels are generated through the unified `generateUnifiedQuantizedGEMV`
+pipeline. Kernel-level correctness is covered by `UnifiedGEMVBitLevelTests`,
+`UnifiedGEMVMultiBlockTests`, and `UnifiedGEMVMultiRowTests` in
+`Tests/MetalCompilerTests/Core/`. MLX→STAF bit-stream round-trip is covered by
+`STAFQuantizedRoundtripTests` and `STAFRoundtripTests`. Full MLX safetensors
+→ `STAFConverter` → `STAFLoader` → unified GEMV dispatch is covered
+end-to-end by `STAFEndToEndGEMVTests` — one @Test per MLX-reachable
+(bits, groupSize) pair.
+
+Real-bundle end-to-end correctness (weight load + decode token quality) is
+tracked separately in the "Per-Model Support Matrix" below — registry presence
+alone does not imply a published bundle has been validated end-to-end.
 
 ## KV Cache Schemes
 
@@ -62,6 +83,14 @@ Support means the scheme has a passing **real-bundle correctness test** or
 **real-bundle embedding evaluation** at HEAD. Untested combinations are
 considered unsupported — even if the loader accepts them — because there is no
 regression guard preventing silent correctness loss.
+
+**Synthetic vs real-bundle coverage.** This matrix only counts *real-bundle*
+validation (downloaded weights → decode token quality or embedding checksum
+compared against a HuggingFace/MLX reference). The *synthetic* pipeline —
+MLX-shaped safetensors → `STAFConverter` → `STAFLoader` → unified GEMV
+dispatch — is validated for all 13 MLX-reachable (bits, groupSize) pairs by
+`STAFEndToEndGEMVTests`. A ❌ below therefore means "no real bundle validated
+for this model × format" and **not** "the kernel path is unverified".
 
 ### Gemma4 (text decoder)
 
