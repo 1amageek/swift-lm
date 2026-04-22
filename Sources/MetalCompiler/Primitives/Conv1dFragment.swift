@@ -13,7 +13,7 @@ public struct Conv1dFragment: PrimitiveMetalKernelFragment {
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
         if context.bufferPrecision == .float32 { return "conv1d_causal_seq_f32" }
-        return context.weightFormat == .bfloat16 ? "conv_state_update_bf16" : "conv_state_update"
+        return context.weightFormat.isBFloat16 ? "conv_state_update_bf16" : "conv_state_update"
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: "conv_weight", role: .weight)] }

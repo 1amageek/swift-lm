@@ -67,7 +67,7 @@ struct Input2048GEMVSourcePolicy: Sendable {
             fixedSimdgroups: nil,
             stagesInputAsFloat: true,
             unrollFactor: 8,
-            bf16ArgumentReadPolicy: weightFormat == .bfloat16 ? .pairwisePointerFloatInput : .scalar,
+            bf16ArgumentReadPolicy: weightFormat.isBFloat16 ? .pairwisePointerFloatInput : .scalar,
             weightLayoutPolicy: .rowMajor
         )
     }
@@ -79,7 +79,7 @@ struct Input2048GEMVSourcePolicy: Sendable {
             fixedSimdgroups: 4,
             stagesInputAsFloat: false,
             unrollFactor: 4,
-            bf16ArgumentReadPolicy: weightFormat == .bfloat16 ? .packed4ThreadgroupFixedPointerInput : .scalar,
+            bf16ArgumentReadPolicy: weightFormat.isBFloat16 ? .packed4ThreadgroupFixedPointerInput : .scalar,
             weightLayoutPolicy: .rowMajor
         )
     }

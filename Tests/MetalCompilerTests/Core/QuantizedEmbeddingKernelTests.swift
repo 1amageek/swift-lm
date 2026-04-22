@@ -9,7 +9,7 @@ struct QuantizedEmbeddingKernelTests {
         let fragment = GatherFragment(vocabularySize: 1024, embeddingDimension: 256)
         let context = KernelContext(
             bufferPrecision: .float32,
-            weightFormat: .quantized4Bit(groupSize: 64)
+            weightFormat: WeightFormats.quantized4Bit(groupSize: 64)
         )
 
         let name = fragment.kernelName(context: context)
@@ -18,7 +18,7 @@ struct QuantizedEmbeddingKernelTests {
         let source = fragment.kernelSource(
             name: name,
             bufferPrecision: .float32,
-            weightFormat: .quantized4Bit(groupSize: 64)
+            weightFormat: WeightFormats.quantized4Bit(groupSize: 64)
         )
         #expect(source.contains("const uint GROUP_SIZE = 64;"))
         #expect(source.contains("tokenIDs[seqPos]"))
@@ -30,7 +30,7 @@ struct QuantizedEmbeddingKernelTests {
         let fragment = GatherFragment(vocabularySize: 1024, embeddingDimension: 256)
         let context = KernelContext(
             bufferPrecision: .float16,
-            weightFormat: .quantized8Bit(groupSize: 32)
+            weightFormat: WeightFormats.quantized8Bit(groupSize: 32)
         )
 
         let name = fragment.kernelName(context: context)
@@ -39,7 +39,7 @@ struct QuantizedEmbeddingKernelTests {
         let source = fragment.kernelSource(
             name: name,
             bufferPrecision: .float16,
-            weightFormat: .quantized8Bit(groupSize: 32)
+            weightFormat: WeightFormats.quantized8Bit(groupSize: 32)
         )
         #expect(source.contains("const uint GROUP_SIZE = 32;"))
         #expect(source.contains("quantized[indexInGroup]"))

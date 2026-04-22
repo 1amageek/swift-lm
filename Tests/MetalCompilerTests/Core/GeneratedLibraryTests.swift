@@ -76,14 +76,14 @@ struct GeneratedLibraryTests {
             for: entry,
             kernelContext: .init(
                 bufferPrecision: .float32,
-                weightFormat: .quantized4Bit(groupSize: 64)
+                weightFormat: WeightFormats.quantized4Bit(groupSize: 64)
             )
         )
         #expect(kernelName == "gemm_q4_g64_f32s")
 
         let catalog = MetalKernelSourceCatalog(
             stafWeightStore: store,
-            modelWeightFormat: .quantized4Bit(groupSize: 64),
+            modelWeightFormat: WeightFormats.quantized4Bit(groupSize: 64),
             bufferPrecision: .float32,
             accessPolicyResolver: ProjectionWeightAccessPolicyResolver(),
             kernelNameResolver: resolver

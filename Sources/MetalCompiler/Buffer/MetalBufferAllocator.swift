@@ -393,7 +393,7 @@ struct MetalBufferAllocator {
     ) -> QuantizationSchemeIdentifier {
         switch selection {
         case .automatic:
-            return weightFormat == .bfloat16 ? .bf16RowMajor : .fp16RowMajor
+            return weightFormat.isBFloat16 ? .bf16RowMajor : .fp16RowMajor
         case .fixed(let scheme):
             return scheme
         }

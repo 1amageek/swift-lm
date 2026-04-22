@@ -60,16 +60,15 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
         }
         let precisionTag = context.bufferPrecision == .float32 ? "f32" : "f16"
         let weightTag: String
-        switch context.weightFormat {
-        case .float16: weightTag = "wf16"
-        case .bfloat16: weightTag = "wbf16"
-        case .float32: weightTag = "wf32"
-        case .quantized2Bit(let gs): weightTag = "wq2g\(gs)"
-        case .quantized3Bit(let gs): weightTag = "wq3g\(gs)"
-        case .quantized4Bit(let gs): weightTag = "wq4g\(gs)"
-        case .quantized5Bit(let gs): weightTag = "wq5g\(gs)"
-        case .quantized6Bit(let gs): weightTag = "wq6g\(gs)"
-        case .quantized8Bit(let gs): weightTag = "wq8g\(gs)"
+        let format = context.weightFormat
+        if format.isQuantized {
+            weightTag = "wq\(format.bits)g\(format.groupSize)"
+        } else if format.isBFloat16 {
+            weightTag = "wbf16"
+        } else if format.isFloat32 {
+            weightTag = "wf32"
+        } else {
+            weightTag = "wf16"
         }
         // Composition tag: distinct compositions must produce distinct kernel names
         // because the MSL body differs per composition. Using fragments.count alone

@@ -114,6 +114,42 @@ public protocol QuantizationFormat: Sendable {
     /// combination; the compiler will fall through to per-projection direct
     /// GEMM or the dequant→BF16 MPP path.
     func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM?
+
+    /// Generate the MSL source for the direct prefill GEMM kernel declared by
+    /// `directGEMMKernel()`. Must return non-nil whenever `directGEMMKernel()`
+    /// does; returns nil otherwise so the compiler routes through the
+    /// dequant→BF16→MPP pipeline.
+    func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String?
+
+    /// Generate the MSL source for the batched direct prefill GEMM kernel
+    /// declared by `batchedGEMMKernel(count:)`. Must return non-nil whenever
+    /// `batchedGEMMKernel(count:)` does for the same `count`.
+    func batchedGEMMKernelSource(
+        name: String,
+        count: Int,
+        bufferPrecision: BufferPrecision
+    ) -> String?
+
+    // MARK: - Embedding lookup capabilities
+
+    /// Format token used to disambiguate embedding-lookup kernel names.
+    /// Dense fp16 returns "" (base name is plain `embedding_lookup`), dense
+    /// bf16/fp32 return "bf16"/"fp32", quantized formats return
+    /// "q{bits}_g{groupSize}".
+    var embeddingLookupToken: String { get }
+
+    /// Generate the MSL source for the embedding-lookup kernel on this format.
+    /// Dense formats delegate to `generateEmbeddingLookup`; quantized formats
+    /// delegate to the matching hand-tuned or unified generator.
+    func embeddingLookupKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        isSequence: Bool,
+        embeddingScale: Float?
+    ) -> String
 }
 
 // MARK: - Protocol default implementations
@@ -149,6 +185,172 @@ public extension QuantizationFormat {
 
     /// Default: no batched direct GEMM kernel. Q4G64 / Q4G128 override this.
     func batchedGEMMKernel(count: Int) -> DirectQuantizedGEMM? { nil }
+
+    /// Default: no direct GEMM source. Formats that override `directGEMMKernel()`
+    /// also override this to produce the matching MSL.
+    func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String? { nil }
+
+    /// Default: no batched direct GEMM source. Formats that override
+    /// `batchedGEMMKernel(count:)` also override this.
+    func batchedGEMMKernelSource(
+        name: String,
+        count: Int,
+        bufferPrecision: BufferPrecision
+    ) -> String? { nil }
+
+    /// Default embedding-lookup token derivation:
+    /// * Quantized: `q{bits}_g{groupSize}`
+    /// * Dense bf16 / fp32: `bf16` / `fp32`
+    /// * Dense fp16: empty (the base kernel name has no token)
+    var embeddingLookupToken: String {
+        if isQuantized { return "q\(bits)_g\(groupSize)" }
+        if isBFloat16 { return "bf16" }
+        if isFloat32 { return "fp32" }
+        return ""
+    }
+
+    /// Default: dense formats use `generateEmbeddingLookup`; quantized formats
+    /// pick the appropriate generator based on their bit-width.
+    func embeddingLookupKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        isSequence: Bool,
+        embeddingScale: Float?
+    ) -> String {
+        if isQuantized {
+            switch bits {
+            case 4:
+                return MetalSourceGenerator.generateQuantizedEmbeddingLookupQ4(
+                    name: name,
+                    bufferPrecision: bufferPrecision,
+                    groupSize: groupSize,
+                    isSequence: isSequence,
+                    embeddingScale: embeddingScale
+                )
+            case 8:
+                return MetalSourceGenerator.generateQuantizedEmbeddingLookupQ8(
+                    name: name,
+                    bufferPrecision: bufferPrecision,
+                    groupSize: groupSize,
+                    isSequence: isSequence,
+                    embeddingScale: embeddingScale
+                )
+            default:
+                return MetalSourceGenerator.generateUnifiedQuantizedEmbeddingLookup(
+                    name: name,
+                    format: self,
+                    bufferPrecision: bufferPrecision,
+                    isSequence: isSequence,
+                    embeddingScale: embeddingScale
+                )
+            }
+        }
+        return MetalSourceGenerator.generateEmbeddingLookup(
+            name: name,
+            bufferPrecision: bufferPrecision,
+            weightFormat: self,
+            isSequence: isSequence,
+            embeddingScale: embeddingScale
+        )
+    }
+
+    // MARK: - Polymorphic queries
+
+    /// True when the format is dense fp16 (`.fp16RowMajor`).
+    var isFloat16: Bool { schemeIdentifier == .fp16RowMajor }
+
+    /// True when the format is dense bf16 (`.bf16RowMajor`).
+    var isBFloat16: Bool { schemeIdentifier == .bf16RowMajor }
+
+    /// True when the format is dense fp32 (`.fp32RowMajor`).
+    var isFloat32: Bool { schemeIdentifier == .fp32RowMajor }
+}
+
+// MARK: - Dot-syntax factories for `any QuantizationFormat`
+
+public extension QuantizationFormat where Self == Float16Format {
+    static var float16: Float16Format { Float16Format() }
+}
+
+public extension QuantizationFormat where Self == BFloat16Format {
+    static var bfloat16: BFloat16Format { BFloat16Format() }
+}
+
+public extension QuantizationFormat where Self == Float32Format {
+    static var float32: Float32Format { Float32Format() }
+}
+
+/// Equality for `any QuantizationFormat` existentials: compare by scheme identifier.
+public func == (lhs: any QuantizationFormat, rhs: any QuantizationFormat) -> Bool {
+    lhs.schemeIdentifier == rhs.schemeIdentifier
+}
+
+public func != (lhs: any QuantizationFormat, rhs: any QuantizationFormat) -> Bool {
+    lhs.schemeIdentifier != rhs.schemeIdentifier
+}
+
+public func == (lhs: (any QuantizationFormat)?, rhs: any QuantizationFormat) -> Bool {
+    guard let lhs else { return false }
+    return lhs.schemeIdentifier == rhs.schemeIdentifier
+}
+
+public func == (lhs: any QuantizationFormat, rhs: (any QuantizationFormat)?) -> Bool {
+    guard let rhs else { return false }
+    return lhs.schemeIdentifier == rhs.schemeIdentifier
+}
+
+public func != (lhs: (any QuantizationFormat)?, rhs: any QuantizationFormat) -> Bool {
+    !(lhs == rhs)
+}
+
+public func != (lhs: any QuantizationFormat, rhs: (any QuantizationFormat)?) -> Bool {
+    !(lhs == rhs)
+}
+
+public extension QuantizationFormat {
+
+    // MARK: - Legacy WeightFormat compatibility
+
+    /// MSL type name used for the raw weight buffer parameter.
+    /// Alias for `bufferElementType` to match the legacy enum API.
+    var bufferType: String { bufferElementType }
+
+    /// Per-element weight byte stride for raw dense buffers.
+    /// Quantized formats always use `uchar`-addressed packed bytes (1 B stride).
+    var storageByteSize: Int {
+        if isQuantized { return MemoryLayout<UInt8>.stride }
+        switch bits {
+        case 16: return MemoryLayout<UInt16>.stride
+        case 32: return MemoryLayout<Float>.stride
+        default: return MemoryLayout<UInt8>.stride
+        }
+    }
+
+    /// MSL expression that reads one dense weight and yields a float.
+    ///
+    /// Only valid for dense formats (fp16 / bf16 / fp32). Block-packed quantized
+    /// formats cannot produce a single-element read expression because they require
+    /// per-block scale/zero lookup; callers must route quantized weights through a
+    /// dedicated quantized kernel. The protocol returns the bare scalar read
+    /// expression because the caller already indexes into the dense buffer.
+    func readExpression(_ expr: String) -> String {
+        if isQuantized {
+            fatalError("QuantizationFormat.readExpression called on quantized format \(schemeIdentifier); quantized weights must be routed through a dedicated quantized kernel, not a dense GEMV/GEMM template.")
+        }
+        switch bits {
+        case 16:
+            // Float16 stores as `half`; BFloat16 stores as `uint16_t` and needs
+            // an explicit bf16→float helper.
+            return bufferElementType == "half" ? "float(\(expr))" : "bf16_to_float(\(expr))"
+        case 32:
+            return "(\(expr))"
+        default:
+            fatalError("QuantizationFormat.readExpression: unsupported dense bit width \(bits) for \(schemeIdentifier)")
+        }
+    }
 }
 
 // MARK: - Threadgroup memory helper
@@ -297,6 +499,31 @@ public struct AffineQ4Group64Format: QuantizationFormat {
         )
     }
 
+    public func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        MetalSourceGenerator.generateQuantizedGEMM_Q4(
+            name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+    }
+
+    public func batchedGEMMKernelSource(
+        name: String,
+        count: Int,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        switch count {
+        case 2:
+            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_2(
+                name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+        case 3:
+            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_3(
+                name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+        default:
+            return nil
+        }
+    }
+
     public init() {}
 }
 
@@ -346,6 +573,31 @@ public struct AffineQ4Group128Format: QuantizationFormat {
             kernelName: "batched_gemm_q4_g128_\(count)",
             threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
         )
+    }
+
+    public func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        MetalSourceGenerator.generateQuantizedGEMM_Q4(
+            name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+    }
+
+    public func batchedGEMMKernelSource(
+        name: String,
+        count: Int,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        switch count {
+        case 2:
+            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_2(
+                name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+        case 3:
+            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_3(
+                name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+        default:
+            return nil
+        }
     }
 
     public init() {}
@@ -675,6 +927,14 @@ public struct AffineQ8Group32Format: QuantizationFormat {
         )
     }
 
+    public func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        MetalSourceGenerator.generateQuantizedGEMM_Q8(
+            name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
+    }
+
     public init() {}
 }
 
@@ -706,6 +966,14 @@ public struct AffineQ8Group64Format: QuantizationFormat {
             kernelName: "gemm_q8_g64_f32s",
             threadgroupMemoryLength: directQuantizedGEMMThreadgroupMemoryLength(groupSize: groupSize)
         )
+    }
+
+    public func directGEMMKernelSource(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String? {
+        MetalSourceGenerator.generateQuantizedGEMM_Q8(
+            name: name, bufferPrecision: bufferPrecision, groupSize: groupSize)
     }
 
     public init() {}

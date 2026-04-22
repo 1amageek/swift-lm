@@ -6,43 +6,12 @@ struct KernelWeightFormatResolver {
     func resolve(role: String, entry: DispatchEntry) -> MetalSourceGenerator.WeightFormat {
         guard let staf = stafWeightStore,
               let binding = entry.parameterBindings.first(where: { $0.role == role }),
-              let info = staf.tensor(for: binding.tensorName) else { return .float16 }
-        switch info.format.schemeIdentifier {
-        case .fp16RowMajor, .passthrough:
-            return .float16
-        case .bf16RowMajor:
-            return .bfloat16
-        case .fp32RowMajor:
-            return .float32
-        case .q2Group16ScaleF16:
-            return .quantized2Bit(groupSize: 16)
-        case .q2Group32ScaleF16:
-            return .quantized2Bit(groupSize: 32)
-        case .q3Group16ScaleF16:
-            return .quantized3Bit(groupSize: 16)
-        case .q3Group32ScaleF16:
-            return .quantized3Bit(groupSize: 32)
-        case .q4Group64ScaleF16:
-            return .quantized4Bit(groupSize: 64)
-        case .q4Group128ScaleF16, .q4Group128ScaleF16Zero:
-            return .quantized4Bit(groupSize: 128)
-        case .q5Group32ScaleF16:
-            return .quantized5Bit(groupSize: 32)
-        case .q5Group64ScaleF16:
-            return .quantized5Bit(groupSize: 64)
-        case .q6Group16ScaleF16:
-            return .quantized6Bit(groupSize: 16)
-        case .q6Group32ScaleF16:
-            return .quantized6Bit(groupSize: 32)
-        case .q8Group32ScaleF16:
-            return .quantized8Bit(groupSize: 32)
-        case .q8Group64ScaleF16:
-            return .quantized8Bit(groupSize: 64)
-        case .q8Group128ScaleF16:
-            return .quantized8Bit(groupSize: 128)
-        default:
-            fatalError("KernelWeightFormatResolver: unsupported STAF scheme 0x\(String(info.format.schemeIdentifier.rawValue, radix: 16)) for tensor '\(binding.tensorName)'. Silent fallback to float16 has been removed — add explicit handling for this scheme or extend WeightFormat.")
+              let info = staf.tensor(for: binding.tensorName) else { return WeightFormats.float16 }
+        let identifier = info.format.schemeIdentifier
+        if let format = QuantizationFormatRegistry.format(for: identifier) {
+            return format
         }
+        fatalError("KernelWeightFormatResolver: unsupported STAF scheme 0x\(String(identifier.rawValue, radix: 16)) for tensor '\(binding.tensorName)'. Silent fallback to float16 has been removed — register the scheme in QuantizationFormatRegistry.format(for:).")
     }
 
     func resolve(forFragment fragment: any PrimitiveMetalKernelFragment, entry: DispatchEntry) -> MetalSourceGenerator.WeightFormat {
@@ -62,11 +31,11 @@ struct KernelWeightFormatResolver {
         let roles = slotRoles + ["scale", "embedding_table", "conv_weight"]
         for role in roles {
             let format = resolve(role: role, entry: entry)
-            if format != .float16 {
+            if !format.isFloat16 {
                 return format
             }
         }
-        return .float16
+        return WeightFormats.float16
     }
 }
 
@@ -688,41 +657,18 @@ struct MetalKernelSourceCatalog {
         for weightFormat: WeightFormat,
         bufferPrecision: BufferPrecision
     ) -> String? {
+        guard weightFormat.isQuantized else { return nil }
         let isPrefill = bufferPrecision == .float32
-        switch (weightFormat, bufferPrecision) {
-        case (.quantized4Bit(let groupSize), _):
-            switch groupSize {
-            case 64:
-                return isPrefill ? "gemm_q4_g64_f32s" : "gemv_q4_g64"
-            case 128:
-                return isPrefill ? "gemm_q4_g128_f32s" : "gemv_q4_g128"
-            default:
-                return nil
-            }
-        case (.quantized8Bit(let groupSize), _):
-            switch groupSize {
-            case 32:
-                return isPrefill ? "gemm_q8_g32_f32s" : "gemv_q8_g32"
-            case 64:
-                return isPrefill ? "gemm_q8_g64_f32s" : "gemv_q8_g64"
-            case 128:
-                // Q8G128: unified generator path (no dedicated legacy kernel).
-                // No direct prefill GEMM; prefill uses dequant→BF16 MPP.
-                guard !isPrefill else { return nil }
-                guard let format = weightFormat.quantizationFormat else { return nil }
-                return format.gemvKernelName
-            default:
-                return nil
-            }
-        case (.quantized2Bit, _), (.quantized3Bit, _), (.quantized5Bit, _), (.quantized6Bit, _):
-            // Q2/Q3/Q5/Q6 have no direct prefill GEMM; prefill uses dequant→BF16 MPP.
-            // Only decode gets a dedicated GEMV kernel from the unified generator.
-            guard !isPrefill else { return nil }
-            guard let format = weightFormat.quantizationFormat else { return nil }
-            return format.gemvKernelName
-        default:
-            return nil
+        // Direct kernel path: Q4/Q8 with a hand-tuned GEMM declare `directGEMMKernel`.
+        if isPrefill, let direct = weightFormat.directGEMMKernel() {
+            return direct.kernelName
         }
+        if !isPrefill {
+            // Decode uses the format's own GEMV kernel (unified or hand-tuned).
+            return weightFormat.gemvKernelName
+        }
+        // Prefill + quantized without direct kernel: handled by dequant→BF16 MPP elsewhere.
+        return nil
     }
 
     private func quantizedProjectionSource(
@@ -730,34 +676,23 @@ struct MetalKernelSourceCatalog {
         weightFormat: WeightFormat,
         bufferPrecision: BufferPrecision
     ) -> String? {
-        // Prefill (Float32 buffer precision) keeps its hand-tuned multi-row
-        // GEMM generators for Q4/Q8. Every quantized decode GEMV (Q2–Q8) flows
-        // through the unified format-driven scaffold.
+        guard weightFormat.isQuantized else { return nil }
+
+        // Prefill (Float32 buffer precision): hand-tuned multi-row GEMM generators
+        // declared by each format via `directGEMMKernelSource`. Formats without a
+        // direct kernel (e.g. Q2/Q3/Q5/Q6) return nil and route through the
+        // dequant→BF16 MPP pipeline.
         if bufferPrecision == .float32 {
-            switch weightFormat {
-            case .quantized4Bit(let groupSize):
-                guard groupSize == 64 || groupSize == 128 else { return nil }
-                return MetalSourceGenerator.generateQuantizedGEMM_Q4(
-                    name: kernelName,
-                    bufferPrecision: bufferPrecision,
-                    groupSize: groupSize
-                )
-            case .quantized8Bit(let groupSize):
-                guard groupSize == 32 || groupSize == 64 else { return nil }
-                return MetalSourceGenerator.generateQuantizedGEMM_Q8(
-                    name: kernelName,
-                    bufferPrecision: bufferPrecision,
-                    groupSize: groupSize
-                )
-            default:
-                return nil
-            }
+            return weightFormat.directGEMMKernelSource(
+                name: kernelName,
+                bufferPrecision: bufferPrecision
+            )
         }
 
-        guard let format = weightFormat.quantizationFormat else { return nil }
+        // Decode (Float16 buffer precision): unified format-driven GEMV scaffold.
         return MetalSourceGenerator.generateUnifiedQuantizedGEMV(
             name: kernelName,
-            format: format,
+            format: weightFormat,
             bufferPrecision: bufferPrecision
         )
     }
@@ -768,12 +703,10 @@ struct MetalKernelSourceCatalog {
         for weightFormat: MetalSourceGenerator.WeightFormat,
         count: Int
     ) -> String? {
-        switch weightFormat {
-        case .quantized4Bit(let groupSize):
-            return "batched_gemm_q4_g\(groupSize)_\(count)"
-        default:
-            return nil
+        if let batched = weightFormat.batchedGEMMKernel(count: count) {
+            return batched.kernelName
         }
+        return nil
     }
 
     // MARK: - Batched MPP GEMM (Prefill BF16 / FP16 / FP32)
@@ -786,16 +719,11 @@ struct MetalKernelSourceCatalog {
         count: Int
     ) -> String? {
         guard count >= 2 && count <= 4 else { return nil }
-        switch weightFormat {
-        case .bfloat16:
-            return "batched_gemm_bf16_f32s_\(count)"
-        case .float16:
-            return "batched_gemm_f16_f32s_\(count)"
-        case .float32:
-            return "batched_gemm_f32_f32s_\(count)"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            return nil
-        }
+        if weightFormat.isQuantized { return nil }
+        if weightFormat.isBFloat16 { return "batched_gemm_bf16_f32s_\(count)" }
+        if weightFormat.isFloat16 { return "batched_gemm_f16_f32s_\(count)" }
+        if weightFormat.isFloat32 { return "batched_gemm_f32_f32s_\(count)" }
+        return nil
     }
 
     private func batchedQuantizedGEMMSource(
@@ -804,17 +732,11 @@ struct MetalKernelSourceCatalog {
         count: Int,
         bufferPrecision: MetalSourceGenerator.BufferPrecision
     ) -> String? {
-        guard case .quantized4Bit(let groupSize) = weightFormat else { return nil }
-        switch count {
-        case 2:
-            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_2(
-                name: kernelName, bufferPrecision: bufferPrecision, groupSize: groupSize)
-        case 3:
-            return MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_3(
-                name: kernelName, bufferPrecision: bufferPrecision, groupSize: groupSize)
-        default:
-            return nil
-        }
+        weightFormat.batchedGEMMKernelSource(
+            name: kernelName,
+            count: count,
+            bufferPrecision: bufferPrecision
+        )
     }
 
     func format(_ generated: GeneratedKernelSources) -> String {

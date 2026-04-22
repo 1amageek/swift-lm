@@ -35,16 +35,14 @@ public struct ScalarMultiplyFragment: PrimitiveMetalKernelFragment {
     }
 
     public func kernelName(context: KernelContext) -> String {
-        let weightSuffix: String = switch context.weightFormat {
-        case .float16:
-            "f16"
-        case .bfloat16:
-            "bf16"
-        case .float32:
-            "f32"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
+        let format = context.weightFormat
+        if format.isQuantized {
             fatalError("[Compiler] ScalarMultiplyFragment does not support quantized weights")
         }
+        let weightSuffix: String
+        if format.isBFloat16 { weightSuffix = "bf16" }
+        else if format.isFloat32 { weightSuffix = "f32" }
+        else { weightSuffix = "f16" }
         if context.bufferPrecision == .float32 {
             return "scalar_multiply_seq_\(weightSuffix)"
         }

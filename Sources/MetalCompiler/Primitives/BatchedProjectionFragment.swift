@@ -19,25 +19,26 @@ extension BatchedProjection: PrimitiveMetalKernelFragment {
         // Prefill paths:
         //   Q4 packed weights → block-level batched GEMM kernel.
         //   Dense weights (BF16/FP16/FP32) → MPP matmul2d-based batched kernel.
+        let format = context.weightFormat
         if isPrefill {
-            switch context.weightFormat {
-            case .quantized4Bit(let groupSize):
-                return "batched_gemm_q4_g\(groupSize)_\(count)"
-            case .bfloat16:
-                return "batched_gemm_bf16_f32s_\(count)"
-            case .float16:
-                return "batched_gemm_f16_f32s_\(count)"
-            case .float32:
-                return "batched_gemm_f32_f32s_\(count)"
-            case .quantized2Bit, .quantized3Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
-                // No batched prefill kernel for these formats yet — fragment is
-                // decomposed into per-projection dispatches upstream.
-                break
+            if format.isQuantized && format.bits == 4 {
+                return "batched_gemm_q4_g\(format.groupSize)_\(count)"
             }
+            if format.isBFloat16 {
+                return "batched_gemm_bf16_f32s_\(count)"
+            }
+            if format.isFloat16 {
+                return "batched_gemm_f16_f32s_\(count)"
+            }
+            if format.isFloat32 {
+                return "batched_gemm_f32_f32s_\(count)"
+            }
+            // Other quantized formats (Q2/Q3/Q5/Q6/Q8): no batched prefill kernel yet;
+            // the fragment is decomposed into per-projection dispatches upstream.
         }
 
         // Decode / dense weights: batched GEMV
-        let suffix = context.weightFormat == .bfloat16 ? "_bf16" : ""
+        let suffix = format.isBFloat16 ? "_bf16" : ""
         return "batched_gemv\(count)\(suffix)"
     }
 

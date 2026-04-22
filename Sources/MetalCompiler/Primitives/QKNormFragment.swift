@@ -90,7 +90,7 @@ public struct QKNormFragment: PrimitiveMetalKernelFragment {
 
     public func kernelName(context: KernelContext) -> String {
         if context.bufferPrecision == .float32 { return "qk_rms_norm_seq_f32" }
-        return context.weightFormat == .bfloat16 ? "qk_rms_norm_bf16" : "qk_rms_norm"
+        return context.weightFormat.isBFloat16 ? "qk_rms_norm_bf16" : "qk_rms_norm"
     }
     public var dispatchDimension: MetalDispatchDimension { .perHead(headCount: headCount) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: weightRole, role: .weight)] }

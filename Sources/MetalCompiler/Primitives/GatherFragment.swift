@@ -15,86 +15,23 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
         let scaled = embeddingScale != nil ? "_scaled" : ""
-        switch (context.bufferPrecision, context.weightFormat) {
-        case (.float32, .bfloat16):
-            return "embedding_lookup_seq_bf16_f32\(scaled)"
-        case (.float32, .float32):
-            return "embedding_lookup_seq_fp32_f32\(scaled)"
-        case (.float32, .quantized4Bit(let groupSize)):
-            return "embedding_lookup_seq_q4_g\(groupSize)_f32\(scaled)"
-        case (.float32, .quantized8Bit(let groupSize)):
-            return "embedding_lookup_seq_q8_g\(groupSize)_f32\(scaled)"
-        case (_, .bfloat16):
-            return "embedding_lookup_bf16\(scaled)"
-        case (_, .float32):
-            return "embedding_lookup_fp32\(scaled)"
-        case (_, .quantized4Bit(let groupSize)):
-            return "embedding_lookup_q4_g\(groupSize)\(scaled)"
-        case (_, .quantized8Bit(let groupSize)):
-            return "embedding_lookup_q8_g\(groupSize)\(scaled)"
-        case (_, .float16):
-            return context.bufferPrecision == .float32
-                ? "embedding_lookup_seq_f32\(scaled)"
-                : "embedding_lookup\(scaled)"
-        case (_, .quantized2Bit(let groupSize)):
-            return context.bufferPrecision == .float32
-                ? "embedding_lookup_seq_q2_g\(groupSize)_f32\(scaled)"
-                : "embedding_lookup_q2_g\(groupSize)\(scaled)"
-        case (_, .quantized3Bit(let groupSize)):
-            return context.bufferPrecision == .float32
-                ? "embedding_lookup_seq_q3_g\(groupSize)_f32\(scaled)"
-                : "embedding_lookup_q3_g\(groupSize)\(scaled)"
-        case (_, .quantized5Bit(let groupSize)):
-            return context.bufferPrecision == .float32
-                ? "embedding_lookup_seq_q5_g\(groupSize)_f32\(scaled)"
-                : "embedding_lookup_q5_g\(groupSize)\(scaled)"
-        case (_, .quantized6Bit(let groupSize)):
-            return context.bufferPrecision == .float32
-                ? "embedding_lookup_seq_q6_g\(groupSize)_f32\(scaled)"
-                : "embedding_lookup_q6_g\(groupSize)\(scaled)"
-        }
+        let token = context.weightFormat.embeddingLookupToken
+        let tokenPart = token.isEmpty ? "" : "_\(token)"
+        let isSeq = context.bufferPrecision == .float32
+        return isSeq
+            ? "embedding_lookup_seq\(tokenPart)_f32\(scaled)"
+            : "embedding_lookup\(tokenPart)\(scaled)"
     }
     public var dispatchDimension: MetalDispatchDimension { .gather(count: embeddingDimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: nil, role: .weight)] }
 
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
-        switch weightFormat {
-        case .quantized4Bit(let groupSize):
-            return MetalSourceGenerator.generateQuantizedEmbeddingLookupQ4(
-                name: name,
-                bufferPrecision: bufferPrecision,
-                groupSize: groupSize,
-                isSequence: bufferPrecision == .float32,
-                embeddingScale: embeddingScale
-            )
-        case .quantized8Bit(let groupSize):
-            return MetalSourceGenerator.generateQuantizedEmbeddingLookupQ8(
-                name: name,
-                bufferPrecision: bufferPrecision,
-                groupSize: groupSize,
-                isSequence: bufferPrecision == .float32,
-                embeddingScale: embeddingScale
-            )
-        case .quantized2Bit, .quantized3Bit, .quantized5Bit, .quantized6Bit:
-            guard let format = weightFormat.quantizationFormat else {
-                fatalError("GatherFragment.kernelSource: registry missing format for \(weightFormat)")
-            }
-            return MetalSourceGenerator.generateUnifiedQuantizedEmbeddingLookup(
-                name: name,
-                format: format,
-                bufferPrecision: bufferPrecision,
-                isSequence: bufferPrecision == .float32,
-                embeddingScale: embeddingScale
-            )
-        default:
-            return MetalSourceGenerator.generateEmbeddingLookup(
-                name: name,
-                bufferPrecision: bufferPrecision,
-                weightFormat: weightFormat,
-                isSequence: bufferPrecision == .float32,
-                embeddingScale: embeddingScale
-            )
-        }
+        weightFormat.embeddingLookupKernelSource(
+            name: name,
+            bufferPrecision: bufferPrecision,
+            isSequence: bufferPrecision == .float32,
+            embeddingScale: embeddingScale
+        )
     }
 
     public func requiredFallbackBufferSize(for role: String, bytesPerScalar: Int) -> Int {

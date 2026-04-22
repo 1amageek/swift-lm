@@ -33,7 +33,7 @@ public struct Reduction: PrimitiveMetalKernelFragment {
         return ["epsilon": .float(epsilon)]
     }
     public func kernelName(context: KernelContext) -> String {
-        let bf16 = context.weightFormat == .bfloat16
+        let bf16 = context.weightFormat.isBFloat16
         if context.bufferPrecision == .float32 {
             return bf16 ? "rms_norm_seq_bf16_f32_inplace" : "rms_norm_seq_f32_inplace"
         }

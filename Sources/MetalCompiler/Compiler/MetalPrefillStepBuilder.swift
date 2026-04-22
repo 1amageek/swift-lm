@@ -1121,7 +1121,7 @@ private struct PrefillStepPlanner {
         kNorm: QKNormFragment,
         entry: DispatchEntry
     ) throws -> MetalPrefillStep? {
-        let kernelName = fallbackWeightFormat == .bfloat16
+        let kernelName = fallbackWeightFormat.isBFloat16
             ? "batched_qk_rms_norm_seq_bf16_f32"
             : "batched_qk_rms_norm_seq_f32"
         guard let pipeline = planBuildContext.pipelineCache[kernelName] else { return nil }
@@ -1514,7 +1514,7 @@ private struct PrefillStepPlanner {
     }
 
     private var fallbackSchemeIdentifier: QuantizationSchemeIdentifier {
-        fallbackWeightFormat.quantizationSchemeIdentifier
+        fallbackWeightFormat.schemeIdentifier
     }
 }
 

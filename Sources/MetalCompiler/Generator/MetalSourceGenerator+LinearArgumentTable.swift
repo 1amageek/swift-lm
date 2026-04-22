@@ -31,7 +31,7 @@ extension MetalSourceGenerator {
             (bf16ArgumentReadPolicy == .pairwise ||
              bf16ArgumentReadPolicy == .pairwisePointerInput ||
              bf16ArgumentReadPolicy == .pairwisePointerFloatInput) &&
-            weightFormat == .bfloat16 &&
+            weightFormat.isBFloat16 &&
             effectiveUnroll.isMultiple(of: 2)
         let usesPointerInputRead =
             bf16ArgumentReadPolicy == .pairwisePointerInput
@@ -40,16 +40,16 @@ extension MetalSourceGenerator {
             (bf16ArgumentReadPolicy == .packed4PointerInput ||
              bf16ArgumentReadPolicy == .packed4FixedPointerInput ||
              bf16ArgumentReadPolicy == .packed4ThreadgroupFixedPointerInput) &&
-            weightFormat == .bfloat16 &&
+            weightFormat.isBFloat16 &&
             effectiveUnroll == 4
         let usesPacked4FixedPointerInputRead =
             (bf16ArgumentReadPolicy == .packed4FixedPointerInput ||
              bf16ArgumentReadPolicy == .packed4ThreadgroupFixedPointerInput) &&
-            weightFormat == .bfloat16 &&
+            weightFormat.isBFloat16 &&
             effectiveUnroll == 4
         let usesPacked4ThreadgroupFixedPointerInputRead =
             bf16ArgumentReadPolicy == .packed4ThreadgroupFixedPointerInput &&
-            weightFormat == .bfloat16 &&
+            weightFormat.isBFloat16 &&
             effectiveUnroll == 4
         let usesBlockedRows8Tile128Layout =
             weightLayoutPolicy == .blockedRows8Tiles128 &&

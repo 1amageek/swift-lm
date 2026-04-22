@@ -7,32 +7,27 @@ struct MetalKernelNameResolver {
     }
 
     func resolveModelWeightFormat() -> WeightFormat {
-        guard let stafWeightStore else { return .float16 }
+        guard let stafWeightStore else { return WeightFormats.float16 }
         for name in stafWeightStore.entries.keys {
             if let info = stafWeightStore.tensor(for: name) {
                 switch info.format.schemeIdentifier {
                 case .bf16RowMajor:
-                    return .bfloat16
+                    return WeightFormats.bfloat16
                 case .fp16RowMajor:
-                    return .float16
+                    return WeightFormats.float16
                 default:
                     continue
                 }
             }
         }
-        return .float16
+        return WeightFormats.float16
     }
 
     func preferredDecodeBufferPrecision(for weightFormat: WeightFormat) -> BufferPrecision {
-        switch weightFormat {
-        case .bfloat16:
-            return .bfloat16
-        case .float32:
-            return .float32
-        case .float16,
-             .quantized2Bit, .quantized3Bit, .quantized4Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            return .float16
-        }
+        if weightFormat.isBFloat16 { return .bfloat16 }
+        if weightFormat.isFloat32 { return .float32 }
+        // Float16 and all quantized formats decode through half-precision buffers.
+        return .float16
     }
 
     func resolvedInput2048SourcePolicy(
@@ -79,7 +74,7 @@ struct MetalKernelNameResolver {
         kernelContext: KernelContext
     ) -> String {
         let weightFormatResolver = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
-        let isBF16 = kernelContext.weightFormat == .bfloat16
+        let isBF16 = kernelContext.weightFormat.isBFloat16
         let bf16Suffix = isBF16 ? "_bf16" : ""
         let isPrefill = kernelContext.bufferPrecision == .float32
         let accessPolicyResolver = ProjectionWeightAccessPolicyResolver(
@@ -110,8 +105,8 @@ struct MetalKernelNameResolver {
                     schemeIdentifier: tensorInfo.format.schemeIdentifier
                    ) {
                     let weightFormat: WeightFormat = tensorInfo.format.schemeIdentifier == .bf16RowMajor
-                        ? .bfloat16
-                        : (tensorInfo.format.schemeIdentifier == .fp32RowMajor ? .float32 : .float16)
+                        ? WeightFormats.bfloat16
+                        : (tensorInfo.format.schemeIdentifier == .fp32RowMajor ? WeightFormats.float32 : WeightFormats.float16)
                     if let sourcePolicy = resolvedInput2048SourcePolicy(
                         for: projection,
                         entry: entry,
@@ -160,7 +155,7 @@ struct MetalKernelNameResolver {
                     for: projection,
                     entry: entry,
                     role: projection.field,
-                    weightFormat: isBF16 ? .bfloat16 : .float16,
+                    weightFormat: isBF16 ? WeightFormats.bfloat16 : WeightFormats.float16,
                     accessPolicyResolver: accessPolicyResolver
                 ) {
                     let baseName = family.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
@@ -227,11 +222,11 @@ struct MetalKernelNameResolver {
         }
         switch tensorInfo.format.schemeIdentifier {
         case .bf16RowMajor:
-            return .bfloat16
+            return WeightFormats.bfloat16
         case .fp32RowMajor:
-            return .float32
+            return WeightFormats.float32
         default:
-            return .float16
+            return WeightFormats.float16
         }
     }
 }

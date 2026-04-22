@@ -37,126 +37,83 @@ public enum BufferPrecision: Sendable {
 
 // MARK: - Weight Format
 
-/// Weight data format determines how weight bytes are read and converted to float.
-public enum WeightFormat: Sendable, Equatable {
-    /// Float16 — direct read as half, convert to float.
-    case float16
-    /// BFloat16 — read as uint16_t, shift left 16 to get float32.
-    case bfloat16
-    /// Float32 — direct read as float.
-    case float32
-    /// Quantized 2-bit (aligned) with group size.
-    case quantized2Bit(groupSize: Int)
-    /// Quantized 3-bit (non-aligned: 8 weights per 3 bytes) with group size.
-    case quantized3Bit(groupSize: Int)
-    /// Quantized 4-bit (aligned) with group size.
-    case quantized4Bit(groupSize: Int)
-    /// Quantized 5-bit (non-aligned: 8 weights per 5 bytes) with group size.
-    case quantized5Bit(groupSize: Int)
-    /// Quantized 6-bit (non-aligned: 4 weights per 3 bytes) with group size.
-    case quantized6Bit(groupSize: Int)
-    /// Quantized 8-bit (aligned) with group size.
-    case quantized8Bit(groupSize: Int)
+/// Weight data format is a `QuantizationFormat` instance.
+///
+/// Previously a closed enum; now a type alias over the protocol so that
+/// new formats can be added without enum case proliferation. Dense formats
+/// (fp16 / bf16 / fp32) conform to the same protocol as quantized formats.
+///
+/// Pattern matching is replaced by protocol property queries:
+/// `format.isQuantized`, `format.bits`, `format.groupSize`, `format.schemeIdentifier`.
+public typealias WeightFormat = any QuantizationFormat
 
-    /// MSL type for the weight buffer parameter.
-    public var bufferType: String {
-        switch self {
-        case .float16: return "half"
-        case .bfloat16: return "uint16_t"
-        case .float32: return "float"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit,
-             .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            return "uchar"
+/// Factory constants that mirror the legacy enum-case API used throughout the compiler.
+///
+/// Dense formats are provided as singletons; quantized factories resolve to the
+/// registry so that unsupported (bits, groupSize) pairs fail loudly.
+public enum WeightFormats {
+    public static let float16: any QuantizationFormat = Float16Format()
+    public static let bfloat16: any QuantizationFormat = BFloat16Format()
+    public static let float32: any QuantizationFormat = Float32Format()
+
+    public static func quantized2Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 2, groupSize: groupSize) else {
+            fatalError("Unsupported Q2 group size \(groupSize)")
         }
+        return format
     }
 
-    /// MSL expression to convert a weight value to float.
-    ///
-    /// Only valid for dense formats (float16 / bfloat16 / float32). Block-packed
-    /// quantized formats cannot produce a single-element read expression because
-    /// they require per-block scale/zero lookup; they must be routed to dedicated
-    /// quantized kernels (`gemv_q*`), not a dense GEMV/GEMM template.
-    public func readExpression(_ expr: String) -> String {
-        switch self {
-        case .float16: return "float(\(expr))"
-        case .bfloat16: return "bf16_to_float(\(expr))"
-        case .float32: return "(\(expr))"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit,
-             .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            fatalError("WeightFormat.readExpression called with quantized format \(self); quantized weights must be routed to a dedicated quantized kernel, not a dense GEMV/GEMM template. The caller should pass `effectiveWeightFormat` (post dequant→BF16 substitution) rather than the original quantized `weightFormat`.")
+    public static func quantized3Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 3, groupSize: groupSize) else {
+            fatalError("Unsupported Q3 group size \(groupSize)")
         }
+        return format
     }
 
-    var isQuantized: Bool {
-        switch self {
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit,
-             .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            return true
-        case .float16, .bfloat16, .float32:
-            return false
+    public static func quantized4Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 4, groupSize: groupSize) else {
+            fatalError("Unsupported Q4 group size \(groupSize)")
         }
+        return format
     }
 
-    var storageByteSize: Int {
-        switch self {
-        case .float16, .bfloat16:
-            return MemoryLayout<UInt16>.stride
-        case .float32:
-            return MemoryLayout<Float>.stride
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit,
-             .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            return MemoryLayout<UInt8>.stride
+    public static func quantized5Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 5, groupSize: groupSize) else {
+            fatalError("Unsupported Q5 group size \(groupSize)")
         }
+        return format
     }
 
-    /// Bit width for quantized formats (nil for dense).
-    var quantizationBits: Int? {
-        switch self {
-        case .quantized2Bit: return 2
-        case .quantized3Bit: return 3
-        case .quantized4Bit: return 4
-        case .quantized5Bit: return 5
-        case .quantized6Bit: return 6
-        case .quantized8Bit: return 8
-        case .float16, .bfloat16, .float32: return nil
+    public static func quantized6Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 6, groupSize: groupSize) else {
+            fatalError("Unsupported Q6 group size \(groupSize)")
         }
+        return format
     }
 
-    /// Group size for quantized formats (nil for dense).
-    var quantizationGroupSize: Int? {
-        switch self {
-        case .quantized2Bit(let g), .quantized3Bit(let g),
-             .quantized4Bit(let g), .quantized5Bit(let g),
-             .quantized6Bit(let g), .quantized8Bit(let g):
-            return g
-        case .float16, .bfloat16, .float32: return nil
+    public static func quantized8Bit(groupSize: Int) -> any QuantizationFormat {
+        guard let format = QuantizationFormatRegistry.formatForMLXQuantization(bits: 8, groupSize: groupSize) else {
+            fatalError("Unsupported Q8 group size \(groupSize)")
         }
+        return format
+    }
+}
+
+public extension QuantizationFormat {
+    /// Compare formats by their STAF scheme identifier (single source of truth).
+    func matches(_ other: any QuantizationFormat) -> Bool {
+        schemeIdentifier == other.schemeIdentifier
     }
 
-    /// Resolve the protocol-driven `QuantizationFormat` instance for this enum case.
-    ///
-    /// Returns nil for dense formats and for quantized (bits, groupSize) pairs that
-    /// the registry does not recognise. Used by the catalog and prefill builder to
-    /// select kernels through `QuantizationFormat` properties instead of switching
-    /// on enum cases — the long-term Phase 5 migration path.
-    var quantizationFormat: (any QuantizationFormat)? {
-        switch self {
-        case .quantized2Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 2, groupSize: g)
-        case .quantized3Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 3, groupSize: g)
-        case .quantized4Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 4, groupSize: g)
-        case .quantized5Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 5, groupSize: g)
-        case .quantized6Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 6, groupSize: g)
-        case .quantized8Bit(let g):
-            return QuantizationFormatRegistry.formatForMLXQuantization(bits: 8, groupSize: g)
-        case .float16, .bfloat16, .float32:
-            return nil
-        }
-    }
+    /// Bit width if quantized; nil for dense formats.
+    var quantizationBits: Int? { isQuantized ? bits : nil }
+
+    /// Group size if quantized; nil for dense formats.
+    var quantizationGroupSize: Int? { isQuantized ? groupSize : nil }
+
+    /// Returns self if quantized, nil for dense formats. Preserved for call sites
+    /// that used the old `WeightFormat.quantizationFormat` bridge.
+    var quantizationFormat: (any QuantizationFormat)? { isQuantized ? self : nil }
 }
 
 // MARK: - Kernel Context

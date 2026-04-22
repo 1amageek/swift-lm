@@ -68,7 +68,7 @@ public struct BatchedQKNormRoPEFragment: PrimitiveMetalKernelFragment {
     /// applied inline inside `rope_flash_attn_decode`, so the fused norm+RoPE
     /// kernel is unnecessary here.
     public func kernelName(context: KernelContext) -> String {
-        context.weightFormat == .bfloat16
+        context.weightFormat.isBFloat16
             ? "batched_qk_rms_norm_bf16_2"
             : "batched_qk_rms_norm_2"
     }
@@ -98,7 +98,7 @@ public struct BatchedQKNormRoPEFragment: PrimitiveMetalKernelFragment {
     // MARK: - Prefill (fused)
 
     public func prefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
-        let kernelName = context.kernelContext.weightFormat == .bfloat16
+        let kernelName = context.kernelContext.weightFormat.isBFloat16
             ? "batched_qk_rms_norm_rope_seq_bf16_f32"
             : "batched_qk_rms_norm_rope_seq_f32"
         let pipeline = try context.getPipeline(kernelName)

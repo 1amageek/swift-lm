@@ -47,7 +47,7 @@ struct MetalDispatchStepBuilder {
                 selectedKernelName: resolved.name,
                 stafWeightStore: stafWeightStore,
                 accessPolicyResolver: accessPolicyResolver,
-                fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.quantizationSchemeIdentifier,
+                fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.schemeIdentifier,
                 into: &quantizationEntries
             )
             steps.append(MetalDispatchStep(

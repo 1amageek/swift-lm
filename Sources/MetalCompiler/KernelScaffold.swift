@@ -94,7 +94,7 @@ public struct KernelScaffold {
                     rowPointerLines.append("        device \(constQualifier)\(bt)* \(port.name) = \(port.name)_base + seqPos * dimension;")
                     bufferIndex += 1
                 case .weight(let field):
-                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? WeightFormats.float16
                     bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
                     bufferIndex += 1
                 }
@@ -143,7 +143,7 @@ public struct KernelScaffold {
                     bufferDecls.append("    device \(constQualifier)\(bt)* \(port.name) [[buffer(\(bufferIndex))]]")
                     bufferIndex += 1
                 case .weight(let field):
-                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? WeightFormats.float16
                     bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
                     bufferIndex += 1
                 }
@@ -276,7 +276,7 @@ public struct KernelScaffold {
                     pointerLines.append("        device \(constQualifier)\(bt)* \(port.name) = \(port.name)_base + seqPos * \(headCount) * dimension + headIndex * dimension;")
                     bufferIndex += 1
                 case .weight(let field):
-                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? WeightFormats.float16
                     bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
                     bufferIndex += 1
                 }
@@ -328,7 +328,7 @@ public struct KernelScaffold {
                     pointerLines.append("        device \(constQualifier)\(bt)* \(port.name) = \(port.name)_base + headIndex * dimension;")
                     bufferIndex += 1
                 case .weight(let field):
-                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                    let wf = weightFormats[port.name] ?? weightFormats[field] ?? WeightFormats.float16
                     bufferDecls.append("    device const \(wf.bufferType)* \(port.name) [[buffer(\(bufferIndex))]]")
                     bufferIndex += 1
                 }
@@ -395,7 +395,7 @@ public struct KernelScaffold {
                 }
 
             case .weight(let field):
-                let wf = weightFormats[port.name] ?? weightFormats[field] ?? .float16
+                let wf = weightFormats[port.name] ?? weightFormats[field] ?? WeightFormats.float16
                 metalType = wf.bufferType
                 constQualifier = "const "
             }

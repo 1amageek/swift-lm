@@ -22,15 +22,15 @@ extension MetalSourceGenerator {
         mTile: Int = mppGEMMDefaultTileSize
     ) -> String {
         let bt = bufferPrecision.metalType
-        let tensorWeightType: String = switch weightFormat {
-        case .bfloat16:
-            "bfloat"
-        case .float16:
-            "half"
-        case .float32:
-            "float"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            bt
+        let tensorWeightType: String
+        if weightFormat.isQuantized {
+            tensorWeightType = bt
+        } else if weightFormat.isBFloat16 {
+            tensorWeightType = "bfloat"
+        } else if weightFormat.isFloat32 {
+            tensorWeightType = "float"
+        } else {
+            tensorWeightType = "half"
         }
 
         return """
@@ -103,15 +103,15 @@ extension MetalSourceGenerator {
     ) -> String {
         precondition(count >= 2, "batched MPP GEMM requires count >= 2")
         let bt = bufferPrecision.metalType
-        let tensorWeightType: String = switch weightFormat {
-        case .bfloat16:
-            "bfloat"
-        case .float16:
-            "half"
-        case .float32:
-            "float"
-        case .quantized2Bit, .quantized3Bit, .quantized4Bit, .quantized5Bit, .quantized6Bit, .quantized8Bit:
-            bt
+        let tensorWeightType: String
+        if weightFormat.isQuantized {
+            tensorWeightType = bt
+        } else if weightFormat.isBFloat16 {
+            tensorWeightType = "bfloat"
+        } else if weightFormat.isFloat32 {
+            tensorWeightType = "float"
+        } else {
+            tensorWeightType = "half"
         }
 
         // Buffer binding layout:
