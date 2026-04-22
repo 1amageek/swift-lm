@@ -1,181 +1,4 @@
 extension MetalSourceGenerator {
-/// Generate quantized GEMV (Q4 group 64).
-public static func generateQuantizedGEMV_Q4G64(
-    name: String,
-    bufferPrecision: BufferPrecision
-) -> String {
-    let bt = bufferPrecision.metalType
-    let tileElements = 256
-    return """
-    kernel void \(name)(
-        device const \(bt)* input       [[buffer(0)]],
-        device const uchar* weight     [[buffer(1)]],
-        device \(bt)* output            [[buffer(2)]],
-        constant uint& inputDimension  [[buffer(3)]],
-        constant uint& outputDimension [[buffer(4)]],
-        uint2 gid                      [[threadgroup_position_in_grid]],
-        uint tid                       [[thread_index_in_threadgroup]],
-        uint tiisg                     [[thread_index_in_simdgroup]],
-        uint sgitg                     [[simdgroup_index_in_threadgroup]],
-        uint2 tptg                     [[threads_per_threadgroup]]
-    ) {
-        const uint WEIGHTS_PER_BLOCK = 64;
-        const uint BYTES_PER_BLOCK = 36;
-        const uint THREADS_PER_THREADGROUP = tptg.x;
-        const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
-        const uint TILE_ELEMENTS = \(tileElements);
-        const uint row = gid.x * rowsPerThreadgroup + sgitg;
-        if (row >= outputDimension) return;
-
-        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
-        threadgroup \(bt) inputTile[TILE_ELEMENTS];
-        float sum = 0.0f;
-
-        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
-            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
-            for (uint j = tid; j < tileCount; j += THREADS_PER_THREADGROUP) {
-                inputTile[j] = input[base + j];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const uint blockBase = base / WEIGHTS_PER_BLOCK;
-            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* nibbles = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
-                for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
-                    uchar packed = nibbles[i];
-                    const uint inputOffset = tileOffset + i * 2;
-                float w0 = float(packed & 0x0F) * blockScale + blockZero;
-                float w1 = float(packed >> 4) * blockScale + blockZero;
-                    sum += w0 * float(inputTile[inputOffset]);
-                    sum += w1 * float(inputTile[inputOffset + 1]);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        sum = simd_sum(sum);
-        if (tiisg == 0) output[row] = \(bt)(sum);
-    }
-    """
-}
-
-/// Generate quantized GEMV (Q4 group 128).
-public static func generateQuantizedGEMV_Q4G128(
-    name: String,
-    bufferPrecision: BufferPrecision
-) -> String {
-    let bt = bufferPrecision.metalType
-    let tileElements = 256
-    return """
-    kernel void \(name)(
-        device const \(bt)* input       [[buffer(0)]],
-        device const uchar* weight     [[buffer(1)]],
-        device \(bt)* output            [[buffer(2)]],
-        constant uint& inputDimension  [[buffer(3)]],
-        constant uint& outputDimension [[buffer(4)]],
-        uint2 gid                      [[threadgroup_position_in_grid]],
-        uint tid                       [[thread_index_in_threadgroup]],
-        uint tiisg                     [[thread_index_in_simdgroup]],
-        uint sgitg                     [[simdgroup_index_in_threadgroup]],
-        uint2 tptg                     [[threads_per_threadgroup]]
-    ) {
-        const uint WEIGHTS_PER_BLOCK = 128;
-        const uint BYTES_PER_BLOCK = 68;
-        const uint THREADS_PER_THREADGROUP = tptg.x;
-        const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
-        const uint TILE_ELEMENTS = \(tileElements);
-        const uint row = gid.x * rowsPerThreadgroup + sgitg;
-        if (row >= outputDimension) return;
-
-        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
-        threadgroup \(bt) inputTile[TILE_ELEMENTS];
-        float sum = 0.0f;
-
-        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
-            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
-            for (uint j = tid; j < tileCount; j += THREADS_PER_THREADGROUP) {
-                inputTile[j] = input[base + j];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const uint blockBase = base / WEIGHTS_PER_BLOCK;
-            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* nibbles = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
-                for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
-                    uchar packed = nibbles[i];
-                    const uint inputOffset = tileOffset + i * 2;
-                float w0 = float(packed & 0x0F) * blockScale + blockZero;
-                float w1 = float(packed >> 4) * blockScale + blockZero;
-                    sum += w0 * float(inputTile[inputOffset]);
-                    sum += w1 * float(inputTile[inputOffset + 1]);
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-        sum = simd_sum(sum);
-        if (tiisg == 0) output[row] = \(bt)(sum);
-    }
-    """
-}
-
-/// Generate quantized GEMV (Q8 with configurable group size).
-public static func generateQuantizedGEMV_Q8(
-    name: String,
-    bufferPrecision: BufferPrecision,
-    groupSize: Int
-) -> String {
-    let bt = bufferPrecision.metalType
-    let bytesPerBlock = 4 + groupSize  // scale(f16) + zero(f16) + int8 × groupSize
-    return """
-    kernel void \(name)(
-        device const \(bt)* input       [[buffer(0)]],
-        device const uchar* weight     [[buffer(1)]],
-        device \(bt)* output            [[buffer(2)]],
-        constant uint& inputDimension  [[buffer(3)]],
-        constant uint& outputDimension [[buffer(4)]],
-        uint2 gid                      [[threadgroup_position_in_grid]],
-        uint tiisg                     [[thread_index_in_simdgroup]],
-        uint sgitg                     [[simdgroup_index_in_threadgroup]],
-        uint2 tptg                     [[threads_per_threadgroup]]
-    ) {
-        const uint GROUP_SIZE = \(groupSize);
-        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
-        const uint rowsPerThreadgroup = tptg.x / SIMD_WIDTH;
-        const uint row = gid.x * rowsPerThreadgroup + sgitg;
-        if (row >= outputDimension) return;
-
-        const uint blocksPerRow = inputDimension / GROUP_SIZE;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
-        float sum = 0.0f;
-
-        for (uint b = tiisg; b < blocksPerRow; b += SIMD_WIDTH) {
-            device const uchar* block = rowBase + b * BYTES_PER_BLOCK;
-            float blockScale = float(*(device const half*)(block));
-            float blockZero = float(*(device const half*)(block + 2));
-            device const uchar* quantized = (device const uchar*)(block + 4);
-            uint startWeight = b * GROUP_SIZE;
-            for (uint i = 0; i < GROUP_SIZE; i++) {
-                float w = blockScale * float(quantized[i]) + blockZero;
-                sum += w * float(input[startWeight + i]);
-            }
-        }
-        sum = simd_sum(sum);
-        if (tiisg == 0) output[row] = \(bt)(sum);
-    }
-    """
-}
-
 /// Generate quantized GEMM (Q8 group, multi-row prefill sequence).
 ///
 /// Signature matches `generateQuantizedGEMM_Q4` exactly so dispatch builder
@@ -514,27 +337,47 @@ public static func generateBatchedQuantizedGEMM_Q4_3(
     """
 }
 
-// MARK: - Dequant Q4 → BF16
-
-/// Dequantize Q4 weight matrix to BFloat16 for AMX matmul2d consumption.
+/// Stable kernel name for a format's dequant→BF16 prefill path.
 ///
-/// Grid (threadgroups): (outputDimension, 1, 1) — one threadgroup per output row
-/// Threadgroup: (256, 1, 1) — 256 threads process all blocks in the row
-///
-/// Each threadgroup unpacks an entire row of Q4 blocks into BF16 values.
-/// Output layout is N-major (row = outputDim, col = inputDim), matching
-/// the `tensor_inline` layout expected by MPP GEMM.
-///
-/// Previous design dispatched (blocksPerRow × outputDimension) threadgroups of
-/// (groupSize/2) threads each, resulting in ~36K tiny threadgroups for a 1536×1536
-/// matrix. This version collapses to outputDimension threadgroups of 256 threads,
-/// reducing dispatch overhead by ~24x.
-public static func generateDequantQ4ToBFloat(
-    name: String,
-    groupSize: Int
+/// Uses the generic `dequant_q{bits}_g{group}_bf16` form produced by
+/// `generateUnifiedDequantToBFloat`.
+public static func unifiedDequantKernelName(
+    for format: any QuantizationFormat
 ) -> String {
-    let bytesPerBlock = 4 + groupSize / 2  // scale(f16) + zero(f16) + nibbles
-    let nibbleBytesPerBlock = groupSize / 2
+    "dequant_q\(format.bits)_g\(format.groupSize)_bf16"
+}
+
+/// Generic dequant→BF16 kernel generator driven by `QuantizationFormat`.
+///
+/// Emits one threadgroup per output row, 256 threads each, unpacking every
+/// weight in the row into BFloat16 laid out row-major. The BF16 output is the
+/// input format expected by the Metal 4 MPP GEMM path used during prefill.
+///
+/// Uses per-weight parallelism via `format.perWeightReadExpression`: each
+/// thread handles one weight at a time and the block header (scale/zero) is
+/// loaded fresh per iteration. Cache coalescing across threads in the same
+/// block keeps the repeated header loads cheap. Aligned (Q2/Q4/Q8) and
+/// non-aligned (Q3/Q5/Q6) formats share the same scaffold.
+public static func generateUnifiedDequantToBFloat(
+    name: String,
+    format: any QuantizationFormat
+) -> String {
+    precondition(
+        format.isQuantized,
+        "generateUnifiedDequantToBFloat requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
     return """
     #include <metal_stdlib>
     using namespace metal;
@@ -547,181 +390,29 @@ public static func generateDequantQ4ToBFloat(
         uint tgpos [[threadgroup_position_in_grid]],
         uint tid   [[thread_index_in_threadgroup]]
     ) {
-        const uint WEIGHTS_PER_BLOCK = \(groupSize);
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
         const uint BYTES_PER_BLOCK = \(bytesPerBlock);
-        const uint NIBBLE_BYTES_PER_BLOCK = \(nibbleBytesPerBlock);
         const uint THREADS_PER_TG = 256;
         const uint row = tgpos;
         if (row >= outputDimension) return;
 
         const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-        const uint totalNibbleBytes = blocksPerRow * NIBBLE_BYTES_PER_BLOCK;
         device const uchar* rowBase = packed + row * blocksPerRow * BYTES_PER_BLOCK;
         device bfloat* outRow = output + row * inputDimension;
 
-        for (uint byteIdx = tid; byteIdx < totalNibbleBytes; byteIdx += THREADS_PER_TG) {
-            uint blockIdx = byteIdx / NIBBLE_BYTES_PER_BLOCK;
-            uint localByte = byteIdx % NIBBLE_BYTES_PER_BLOCK;
+        for (uint weightIdx = tid; weightIdx < inputDimension; weightIdx += THREADS_PER_TG) {
+            uint blockIdx = weightIdx / WEIGHTS_PER_BLOCK;
+            uint k = weightIdx % WEIGHTS_PER_BLOCK;
 
             device const uchar* block = rowBase + blockIdx * BYTES_PER_BLOCK;
             float scale = float(*(device const half*)(block));
             float zero  = float(*(device const half*)(block + 2));
-            uchar packed_byte = block[4 + localByte];
+            device const uchar* qs = block + 4;
 
-            float w0 = float(packed_byte & 0x0F) * scale + zero;
-            float w1 = float(packed_byte >> 4)   * scale + zero;
-            uint col = blockIdx * WEIGHTS_PER_BLOCK + localByte * 2;
-            outRow[col]     = bfloat(w0);
-            outRow[col + 1] = bfloat(w1);
+            outRow[weightIdx] = bfloat(\(readExpression));
         }
     }
     """
-}
-
-/// Stable kernel name for a format's dequant→BF16 prefill path.
-///
-/// Q4 keeps its historical `dequant_q4_g{group}_bf16` name (emitted by the
-/// hand-tuned generator) so the MPP pipeline in benchmarks sees the same
-/// symbol. Other quantized formats use the generic `dequant_q{bits}_g{group}_bf16`
-/// form produced by `generateUnifiedDequantToBFloat`.
-public static func unifiedDequantKernelName(
-    for format: any QuantizationFormat
-) -> String {
-    "dequant_q\(format.bits)_g\(format.groupSize)_bf16"
-}
-
-/// Generic dequant→BF16 kernel generator driven by `QuantizationFormat`.
-///
-/// Emits one threadgroup per output row, 256 threads each, unpacking every block
-/// in the row into BFloat16 weights laid out row-major. The BF16 output is the
-/// input format expected by the Metal 4 MPP GEMM path used during prefill.
-///
-/// Aligned formats (Q2 / Q4 / Q8): per-packed-byte parallelism using
-/// `format.perWeightReadExpression`. Each thread processes one packed byte and
-/// writes its `8 / bits` weights.
-///
-/// Non-aligned formats (Q6): per-block parallelism using
-/// `format.emitGroupDequant`. Each thread expands one block into a local float
-/// array before casting to BF16. For typical prefill widths (1536 input × 16/32
-/// weights per block) this yields 48–96 blocks per row, which fits within the
-/// 256 threads per threadgroup.
-public static func generateUnifiedDequantToBFloat(
-    name: String,
-    format: any QuantizationFormat
-) -> String {
-    precondition(
-        format.isQuantized,
-        "generateUnifiedDequantToBFloat requires isQuantized=true; got \(format.schemeIdentifier)"
-    )
-
-    let weightsPerBlock = format.weightsPerBlock
-    let bytesPerBlock = format.bytesPerBlock
-
-    if format.isAligned {
-        guard let readExpression = format.perWeightReadExpression(
-            blocksVar: "qs",
-            weightIndexVar: "k"
-        ) else {
-            fatalError(
-                "Aligned format \(format.schemeIdentifier) did not provide perWeightReadExpression"
-            )
-        }
-        let bits = format.bits
-        precondition(8 % bits == 0, "Aligned dequant expects bits ∈ {2,4,8}; got \(bits)")
-        let weightsPerPackedByte = 8 / bits
-        let packedBytesPerBlock = weightsPerBlock / weightsPerPackedByte
-        return """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        kernel void \(name)(
-            device const uchar* packed       [[buffer(0)]],
-            device bfloat* output            [[buffer(1)]],
-            constant uint& inputDimension    [[buffer(2)]],
-            constant uint& outputDimension   [[buffer(3)]],
-            uint tgpos [[threadgroup_position_in_grid]],
-            uint tid   [[thread_index_in_threadgroup]]
-        ) {
-            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
-            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
-            const uint PACKED_BYTES_PER_BLOCK = \(packedBytesPerBlock);
-            const uint WEIGHTS_PER_BYTE = \(weightsPerPackedByte);
-            const uint THREADS_PER_TG = 256;
-            const uint row = tgpos;
-            if (row >= outputDimension) return;
-
-            const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-            const uint totalPackedBytes = blocksPerRow * PACKED_BYTES_PER_BLOCK;
-            device const uchar* rowBase = packed + row * blocksPerRow * BYTES_PER_BLOCK;
-            device bfloat* outRow = output + row * inputDimension;
-
-            for (uint byteIdx = tid; byteIdx < totalPackedBytes; byteIdx += THREADS_PER_TG) {
-                uint blockIdx = byteIdx / PACKED_BYTES_PER_BLOCK;
-                uint localByte = byteIdx % PACKED_BYTES_PER_BLOCK;
-
-                device const uchar* block = rowBase + blockIdx * BYTES_PER_BLOCK;
-                float scale = float(*(device const half*)(block));
-                float zero  = float(*(device const half*)(block + 2));
-                device const uchar* qs = block + 4;
-
-                uint baseK = localByte * WEIGHTS_PER_BYTE;
-                uint outBase = blockIdx * WEIGHTS_PER_BLOCK + baseK;
-                for (uint w = 0; w < WEIGHTS_PER_BYTE; w++) {
-                    uint k = baseK + w;
-                    outRow[outBase + w] = bfloat(\(readExpression));
-                }
-            }
-        }
-        """
-    } else {
-        guard let groupExpansion = format.emitGroupDequant(
-            blocksVar: "qs",
-            blockIndexVar: "0",
-            outputArrayVar: "weights_f32"
-        ) else {
-            fatalError(
-                "Non-aligned format \(format.schemeIdentifier) did not provide emitGroupDequant"
-            )
-        }
-        return """
-        #include <metal_stdlib>
-        using namespace metal;
-
-        kernel void \(name)(
-            device const uchar* packed       [[buffer(0)]],
-            device bfloat* output            [[buffer(1)]],
-            constant uint& inputDimension    [[buffer(2)]],
-            constant uint& outputDimension   [[buffer(3)]],
-            uint tgpos [[threadgroup_position_in_grid]],
-            uint tid   [[thread_index_in_threadgroup]]
-        ) {
-            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
-            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
-            const uint THREADS_PER_TG = 256;
-            const uint row = tgpos;
-            if (row >= outputDimension) return;
-
-            const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-            device const uchar* rowBase = packed + row * blocksPerRow * BYTES_PER_BLOCK;
-            device bfloat* outRow = output + row * inputDimension;
-
-            for (uint blockIdx = tid; blockIdx < blocksPerRow; blockIdx += THREADS_PER_TG) {
-                device const uchar* block = rowBase + blockIdx * BYTES_PER_BLOCK;
-                float scale = float(*(device const half*)(block));
-                float zero  = float(*(device const half*)(block + 2));
-                device const uchar* qs = block + 4;
-
-                float weights_f32[\(weightsPerBlock)];
-                \(groupExpansion)
-
-                device bfloat* outBlock = outRow + blockIdx * WEIGHTS_PER_BLOCK;
-                for (uint k = 0; k < WEIGHTS_PER_BLOCK; k++) {
-                    outBlock[k] = bfloat(weights_f32[k]);
-                }
-            }
-        }
-        """
-    }
 }
 
 static let kvQuantizationSource = """
@@ -795,11 +486,13 @@ kernel void gemm_bf16_f32s_halfout(
 /// └──────────┴──────────┴────────────────────┘
 /// ```
 ///
-/// For aligned formats (2 / 4 / 8 bits) the inner loop uses
-/// `format.perWeightReadExpression(blocksVar: "qs", weightIndexVar: "k")`.
-/// For non-aligned formats (3 / 5 / 6 bits) the inner loop calls
-/// `format.emitGroupDequant(...)` to expand the group into thread-local floats
-/// before the simd-parallel multiply-accumulate.
+/// Dispatch:
+/// Each simdgroup thread reads and dequantizes a single weight per iteration
+/// via `format.perWeightReadExpression`. This is work-efficient: total work =
+/// weightsPerBlock, parallelism spread across SIMD_WIDTH threads. Aligned
+/// formats (Q2/Q4/Q8) and non-aligned formats (Q3/Q5/Q6) share the same
+/// scaffold; the Metal compiler flattens ternary-chain expressions used by
+/// non-aligned formats into predicated selection.
 public static func generateUnifiedQuantizedGEMV(
     name: String,
     format: any QuantizationFormat,
@@ -815,40 +508,20 @@ public static func generateUnifiedQuantizedGEMV(
     let weightsPerBlock = format.weightsPerBlock
     let bytesPerBlock = format.bytesPerBlock
 
-    let scaffoldBody: String
-    if format.isAligned {
-        guard let readExpression = format.perWeightReadExpression(
-            blocksVar: "qs",
-            weightIndexVar: "k"
-        ) else {
-            fatalError(
-                "Aligned format \(format.schemeIdentifier) did not provide perWeightReadExpression"
-            )
-        }
-        scaffoldBody = """
-                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
-                        float w = \(readExpression);
-                        sum += w * float(inputTile[tileOffset + k]);
-                    }
-        """
-    } else {
-        guard let groupExpansion = format.emitGroupDequant(
-            blocksVar: "qs",
-            blockIndexVar: "0",
-            outputArrayVar: "weights_f32"
-        ) else {
-            fatalError(
-                "Non-aligned format \(format.schemeIdentifier) did not provide emitGroupDequant"
-            )
-        }
-        scaffoldBody = """
-                    float weights_f32[\(weightsPerBlock)];
-                    \(groupExpansion)
-                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
-                        sum += weights_f32[k] * float(inputTile[tileOffset + k]);
-                    }
-        """
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
     }
+    let scaffoldBody = """
+                for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                    float w = \(readExpression);
+                    sum += w * float(inputTile[tileOffset + k]);
+                }
+    """
 
     return """
     kernel void \(name)(

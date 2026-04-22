@@ -251,8 +251,11 @@ struct STAFWriter: Sendable {
             }
             let outputDimension = entry.info.shape[0]
             let packedDimension = entry.info.shape.count >= 2 ? entry.info.shape[1] : 1
-            let elementsPerUInt32 = 32 / format.bits
-            let inputDimension = packedDimension * elementsPerUInt32
+            // Input dimension formula must match `STAFPayloadConverter.repackMLXQuantized`.
+            // Non-aligned bit widths (3/5/6) require `(packedDim × 32) / bits` rather
+            // than `packedDim × (32 / bits)`; the latter truncates and produces
+            // under-sized payloads (or zero for bits that don't divide 32).
+            let inputDimension = packedDimension * 32 / format.bits
             let blocksPerRow = inputDimension / format.groupSize
             let totalBlocks = outputDimension * blocksPerRow
             return totalBlocks * format.bytesPerBlock

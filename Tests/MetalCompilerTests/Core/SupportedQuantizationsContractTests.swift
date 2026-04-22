@@ -18,28 +18,27 @@ struct SupportedQuantizationsContractTests {
         .fp16RowMajor,
         .bf16RowMajor,
         .fp32RowMajor,
-        .q8Group32ScaleF16,
-        .q8Group64ScaleF16,
+        .q2Group16ScaleF16,
+        .q2Group32ScaleF16,
+        .q3Group16ScaleF16,
+        .q3Group32ScaleF16,
         .q4Group64ScaleF16,
         .q4Group128ScaleF16,
+        .q4Group128ScaleF16Zero,
+        .q5Group32ScaleF16,
+        .q5Group64ScaleF16,
+        .q6Group16ScaleF16,
+        .q6Group32ScaleF16,
+        .q8Group32ScaleF16,
+        .q8Group64ScaleF16,
+        .q8Group128ScaleF16,
         .passthrough,
     ]
 
     /// Schemes that are declared in the enum but intentionally have no
     /// runtime mapping today. Attempting to load one must fail explicitly
     /// rather than silently falling back.
-    static let declaredButUnsupportedSchemes: Set<QuantizationSchemeIdentifier> = [
-        .q8Group128ScaleF16,
-        .q6Group16ScaleF16,
-        .q6Group32ScaleF16,
-        .q5Group32ScaleF16,
-        .q5Group64ScaleF16,
-        .q4Group128ScaleF16Zero,
-        .q3Group16ScaleF16,
-        .q3Group32ScaleF16,
-        .q2Group16ScaleF16,
-        .q2Group32ScaleF16,
-    ]
+    static let declaredButUnsupportedSchemes: Set<QuantizationSchemeIdentifier> = []
 
     /// KV-cache-only schemes. These are weight formats too in principle but
     /// the registry intentionally does not map them to GEMV kernels — rotor
@@ -96,10 +95,8 @@ struct SupportedQuantizationsContractTests {
     func registeredSchemesAdvertiseBlockGeometry() throws {
         for scheme in Self.registeredSchemes {
             let format = try #require(QuantizationFormatRegistry.format(for: scheme))
-            // Bit width must be >= 4 for the registered set today; raise the floor here
-            // if a sub-4-bit format is registered in the future.
-            #expect(format.bits >= 4,
-                "Registered scheme \(scheme) has bits=\(format.bits); update the contract test if a sub-4-bit scheme is intentionally registered")
+            #expect(format.bits >= 2,
+                "Registered scheme \(scheme) has bits=\(format.bits); sub-2-bit formats are not supported")
             if format.bits >= 16 {
                 // Dense formats: groupSize is not meaningful; block struct is empty
                 #expect(format.blockStructName.isEmpty,

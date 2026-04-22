@@ -154,31 +154,16 @@ struct MetalKernelSourceCatalog {
                 // For quantized prefill: generate a dequant kernel and treat the
                 // projection as BF16 for the downstream MPP GEMM. The dequant kernel
                 // unpacks packed weights into BF16 row-major and then the standard
-                // BF16 MPP path handles GEMM.
-                //
-                // Q4 kept on the hand-tuned Q4-specific generator to preserve the
-                // exact kernel name and byte-level parallelism that benchmarking has
-                // already locked in. Other quantized formats (Q2 / Q6, plus Q8 that
-                // also lacks a direct prefill GEMM) go through the unified
-                // format-driven generator.
+                // BF16 MPP path handles GEMM. All quantized formats share the
+                // format-driven unified generator.
                 let needsDequantForAMX = bufferPrecision == .float32 && weightFormat.isQuantized
-                if needsDequantForAMX {
-                    if case .quantized4Bit(let groupSize) = weightFormat {
-                        let dequantName = "dequant_q4_g\(groupSize)_bf16"
-                        if generatedNames.insert(dequantName).inserted {
-                            sources.append(MetalSourceGenerator.generateDequantQ4ToBFloat(
-                                name: dequantName,
-                                groupSize: groupSize
-                            ))
-                        }
-                    } else if let format = weightFormat.quantizationFormat {
-                        let dequantName = MetalSourceGenerator.unifiedDequantKernelName(for: format)
-                        if generatedNames.insert(dequantName).inserted {
-                            sources.append(MetalSourceGenerator.generateUnifiedDequantToBFloat(
-                                name: dequantName,
-                                format: format
-                            ))
-                        }
+                if needsDequantForAMX, let format = weightFormat.quantizationFormat {
+                    let dequantName = MetalSourceGenerator.unifiedDequantKernelName(for: format)
+                    if generatedNames.insert(dequantName).inserted {
+                        sources.append(MetalSourceGenerator.generateUnifiedDequantToBFloat(
+                            name: dequantName,
+                            format: format
+                        ))
                     }
                 }
                 let effectiveWeightFormat: WeightFormat = needsDequantForAMX ? .bfloat16 : weightFormat
@@ -745,70 +730,36 @@ struct MetalKernelSourceCatalog {
         weightFormat: WeightFormat,
         bufferPrecision: BufferPrecision
     ) -> String? {
-        switch (weightFormat, bufferPrecision) {
-        case (.quantized4Bit(let groupSize), .float32):
-            guard groupSize == 64 || groupSize == 128 else { return nil }
-            return MetalSourceGenerator.generateQuantizedGEMM_Q4(
-                name: kernelName,
-                bufferPrecision: bufferPrecision,
-                groupSize: groupSize
-            )
-        case (.quantized4Bit(let groupSize), _):
-            switch groupSize {
-            case 64:
-                return MetalSourceGenerator.generateQuantizedGEMV_Q4G64(
-                    name: kernelName,
-                    bufferPrecision: bufferPrecision
-                )
-            case 128:
-                return MetalSourceGenerator.generateQuantizedGEMV_Q4G128(
-                    name: kernelName,
-                    bufferPrecision: bufferPrecision
-                )
-            default:
-                return nil
-            }
-        case (.quantized8Bit(let groupSize), .float32):
-            guard groupSize == 32 || groupSize == 64 else { return nil }
-            return MetalSourceGenerator.generateQuantizedGEMM_Q8(
-                name: kernelName,
-                bufferPrecision: bufferPrecision,
-                groupSize: groupSize
-            )
-        case (.quantized8Bit(let groupSize), _):
-            switch groupSize {
-            case 32, 64:
-                return MetalSourceGenerator.generateQuantizedGEMV_Q8(
+        // Prefill (Float32 buffer precision) keeps its hand-tuned multi-row
+        // GEMM generators for Q4/Q8. Every quantized decode GEMV (Q2–Q8) flows
+        // through the unified format-driven scaffold.
+        if bufferPrecision == .float32 {
+            switch weightFormat {
+            case .quantized4Bit(let groupSize):
+                guard groupSize == 64 || groupSize == 128 else { return nil }
+                return MetalSourceGenerator.generateQuantizedGEMM_Q4(
                     name: kernelName,
                     bufferPrecision: bufferPrecision,
                     groupSize: groupSize
                 )
-            case 128:
-                // Q8G128: unified generator path.
-                guard bufferPrecision != .float32 else { return nil }
-                guard let format = weightFormat.quantizationFormat else { return nil }
-                return MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+            case .quantized8Bit(let groupSize):
+                guard groupSize == 32 || groupSize == 64 else { return nil }
+                return MetalSourceGenerator.generateQuantizedGEMM_Q8(
                     name: kernelName,
-                    format: format,
-                    bufferPrecision: bufferPrecision
+                    bufferPrecision: bufferPrecision,
+                    groupSize: groupSize
                 )
             default:
                 return nil
             }
-        case (.quantized2Bit, _), (.quantized3Bit, _), (.quantized5Bit, _), (.quantized6Bit, _):
-            // Q2/Q3/Q5/Q6 decode GEMV is generated by the unified format-driven scaffold.
-            // Prefill is not reached here — quantizedProjectionKernelName returns nil
-            // for these formats during prefill and the dequant→BF16 MPP GEMM path takes over.
-            guard bufferPrecision != .float32 else { return nil }
-            guard let format = weightFormat.quantizationFormat else { return nil }
-            return MetalSourceGenerator.generateUnifiedQuantizedGEMV(
-                name: kernelName,
-                format: format,
-                bufferPrecision: bufferPrecision
-            )
-        default:
-            return nil
         }
+
+        guard let format = weightFormat.quantizationFormat else { return nil }
+        return MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+            name: kernelName,
+            format: format,
+            bufferPrecision: bufferPrecision
+        )
     }
 
     // MARK: - Batched Quantized GEMM (Prefill)

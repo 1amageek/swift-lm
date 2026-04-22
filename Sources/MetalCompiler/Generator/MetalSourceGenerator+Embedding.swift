@@ -228,12 +228,11 @@ extension MetalSourceGenerator {
 
     /// Protocol-driven quantized embedding lookup kernel.
     ///
-    /// Works for any `QuantizationFormat` — aligned (Q2/Q4/Q8) uses
-    /// `perWeightReadExpression`; non-aligned (Q6) expands the full group via
-    /// `emitGroupDequant` into a thread-local float array then indexes by
-    /// `indexInGroup`. Q4 and Q8 still have hand-written generators above
-    /// (`generateQuantizedEmbeddingLookupQ4/Q8`) — this unified generator is
-    /// the sole path for Q2/Q6.
+    /// Works for any `QuantizationFormat`. Uses `perWeightReadExpression` for
+    /// single-weight dequant — aligned formats (Q2/Q4/Q8) and non-aligned
+    /// formats (Q3/Q5/Q6) share this scaffold. Q4 and Q8 still have
+    /// hand-written generators above (`generateQuantizedEmbeddingLookupQ4/Q8`);
+    /// this unified generator is the sole path for Q2/Q3/Q5/Q6.
     public static func generateUnifiedQuantizedEmbeddingLookup(
         name: String,
         format: any QuantizationFormat,
@@ -247,39 +246,26 @@ extension MetalSourceGenerator {
         let blockStructName = format.blockStructName
         let scaleParam = embeddingScale != nil
             ? (isSequence
-                ? "\n            constant float& scale            [[buffer(5)]],"
-                : "\n            constant float& scale            [[buffer(4)]],")
+                ? "\n            constant float& embeddingScale   [[buffer(5)]],"
+                : "\n            constant float& embeddingScale   [[buffer(4)]],")
             : ""
-        let scaleExpr = embeddingScale != nil ? " * scale" : ""
+        let scaleExpr = embeddingScale != nil ? " * embeddingScale" : ""
 
         let blockDecl = format.mslDeclarations
 
-        let dequantBody: String
-        if format.isAligned, let perWeight = format.perWeightReadExpression(
+        guard let perWeight = format.perWeightReadExpression(
             blocksVar: "block->qs", weightIndexVar: "indexInGroup"
-        ) {
-            dequantBody = """
-                device const \(blockStructName)* block = reinterpret_cast<device const \(blockStructName)*>(rowBase + groupIndex * BYTES_PER_BLOCK);
-                float scale = float(block->scale);
-                float zero  = float(block->zero);
-                float value = \(perWeight);
-            """
-        } else if let groupDequant = format.emitGroupDequant(
-            blocksVar: "block->qs", blockIndexVar: "groupIndex", outputArrayVar: "weights_f32"
-        ) {
-            dequantBody = """
-                device const \(blockStructName)* block = reinterpret_cast<device const \(blockStructName)*>(rowBase + groupIndex * BYTES_PER_BLOCK);
-                float scale = float(block->scale);
-                float zero  = float(block->zero);
-                float weights_f32[\(groupSize)];
-                \(groupDequant)
-                float value = weights_f32[indexInGroup];
-            """
-        } else {
+        ) else {
             fatalError(
                 "generateUnifiedQuantizedEmbeddingLookup: format \(format.schemeIdentifier) " +
-                "provides neither perWeightReadExpression nor emitGroupDequant")
+                "did not provide perWeightReadExpression")
         }
+        let dequantBody = """
+            device const \(blockStructName)* block = reinterpret_cast<device const \(blockStructName)*>(rowBase + groupIndex * BYTES_PER_BLOCK);
+            float scale = float(block->scale);
+            float zero  = float(block->zero);
+            float value = \(perWeight);
+        """
 
         if isSequence {
             return """

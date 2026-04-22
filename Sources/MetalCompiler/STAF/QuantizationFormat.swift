@@ -66,33 +66,23 @@ public protocol QuantizationFormat: Sendable {
     /// - Compiler is expected to deduplicate by `schemeIdentifier` when assembling a program.
     var mslDeclarations: String { get }
 
-    /// Aligned-format per-weight read expression.
+    /// Per-weight read expression.
     ///
-    /// The caller (unified aligned GEMV scaffold) already captured `scale` and `zero`
-    /// as local `float` variables for the current block. This hook returns a single
-    /// MSL expression that evaluates to the dequantized float weight at
-    /// `blocksVar[weightIndexVar]`.
+    /// The caller (unified GEMV / dequant scaffold) already captured `scale`
+    /// and `zero` as local `float` variables for the current block. This hook
+    /// returns a single MSL expression that evaluates to the dequantized float
+    /// weight at `blocksVar[weightIndexVar]`.
     ///
     /// - `blocksVar`: name of the packed-quant array within the current block
     ///   (for dense, the flat weight array; for Q4/Q8, e.g. "blk.qs").
     /// - `weightIndexVar`: name of the weight index variable within `blocksVar`.
     ///
-    /// Returns `nil` for non-aligned formats (Q3/Q5/Q6) — those must use `emitGroupDequant`.
+    /// All quantized formats (aligned and non-aligned) must implement this.
+    /// Non-aligned formats (Q3/Q5/Q6) return a ternary-chain expression that
+    /// the Metal compiler flattens into predicated selection.
     func perWeightReadExpression(
         blocksVar: String,
         weightIndexVar: String
-    ) -> String?
-
-    /// Non-aligned format per-group dequant statement.
-    ///
-    /// Emits MSL statements that populate `outputArrayVar[0..<groupSize]` with dequantized
-    /// floats for block `blockIndexVar`. `blocksVar` names the typed block array pointer.
-    ///
-    /// Returns `nil` for aligned formats — those use `perWeightReadExpression` instead.
-    func emitGroupDequant(
-        blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
     ) -> String?
 
     // MARK: - Prefill dispatch capabilities
@@ -139,14 +129,7 @@ public extension QuantizationFormat {
         }
     }
 
-    /// Default: no group-level dequant. Aligned formats only use per-weight reads.
-    func emitGroupDequant(
-        blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
-    ) -> String? { nil }
-
-    /// Default: no per-weight read. Non-aligned formats only use group dequant.
+    /// Default: no per-weight read. Formats must override to provide one.
     func perWeightReadExpression(
         blocksVar: String,
         weightIndexVar: String
@@ -477,16 +460,11 @@ public struct AffineQ3Group16Format: QuantizationFormat {
         Q3AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q3AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q3AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -511,16 +489,11 @@ public struct AffineQ3Group32Format: QuantizationFormat {
         Q3AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q3AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q3AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -556,16 +529,11 @@ public struct AffineQ5Group32Format: QuantizationFormat {
         Q5AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q5AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q5AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -590,16 +558,11 @@ public struct AffineQ5Group64Format: QuantizationFormat {
         Q5AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q5AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q5AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -639,16 +602,11 @@ public struct AffineQ6Group16Format: QuantizationFormat {
         Q6AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q6AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q6AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -675,16 +633,11 @@ public struct AffineQ6Group32Format: QuantizationFormat {
         Q6AffineMSL.blockStruct(name: blockStructName, weightsPerBlock: weightsPerBlock)
     }
 
-    public func emitGroupDequant(
+    public func perWeightReadExpression(
         blocksVar: String,
-        blockIndexVar: String,
-        outputArrayVar: String
+        weightIndexVar: String
     ) -> String? {
-        Q6AffineMSL.groupDequant(
-            blocksVar: blocksVar,
-            outputArrayVar: outputArrayVar,
-            weightsPerBlock: weightsPerBlock
-        )
+        Q6AffineMSL.perWeightExpression(blocksVar: blocksVar, weightIndexVar: weightIndexVar)
     }
 
     public init() {}
@@ -864,31 +817,30 @@ enum Q3AffineMSL {
         """
     }
 
-    /// Emits a loop that expands one block's `weightsPerBlock` weights into
-    /// `outputArrayVar[0..<weightsPerBlock]` as float. Assumes `scale` and
-    /// `zero` are captured as `float` locals by the caller.
-    static func groupDequant(
-        blocksVar: String,
-        outputArrayVar: String,
-        weightsPerBlock: Int
-    ) -> String {
-        let numGroups = weightsPerBlock / 8
-        return """
-        for (uint g = 0; g < \(numGroups); g++) {
-                            uchar b0 = \(blocksVar)[g * 3 + 0];
-                            uchar b1 = \(blocksVar)[g * 3 + 1];
-                            uchar b2 = \(blocksVar)[g * 3 + 2];
-                            \(outputArrayVar)[g * 8 + 0] = scale * float(b0 & 0x07) + zero;
-                            \(outputArrayVar)[g * 8 + 1] = scale * float((b0 >> 3) & 0x07) + zero;
-                            \(outputArrayVar)[g * 8 + 2] = scale * float(((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)) + zero;
-                            \(outputArrayVar)[g * 8 + 3] = scale * float((b1 >> 1) & 0x07) + zero;
-                            \(outputArrayVar)[g * 8 + 4] = scale * float((b1 >> 4) & 0x07) + zero;
-                            \(outputArrayVar)[g * 8 + 5] = scale * float(((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)) + zero;
-                            \(outputArrayVar)[g * 8 + 6] = scale * float((b2 >> 2) & 0x07) + zero;
-                            \(outputArrayVar)[g * 8 + 7] = scale * float((b2 >> 5) & 0x07) + zero;
-                        }
-        """
+    /// Per-weight dequant expression assuming `scale` and `zero` are captured
+    /// as `float` locals by the caller. 8 weights share 3 bytes — group
+    /// `g = k/8` lives at bytes `blocksVar[g*3 .. g*3+2]`, and slot
+    /// `s = k%8` selects one of eight bit patterns.
+    static func perWeightExpression(blocksVar: String, weightIndexVar: String) -> String {
+        let k = "(\(weightIndexVar))"
+        let qs = blocksVar
+        let base = "((\(k)) >> 3) * 3"
+        let slot = "((\(k)) & 7)"
+        let b0 = "\(qs)[\(base) + 0]"
+        let b1 = "\(qs)[\(base) + 1]"
+        let b2 = "\(qs)[\(base) + 2]"
+        return "(scale * float(" +
+            "\(slot) == 0 ? (\(b0) & 0x07) : " +
+            "\(slot) == 1 ? ((\(b0) >> 3) & 0x07) : " +
+            "\(slot) == 2 ? (((\(b0) >> 6) & 0x03) | ((\(b1) & 0x01) << 2)) : " +
+            "\(slot) == 3 ? ((\(b1) >> 1) & 0x07) : " +
+            "\(slot) == 4 ? ((\(b1) >> 4) & 0x07) : " +
+            "\(slot) == 5 ? (((\(b1) >> 7) & 0x01) | ((\(b2) & 0x03) << 1)) : " +
+            "\(slot) == 6 ? ((\(b2) >> 2) & 0x07) : " +
+            "((\(b2) >> 5) & 0x07)" +
+            ") + zero)"
     }
+
 }
 
 /// MSL source fragments for Q5 affine block formats.
@@ -916,41 +868,38 @@ enum Q5AffineMSL {
         """
     }
 
-    /// Emits a loop that expands one block's `weightsPerBlock` weights into
-    /// `outputArrayVar[0..<weightsPerBlock]` as float. Assumes `scale` and
-    /// `zero` are captured as `float` locals by the caller.
-    static func groupDequant(
-        blocksVar: String,
-        outputArrayVar: String,
-        weightsPerBlock: Int
-    ) -> String {
-        let numGroups = weightsPerBlock / 8
-        return """
-        for (uint g = 0; g < \(numGroups); g++) {
-                            uchar b0 = \(blocksVar)[g * 5 + 0];
-                            uchar b1 = \(blocksVar)[g * 5 + 1];
-                            uchar b2 = \(blocksVar)[g * 5 + 2];
-                            uchar b3 = \(blocksVar)[g * 5 + 3];
-                            uchar b4 = \(blocksVar)[g * 5 + 4];
-                            \(outputArrayVar)[g * 8 + 0] = scale * float(b0 & 0x1f) + zero;
-                            \(outputArrayVar)[g * 8 + 1] = scale * float(((b0 >> 5) & 0x07) | ((b1 & 0x03) << 3)) + zero;
-                            \(outputArrayVar)[g * 8 + 2] = scale * float((b1 >> 2) & 0x1f) + zero;
-                            \(outputArrayVar)[g * 8 + 3] = scale * float(((b1 >> 7) & 0x01) | ((b2 & 0x0f) << 1)) + zero;
-                            \(outputArrayVar)[g * 8 + 4] = scale * float(((b2 >> 4) & 0x0f) | ((b3 & 0x01) << 4)) + zero;
-                            \(outputArrayVar)[g * 8 + 5] = scale * float((b3 >> 1) & 0x1f) + zero;
-                            \(outputArrayVar)[g * 8 + 6] = scale * float(((b3 >> 6) & 0x03) | ((b4 & 0x07) << 2)) + zero;
-                            \(outputArrayVar)[g * 8 + 7] = scale * float((b4 >> 3) & 0x1f) + zero;
-                        }
-        """
+    /// Per-weight dequant expression assuming `scale` and `zero` are captured
+    /// as `float` locals by the caller. 8 weights share 5 bytes — group
+    /// `g = k/8` lives at bytes `blocksVar[g*5 .. g*5+4]`, and slot
+    /// `s = k%8` selects one of eight bit patterns.
+    static func perWeightExpression(blocksVar: String, weightIndexVar: String) -> String {
+        let k = "(\(weightIndexVar))"
+        let qs = blocksVar
+        let base = "((\(k)) >> 3) * 5"
+        let slot = "((\(k)) & 7)"
+        let b0 = "\(qs)[\(base) + 0]"
+        let b1 = "\(qs)[\(base) + 1]"
+        let b2 = "\(qs)[\(base) + 2]"
+        let b3 = "\(qs)[\(base) + 3]"
+        let b4 = "\(qs)[\(base) + 4]"
+        return "(scale * float(" +
+            "\(slot) == 0 ? (\(b0) & 0x1f) : " +
+            "\(slot) == 1 ? (((\(b0) >> 5) & 0x07) | ((\(b1) & 0x03) << 3)) : " +
+            "\(slot) == 2 ? ((\(b1) >> 2) & 0x1f) : " +
+            "\(slot) == 3 ? (((\(b1) >> 7) & 0x01) | ((\(b2) & 0x0f) << 1)) : " +
+            "\(slot) == 4 ? (((\(b2) >> 4) & 0x0f) | ((\(b3) & 0x01) << 4)) : " +
+            "\(slot) == 5 ? ((\(b3) >> 1) & 0x1f) : " +
+            "\(slot) == 6 ? (((\(b3) >> 6) & 0x03) | ((\(b4) & 0x07) << 2)) : " +
+            "((\(b4) >> 3) & 0x1f)" +
+            ") + zero)"
     }
+
 }
 
 /// MSL source fragments for Q6 affine block formats.
 ///
 /// Non-aligned packing: 4 weights share 3 bytes (see MLX
-/// `mlx/backend/cpu/quantized.cpp` `extract_bits<6>`). This helper emits a
-/// group-level dequant statement that populates a thread-local float array
-/// for the unified GEMV kernel.
+/// `mlx/backend/cpu/quantized.cpp` `extract_bits<6>`).
 enum Q6AffineMSL {
     /// Block struct definition. Packed bytes = (weightsPerBlock / 4) * 3.
     static func blockStruct(name: String, weightsPerBlock: Int) -> String {
@@ -964,27 +913,30 @@ enum Q6AffineMSL {
         """
     }
 
-    /// Emits a loop that expands one block's `weightsPerBlock` weights into
-    /// `outputArrayVar[0..<weightsPerBlock]` as float. Assumes `scale` and
-    /// `zero` are captured as `float` locals by the caller.
-    static func groupDequant(
-        blocksVar: String,
-        outputArrayVar: String,
-        weightsPerBlock: Int
-    ) -> String {
-        let numGroups = weightsPerBlock / 4
-        return """
-        for (uint g = 0; g < \(numGroups); g++) {
-                            uchar b0 = \(blocksVar)[g * 3 + 0];
-                            uchar b1 = \(blocksVar)[g * 3 + 1];
-                            uchar b2 = \(blocksVar)[g * 3 + 2];
-                            \(outputArrayVar)[g * 4 + 0] = scale * float(b0 & 0x3f) + zero;
-                            \(outputArrayVar)[g * 4 + 1] = scale * float(((b0 >> 6) & 0x03) | ((b1 & 0x0f) << 2)) + zero;
-                            \(outputArrayVar)[g * 4 + 2] = scale * float(((b1 >> 4) & 0x0f) | ((b2 & 0x03) << 4)) + zero;
-                            \(outputArrayVar)[g * 4 + 3] = scale * float(b2 >> 2) + zero;
-                        }
-        """
+    /// Per-weight dequant expression assuming `scale` and `zero` are captured
+    /// as `float` locals by the caller. Reads weight `k` from the packed
+    /// stream at `blocksVar`: 4 weights share 3 bytes, so group `g = k/4`
+    /// lives at bytes `blocksVar[g*3 .. g*3+2]`, and slot `s = k%4` selects
+    /// one of four bit patterns. The expression is a single ternary chain so
+    /// the Metal compiler can CSE shared sub-expressions and emit tight
+    /// branch-free selection in the common case (k varies by simdgroup
+    /// thread).
+    static func perWeightExpression(blocksVar: String, weightIndexVar: String) -> String {
+        let k = "(\(weightIndexVar))"
+        let qs = blocksVar
+        let base = "((\(k)) >> 2) * 3"
+        let slot = "((\(k)) & 3)"
+        let b0 = "\(qs)[\(base) + 0]"
+        let b1 = "\(qs)[\(base) + 1]"
+        let b2 = "\(qs)[\(base) + 2]"
+        return "(scale * float(" +
+            "\(slot) == 0 ? (\(b0) & 0x3f) : " +
+            "\(slot) == 1 ? (((\(b0) >> 6) & 0x03) | ((\(b1) & 0x0f) << 2)) : " +
+            "\(slot) == 2 ? (((\(b1) >> 4) & 0x0f) | ((\(b2) & 0x03) << 4)) : " +
+            "(\(b2) >> 2)" +
+            ") + zero)"
     }
+
 }
 
 /// MSL source fragments for Q8 affine block formats.

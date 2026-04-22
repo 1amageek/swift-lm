@@ -463,13 +463,145 @@ struct MetalSourceGeneratorTests {
                 format: format,
                 bufferPrecision: .float16
             )
-            // MLX extract_bits<6>: 4 weights span 3 bytes
+            // MLX extract_bits<6>: 4 weights span 3 bytes. Each weight slot is
+            // selected by a ternary chain keyed on `k & 3`.
             #expect(source.contains("b0 & 0x3f"), "Missing w[0] extraction for \(format.schemeIdentifier)")
             #expect(source.contains("((b0 >> 6) & 0x03) | ((b1 & 0x0f) << 2)"),
                 "Missing w[1] extraction for \(format.schemeIdentifier)")
             #expect(source.contains("((b1 >> 4) & 0x0f) | ((b2 & 0x03) << 4)"),
                 "Missing w[2] extraction for \(format.schemeIdentifier)")
             #expect(source.contains("b2 >> 2"), "Missing w[3] extraction for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV emits MLX-compatible Q2 bit extraction")
+    func unifiedQuantizedGEMVQ2EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ2Group16Format(),
+            AffineQ2Group32Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // Aligned Q2: 4 weights per byte. perWeightExpression inlined in per-k loop.
+            // `qs[(k) >> 2]` selects the byte; `((k) & 3) * 2` shifts to low bits; `& 0x3` masks.
+            #expect(source.contains("qs[(k) >> 2]"),
+                "Missing Q2 byte index for \(format.schemeIdentifier)")
+            #expect(source.contains("((k) & 3) * 2"),
+                "Missing Q2 sub-byte shift for \(format.schemeIdentifier)")
+            #expect(source.contains("& 0x3)"),
+                "Missing Q2 2-bit mask for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV emits MLX-compatible Q4 bit extraction")
+    func unifiedQuantizedGEMVQ4EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ4Group64Format(),
+            AffineQ4Group128Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // Aligned Q4: 2 weights per byte.
+            // `qs[(k) >> 1]` selects the byte; `((k) & 1) * 4` shifts to low nibble; `& 0xF` masks.
+            #expect(source.contains("qs[(k) >> 1]"),
+                "Missing Q4 byte index for \(format.schemeIdentifier)")
+            #expect(source.contains("((k) & 1) * 4"),
+                "Missing Q4 nibble shift for \(format.schemeIdentifier)")
+            #expect(source.contains("& 0xF)"),
+                "Missing Q4 4-bit mask for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV emits MLX-compatible Q8 byte read")
+    func unifiedQuantizedGEMVQ8EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ8Group32Format(),
+            AffineQ8Group64Format(),
+            AffineQ8Group128Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // Aligned Q8: 1 weight per byte, direct read.
+            #expect(source.contains("float(qs[k])"),
+                "Missing Q8 direct byte read for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV emits MLX-compatible Q3 bit extraction")
+    func unifiedQuantizedGEMVQ3EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ3Group16Format(),
+            AffineQ3Group32Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // MLX extract_bits<3>: 8 weights span 3 bytes.
+            #expect(source.contains("b0 & 0x07"),
+                "Missing Q3 w[0] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b0 >> 3) & 0x07"),
+                "Missing Q3 w[1] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b0 >> 6) & 0x03) | ((b1 & 0x01) << 2)"),
+                "Missing Q3 w[2] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b1 >> 1) & 0x07"),
+                "Missing Q3 w[3] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b1 >> 4) & 0x07"),
+                "Missing Q3 w[4] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b1 >> 7) & 0x01) | ((b2 & 0x03) << 1)"),
+                "Missing Q3 w[5] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b2 >> 2) & 0x07"),
+                "Missing Q3 w[6] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b2 >> 5) & 0x07"),
+                "Missing Q3 w[7] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("weights_f32[\(format.weightsPerBlock)]"),
+                "Missing weights_f32 array for \(format.schemeIdentifier)")
+        }
+    }
+
+    @Test("Unified quantized GEMV emits MLX-compatible Q5 bit extraction")
+    func unifiedQuantizedGEMVQ5EmitsMLXBitPattern() throws {
+        let formats: [any QuantizationFormat] = [
+            AffineQ5Group32Format(),
+            AffineQ5Group64Format(),
+        ]
+        for format in formats {
+            let source = MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: "test_\(format.gemvKernelName)",
+                format: format,
+                bufferPrecision: .float16
+            )
+            // MLX extract_bits<5>: 8 weights span 5 bytes.
+            #expect(source.contains("b0 & 0x1f"),
+                "Missing Q5 w[0] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b0 >> 5) & 0x07) | ((b1 & 0x03) << 3)"),
+                "Missing Q5 w[1] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b1 >> 2) & 0x1f"),
+                "Missing Q5 w[2] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b1 >> 7) & 0x01) | ((b2 & 0x0f) << 1)"),
+                "Missing Q5 w[3] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b2 >> 4) & 0x0f) | ((b3 & 0x01) << 4)"),
+                "Missing Q5 w[4] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b3 >> 1) & 0x1f"),
+                "Missing Q5 w[5] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("((b3 >> 6) & 0x03) | ((b4 & 0x07) << 2)"),
+                "Missing Q5 w[6] extraction for \(format.schemeIdentifier)")
+            #expect(source.contains("(b4 >> 3) & 0x1f"),
+                "Missing Q5 w[7] extraction for \(format.schemeIdentifier)")
             #expect(source.contains("weights_f32[\(format.weightsPerBlock)]"),
                 "Missing weights_f32 array for \(format.schemeIdentifier)")
         }
@@ -544,12 +676,11 @@ struct MetalSourceGeneratorTests {
                 }
             }
 
-            // Compile a dequant-only kernel that wraps emitGroupDequant.
+            // Compile a dequant-only kernel that wraps perWeightReadExpression.
             let name = "dequant_q6_g\(format.groupSize)_test"
-            let dequantBody = format.emitGroupDequant(
+            let readExpression = format.perWeightReadExpression(
                 blocksVar: "qs",
-                blockIndexVar: "0",
-                outputArrayVar: "weights_f32"
+                weightIndexVar: "k"
             )!
             let source = """
             #include <metal_stdlib>
@@ -562,9 +693,7 @@ struct MetalSourceGeneratorTests {
                 float scale = float(*(device const half*)(block));
                 float zero  = float(*(device const half*)(block + 2));
                 device const uchar* qs = block + 4;
-                float weights_f32[\(wpb)];
-                \(dequantBody)
-                for (uint k = 0; k < \(wpb); k++) output[k] = weights_f32[k];
+                for (uint k = 0; k < \(wpb); k++) output[k] = \(readExpression);
             }
             """
             let options = MTLCompileOptions()

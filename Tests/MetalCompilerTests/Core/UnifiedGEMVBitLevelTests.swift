@@ -67,7 +67,19 @@ struct UnifiedGEMVBitLevelTests {
         )
     }
 
-    // MARK: - Regression anchors
+    // MARK: - Q6G16 (non-aligned)
+
+    @Test("Q6G16 GEMV matches reference dot product")
+    func q6Group16() throws {
+        try runSingleRowGEMVTest(
+            format: AffineQ6Group16Format(),
+            weights: (0..<16).map { UInt32($0 % 64) },
+            scale: 0.03125,
+            zero: -1.0
+        )
+    }
+
+    // MARK: - Aligned formats (bit-exact variants across group sizes)
 
     @Test("Q2G16 GEMV baseline (regression anchor)")
     func q2Group16Baseline() throws {
@@ -76,6 +88,16 @@ struct UnifiedGEMVBitLevelTests {
             weights: (0..<16).map { UInt32($0 % 4) },
             scale: 0.25,
             zero: -0.5
+        )
+    }
+
+    @Test("Q2G32 GEMV matches reference dot product")
+    func q2Group32() throws {
+        try runSingleRowGEMVTest(
+            format: AffineQ2Group32Format(),
+            weights: (0..<32).map { UInt32($0 % 4) },
+            scale: 0.125,
+            zero: 0.25
         )
     }
 
@@ -89,6 +111,16 @@ struct UnifiedGEMVBitLevelTests {
         )
     }
 
+    @Test("Q4G128 GEMV matches reference dot product")
+    func q4Group128() throws {
+        try runSingleRowGEMVTest(
+            format: AffineQ4Group128Format(),
+            weights: (0..<128).map { UInt32($0 % 16) },
+            scale: 0.03125,
+            zero: -0.25
+        )
+    }
+
     @Test("Q6G32 GEMV baseline (regression anchor)")
     func q6Group32Baseline() throws {
         try runSingleRowGEMVTest(
@@ -96,6 +128,26 @@ struct UnifiedGEMVBitLevelTests {
             weights: (0..<32).map { UInt32($0 % 64) },
             scale: 0.015625,
             zero: -0.5
+        )
+    }
+
+    @Test("Q8G32 GEMV matches reference dot product")
+    func q8Group32() throws {
+        try runSingleRowGEMVTest(
+            format: AffineQ8Group32Format(),
+            weights: (0..<32).map { UInt32($0 % 256) },
+            scale: 0.00390625,
+            zero: -0.5
+        )
+    }
+
+    @Test("Q8G64 GEMV matches reference dot product")
+    func q8Group64() throws {
+        try runSingleRowGEMVTest(
+            format: AffineQ8Group64Format(),
+            weights: (0..<64).map { UInt32($0 % 256) },
+            scale: 0.0078125,
+            zero: -32.0
         )
     }
 

@@ -652,7 +652,19 @@ enum BenchmarkSupport {
         if !FileManager.default.fileExists(atPath: stafURL.path) {
             let safetensorsURLs = try resolveSafetensorsFiles(in: bundleURL)
             guard !safetensorsURLs.isEmpty else { throw BenchError.noModel }
-            try STAFConverter().convert(safetensorsURLs: safetensorsURLs, outputURL: stafURL)
+            let configURL = bundleURL.appendingPathComponent("config.json")
+            let quantization: MLXQuantizationHint?
+            if FileManager.default.fileExists(atPath: configURL.path) {
+                let configData = try Data(contentsOf: configURL)
+                quantization = try HFConfigDecoder().quantizationHint(from: configData)
+            } else {
+                quantization = nil
+            }
+            try STAFConverter().convert(
+                safetensorsURLs: safetensorsURLs,
+                outputURL: stafURL,
+                quantization: quantization
+            )
         }
 
         let store = try STAFLoader().load(at: stafURL, device: device)

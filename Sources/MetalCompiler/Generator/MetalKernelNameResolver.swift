@@ -128,9 +128,19 @@ struct MetalKernelNameResolver {
                         ? family.kernelBaseName + "_bf16"
                         : family.kernelBaseName
                 }
-                return isPrefill
-                    ? tensorInfo.format.gemmKernelName(bufferPrecision: kernelContext.bufferPrecision)
-                    : tensorInfo.format.gemvKernelName
+                if isPrefill {
+                    // Formats without a hand-tuned direct prefill GEMM kernel route
+                    // through the dequant→BF16 MPP GEMM pipeline; the primary kernel
+                    // is `gemm_bf16_f32s`. MetalPrefillStepBuilder emits the separate
+                    // dequant step and may still swap in a direct kernel if one is
+                    // available at dispatch time.
+                    if tensorInfo.format.isQuantized,
+                       tensorInfo.format.directGEMMKernel() == nil {
+                        return "gemm_bf16_f32s"
+                    }
+                    return tensorInfo.format.gemmKernelName(bufferPrecision: kernelContext.bufferPrecision)
+                }
+                return tensorInfo.format.gemvKernelName
             }
 
             if isPrefill,

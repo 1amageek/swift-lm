@@ -102,7 +102,9 @@ Weight formats:
 |---|---|---|
 | FP16 | ✅ Validated | `RotorQuantRealBundleBaselineTests` — token "Tokyo" |
 | BF16 | ⚠ Loader-supported only | No real-bundle test |
-| Q4 / Q8 | ❌ Not tested | No published bundle converted to STAF |
+| Q4g64 | ✅ Validated | `Gemma4Q4AgreementTests` — token diversity 28–31/31 |
+| Q6g32 | ✅ Validated | `Gemma4Q6AgreementTests` — token diversity 23–29/31 |
+| Q8 | ❌ Not tested | No published bundle converted to STAF |
 
 KV cache schemes (FP16 weights, Gemma4-E2B):
 
@@ -168,12 +170,12 @@ rotor application partial at best. Not tested with rotor schemes.
 
 ## Roll-up
 
-|   | FP16 | BF16 | Q4 | Q8 | Rotor KV |
-|---|---|---|---|---|---|
-| Gemma4 text | ✅ | ⚠ | — | — | ✅ (Q4 / Q8 both K, V, or full) |
-| EmbeddingGemma | — | ✅ | ✅ | — | N/A |
-| LFM2 | — | ✅ | — | — | ❌ loader-excluded |
-| Qwen3.5 VLM | — | ✅ | — | — | ❌ not tested |
+|   | FP16 | BF16 | Q4 | Q6 | Q8 | Rotor KV |
+|---|---|---|---|---|---|---|
+| Gemma4 text | ✅ | ⚠ | ✅ (g64) | ✅ (g32) | — | ✅ (Q4 / Q8 both K, V, or full) |
+| EmbeddingGemma | — | ✅ | ✅ | — | — | N/A |
+| LFM2 | — | ✅ | — | — | — | ❌ loader-excluded |
+| Qwen3.5 VLM | — | ✅ | — | — | — | ❌ not tested |
 
 Legend: ✅ real-bundle test passes · ⚠ loader accepts but untested · ❌ unsupported · — no bundle
 

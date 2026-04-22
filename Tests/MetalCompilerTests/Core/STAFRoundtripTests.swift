@@ -438,7 +438,11 @@ struct STAFRoundtripTests {
             to: safetensorsURL)
 
         let stafURL = tempDirectory.appendingPathComponent("model.staf")
-        try STAFConverter().convert(safetensorsURLs: [safetensorsURL], outputURL: stafURL)
+        try STAFConverter().convert(
+            safetensorsURLs: [safetensorsURL],
+            outputURL: stafURL,
+            quantization: MLXQuantizationHint(bits: 4, groupSize: 64)
+        )
 
         let store = try STAFLoader().load(at: stafURL, device: device)
 
@@ -472,6 +476,63 @@ struct STAFRoundtripTests {
                 "Consumed scales tensor should not be in STAF")
         #expect(store.entries["model.layers.0.mlp.gate_proj.biases"] == nil,
                 "Consumed biases tensor should not be in STAF")
+    }
+
+    // MARK: - Q2/Q3/Q5/Q6/Q8G128 Quantized Roundtrip
+
+    @Test("Q2G16 quantized tensor block layout is preserved")
+    func q2Group16QuantizedRoundtrip() throws {
+        try runQuantizedRoundtripTest(
+            format: AffineQ2Group16Format(),
+            bits: 2,
+            groupSize: 16,
+            outputDimension: 4,
+            packedDimension: 1
+        )
+    }
+
+    @Test("Q3G16 quantized tensor block layout is preserved")
+    func q3Group16QuantizedRoundtrip() throws {
+        try runQuantizedRoundtripTest(
+            format: AffineQ3Group16Format(),
+            bits: 3,
+            groupSize: 16,
+            outputDimension: 4,
+            packedDimension: 3
+        )
+    }
+
+    @Test("Q5G32 quantized tensor block layout is preserved")
+    func q5Group32QuantizedRoundtrip() throws {
+        try runQuantizedRoundtripTest(
+            format: AffineQ5Group32Format(),
+            bits: 5,
+            groupSize: 32,
+            outputDimension: 4,
+            packedDimension: 5
+        )
+    }
+
+    @Test("Q6G16 quantized tensor block layout is preserved")
+    func q6Group16QuantizedRoundtrip() throws {
+        try runQuantizedRoundtripTest(
+            format: AffineQ6Group16Format(),
+            bits: 6,
+            groupSize: 16,
+            outputDimension: 4,
+            packedDimension: 3
+        )
+    }
+
+    @Test("Q8G128 quantized tensor block layout is preserved")
+    func q8Group128QuantizedRoundtrip() throws {
+        try runQuantizedRoundtripTest(
+            format: AffineQ8Group128Format(),
+            bits: 8,
+            groupSize: 128,
+            outputDimension: 4,
+            packedDimension: 32
+        )
     }
 
     // MARK: - Deallocator Safety
@@ -703,6 +764,160 @@ struct STAFRoundtripTests {
     }
 
     // MARK: - Helpers
+
+    /// Write an MLX-style quantized tensor (weight + scales + biases) to
+    /// safetensors, convert to STAF, load back, and verify the block layout.
+    ///
+    /// Checks performed:
+    /// 1. The STAF entry reports the expected scheme identifier.
+    /// 2. `payloadSize == totalBlocks × bytesPerBlock`.
+    /// 3. Per-block scale (F16) and zero (F16) round-trip byte-for-byte.
+    /// 4. The packed quant bytes match the MLX bit-stream layout.
+    /// 5. The `.scales` and `.biases` companion tensors are consumed (removed).
+    private func runQuantizedRoundtripTest(
+        format: any QuantizationFormat,
+        bits: Int,
+        groupSize: Int,
+        outputDimension: Int,
+        packedDimension: Int
+    ) throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("staf_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+
+        let inputDimension = packedDimension * 32 / bits
+        let groupsPerRow = inputDimension / groupSize
+        #expect(
+            groupsPerRow >= 1,
+            "Invalid test parameters: inputDim=\(inputDimension) < groupSize=\(groupSize)"
+        )
+        let bytesPerGroup = groupSize * bits / 8
+
+        // Weight data: distinct bit pattern per (row, position) so byte-level
+        // equality can catch misaligned copies across rows or groups.
+        var weightData: [UInt32] = []
+        for row in 0..<outputDimension {
+            for p in 0..<packedDimension {
+                let pattern = UInt32(0x0103_0507)
+                    &+ UInt32(row) &* UInt32(0x1111_1111)
+                    &+ UInt32(p) &* UInt32(0x0010_0100)
+                weightData.append(pattern)
+            }
+        }
+
+        // Scales and biases: distinct per (row, group).
+        var scalesData: [Float16] = []
+        var biasesData: [Float16] = []
+        for row in 0..<outputDimension {
+            for g in 0..<groupsPerRow {
+                let scale = 0.125 + 0.0625 * Float(row) + 0.03125 * Float(g)
+                let zero = -0.25 + 0.125 * Float(row) - 0.0625 * Float(g)
+                scalesData.append(Float16(scale))
+                biasesData.append(Float16(zero))
+            }
+        }
+
+        let safetensorsURL = tempDirectory.appendingPathComponent("model.safetensors")
+        try writeSafetensors(
+            tensors: [
+                TestTensor(
+                    name: "model.layers.0.mlp.gate_proj.weight",
+                    dtype: "U32",
+                    shape: [outputDimension, packedDimension],
+                    data: Data(bytes: &weightData, count: weightData.count * MemoryLayout<UInt32>.size)
+                ),
+                TestTensor(
+                    name: "model.layers.0.mlp.gate_proj.scales",
+                    dtype: "F16",
+                    shape: [outputDimension, groupsPerRow],
+                    data: Data(bytes: &scalesData, count: scalesData.count * MemoryLayout<Float16>.size)
+                ),
+                TestTensor(
+                    name: "model.layers.0.mlp.gate_proj.biases",
+                    dtype: "F16",
+                    shape: [outputDimension, groupsPerRow],
+                    data: Data(bytes: &biasesData, count: biasesData.count * MemoryLayout<Float16>.size)
+                ),
+            ],
+            to: safetensorsURL
+        )
+
+        let stafURL = tempDirectory.appendingPathComponent("model.staf")
+        try STAFConverter().convert(
+            safetensorsURLs: [safetensorsURL],
+            outputURL: stafURL,
+            quantization: MLXQuantizationHint(bits: bits, groupSize: groupSize)
+        )
+
+        let store = try STAFLoader().load(at: stafURL, device: device)
+
+        guard let entry = store.entries["model.layers.0.mlp.gate_proj.weight"] else {
+            Issue.record("Quantized weight not found in STAF for \(format.schemeIdentifier)")
+            return
+        }
+
+        #expect(entry.schemeIdentifier == format.schemeIdentifier)
+        let totalBlocks = outputDimension * groupsPerRow
+        #expect(entry.payloadSize == totalBlocks * format.bytesPerBlock)
+        #expect(format.bytesPerBlock == 4 + bytesPerGroup,
+                "\(format.schemeIdentifier): bytesPerBlock=\(format.bytesPerBlock) != 4 + bytesPerGroup=\(bytesPerGroup)")
+
+        // Packed weight bytes as raw uint8 for byte-level comparison with the
+        // STAF-stored qs region.
+        let sourceWeightBytes: [UInt8] = weightData.withUnsafeBytes { buffer in
+            Array(buffer.bindMemory(to: UInt8.self))
+        }
+
+        let blockPointer = store.buffer.contents() + entry.bufferOffset
+        for row in 0..<outputDimension {
+            for g in 0..<groupsPerRow {
+                let blockIndex = row * groupsPerRow + g
+                let blockBase = blockPointer + blockIndex * format.bytesPerBlock
+
+                let loadedScale = blockBase.load(as: Float16.self)
+                let expectedScale = scalesData[blockIndex]
+                #expect(
+                    loadedScale == expectedScale,
+                    "\(format.schemeIdentifier) row=\(row) group=\(g) scale: loaded=\(loadedScale) expected=\(expectedScale)"
+                )
+
+                let loadedZero = (blockBase + 2).load(as: Float16.self)
+                let expectedZero = biasesData[blockIndex]
+                #expect(
+                    loadedZero == expectedZero,
+                    "\(format.schemeIdentifier) row=\(row) group=\(g) zero: loaded=\(loadedZero) expected=\(expectedZero)"
+                )
+
+                // MLX bit-stream packing is preserved byte-for-byte by the
+                // converter (see STAFPayloadConverter.repackMLXQuantized).
+                let rowByteOffset = row * packedDimension * MemoryLayout<UInt32>.size
+                let sourceOffset = rowByteOffset + g * bytesPerGroup
+                for byteIndex in 0..<bytesPerGroup {
+                    let loadedByte = (blockBase + 4 + byteIndex).load(as: UInt8.self)
+                    let expectedByte = sourceWeightBytes[sourceOffset + byteIndex]
+                    #expect(
+                        loadedByte == expectedByte,
+                        "\(format.schemeIdentifier) row=\(row) group=\(g) qs[\(byteIndex)]: loaded=0x\(String(loadedByte, radix: 16)) expected=0x\(String(expectedByte, radix: 16))"
+                    )
+                }
+            }
+        }
+
+        #expect(
+            store.entries["model.layers.0.mlp.gate_proj.scales"] == nil,
+            "\(format.schemeIdentifier): consumed scales tensor should not be in STAF"
+        )
+        #expect(
+            store.entries["model.layers.0.mlp.gate_proj.biases"] == nil,
+            "\(format.schemeIdentifier): consumed biases tensor should not be in STAF"
+        )
+    }
 
     private func converter() -> STAFConverter { STAFConverter() }
 

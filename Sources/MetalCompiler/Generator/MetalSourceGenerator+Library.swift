@@ -162,11 +162,11 @@ extension MetalSourceGenerator {
         sources.append(generateDirectScratchBatchFlashAttention(name: "flash_attn_batch_scratch_f32", bufferPrecision: prefill))
         sources.append(generateKVCacheFillSeq(name: "kv_cache_fill_seq_f32", bufferPrecision: prefill))
 
-        // === Quantized GEMV (decode) ===
-        sources.append(generateQuantizedGEMV_Q4G64(name: "gemv_q4_g64", bufferPrecision: decode))
-        sources.append(generateQuantizedGEMV_Q4G128(name: "gemv_q4_g128", bufferPrecision: decode))
-        sources.append(generateQuantizedGEMV_Q8(name: "gemv_q8_g32", bufferPrecision: decode, groupSize: 32))
-        sources.append(generateQuantizedGEMV_Q8(name: "gemv_q8_g64", bufferPrecision: decode, groupSize: 64))
+        // === Quantized GEMV (decode) === format-driven unified scaffold
+        sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q4_g64", format: AffineQ4Group64Format(), bufferPrecision: decode))
+        sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q4_g128", format: AffineQ4Group128Format(), bufferPrecision: decode))
+        sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q8_g32", format: AffineQ8Group32Format(), bufferPrecision: decode))
+        sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q8_g64", format: AffineQ8Group64Format(), bufferPrecision: decode))
 
         // === Quantized GEMM (prefill) ===
         sources.append(generateQuantizedGEMM_Q4(name: "gemm_q4_g64", bufferPrecision: decode, groupSize: 64))
