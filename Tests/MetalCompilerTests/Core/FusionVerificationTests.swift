@@ -19,6 +19,135 @@ struct FusionVerificationTests {
     /// Uses the full common header to include BF16 utilities (bf16_to_float, etc.).
     private static let mslPreamble = MetalSourceGenerator.commonHeader
 
+    // MARK: - Structural Lock-in (sandwich-norm transformer)
+
+    /// Lock-in: the cross-block bridge Reduction→ResidualAdd→Copy→Reduction must
+    /// survive as a single 4-way SynthesizedFragment on a sandwich-norm graph.
+    ///
+    /// This pattern is produced by Gemma4-style models where each Residual block
+    /// begins and ends with an RMSNorm. A regression in the fusion engine that
+    /// breaks chain-fusion through ResidualAdd/Copy would split this 4-way chain
+    /// into two 2-way chains — that is the specific failure we guard against.
+    ///
+    /// With `layers=2`, the sandwich-norm graph contains:
+    ///   - 1 initial SYNTH(2) [Copy → Reduction] before the first Attention
+    ///   - 3 SYNTH(4) cross-block chains (end-of-block + start-of-next-block)
+    ///   - 1 final SYNTH(3) [Reduction → ResidualAdd → Reduction] wrapping the
+    ///     final FFN Residual close + the graph-level final norm
+    @Test("Sandwich-norm: cross-block 4-way chain fusion is preserved")
+    func sandwichNormCrossBlockChainFusion() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let graph = try ModelGraph(SandwichNormTransformerForFusion(hiddenSize: 64, layers: 2, vocabSize: 100))
+        let kernelContext = KernelContext(bufferPrecision: .float32, weightFormat: .float16)
+
+        let context = CompileContext(
+            graph: graph, hiddenSize: 64, intermediateSize: 256, vocabSize: 100,
+            inferencePolicy: InferencePolicy(maximumSequenceLength: 64),
+            stafWeightStore: nil, device: device, weightFormat: .float16,
+            decodeBufferPrecision: .float16,
+            accessPolicyResolver: ProjectionWeightAccessPolicyResolver(override: nil)
+        )
+        let collector = MetalEntryCollector()
+        let result = collector.collect(using: context, kernelContext: kernelContext)
+
+        // Baseline reduction: fusion must shrink dispatch count significantly.
+        #expect(result.fusedEntries.count < result.unfusedCount,
+            "Fusion should reduce dispatch count: unfused=\(result.unfusedCount), fused=\(result.fusedEntries.count)")
+
+        // Enumerate SynthesizedFragment depths by their inner fragment type sequence.
+        let syntheses = result.fusedEntries.compactMap { $0.fragment as? SynthesizedFragment }
+        let chainSignatures = syntheses.map { synthesized in
+            synthesized.fragments.map { String(describing: type(of: $0)) }.joined(separator: "+")
+        }
+
+        // Required: at least 3 cross-block 4-way chains for 2 layers.
+        // (layer0-attn end → layer0-ffn start, layer0-ffn end → layer1-attn start,
+        //  layer1-attn end → layer1-ffn start)
+        let fourWayChains = chainSignatures.filter {
+            $0 == "Reduction+ResidualAddFragment+CopyFragment+Reduction"
+        }
+        #expect(fourWayChains.count >= 3,
+            "Expected >= 3 cross-block 4-way chains, got \(fourWayChains.count). All chains: \(chainSignatures)")
+
+        // Required: the leading [Copy→Reduction] before the first Attention is fused.
+        #expect(chainSignatures.contains("CopyFragment+Reduction"),
+            "Leading Copy→Reduction fusion missing. Chains: \(chainSignatures)")
+
+        // Leaked fusion opportunity detection: any adjacent pair with compatible
+        // contracts and primary output/input must have fused (or the test lied).
+        for i in 0..<(result.fusedEntries.count - 1) {
+            let a = result.fusedEntries[i].fragment
+            let b = result.fusedEntries[i + 1].fragment
+            guard let ca = a.fusionContract, let cb = b.fusionContract,
+                  ca.parallelism.isCompatible(with: cb.parallelism),
+                  ca.primaryOutput != nil, cb.primaryInput != nil
+            else { continue }
+            Issue.record("Leaked fusion opportunity at index \(i)→\(i+1): \(type(of: a)) / \(type(of: b))")
+        }
+    }
+
+    /// Lock-in: LayerScale (ScalarMultiplyFragment) sitting between two Residual
+    /// blocks must chain-fuse into the surrounding Reduction+ResidualAdd / Copy+Reduction
+    /// sequence, producing a 5-way chain at each block boundary.
+    ///
+    /// This guards against regressions in two directions:
+    /// 1. ScalarMultiplyFragment loses its fusionContract → chain breaks.
+    /// 2. FusionSynthesizer fails to thread a per-element op through a larger chain.
+    @Test("LayerScale chain-fuses with adjacent ResidualAdd/Copy/Reduction")
+    func layerScaleChainFusion() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let graph = try ModelGraph(LayerScaleTransformerForFusion(hiddenSize: 64, layers: 2, vocabSize: 100))
+        let kernelContext = KernelContext(bufferPrecision: .float32, weightFormat: .float16)
+
+        let context = CompileContext(
+            graph: graph, hiddenSize: 64, intermediateSize: 256, vocabSize: 100,
+            inferencePolicy: InferencePolicy(maximumSequenceLength: 64),
+            stafWeightStore: nil, device: device, weightFormat: .float16,
+            decodeBufferPrecision: .float16,
+            accessPolicyResolver: ProjectionWeightAccessPolicyResolver(override: nil)
+        )
+        let collector = MetalEntryCollector()
+        let result = collector.collect(using: context, kernelContext: kernelContext)
+
+        let syntheses = result.fusedEntries.compactMap { $0.fragment as? SynthesizedFragment }
+        let chainSignatures = syntheses.map { synthesized in
+            synthesized.fragments.map { String(describing: type(of: $0)) }.joined(separator: "+")
+        }
+
+        // Required: ScalarMultiplyFragment must appear inside at least one synthesized chain.
+        // If fusion breaks chain-through-ScalarMultiply, this will fail.
+        let scalarInChain = chainSignatures.contains { $0.contains("ScalarMultiplyFragment") }
+        #expect(scalarInChain,
+            "Expected at least one SynthesizedFragment containing ScalarMultiplyFragment. Chains: \(chainSignatures)")
+
+        // Stronger lock-in: expect the full 5-way chain across at least one boundary.
+        // Each of the 2 layers has 2 ScalarMultiply boundaries (attn→ffn, ffn→next-attn),
+        // giving 4 boundaries total. The last boundary at the end of the graph does not
+        // chain-fuse into a following Residual (there is none), so we require >= 3.
+        let fiveWayChains = chainSignatures.filter {
+            $0 == "Reduction+ResidualAddFragment+ScalarMultiplyFragment+CopyFragment+Reduction"
+        }
+        #expect(fiveWayChains.count >= 3,
+            "Expected >= 3 five-way chains (Reduction+ResidualAdd+ScalarMultiply+Copy+Reduction), got \(fiveWayChains.count). All chains: \(chainSignatures)")
+
+        // Leaked fusion detection: no adjacent pair with compatible contracts should be left unfused.
+        for i in 0..<(result.fusedEntries.count - 1) {
+            let a = result.fusedEntries[i].fragment
+            let b = result.fusedEntries[i + 1].fragment
+            guard let ca = a.fusionContract, let cb = b.fusionContract,
+                  ca.parallelism.isCompatible(with: cb.parallelism),
+                  ca.primaryOutput != nil, cb.primaryInput != nil
+            else { continue }
+            Issue.record("Leaked fusion opportunity at index \(i)→\(i+1): \(type(of: a)) / \(type(of: b))")
+        }
+    }
+
     // MARK: - Layer 1: Structural Verification
 
     @Test("Fusion reduces dispatch count on Transformer model")
@@ -1087,6 +1216,75 @@ private struct TinyTransformerForFusion: ModelComponent {
                 RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
                 MLP(inputSize: hiddenSize, intermediateSize: hiddenSize * 4)
             }
+        }
+        RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+        OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
+    }
+}
+
+/// Gemma4-like sandwich-norm transformer used to surface cross-block fusion opportunities.
+private struct SandwichNormTransformerForFusion: ModelComponent {
+    let hiddenSize: Int
+    let layers: Int
+    let vocabSize: Int
+    var body: some ModelComponent {
+        TokenEmbedding(vocabSize: vocabSize, embeddingSize: hiddenSize)
+        Repeat(count: layers) {
+            Residual {
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+                Attention(
+                    hiddenSize: hiddenSize, headCount: 4, kvHeadCount: 2,
+                    headDimension: hiddenSize / 4,
+                    rope: RoPEAttributes(dimension: hiddenSize / 4, base: 10000.0))
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+            }
+            Residual {
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+                MLP(inputSize: hiddenSize, intermediateSize: hiddenSize * 4)
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+            }
+        }
+        RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+        OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
+    }
+}
+
+/// LayerScale leaf component — emits `LayerScaleAttributes` which lowers to a
+/// single `ScalarMultiplyFragment` per Gemma4's compilable conformance.
+///
+/// Defined locally because the `Models` module is not a test dependency.
+private struct TestLayerScale: ModelComponent {
+    typealias Attributes = LayerScaleAttributes
+    let dimension: Int
+    var attributes: LayerScaleAttributes { LayerScaleAttributes(dimension: dimension) }
+}
+
+/// Gemma4-style transformer: sandwich norms plus a LayerScale scalar multiply
+/// between residual blocks. This surfaces the 5-way chain
+/// Reduction→ResidualAdd→ScalarMultiply→Copy→Reduction that sits at each
+/// block boundary in the real model.
+private struct LayerScaleTransformerForFusion: ModelComponent {
+    let hiddenSize: Int
+    let layers: Int
+    let vocabSize: Int
+    var body: some ModelComponent {
+        TokenEmbedding(vocabSize: vocabSize, embeddingSize: hiddenSize)
+        Repeat(count: layers) {
+            Residual {
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+                Attention(
+                    hiddenSize: hiddenSize, headCount: 4, kvHeadCount: 2,
+                    headDimension: hiddenSize / 4,
+                    rope: RoPEAttributes(dimension: hiddenSize / 4, base: 10000.0))
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+            }
+            TestLayerScale(dimension: hiddenSize)
+            Residual {
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+                MLP(inputSize: hiddenSize, intermediateSize: hiddenSize * 4)
+                RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
+            }
+            TestLayerScale(dimension: hiddenSize)
         }
         RMSNorm(dimension: hiddenSize, epsilon: 1e-5)
         OutputHead(inputSize: hiddenSize, vocabSize: vocabSize, tiedToEmbedding: true)
