@@ -53,60 +53,56 @@ public struct KVCacheSpecification: Sendable {
         self.maximumSequenceLength = maximumSequenceLength
     }
 
-    /// Token slot alignment in bytes, determined by quantization scheme.
+    /// Resolve a scheme identifier to its block-layout `QuantizationFormat`.
     ///
-    /// FP16: 256B (head_dim=128 → 256B natural)
-    /// Q8:    64B (block fits in 64B)
-    /// Q4:    64B (block fits in 64B)
-    public func tokenSlotAlignment(scheme: QuantizationSchemeIdentifier) -> Int {
-        switch scheme {
-        case .fp16RowMajor, .bf16RowMajor, .fp32RowMajor:
-            return 256
-        default:
-            return 64  // quantized blocks fit in 64B alignment
+    /// RotorQuant schemes share the block layout of their base scheme
+    /// (`q8Group32ScaleF16` / `q4Group64ScaleF16`); rotation is a kernel-level
+    /// concern and does not alter storage sizing. Unknown schemes terminate
+    /// immediately rather than falling back to FP16 — a silent fallback here
+    /// would hand out undersized buffers and cause out-of-bounds KV writes.
+    private func resolveBlockLayout(
+        for scheme: QuantizationSchemeIdentifier
+    ) -> any QuantizationFormat {
+        let base = scheme.baseScheme
+        guard let format = QuantizationFormatRegistry.format(for: base) else {
+            fatalError("KVCacheSpecification: no QuantizationFormat registered for scheme \(scheme) (base: \(base)). Register the format in QuantizationFormatRegistry before referencing it from an InferencePolicy.")
         }
+        return format
+    }
+
+    /// Token slot alignment policy, expressed directly over the block format.
+    ///
+    /// Dense formats use 256B so that common `head_dim = 128` slots land on a
+    /// cache-line-friendly natural boundary. Quantized block-packed formats use
+    /// 64B — the block payloads (36B or 68B per group) fit comfortably within
+    /// one cache line at this alignment.
+    ///
+    /// This is the single source of truth; the scheme-keyed overload and the
+    /// byte-sizing path both route through here so the two stay in lockstep.
+    private func tokenSlotAlignment(for format: any QuantizationFormat) -> Int {
+        format.isQuantized ? 64 : 256
+    }
+
+    /// Token slot alignment in bytes for a given scheme.
+    public func tokenSlotAlignment(scheme: QuantizationSchemeIdentifier) -> Int {
+        tokenSlotAlignment(for: resolveBlockLayout(for: scheme))
     }
 
     /// Byte size of one head's data for one token in a given scheme.
     ///
-    /// This is the per-head slot size. Includes scale/zero overhead for quantized schemes.
-    /// For a full token (all heads), multiply by kvHeadCount.
+    /// Derived directly from the format's block layout: each head stores
+    /// `ceil(headDimension / weightsPerBlock)` blocks of `bytesPerBlock` bytes.
+    /// For dense formats `weightsPerBlock == 1` and `bytesPerBlock` equals the
+    /// element stride, so the expression collapses to `headDimension * stride`.
+    /// For quantized formats the scale/zero header is already accounted for in
+    /// `bytesPerBlock`. Result is rounded up to the token slot alignment for
+    /// the same format — a single resolve so the alignment and byte math can
+    /// never disagree.
     public func bytesPerHeadSlot(scheme: QuantizationSchemeIdentifier) -> Int {
-        let rawBytes: Int
-        switch scheme {
-        case .fp16RowMajor:
-            rawBytes = headDimension * 2
-        case .bf16RowMajor:
-            rawBytes = headDimension * 2
-        case .fp32RowMajor:
-            rawBytes = headDimension * 4
-        case .q8Group32ScaleF16:
-            // Per group: 4B header (scale+zero) + 32B int8 = 36B per 32 elements
-            let groups = (headDimension + 31) / 32
-            rawBytes = groups * 36
-        case .q8Group64ScaleF16:
-            let groups = (headDimension + 63) / 64
-            rawBytes = groups * 68
-        case .q4Group64ScaleF16:
-            // Per group: 4B header (scale+zero) + 32B packed 4-bit = 36B per 64 elements
-            let groups = (headDimension + 63) / 64
-            rawBytes = groups * 36
-        case .q4Group128ScaleF16Zero:
-            let groups = (headDimension + 127) / 128
-            rawBytes = groups * 68
-        case .rotorQ8Group32ScaleF16:
-            // Same block layout as q8Group32: 4B header + 32B int8 = 36B per 32 elements
-            let groups = (headDimension + 31) / 32
-            rawBytes = groups * 36
-        case .rotorQ4Group64ScaleF16:
-            // Same block layout as q4Group64: 4B header + 32B packed 4-bit = 36B per 64 elements
-            let groups = (headDimension + 63) / 64
-            rawBytes = groups * 36
-        default:
-            rawBytes = headDimension * 2  // fallback FP16
-        }
-        let alignment = tokenSlotAlignment(scheme: scheme)
-        return alignUp(rawBytes, to: alignment)
+        let format = resolveBlockLayout(for: scheme)
+        let blockCount = (headDimension + format.weightsPerBlock - 1) / format.weightsPerBlock
+        let rawBytes = blockCount * format.bytesPerBlock
+        return alignUp(rawBytes, to: tokenSlotAlignment(for: format))
     }
 
     /// Byte size of one token slot (one token, all KV heads).
@@ -423,16 +419,6 @@ public struct MetalKVCache: @unchecked Sendable {
         specification.offset(
             layer: layer, head: head, position: position,
             scheme: specification.valueQuantizationScheme)
-    }
-
-    /// Whether K cache uses quantization (not FP16).
-    public var isKeyQuantized: Bool {
-        specification.keyQuantizationScheme != .fp16RowMajor
-    }
-
-    /// Whether V cache uses quantization (not FP16).
-    public var isValueQuantized: Bool {
-        specification.valueQuantizationScheme != .fp16RowMajor
     }
 
     /// Rotor parameter byte offset for a given layer.
