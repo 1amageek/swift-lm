@@ -60,7 +60,10 @@ struct STAFPayloadConverter: Sendable {
     }
 
     private func repackMLXQuantized(entry: STAFConversionEntry, weightData: Data) throws -> Data {
-        let modulePath = String(entry.name.dropLast(".weight".count))
+        // Companion tensors (`.scales`, `.biases`) are resolved against the
+        // safetensors shard by their ON-DISK name, which may differ from the
+        // canonicalized `entry.name` (e.g. MLX VLM → HF rewrite).
+        let modulePath = String(entry.sourceName.dropLast(".weight".count))
         let (rawScalesData, scalesDType) = try loadTensorFromSafetensorsWithDType(
             name: modulePath + ".scales", shardURL: entry.shardURL)
         let (rawBiasesData, biasesDType) = try loadTensorFromSafetensorsWithDType(

@@ -477,6 +477,7 @@ struct STAFQuantizedRoundtripTests {
         }
         let entry = STAFConversionEntry(
             name: tensorName,
+            sourceName: tensorName,
             info: info,
             shardIndex: 0,
             shardURL: url,

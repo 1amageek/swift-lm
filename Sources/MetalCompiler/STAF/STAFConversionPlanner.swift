@@ -9,38 +9,51 @@ struct STAFConversionPlanner: Sendable {
         let sortedURLs = safetensorsURLs.sorted { $0.lastPathComponent < $1.lastPathComponent }
 
         let loader = SafetensorsLoader()
-        var allTensors: [(name: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)] = []
+        var rawTensors: [(sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)] = []
 
         for (shardIndex, url) in sortedURLs.enumerated() {
             let tensors = try loader.parseHeader(at: url)
             for tensor in tensors {
-                allTensors.append((name: tensor.name, info: tensor, shardIndex: shardIndex, shardURL: url))
+                rawTensors.append((sourceName: tensor.name, info: tensor, shardIndex: shardIndex, shardURL: url))
             }
+        }
+
+        // Detect the source convention from raw names, then canonicalize every
+        // tensor before companion discovery so `.weight`/`.scales`/`.biases`
+        // sibling matching sees a single consistent namespace.
+        let canonicalizer = TensorNameCanonicalizer.detect(from: rawTensors.map { $0.sourceName })
+        let allTensors = rawTensors.map { raw -> (name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL) in
+            (name: canonicalizer.canonicalize(raw.sourceName),
+             sourceName: raw.sourceName,
+             info: raw.info,
+             shardIndex: raw.shardIndex,
+             shardURL: raw.shardURL)
         }
 
         let consumedCompanions = consumedCompanions(in: allTensors)
         var entries: [STAFConversionEntry] = []
         entries.reserveCapacity(allTensors.count)
 
-        for (name, info, shardIndex, shardURL) in allTensors {
-            if consumedCompanions.contains(name) {
+        for tensor in allTensors {
+            if consumedCompanions.contains(tensor.name) {
                 continue
             }
 
             entries.append(
                 STAFConversionEntry(
-                    name: name,
-                    info: info,
-                    shardIndex: shardIndex,
-                    shardURL: shardURL,
+                    name: tensor.name,
+                    sourceName: tensor.sourceName,
+                    info: tensor.info,
+                    shardIndex: tensor.shardIndex,
+                    shardURL: tensor.shardURL,
                     schemeIdentifier: try determineScheme(
-                        name: name,
-                        info: info,
+                        name: tensor.name,
+                        info: tensor.info,
                         allTensors: allTensors,
                         quantization: quantization
                     ),
-                    semanticRole: inferSemanticRole(name: name),
-                    originalDType: mapOriginalDType(info.dtype)
+                    semanticRole: inferSemanticRole(name: tensor.name),
+                    originalDType: mapOriginalDType(tensor.info.dtype)
                 )
             )
         }
@@ -49,11 +62,11 @@ struct STAFConversionPlanner: Sendable {
     }
 
     private func consumedCompanions(
-        in allTensors: [(name: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)]
+        in allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)]
     ) -> Set<String> {
         var consumed = Set<String>()
-        for (name, _, _, _) in allTensors where name.hasSuffix(".weight") {
-            let modulePath = String(name.dropLast(".weight".count))
+        for tensor in allTensors where tensor.name.hasSuffix(".weight") {
+            let modulePath = String(tensor.name.dropLast(".weight".count))
             let scalesName = modulePath + ".scales"
             let biasesName = modulePath + ".biases"
             if allTensors.contains(where: { $0.name == scalesName }),
@@ -68,7 +81,7 @@ struct STAFConversionPlanner: Sendable {
     private func determineScheme(
         name: String,
         info: SafetensorsTensorInfo,
-        allTensors: [(name: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)],
+        allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)],
         quantization: MLXQuantizationHint?
     ) throws -> QuantizationSchemeIdentifier {
         if name.hasSuffix(".weight") {

@@ -13,7 +13,17 @@ public enum STAF {
     public static let magic: UInt32 = 0x46415453  // little-endian "STAF"
 
     /// Current STAF header format version.
-    public static let currentFormatVersion: UInt32 = 1
+    ///
+    /// Version history:
+    /// * 0 — legacy files without file-level metadata support.
+    /// * 1 — added metadata table.
+    /// * 2 — tensor names are stored in canonical (HuggingFace) form.
+    ///       `TensorNameCanonicalizer` rewrites source-convention names
+    ///       (e.g. MLX VLM `language_model.model.*`) at conversion time so
+    ///       downstream lookup has a single namespace. Bumping this
+    ///       invalidates pre-canonicalization caches whose string tables
+    ///       still carry source-convention names.
+    public static let currentFormatVersion: UInt32 = 2
 
     /// Legacy STAF files written before file-level metadata support.
     public static let legacyFormatVersion: UInt32 = 0

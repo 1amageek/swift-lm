@@ -648,10 +648,25 @@ enum BenchmarkSupport {
 
         let bundleURL = URL(fileURLWithPath: bundlePath)
         let stafURL = bundleURL.appendingPathComponent("model.staf")
+        let safetensorsURLs = try resolveSafetensorsFiles(in: bundleURL)
+        guard !safetensorsURLs.isEmpty else { throw BenchError.noModel }
 
-        if !FileManager.default.fileExists(atPath: stafURL.path) {
-            let safetensorsURLs = try resolveSafetensorsFiles(in: bundleURL)
-            guard !safetensorsURLs.isEmpty else { throw BenchError.noModel }
+        // Reconvert when the STAF file is missing OR stale (e.g. header
+        // format version changed). STAFConverter.isValid() checks header
+        // magic, format version, table layout, and safetensors mtime.
+        let converter = STAFConverter()
+        let needsConversion: Bool
+        if FileManager.default.fileExists(atPath: stafURL.path) {
+            needsConversion = !(try converter.isValid(
+                stafURL: stafURL,
+                safetensorsURLs: safetensorsURLs,
+                expectedMetadata: nil
+            ))
+        } else {
+            needsConversion = true
+        }
+
+        if needsConversion {
             let configURL = bundleURL.appendingPathComponent("config.json")
             let quantization: MLXQuantizationHint?
             if FileManager.default.fileExists(atPath: configURL.path) {
@@ -660,7 +675,7 @@ enum BenchmarkSupport {
             } else {
                 quantization = nil
             }
-            try STAFConverter().convert(
+            try converter.convert(
                 safetensorsURLs: safetensorsURLs,
                 outputURL: stafURL,
                 quantization: quantization
