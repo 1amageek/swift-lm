@@ -69,9 +69,13 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
         if hasInlineRoPE {
-            return context.bufferPrecision == .float32 ? "rope_flash_attn_decode_f32" : "rope_flash_attn_decode"
+            return context.bufferPrecision.isPrefillSequencePrecision
+                ? "rope_flash_attn_decode_f32"
+                : "rope_flash_attn_decode\(context.bufferPrecision.decodeKernelNameSuffix)"
         }
-        return context.bufferPrecision == .float32 ? "flash_attn_decode_f32" : "flash_attn_decode"
+        return context.bufferPrecision.isPrefillSequencePrecision
+            ? "flash_attn_decode_f32"
+            : "flash_attn_decode\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
     public var dispatchDimension: MetalDispatchDimension {
         .perHead(headCount: headCount)
@@ -142,7 +146,6 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
             uint32Binding(16, UInt32(vHeadSlotBytes)),
             uint32Binding(20, UInt32(cache.numRotorGroups)),
             uint32Binding(21, UInt32(cache.qjlDimension)),
-            uint32Binding(22, windowLeft.map(UInt32.init) ?? UInt32.max),
             uint32Binding(
                 29,
                 UInt32((sharedKVSourceLayerIndex == nil ? 0 : 1) | (usesProportionalRoPE ? 0b10 : 0))
@@ -158,7 +161,10 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(26, UInt32(mropeSectionCount(at: 1))),
                 uint32Binding(27, UInt32(mropeSectionCount(at: 2))),
                 uint32Binding(28, UInt32(mropeAxes?.interleaved == true ? 1 : 0)),
+                uint32Binding(30, windowLeft.map(UInt32.init) ?? UInt32.max),
             ])
+        } else {
+            bytes.append(uint32Binding(22, windowLeft.map(UInt32.init) ?? UInt32.max))
         }
 
         return FragmentBindings(
@@ -399,7 +405,9 @@ public struct FlashAttentionFragment: PrimitiveMetalKernelFragment {
         context: PrefillBindingContext,
         scratchSlotSize: Int
     ) throws -> MetalPrefillStep {
-        let ropeKernelName = context.kernelContext.bufferPrecision == .float32 ? "rope_seq_f32" : "rope"
+        let ropeKernelName = context.kernelContext.bufferPrecision.isPrefillSequencePrecision
+            ? "rope_seq_f32"
+            : "rope\(context.kernelContext.bufferPrecision.decodeKernelNameSuffix)"
         let ropePipeline = try context.getPipeline(ropeKernelName)
         let ropeThreads = min(32, ropePipeline.maxTotalThreadsPerThreadgroup)
         let totalHeads = headCount + kvHeadCount

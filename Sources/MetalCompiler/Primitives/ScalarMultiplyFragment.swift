@@ -43,11 +43,11 @@ public struct ScalarMultiplyFragment: PrimitiveMetalKernelFragment {
         if format.isBFloat16 { weightSuffix = "bf16" }
         else if format.isFloat32 { weightSuffix = "f32" }
         else { weightSuffix = "f16" }
-        if context.bufferPrecision == .float32 {
+        if context.bufferPrecision.isPrefillSequencePrecision {
             return "scalar_multiply_seq_\(weightSuffix)"
         }
         let outputPrefix = context.bufferPrecision == .bfloat16 ? "scalar_multiply_bf16" : "scalar_multiply"
-        return "\(outputPrefix)_\(weightSuffix)"
+        return "\(outputPrefix)_\(weightSuffix)\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
 
     public func kernelSource(
@@ -65,7 +65,7 @@ public struct ScalarMultiplyFragment: PrimitiveMetalKernelFragment {
             contract: contract,
             bufferPrecision: bufferPrecision,
             weightFormats: [weightRole: weightFormat],
-            isSequence: bufferPrecision == .float32
+            isSequence: bufferPrecision.isPrefillSequencePrecision
         )
     }
 

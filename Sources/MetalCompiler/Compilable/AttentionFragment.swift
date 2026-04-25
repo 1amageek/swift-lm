@@ -11,6 +11,7 @@ extension AttentionAttributes: MetalCompilable {
             ? attentionDimension * 2
             : attentionDimension
         let qkWeightBias: Float = qkNorm == .rmsNormUnitOffset ? 1 : 0
+        let qkEpsilon: Float = qkNormEpsilon ?? 1e-6
         let queryScratchSlotIndex = outputGate == .sigmoidPackedInQProj ? 4 : 1
         let usesSharedKV = sharedKeyValueSourceLayerIndex != nil
 
@@ -52,7 +53,7 @@ extension AttentionAttributes: MetalCompilable {
                 QKNormFragment(
                     headCount: headCount,
                     headDimension: headDimension,
-                    epsilon: 1e-6,
+                    epsilon: qkEpsilon,
                     weightRole: "q_layernorm",
                     weightBias: qkWeightBias,
                     scratchSlotIndex: queryScratchSlotIndex
@@ -64,7 +65,7 @@ extension AttentionAttributes: MetalCompilable {
                     qNorm: QKNormFragment(
                         headCount: headCount,
                         headDimension: headDimension,
-                        epsilon: 1e-6,
+                        epsilon: qkEpsilon,
                         weightRole: "q_layernorm",
                         weightBias: qkWeightBias,
                         scratchSlotIndex: queryScratchSlotIndex
@@ -72,7 +73,7 @@ extension AttentionAttributes: MetalCompilable {
                     kNorm: QKNormFragment(
                         headCount: kvHeadCount,
                         headDimension: headDimension,
-                        epsilon: 1e-6,
+                        epsilon: qkEpsilon,
                         weightRole: "k_layernorm",
                         weightBias: qkWeightBias
                     ),
@@ -88,7 +89,7 @@ extension AttentionAttributes: MetalCompilable {
                         QKNormFragment(
                             headCount: headCount,
                             headDimension: headDimension,
-                            epsilon: 1e-6,
+                            epsilon: qkEpsilon,
                             weightRole: "q_layernorm",
                             weightBias: qkWeightBias,
                             scratchSlotIndex: queryScratchSlotIndex
@@ -96,7 +97,7 @@ extension AttentionAttributes: MetalCompilable {
                         QKNormFragment(
                             headCount: kvHeadCount,
                             headDimension: headDimension,
-                            epsilon: 1e-6,
+                            epsilon: qkEpsilon,
                             weightRole: "k_layernorm",
                             weightBias: qkWeightBias
                         ),

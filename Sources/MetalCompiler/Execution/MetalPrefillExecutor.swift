@@ -1521,7 +1521,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
     ) -> [Float] {
         guard count > 0 else { return [] }
         switch precision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         case .float16:
@@ -1543,7 +1543,7 @@ struct MetalPrefillExecutor: @unchecked Sendable {
     ) -> [[Float]] {
         guard rowCount > 0, elementsPerRow > 0 else { return [] }
         switch precision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(
                 to: Float.self,
                 capacity: buffer.length / MemoryLayout<Float>.stride

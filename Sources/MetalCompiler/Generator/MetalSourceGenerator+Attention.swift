@@ -669,6 +669,7 @@ public static func generateFlashAttentionKernel(
         constant uint& numRotorGroups        [[buffer(20)]],
         constant uint& qjlDimension         [[buffer(21)]],
         constant uint& executionFlags        [[buffer(29)]],
+        constant uint& windowLeft            [[buffer(30)]],
     \(ropeKernelParams)    uint headIndex                       [[threadgroup_position_in_grid]],
         uint tid                             [[thread_index_in_threadgroup]],
         uint tiisg                           [[thread_index_in_simdgroup]],
@@ -841,7 +842,11 @@ public static func generateFlashAttentionKernel(
             sharedOutput[d] = 0.0f;
         }
 
-        for (uint t = 0; t < sequenceLength; t++) {
+        const uint attentionStart = (windowLeft == 0xFFFFFFFFu)
+            ? 0u
+            : ((position + 1 > windowLeft) ? (position - windowLeft + 1u) : 0u);
+
+        for (uint t = attentionStart; t < sequenceLength; t++) {
             uint kByteOffset;
             if (layoutMode == 0) {
                 kByteOffset = kvHeadIndex * maxSequenceLength * kHeadSlotBytes + t * kHeadSlotBytes;

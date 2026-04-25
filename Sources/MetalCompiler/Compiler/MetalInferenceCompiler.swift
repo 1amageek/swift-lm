@@ -30,6 +30,11 @@ public struct MetalInferenceCompiler: Sendable {
         self.decodeBufferPrecisionOverride = nil
     }
 
+    public init(decodeBufferPrecisionOverride: BufferPrecision?) {
+        self.weightAccessPolicyOverride = nil
+        self.decodeBufferPrecisionOverride = decodeBufferPrecisionOverride
+    }
+
     init(
         weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride? = nil,
         decodeBufferPrecisionOverride: BufferPrecision? = nil

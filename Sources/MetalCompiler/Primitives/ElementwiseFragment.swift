@@ -57,9 +57,13 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     public func kernelName(context: KernelContext) -> String {
         switch kind {
         case .swiglu:
-            return context.bufferPrecision == .float32 ? "swiglu_seq_f32" : "swiglu"
+            return context.bufferPrecision.isPrefillSequencePrecision
+                ? "swiglu_seq_f32"
+                : "swiglu\(context.bufferPrecision.decodeKernelNameSuffix)"
         case .geluGated:
-            return context.bufferPrecision == .float32 ? "geglu_seq_f32" : "geglu"
+            return context.bufferPrecision.isPrefillSequencePrecision
+                ? "geglu_seq_f32"
+                : "geglu\(context.bufferPrecision.decodeKernelNameSuffix)"
         }
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: count) }
@@ -67,7 +71,7 @@ public struct ElementwiseFragment: PrimitiveMetalKernelFragment {
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
         MetalSourceGenerator.generateGatedActivation(
             name: name, bufferPrecision: bufferPrecision,
-            activation: gatedActivation, isSequence: bufferPrecision == .float32)
+            activation: gatedActivation, isSequence: bufferPrecision.isPrefillSequencePrecision)
     }
 
     /// The activation function used by this elementwise operation.

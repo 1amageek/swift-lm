@@ -14,7 +14,7 @@ extension BatchedProjection: PrimitiveMetalKernelFragment {
 
     public func kernelName(context: KernelContext) -> String {
         let count = projections.count
-        let isPrefill = context.bufferPrecision == .float32
+        let isPrefill = context.bufferPrecision.isPrefillSequencePrecision
 
         // Prefill paths:
         //   Q4 packed weights → block-level batched GEMM kernel.
@@ -39,7 +39,7 @@ extension BatchedProjection: PrimitiveMetalKernelFragment {
 
         // Decode / dense weights: batched GEMV
         let suffix = format.isBFloat16 ? "_bf16" : ""
-        return "batched_gemv\(count)\(suffix)"
+        return "batched_gemv\(count)\(suffix)\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
 
     public func kernelSource(

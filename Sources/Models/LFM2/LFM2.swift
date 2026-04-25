@@ -146,7 +146,8 @@ struct LFM2AttnDecoderLayer: ModelComponent {
                     dimension: headDimension,
                     base: config.ropeTheta
                 ),
-                qkNorm: .rmsNorm
+                qkNorm: .rmsNorm,
+                qkNormEpsilon: config.normEps
             )
         }
         Residual {

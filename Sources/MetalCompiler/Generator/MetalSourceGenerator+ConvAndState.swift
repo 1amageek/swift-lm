@@ -1,4 +1,16 @@
 extension MetalSourceGenerator {
+private static func convStateStorageType(weightFormat: WeightFormat) -> String {
+    weightFormat.isBFloat16 ? "uint16_t" : "half"
+}
+
+private static func convStateRead(_ expression: String, weightFormat: WeightFormat) -> String {
+    weightFormat.isBFloat16 ? "bf16_to_float(\(expression))" : "float(\(expression))"
+}
+
+private static func convStateWrite(_ expression: String, weightFormat: WeightFormat) -> String {
+    weightFormat.isBFloat16 ? "float_to_bf16(\(expression))" : "half(\(expression))"
+}
+
 // MARK: - Conv1d
 
 /// Generate conv_state_update kernel (decode: single token with persistent state).
@@ -9,11 +21,14 @@ public static func generateConvStateUpdate(
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
+    let ct = convStateStorageType(weightFormat: weightFormat)
     let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let readConvState = { (expr: String) in convStateRead(expr, weightFormat: weightFormat) }
+    let writeConvState = { (expr: String) in convStateWrite(expr, weightFormat: weightFormat) }
 
     return """
     kernel void \(name)(
-        device half* convState           [[buffer(0)]],
+        device \(ct)* convState          [[buffer(0)]],
         device const \(bt)* inProjOutput [[buffer(1)]],
         device const \(wt)* weight       [[buffer(2)]],
         device \(bt)* output             [[buffer(3)]],
@@ -31,11 +46,11 @@ public static func generateConvStateUpdate(
         for (uint k = 0; k < kernelSize - 1; k++) {
             convState[k * dimension + gid] = convState[(k + 1) * dimension + gid];
         }
-        convState[(kernelSize - 1) * dimension + gid] = half(Bx);
+        convState[(kernelSize - 1) * dimension + gid] = \(writeConvState("Bx"));
 
         float convOut = 0.0f;
         for (uint k = 0; k + 1 < kernelSize; k++) {
-            convOut += float(convState[k * dimension + gid]) * \(readWeight("weight[gid * kernelSize + k]"));
+            convOut += \(readConvState("convState[k * dimension + gid]")) * \(readWeight("weight[gid * kernelSize + k]"));
         }
         convOut += Bx * \(readWeight("weight[gid * kernelSize + (kernelSize - 1)]"));
 
@@ -52,12 +67,15 @@ public static func generateConvStateUpdateArgumentTableVariant(
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
+    let ct = convStateStorageType(weightFormat: weightFormat)
     let inputStructName = "\(name)_args"
     let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let readConvState = { (expr: String) in convStateRead(expr, weightFormat: weightFormat) }
+    let writeConvState = { (expr: String) in convStateWrite(expr, weightFormat: weightFormat) }
 
     return """
     struct \(inputStructName) {
-        device half* convState [[id(0)]];
+        device \(ct)* convState [[id(0)]];
         device const \(bt)* inProjOutput [[id(1)]];
         device const \(wt)* weight [[id(2)]];
         device \(bt)* output [[id(3)]];
@@ -79,11 +97,11 @@ public static func generateConvStateUpdateArgumentTableVariant(
         for (uint k = 0; k < kernelSize - 1; k++) {
             args.convState[k * dimension + gid] = args.convState[(k + 1) * dimension + gid];
         }
-        args.convState[(kernelSize - 1) * dimension + gid] = half(Bx);
+        args.convState[(kernelSize - 1) * dimension + gid] = \(writeConvState("Bx"));
 
         float convOut = 0.0f;
         for (uint k = 0; k + 1 < kernelSize; k++) {
-            convOut += float(args.convState[k * dimension + gid]) * \(readWeight("args.weight[gid * kernelSize + k]"));
+            convOut += \(readConvState("args.convState[k * dimension + gid]")) * \(readWeight("args.weight[gid * kernelSize + k]"));
         }
         convOut += Bx * \(readWeight("args.weight[gid * kernelSize + (kernelSize - 1)]"));
 
@@ -136,14 +154,17 @@ public static func generateConv1dCausalSeq(
 /// Generate extract_conv_state kernel (saves last kernelSize positions' B*x to conv_state).
 public static func generateExtractConvState(
     name: String,
-    bufferPrecision: BufferPrecision
+    bufferPrecision: BufferPrecision,
+    weightFormat: WeightFormat
 ) -> String {
     let bt = bufferPrecision.metalType
+    let ct = convStateStorageType(weightFormat: weightFormat)
+    let writeConvState = { (expr: String) in convStateWrite(expr, weightFormat: weightFormat) }
 
     return """
     kernel void \(name)(
         device const \(bt)* inProjOutput   [[buffer(0)]],
-        device half* convState             [[buffer(1)]],
+        device \(ct)* convState            [[buffer(1)]],
         constant uint& convDim             [[buffer(2)]],
         constant uint& inProjDim           [[buffer(3)]],
         constant uint& kernelSize          [[buffer(4)]],
@@ -157,7 +178,7 @@ public static func generateExtractConvState(
         if (srcPos >= 0 && uint(srcPos) < sequenceLength) {
             float B = float(inProjOutput[uint(srcPos) * inProjDim + ch]);
             float x = float(inProjOutput[uint(srcPos) * inProjDim + 2 * convDim + ch]);
-            convState[k * convDim + ch] = half(B * x);
+            convState[k * convDim + ch] = \(writeConvState("B * x"));
         } else {
             convState[k * convDim + ch] = 0;
         }
@@ -199,11 +220,13 @@ public static func generateSSMWeightIndependentHelpers() -> String {
 /// MSL function overloading resolves the correct variant based on convWeight pointer type.
 public static func generateSSMConvSiluHelper(weightFormat: WeightFormat) -> String {
     let wt = weightFormat.bufferType
+    let ct = convStateStorageType(weightFormat: weightFormat)
     let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let readConvState = { (expr: String) in convStateRead(expr, weightFormat: weightFormat) }
 
     return """
     inline float conv_silu(
-        device const half* convState,
+        device const \(ct)* convState,
         device const \(wt)* convWeight,
         uint channel,
         uint convDimension,
@@ -211,7 +234,7 @@ public static func generateSSMConvSiluHelper(weightFormat: WeightFormat) -> Stri
     ) {
         float sum = 0.0f;
         for (uint k = 0; k < convKernelSize; ++k) {
-            sum += float(convState[k * convDimension + channel])
+            sum += \(readConvState("convState[k * convDimension + channel]"))
                 * \(readWeight("convWeight[channel * convKernelSize + k]"));
         }
         return sum * stable_sigmoid(sum);
@@ -237,7 +260,10 @@ public static func generateSSMRecurrence(
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
+    let ct = convStateStorageType(weightFormat: weightFormat)
     let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let readConvState = { (expr: String) in convStateRead(expr, weightFormat: weightFormat) }
+    let writeConvState = { (expr: String) in convStateWrite(expr, weightFormat: weightFormat) }
 
     // Per-threadgroup (per key-group) local channel cache: Q (dk) + K (dk) + V (headsPerGroup*dv).
     // Sized at compile time using the fragment's known dimensions.
@@ -256,7 +282,7 @@ public static func generateSSMRecurrence(
         device const \(wt)* dtBias [[buffer(6)]],
         device const float* aLog [[buffer(7)]],
         device float* recurrentState [[buffer(8)]],
-        device half* convState [[buffer(9)]],
+        device \(ct)* convState [[buffer(9)]],
         device \(bt)* output [[buffer(10)]],
         constant uint& numHeads [[buffer(11)]],
         constant uint& groupCount [[buffer(12)]],
@@ -313,12 +339,12 @@ public static func generateSSMRecurrence(
 
             float sum = 0.0f;
             for (uint k = 0; k + 1 < convKernelSize; ++k) {
-                float val = float(convState[(k + 1) * convDim + globalCh]);
-                convState[k * convDim + globalCh] = half(val);
+                float val = \(readConvState("convState[(k + 1) * convDim + globalCh]"));
+                convState[k * convDim + globalCh] = \(writeConvState("val"));
                 sum += val * \(readWeight("convWeight[globalCh * convKernelSize + k]"));
             }
             float newVal = float(projectedQKV[globalCh]);
-            convState[(convKernelSize - 1) * convDim + globalCh] = half(newVal);
+            convState[(convKernelSize - 1) * convDim + globalCh] = \(writeConvState("newVal"));
             sum += newVal * \(readWeight("convWeight[globalCh * convKernelSize + convKernelSize - 1]"));
             convSiluCache[localCh] = sum * stable_sigmoid(sum);
         }
@@ -418,7 +444,7 @@ public static func generateSSMRecurrence(
                 }
                 float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
                 for (uint d = dStart; d < dEnd; ++d) {
-                    float normed = float(output[headIndex * dv + d]) * rmsScale * (1.0f + normWeight[d]);
+                    float normed = float(output[headIndex * dv + d]) * rmsScale * normWeight[d];
                     float z = float(projectedZ[headIndex * dv + d]);
                     output[headIndex * dv + d] = \(bt)(normed * z * stable_sigmoid(z));
                 }
@@ -441,7 +467,10 @@ public static func generateSSMRecurrenceSequence(
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
+    let ct = convStateStorageType(weightFormat: weightFormat)
     let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let readConvState = { (expr: String) in convStateRead(expr, weightFormat: weightFormat) }
+    let writeConvState = { (expr: String) in convStateWrite(expr, weightFormat: weightFormat) }
 
     // Per-threadgroup (per key-group) local channel cache: Q (dk) + K (dk) + V (headsPerGroup*dv).
     // Sized at compile time using fragment's known dimensions.
@@ -460,7 +489,7 @@ public static func generateSSMRecurrenceSequence(
         device const \(wt)* dtBias [[buffer(6)]],
         device const float* aLog [[buffer(7)]],
         device float* recurrentState [[buffer(8)]],
-        device half* convState [[buffer(9)]],
+        device \(ct)* convState [[buffer(9)]],
         device \(bt)* output [[buffer(10)]],
         constant uint& numHeads [[buffer(11)]],
         constant uint& groupCount [[buffer(12)]],
@@ -524,12 +553,12 @@ public static func generateSSMRecurrenceSequence(
 
                 float sum = 0.0f;
                 for (uint k = 0; k + 1 < convKernelSize; ++k) {
-                    float val = float(convState[(k + 1) * convDim + globalCh]);
-                    convState[k * convDim + globalCh] = half(val);
+                    float val = \(readConvState("convState[(k + 1) * convDim + globalCh]"));
+                    convState[k * convDim + globalCh] = \(writeConvState("val"));
                     sum += val * \(readWeight("convWeight[globalCh * convKernelSize + k]"));
                 }
                 float newVal = float(projectedQKVPos[globalCh]);
-                convState[(convKernelSize - 1) * convDim + globalCh] = half(newVal);
+                convState[(convKernelSize - 1) * convDim + globalCh] = \(writeConvState("newVal"));
                 sum += newVal * \(readWeight("convWeight[globalCh * convKernelSize + convKernelSize - 1]"));
                 convSiluCache[localCh] = sum * stable_sigmoid(sum);
             }
@@ -629,7 +658,7 @@ public static func generateSSMRecurrenceSequence(
                     }
                     float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
                     for (uint d = dStart; d < dEnd; ++d) {
-                        float normed = float(outputPos[headIndex * dv + d]) * rmsScale * (1.0f + normWeight[d]);
+                        float normed = float(outputPos[headIndex * dv + d]) * rmsScale * normWeight[d];
                         float z = float(projectedZPos[headIndex * dv + d]);
                         outputPos[headIndex * dv + d] = \(bt)(normed * z * stable_sigmoid(z));
                     }

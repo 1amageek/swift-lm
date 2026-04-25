@@ -12,15 +12,16 @@ public struct Conv1dFragment: PrimitiveMetalKernelFragment {
 
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
-        if context.bufferPrecision == .float32 { return "conv1d_causal_seq_f32" }
-        return context.weightFormat.isBFloat16 ? "conv_state_update_bf16" : "conv_state_update"
+        if context.bufferPrecision.isPrefillSequencePrecision { return "conv1d_causal_seq_f32" }
+        return (context.weightFormat.isBFloat16 ? "conv_state_update_bf16" : "conv_state_update")
+            + context.bufferPrecision.decodeKernelNameSuffix
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: "conv_weight", role: .weight)] }
     public var cacheSlots: [MetalCacheSlot] { [MetalCacheSlot(name: "conv_cache", kind: .conv, temporalSize: kernelSize)] }
 
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
-        bufferPrecision == .float32
+        bufferPrecision.isPrefillSequencePrecision
             ? MetalSourceGenerator.generateConv1dCausalSeq(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
             : MetalSourceGenerator.generateConvStateUpdate(name: name, bufferPrecision: bufferPrecision, weightFormat: weightFormat)
     }

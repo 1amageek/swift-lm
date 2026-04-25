@@ -137,7 +137,7 @@ struct Gemma4RuntimeTests {
         #expect(try #require(result.completion).tokenCount > 0)
     }
 
-    @Test("Real Gemma4 public generate E2E preserves separate reasoning channel", .timeLimit(.minutes(10)))
+    @Test("Real Gemma4 public generate E2E emits final answer without leaking thought channel", .timeLimit(.minutes(10)))
     func realGemma4PublicGenerateThinkingSeparateE2E() async throws {
         guard let container = try await Gemma4TestSupport.realGemma4Container() else {
             print("[Skip] No local Gemma4 bundle found")
@@ -182,8 +182,12 @@ struct Gemma4RuntimeTests {
         print("[Gemma4 E2E separate reasoning prefix]")
         print(String(reasoning.prefix(400)))
 
+        #expect(eventKinds.contains("text"))
+        #expect(!answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
         #expect(!answer.contains("<|channel>thought"))
         #expect(!answer.contains("<channel|>"))
+        #expect(!answer.contains("<turn|>"))
+        #expect(!answer.contains("�"))
         #expect(!reasoning.contains("<|channel>thought"))
         #expect(!reasoning.contains("<channel|>"))
     }

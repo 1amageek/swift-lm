@@ -25,14 +25,16 @@ public struct RoPEFragment: PrimitiveMetalKernelFragment {
     public var isFusable: Bool { false }
     public var isInPlace: Bool { true }
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32 ? "rope_seq_f32" : "rope"
+        context.bufferPrecision.isPrefillSequencePrecision
+            ? "rope_seq_f32"
+            : "rope\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
     public var dispatchDimension: MetalDispatchDimension {
         .perHead(headCount: max(headCount, kvHeadCount))
     }
 
     public func kernelSource(name: String, bufferPrecision: BufferPrecision, weightFormat: WeightFormat) -> String {
-        bufferPrecision == .float32
+        bufferPrecision.isPrefillSequencePrecision
             ? MetalSourceGenerator.generateRoPESeq(name: name, bufferPrecision: bufferPrecision)
             : MetalSourceGenerator.generateRoPE(name: name, bufferPrecision: bufferPrecision)
     }

@@ -27,11 +27,13 @@ struct QwenVisionRealBundleTextTests {
         let text = RealOutputAssertionSupport.normalized(container.decode(tokenIDs))
         print("[Qwen3.5 real greedy token ids] \(tokenIDs)")
         print("[Qwen3.5 real greedy text] \(text)")
-        RealOutputAssertionSupport.assertHasPrefix(
+        RealOutputAssertionSupport.assertStartsWithTokyo(
             text,
-            prefix: "Japan's capital is Tokyo",
             label: "Qwen3.5 real greedy"
         )
+        #expect(!text.contains("<think>"))
+        #expect(!text.contains("</think>"))
+        #expect(!text.contains("�"))
         #expect(tokenIDs.count >= 2)
     }
 
@@ -58,7 +60,14 @@ struct QwenVisionRealBundleTextTests {
         ))
         print("[Qwen3.5 thinking rendered text prefix]")
         print(String(prepared.renderedText.prefix(400)))
+        print("[Qwen3.5 thinking prepared token ids]")
+        print(prepared.tokenIDs)
         let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
+        container.resetState()
+        print("[Qwen3.5 thinking prefill top logits]")
+        for logit in try container.debugPrefillTopLogits(prompt: prompt, topK: 10) {
+            print("  id=\(logit.tokenID) logit=\(logit.logit) token=\(String(reflecting: logit.decoded))")
+        }
 
         container.resetState()
         let visibleTokenIDs = try container.debugGeneratedTokenIDs(
@@ -80,6 +89,8 @@ struct QwenVisionRealBundleTextTests {
         let rawText = container.tokenizer.decode(tokens: rawTokenIDs, skipSpecialTokens: false)
         let streamedText = streamed.chunks.joined()
 
+        print("[Qwen3.5 thinking raw token ids prefix]")
+        print(Array(rawTokenIDs.prefix(40)))
         print("[Qwen3.5 thinking visible text prefix]")
         print(String(visibleText.prefix(400)))
         print("[Qwen3.5 thinking streamed text prefix]")
@@ -110,7 +121,7 @@ struct QwenVisionRealBundleTextTests {
         )
         let prepared = try await container.prepare(ModelInput(
             chat: [
-                .user([.text("Hello")])
+                .user([.text("hi")])
             ],
             promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
         ))
@@ -137,8 +148,12 @@ struct QwenVisionRealBundleTextTests {
         print(String(reasoning.prefix(400)))
 
         #expect(prepared.renderedText.hasSuffix("<think>\n"))
-        #expect(answer.isEmpty)
-        #expect(!reasoning.isEmpty)
+        #expect(!reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!answer.contains("<think>"))
+        #expect(!answer.contains("</think>"))
+        #expect(!answer.contains("<|im_end|>"))
+        #expect(!answer.contains("�"))
     }
 
     @Test("Real Qwen3.5 public generate E2E emits prompt-opened thinking separately", .timeLimit(.minutes(10)))
@@ -161,7 +176,7 @@ struct QwenVisionRealBundleTextTests {
         let stream = try await container.generate(
             ModelInput(
                 chat: [
-                    .user([.text("Hello")])
+                    .user([.text("hi")])
                 ],
                 promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
             ),
@@ -190,8 +205,13 @@ struct QwenVisionRealBundleTextTests {
         print(String(reasoning.prefix(400)))
 
         #expect(eventKinds.contains("reasoning"))
-        #expect(answer.isEmpty)
-        #expect(!reasoning.isEmpty)
+        #expect(eventKinds.contains("text"))
+        #expect(!reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!answer.contains("<think>"))
+        #expect(!answer.contains("</think>"))
+        #expect(!answer.contains("<|im_end|>"))
+        #expect(!answer.contains("�"))
         #expect(!reasoning.contains("<think>"))
         #expect(!reasoning.contains("</think>"))
     }

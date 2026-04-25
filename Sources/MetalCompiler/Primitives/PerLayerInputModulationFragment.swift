@@ -16,9 +16,9 @@ public struct PerLayerInputModulationFragment: PrimitiveMetalKernelFragment {
 
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32
+        context.bufferPrecision.isPrefillSequencePrecision
             ? "per_layer_input_modulation_seq_f32"
-            : "per_layer_input_modulation"
+            : "per_layer_input_modulation\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
 
@@ -31,7 +31,7 @@ public struct PerLayerInputModulationFragment: PrimitiveMetalKernelFragment {
             name: name,
             bufferPrecision: bufferPrecision,
             activation: activation,
-            isSequence: bufferPrecision == .float32
+            isSequence: bufferPrecision.isPrefillSequencePrecision
         )
     }
 

@@ -190,6 +190,7 @@ public struct ModelBundleLoader: Sendable {
         if let eosId = tokenizer.eosTokenId {
             modelConfig.eosTokenIds.insert(eosId)
         }
+        Self.insertChatStopTokenIDs(from: tokenizer, into: &modelConfig.eosTokenIds)
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
         InternalLog.info("[ModelBundleLoader] ready: \(modelConfig.name) [\(String(format: "%.3f", totalTime))s]")
@@ -361,7 +362,39 @@ public struct ModelBundleLoader: Sendable {
     }
 
     private static func makeInferenceCompiler() -> MetalInferenceCompiler {
-        MetalInferenceCompiler()
+        let precision = ProcessInfo.processInfo.environment["SWIFTLM_DECODE_BUFFER_PRECISION"]
+        let override: BufferPrecision?
+        switch precision?.lowercased() {
+        case "f32", "float32":
+            override = .float32Decode
+        case "bf16", "bfloat16":
+            override = .bfloat16
+        case "f16", "float16":
+            override = .float16
+        case nil, "":
+            override = nil
+        default:
+            override = nil
+        }
+        return MetalInferenceCompiler(decodeBufferPrecisionOverride: override)
+    }
+
+    private static func insertChatStopTokenIDs(
+        from tokenizer: any Tokenizer,
+        into tokenIDs: inout Set<Int>
+    ) {
+        for token in ["<|im_end|>", "<turn|>"] {
+            guard let tokenID = tokenizer.convertTokenToId(token)
+                ?? tokenizer.encode(text: token, addSpecialTokens: false).singleElement else { continue }
+            guard tokenizer.decode(tokens: [tokenID], skipSpecialTokens: false) == token else { continue }
+            tokenIDs.insert(tokenID)
+        }
+    }
+}
+
+private extension Array {
+    var singleElement: Element? {
+        count == 1 ? self[0] : nil
     }
 }
 

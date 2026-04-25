@@ -19,7 +19,9 @@ public struct ResidualAddFragment: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
 
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32 ? "residual_add_seq_f32" : "residual_add"
+        context.bufferPrecision.isPrefillSequencePrecision
+            ? "residual_add_seq_f32"
+            : "residual_add\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
 
     // MARK: - Fusion Contract
@@ -52,7 +54,7 @@ public struct ResidualAddFragment: PrimitiveMetalKernelFragment {
         MetalSourceGenerator.generateResidualAdd(
             name: name,
             bufferPrecision: bufferPrecision,
-            isSequence: bufferPrecision == .float32
+            isSequence: bufferPrecision.isPrefillSequencePrecision
         )
     }
 
@@ -83,7 +85,7 @@ public struct ResidualAddFragment: PrimitiveMetalKernelFragment {
         // to avoid allocating a separate output buffer.
         if context.currentInputBuffer === context.buffers.hidden,
            context.currentInputOffset == 0 {
-            let inplaceKernelName = context.kernelContext.bufferPrecision == .float32
+            let inplaceKernelName = context.kernelContext.bufferPrecision.isPrefillSequencePrecision
                 ? "residual_add_inplace_seq_f32"
                 : "residual_add_inplace"
             let pipeline = try context.getPipeline(inplaceKernelName)

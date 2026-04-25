@@ -76,7 +76,8 @@ struct MetalKernelNameResolver {
         let weightFormatResolver = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
         let isBF16 = kernelContext.weightFormat.isBFloat16
         let bf16Suffix = isBF16 ? "_bf16" : ""
-        let isPrefill = kernelContext.bufferPrecision == .float32
+        let isPrefill = kernelContext.bufferPrecision.isPrefillSequencePrecision
+        let decodeSuffix = kernelContext.bufferPrecision.decodeKernelNameSuffix
         let accessPolicyResolver = ProjectionWeightAccessPolicyResolver(
             override: weightAccessPolicyOverride
         )
@@ -115,13 +116,13 @@ struct MetalKernelNameResolver {
                         accessPolicyResolver: accessPolicyResolver
                     ) {
                         let baseName = family.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
-                        return tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                        return (tensorInfo.format.schemeIdentifier == .bf16RowMajor
                             ? baseName + "_bf16"
-                            : baseName
+                            : baseName) + decodeSuffix
                     }
-                    return tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                    return (tensorInfo.format.schemeIdentifier == .bf16RowMajor
                         ? family.kernelBaseName + "_bf16"
-                        : family.kernelBaseName
+                        : family.kernelBaseName) + decodeSuffix
                 }
                 if isPrefill {
                     // Formats without a hand-tuned direct prefill GEMM kernel route
@@ -135,7 +136,7 @@ struct MetalKernelNameResolver {
                     }
                     return tensorInfo.format.gemmKernelName(bufferPrecision: kernelContext.bufferPrecision)
                 }
-                return tensorInfo.format.gemvKernelName
+                return tensorInfo.format.gemvKernelName + decodeSuffix
             }
 
             if isPrefill,
@@ -159,11 +160,11 @@ struct MetalKernelNameResolver {
                     accessPolicyResolver: accessPolicyResolver
                 ) {
                     let baseName = family.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
-                    return isBF16 ? baseName + "_bf16" : baseName
+                    return (isBF16 ? baseName + "_bf16" : baseName) + decodeSuffix
                 }
-                return isBF16 ? family.kernelBaseName + "_bf16" : family.kernelBaseName
+                return (isBF16 ? family.kernelBaseName + "_bf16" : family.kernelBaseName) + decodeSuffix
             }
-            return isPrefill ? (isBF16 ? "gemm_bf16_f32s" : "gemm_f32s") : "gemv"
+            return isPrefill ? (isBF16 ? "gemm_bf16_f32s" : "gemm_f32s") : "gemv\(decodeSuffix)"
         }
 
         let fragment = entry.fragment

@@ -197,7 +197,7 @@ struct DecodePrecisionDiagnosticTests {
         case .bfloat16:
             let ptr = buffer.contents().bindMemory(to: BFloat16.self, capacity: count)
             return (0..<count).map { Float(ptr[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let ptr = buffer.contents().bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: ptr, count: count))
         }

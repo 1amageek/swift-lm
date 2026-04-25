@@ -34,10 +34,10 @@ public struct Reduction: PrimitiveMetalKernelFragment {
     }
     public func kernelName(context: KernelContext) -> String {
         let bf16 = context.weightFormat.isBFloat16
-        if context.bufferPrecision == .float32 {
+        if context.bufferPrecision.isPrefillSequencePrecision {
             return bf16 ? "rms_norm_seq_bf16_f32_inplace" : "rms_norm_seq_f32_inplace"
         }
-        return bf16 ? "rms_norm_bf16" : "rms_norm"
+        return (bf16 ? "rms_norm_bf16" : "rms_norm") + context.bufferPrecision.decodeKernelNameSuffix
     }
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: dimension) }
     public var weightSlots: [MetalWeightSlot] {
@@ -121,7 +121,7 @@ public struct Reduction: PrimitiveMetalKernelFragment {
             contract: contract,
             bufferPrecision: bufferPrecision,
             weightFormats: formats,
-            isSequence: bufferPrecision == .float32
+            isSequence: bufferPrecision.isPrefillSequencePrecision
         )
     }
 

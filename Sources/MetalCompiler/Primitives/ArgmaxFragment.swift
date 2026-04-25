@@ -10,7 +10,9 @@ public struct ArgmaxFragment: PrimitiveMetalKernelFragment {
 
     public var isFusable: Bool { false }
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32 ? "argmax_f32" : "argmax"
+        context.bufferPrecision.isPrefillSequencePrecision
+            ? "argmax_f32"
+            : "argmax\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
     public var dispatchDimension: MetalDispatchDimension { .reduction(dimension: vocabularySize) }
 

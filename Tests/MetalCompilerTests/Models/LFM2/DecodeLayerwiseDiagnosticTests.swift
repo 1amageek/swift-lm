@@ -272,7 +272,7 @@ struct DecodeLayerwiseDiagnosticTests {
         case .bfloat16:
             let pointer = buffer.contents().bindMemory(to: BFloat16.self, capacity: count)
             return (0..<count).map { Float(pointer[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         }
@@ -283,9 +283,20 @@ struct DecodeLayerwiseDiagnosticTests {
             throw SetupError.tensorNotFound(name)
         }
         let count = info.shape.reduce(1, *)
-        let pointer = (file.buffer.contents() + file.dataSectionOffset + info.dataOffset)
-            .bindMemory(to: Float16.self, capacity: count)
-        return (0..<count).map { Float(pointer[$0]) }
+        let base = file.buffer.contents() + file.dataSectionOffset + info.dataOffset
+        switch info.dtype {
+        case .float16:
+            let pointer = base.bindMemory(to: Float16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .bfloat16:
+            let pointer = base.bindMemory(to: BFloat16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .float32:
+            let pointer = base.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
+        default:
+            throw SetupError.tensorNotFound("Unsupported dtype \(info.dtype) for \(name)")
+        }
     }
 
     private func maxAbsoluteError(_ lhs: [Float], _ rhs: [Float]) -> Float {
@@ -320,7 +331,7 @@ struct DecodeLayerwiseDiagnosticTests {
         case .bfloat16:
             let pointer = (buffer.contents() + offset).bindMemory(to: BFloat16.self, capacity: count)
             return (0..<count).map { Float(pointer[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = (buffer.contents() + offset).bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         }

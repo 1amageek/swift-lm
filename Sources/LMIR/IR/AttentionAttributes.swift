@@ -33,6 +33,10 @@ public struct AttentionAttributes: OperationAttributes, Codable, Equatable {
     /// QK normalization strategy.
     public let qkNorm: QKNormKind?
 
+    /// Optional epsilon for Q/K normalization. Backends use a model-family
+    /// default when this is nil.
+    public let qkNormEpsilon: Float?
+
     /// Optional value normalization strategy.
     public let valueNorm: AttentionValueNormKind?
 
@@ -64,6 +68,7 @@ public struct AttentionAttributes: OperationAttributes, Codable, Equatable {
         causal: Bool = true,
         rope: RoPEAttributes? = nil,
         qkNorm: QKNormKind? = nil,
+        qkNormEpsilon: Float? = nil,
         valueNorm: AttentionValueNormKind? = nil,
         valueProjectionSource: AttentionValueProjectionSource = .dedicatedProjection,
         window: AttentionWindow? = nil,
@@ -80,6 +85,7 @@ public struct AttentionAttributes: OperationAttributes, Codable, Equatable {
         self.causal = causal
         self.rope = rope
         self.qkNorm = qkNorm
+        self.qkNormEpsilon = qkNormEpsilon
         self.valueNorm = valueNorm
         self.valueProjectionSource = valueProjectionSource
         self.window = window

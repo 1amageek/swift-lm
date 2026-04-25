@@ -145,7 +145,7 @@ struct ReferenceComparisonTests {
         for convIdx in 0..<10 {
             let refData = try readRefTensorAsFloats(env.ref, name: "ref.prefill.conv_state.\(convIdx)")
             let layerOffset = convIdx * kernelSize * convDim * elementSize
-            let fullConvState = readDecodeBuffer(convState, precision: .float16)
+            let fullConvState = readDecodeBuffer(convState, precision: .bfloat16)
             let metalVals = Array(fullConvState[(layerOffset / elementSize)..<((layerOffset / elementSize) + kernelSize * convDim)])
 
             var maxErr: Float = 0
@@ -452,7 +452,7 @@ struct ReferenceComparisonTests {
             }
         }
 
-        let convAll = readDecodeBuffer(convState, precision: .float16)
+        let convAll = readDecodeBuffer(convState, precision: .bfloat16)
         let actual = Array(convAll.prefix(kernelSize * hiddenSize))
         let maxErr = maxAbsoluteError(actual, expected)
         let sample = [0, hiddenSize + 575, 2 * hiddenSize + 575].map { index in
@@ -992,7 +992,7 @@ struct ReferenceComparisonTests {
                 for convIdx in 0..<10 {
                     if let refData = try? readRefTensorAsFloats(env.ref, name: "ref.decode_\(step).conv_state.\(convIdx)") {
                         let layerOffset = convIdx * kSize * convDim * elemSize
-                        let fullConvState = readDecodeBuffer(convState, precision: .float16)
+                        let fullConvState = readDecodeBuffer(convState, precision: .bfloat16)
                         let base = layerOffset / elemSize
                         let metalVals = Array(fullConvState[base..<(base + kSize * convDim)])
                         let err = maxAbsoluteError(metalVals, refData)
@@ -1278,7 +1278,7 @@ struct ReferenceComparisonTests {
             let count = buffer.length / MemoryLayout<BFloat16>.size
             let ptr = buffer.contents().bindMemory(to: BFloat16.self, capacity: count)
             return (0..<count).map { Float(ptr[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let count = buffer.length / MemoryLayout<Float32>.size
             let ptr = buffer.contents().bindMemory(to: Float32.self, capacity: count)
             return (0..<count).map { ptr[$0] }
@@ -1297,7 +1297,7 @@ struct ReferenceComparisonTests {
             for i in 0..<count {
                 ptr[i] = BFloat16(values[i])
             }
-        case .float32:
+        case .float32, .float32Decode:
             let ptr = buffer.contents().bindMemory(to: Float32.self, capacity: count)
             for i in 0..<count {
                 ptr[i] = values[i]
@@ -1372,8 +1372,24 @@ struct ReferenceComparisonTests {
     private func readRefTensorAsFloats(
         _ file: MetalWeightFile, name: String
     ) throws -> [Float] {
-        let buf = try readFloat16Tensor(file, name: name)
-        return (0..<buf.count).map { Float(buf[$0]) }
+        guard let info = file.tensors[name] else {
+            throw SetupError.tensorNotFound(name)
+        }
+        let count = info.shape.reduce(1, *)
+        let base = file.buffer.contents() + file.dataSectionOffset + info.dataOffset
+        switch info.dtype {
+        case .float16:
+            let pointer = base.bindMemory(to: Float16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .bfloat16:
+            let pointer = base.bindMemory(to: BFloat16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .float32:
+            let pointer = base.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
+        default:
+            throw SetupError.tensorNotFound("Unsupported dtype \(info.dtype) for \(name)")
+        }
     }
 
     // MARK: - Comparison Utilities (all work on [Float])

@@ -59,6 +59,9 @@ public struct Attention: ModelComponent {
     /// QK normalization strategy applied before attention score computation.
     public let qkNorm: QKNormKind?
 
+    /// Epsilon used by Q/K normalization when present.
+    public let qkNormEpsilon: Float?
+
     public init(
         hiddenSize: Int,
         headCount: Int,
@@ -69,6 +72,7 @@ public struct Attention: ModelComponent {
         causal: Bool = true,
         rope: RoPEAttributes? = nil,
         qkNorm: QKNormKind? = nil,
+        qkNormEpsilon: Float? = nil,
         window: AttentionWindow? = nil
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
@@ -90,6 +94,7 @@ public struct Attention: ModelComponent {
         self.causal = causal
         self.rope = rope
         self.qkNorm = qkNorm
+        self.qkNormEpsilon = qkNormEpsilon
         self.window = window
     }
 
@@ -103,7 +108,8 @@ public struct Attention: ModelComponent {
             bias: bias,
             causal: causal,
             rope: rope,
-            qkNorm: qkNorm
+            qkNorm: qkNorm,
+            qkNormEpsilon: qkNormEpsilon
         )
     }
 }

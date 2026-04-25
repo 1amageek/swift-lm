@@ -17,10 +17,10 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
         let scaled = embeddingScale != nil ? "_scaled" : ""
         let token = context.weightFormat.embeddingLookupToken
         let tokenPart = token.isEmpty ? "" : "_\(token)"
-        let isSeq = context.bufferPrecision == .float32
+        let isSeq = context.bufferPrecision.isPrefillSequencePrecision
         return isSeq
             ? "embedding_lookup_seq\(tokenPart)_f32\(scaled)"
-            : "embedding_lookup\(tokenPart)\(scaled)"
+            : "embedding_lookup\(tokenPart)\(scaled)\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
     public var dispatchDimension: MetalDispatchDimension { .gather(count: embeddingDimension) }
     public var weightSlots: [MetalWeightSlot] { [MetalWeightSlot(field: nil, role: .weight)] }
@@ -29,7 +29,7 @@ public struct GatherFragment: PrimitiveMetalKernelFragment {
         weightFormat.embeddingLookupKernelSource(
             name: name,
             bufferPrecision: bufferPrecision,
-            isSequence: bufferPrecision == .float32,
+            isSequence: bufferPrecision.isPrefillSequencePrecision,
             embeddingScale: embeddingScale
         )
     }

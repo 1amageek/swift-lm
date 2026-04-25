@@ -2012,7 +2012,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
         switch compiledModel.decodePlan.buffers.bufferPrecision {
         case .float16: name = base
         case .bfloat16: name = base + "_bf16"
-        case .float32: return nil  // F32→F32 uses blit copy, no conversion needed
+        case .float32, .float32Decode: return nil  // F32→F32 uses blit copy, no conversion needed
         }
         return compiledModel.auxiliaryPipelines[name]
     }
@@ -2029,7 +2029,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
             return base
         case .bfloat16:
             return base + "_bf16"
-        case .float32:
+        case .float32, .float32Decode:
             return base + "_f32"
         }
     }
@@ -2193,7 +2193,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
             / max(prefillPlan.buffers.bufferPrecision.byteSize, 1)
         let source = prefillPlan.finalHiddenSource(sequenceLength: sequenceLength)
         switch prefillPlan.buffers.bufferPrecision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = source.buffer.contents().bindMemory(
                 to: Float.self,
                 capacity: source.buffer.length / MemoryLayout<Float>.stride
@@ -2264,7 +2264,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
     ) -> [Float] {
         guard count > 0 else { return [] }
         switch precision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         case .float16:

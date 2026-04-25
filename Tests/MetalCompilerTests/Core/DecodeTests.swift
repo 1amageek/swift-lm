@@ -281,7 +281,7 @@ struct DecodeTests {
         case .bfloat16:
             let pointer = readableBuffer.contents().bindMemory(to: BFloat16.self, capacity: resolvedCount)
             return (0..<resolvedCount).map { Float(pointer[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = readableBuffer.contents().bindMemory(to: Float32.self, capacity: resolvedCount)
             return (0..<resolvedCount).map { pointer[$0] }
         }

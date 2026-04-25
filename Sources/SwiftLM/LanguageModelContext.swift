@@ -621,6 +621,9 @@ public final class LanguageModelContext: @unchecked Sendable {
                 tokens: bufferedRawTokenIDs,
                 skipSpecialTokens: false
             )
+            if !force && decodedText.contains("\u{FFFD}") {
+                return
+            }
             bufferedRawTokenIDs.removeAll(keepingCapacity: true)
             let emitted = visibilityState.append(decodedText: decodedText)
             if rawTokenCount <= debugTokenLimit || force {
@@ -1363,7 +1366,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         }
 
         switch decodePlan.buffers.bufferPrecision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = inputBinding.buffer.contents().bindMemory(
                 to: Float.self,
                 capacity: inputBinding.buffer.length / MemoryLayout<Float>.stride
@@ -2269,7 +2272,7 @@ public final class LanguageModelContext: @unchecked Sendable {
     ) -> [Float] {
         guard count > 0 else { return [] }
         switch precision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(
                 to: Float.self,
                 capacity: buffer.length / MemoryLayout<Float>.stride
@@ -2679,7 +2682,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         precision: BufferPrecision
     ) -> [Float] {
         switch precision {
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(to: Float.self, capacity: vocabularySize)
             return Array(UnsafeBufferPointer(start: pointer, count: vocabularySize))
         case .float16:
@@ -3107,6 +3110,7 @@ struct GenerationVisibilityState {
     let emitsReasoning: Bool
     private(set) var suppressingReasoning = false
     private(set) var didSuppressReasoning = false
+    private var didSeeStrayCloseTag = false
     private var pendingText = ""
 
     var debugSummary: String {
@@ -3132,6 +3136,9 @@ struct GenerationVisibilityState {
     mutating func append(decodedText: String) -> GenerationChannelOutput {
         guard let policy else {
             return GenerationChannelOutput(answer: decodedText, reasoning: "")
+        }
+        guard !didSeeStrayCloseTag else {
+            return GenerationChannelOutput()
         }
         pendingText += decodedText
         var emitted = GenerationChannelOutput()
@@ -3169,7 +3176,18 @@ struct GenerationVisibilityState {
                 return emitted
             }
 
-            if let openRange = pendingText.range(of: policy.openTag) {
+            let openRange = pendingText.range(of: policy.openTag)
+            let closeRange = pendingText.range(of: policy.closeTag)
+            if let closeRange,
+               openRange == nil || closeRange.lowerBound < openRange!.lowerBound {
+                emitted.answer += String(pendingText[..<closeRange.lowerBound])
+                pendingText = ""
+                didSuppressReasoning = true
+                didSeeStrayCloseTag = true
+                return emitted
+            }
+
+            if let openRange {
                 emitted.answer += String(pendingText[..<openRange.lowerBound])
                 pendingText.removeSubrange(pendingText.startIndex..<openRange.upperBound)
                 suppressingReasoning = true

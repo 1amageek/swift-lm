@@ -17,12 +17,14 @@ public enum BufferPrecision: Sendable {
     case bfloat16
     /// Float32 — used in prefill (multi-token, prevents accumulation error).
     case float32
+    /// Float32 — used in decode without selecting sequence/prefill kernels.
+    case float32Decode
 
     public var metalType: String {
         switch self {
         case .float16: return "half"
         case .bfloat16: return "bfloat"
-        case .float32: return "float"
+        case .float32, .float32Decode: return "float"
         }
     }
 
@@ -30,8 +32,20 @@ public enum BufferPrecision: Sendable {
         switch self {
         case .float16: return 2
         case .bfloat16: return 2
-        case .float32: return 4
+        case .float32, .float32Decode: return 4
         }
+    }
+
+    public var isPrefillSequencePrecision: Bool {
+        self == .float32
+    }
+
+    public var isFloat32Storage: Bool {
+        self == .float32 || self == .float32Decode
+    }
+
+    public var decodeKernelNameSuffix: String {
+        self == .float32Decode ? "_f32d" : ""
     }
 }
 

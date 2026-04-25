@@ -4,6 +4,48 @@ import Testing
 
 @Suite("LFM Output Diagnostics", .serialized)
 struct LFMOutputDiagnosticsTests {
+    @Test("Inspect LFM hi chat 256 output", .timeLimit(.minutes(10)))
+    func inspectLFMHiChat256Output() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else { return }
+
+        let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
+        let container = try LanguageModelContext(loaded)
+        container.resetState()
+        let prepared = try await container.prepare(ModelInput(
+            prompt: "hi",
+            promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
+        ))
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
+        let tokenIDs = try container.debugRawGeneratedTokenIDs(
+            prompt: prompt,
+            parameters: GenerationParameters(
+                maxTokens: 256,
+                streamChunkTokenCount: 1,
+                temperature: 0
+            )
+        )
+        let rawText = container.tokenizer.decode(tokens: tokenIDs, skipSpecialTokens: false)
+        let visibleText = visibleTextDroppingLeadingThinkingBlock(from: rawText)
+        let expectedPrefix = [64400, 9095, 892, 521, 2944, 1090, 2130, 1620, 779]
+
+        print("[LFM hi 256 prepared]")
+        print(prepared.renderedText)
+        print("[LFM hi 256 prepared token ids] \(prepared.tokenIDs)")
+        print("[LFM hi 256 generated token ids]")
+        print(tokenIDs)
+        print("[LFM hi 256 generated raw text]")
+        print(rawText)
+        print("[LFM hi 256 generated visible text]")
+        print(visibleText)
+
+        #expect(Array(tokenIDs.prefix(expectedPrefix.count)) == expectedPrefix)
+        #expect(rawText.contains("<think>"), "Thinking model should enter a thinking block for this reference prompt")
+        #expect(rawText.contains("</think>"), "Thinking model must close the thinking block within 256 greedy tokens")
+        #expect(!visibleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, "Thinking output must include a final answer, not only reasoning")
+        #expect(!visibleText.contains("<think>"))
+        #expect(!visibleText.contains("</think>"))
+    }
+
     @Test("Inspect LFM real output", .timeLimit(.minutes(10)))
     func inspectLFMRealOutput() async throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else { return }

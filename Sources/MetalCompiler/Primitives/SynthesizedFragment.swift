@@ -58,7 +58,14 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
         case .perElement(let c): parallelismTag = "elem\(c)"
         case .perHead(let h, let d): parallelismTag = "head\(h)x\(d)"
         }
-        let precisionTag = context.bufferPrecision == .float32 ? "f32" : "f16"
+        let precisionTag: String
+        if context.bufferPrecision.isPrefillSequencePrecision {
+            precisionTag = "f32"
+        } else if context.bufferPrecision == .float32Decode {
+            precisionTag = "f32d"
+        } else {
+            precisionTag = "f16"
+        }
         let weightTag: String
         let format = context.weightFormat
         if format.isQuantized {
@@ -113,7 +120,7 @@ public struct SynthesizedFragment: PrimitiveMetalKernelFragment {
                 contract: result.contract,
                 bufferPrecision: bufferPrecision,
                 weightFormats: result.weightFormats,
-                isSequence: bufferPrecision == .float32
+                isSequence: bufferPrecision.isPrefillSequencePrecision
             )
         } catch {
             fatalError("[SynthesizedFragment] Fusion synthesis failed: \(error)")

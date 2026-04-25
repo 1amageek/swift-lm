@@ -166,25 +166,25 @@ struct DecodeConvStateDiagnosticTests {
         let convDim = model.buffers.convStateDimension
         let kernelSize = model.buffers.convStateKernelSize
         let valuesPerLayer = convDim * kernelSize
-        let layerCount = convStateBuffer.length / (valuesPerLayer * MemoryLayout<Float16>.stride)
+        let layerCount = convStateBuffer.length / (valuesPerLayer * MemoryLayout<BFloat16>.stride)
         let totalValueCount = layerCount * valuesPerLayer
-        var packed = Array<Float16>(repeating: .zero, count: totalValueCount)
+        var packed = Array<BFloat16>(repeating: .zero, count: totalValueCount)
 
         for convIdx in 0..<layerCount {
             let values = try readRefTensorAsFloats(ref, name: "ref.decode_\(step).conv_state.\(convIdx)")
             let base = convIdx * valuesPerLayer
             let limit = min(values.count, valuesPerLayer)
             for valueIndex in 0..<limit {
-                packed[base + valueIndex] = Float16(values[valueIndex])
+                packed[base + valueIndex] = BFloat16(values[valueIndex])
             }
         }
 
-        let byteCount = packed.count * MemoryLayout<Float16>.stride
+        let byteCount = packed.count * MemoryLayout<BFloat16>.stride
         if convStateBuffer.storageMode == .private {
             guard let staging = model.device.makeBuffer(length: byteCount, options: .storageModeShared) else {
                 throw SetupError.noDevice
             }
-            let pointer = staging.contents().bindMemory(to: Float16.self, capacity: packed.count)
+            let pointer = staging.contents().bindMemory(to: BFloat16.self, capacity: packed.count)
             packed.withUnsafeBufferPointer { source in
                 guard let sourceBaseAddress = source.baseAddress else { return }
                 pointer.update(from: sourceBaseAddress, count: source.count)
@@ -202,7 +202,7 @@ struct DecodeConvStateDiagnosticTests {
             return
         }
 
-        let pointer = convStateBuffer.contents().bindMemory(to: Float16.self, capacity: packed.count)
+        let pointer = convStateBuffer.contents().bindMemory(to: BFloat16.self, capacity: packed.count)
         packed.withUnsafeBufferPointer { source in
             guard let sourceBaseAddress = source.baseAddress else { return }
             pointer.update(from: sourceBaseAddress, count: source.count)
@@ -234,7 +234,7 @@ struct DecodeConvStateDiagnosticTests {
         case .bfloat16:
             let pointer = buffer.contents().bindMemory(to: BFloat16.self, capacity: count)
             return (0..<count).map { Float(pointer[$0]) }
-        case .float32:
+        case .float32, .float32Decode:
             let pointer = buffer.contents().bindMemory(to: Float.self, capacity: count)
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         }
@@ -245,9 +245,20 @@ struct DecodeConvStateDiagnosticTests {
             throw SetupError.tensorNotFound(name)
         }
         let count = info.shape.reduce(1, *)
-        let pointer = (file.buffer.contents() + file.dataSectionOffset + info.dataOffset)
-            .bindMemory(to: Float16.self, capacity: count)
-        return (0..<count).map { Float(pointer[$0]) }
+        let base = file.buffer.contents() + file.dataSectionOffset + info.dataOffset
+        switch info.dtype {
+        case .float16:
+            let pointer = base.bindMemory(to: Float16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .bfloat16:
+            let pointer = base.bindMemory(to: BFloat16.self, capacity: count)
+            return (0..<count).map { Float(pointer[$0]) }
+        case .float32:
+            let pointer = base.bindMemory(to: Float.self, capacity: count)
+            return Array(UnsafeBufferPointer(start: pointer, count: count))
+        default:
+            throw SetupError.tensorNotFound("Unsupported dtype \(info.dtype) for \(name)")
+        }
     }
 
     private func argmax(_ values: [Float]) -> (index: Int, value: Float) {

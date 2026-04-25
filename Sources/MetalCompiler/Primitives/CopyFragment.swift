@@ -19,7 +19,9 @@ public struct CopyFragment: PrimitiveMetalKernelFragment {
     public var dispatchDimension: MetalDispatchDimension { .elementwise(count: dimension) }
 
     public func kernelName(context: KernelContext) -> String {
-        context.bufferPrecision == .float32 ? "copy_buffer_seq_f32" : "copy_buffer"
+        context.bufferPrecision.isPrefillSequencePrecision
+            ? "copy_buffer_seq_f32"
+            : "copy_buffer\(context.bufferPrecision.decodeKernelNameSuffix)"
     }
 
     // MARK: - Fusion Contract
@@ -53,7 +55,7 @@ public struct CopyFragment: PrimitiveMetalKernelFragment {
         MetalSourceGenerator.generateCopy(
             name: name,
             bufferPrecision: bufferPrecision,
-            isSequence: bufferPrecision == .float32
+            isSequence: bufferPrecision.isPrefillSequencePrecision
         )
     }
 

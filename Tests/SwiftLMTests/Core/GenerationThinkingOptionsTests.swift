@@ -76,6 +76,22 @@ struct GenerationThinkingOptionsTests {
         #expect(trailing.answer.isEmpty)
     }
 
+    @Test("hidden mode drops stray close tag and suppresses following text")
+    func hiddenModeDropsStrayCloseTag() {
+        var state = GenerationVisibilityState(policy: policy, emitsReasoning: false)
+
+        let first = state.append(decodedText: "Tokyo\n</think>")
+        let second = state.append(decodedText: "\n\nextra")
+        let trailing = state.finalize()
+
+        #expect(first.reasoning.isEmpty)
+        #expect(first.answer == "Tokyo\n")
+        #expect(second.reasoning.isEmpty)
+        #expect(second.answer.isEmpty)
+        #expect(trailing.reasoning.isEmpty)
+        #expect(trailing.answer.isEmpty)
+    }
+
     @Test("prompt-opened reasoning is detected only at prompt end")
     func promptOpenedReasoningRequiresTrailingTag() {
         let realPromptOpenedReasoning = "<|im_start|>assistant\n<think>\n"

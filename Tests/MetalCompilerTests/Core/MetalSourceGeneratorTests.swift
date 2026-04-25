@@ -613,8 +613,8 @@ struct MetalSourceGeneratorTests {
         #expect(SSMRecurrenceFragment.sequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32")
     }
 
-    @Test("SSM recurrence reads Qwen norm weight as float unit offset")
-    func ssmRecurrenceUsesFloatUnitOffsetNormWeight() {
+    @Test("SSM recurrence reads Qwen gated norm weight directly")
+    func ssmRecurrenceUsesDirectNormWeight() {
         let decodeSource = MetalSourceGenerator.generateSSMRecurrence(
             name: "ssm_recurrence_bf16",
             bufferPrecision: .float16,
@@ -640,7 +640,8 @@ struct MetalSourceGeneratorTests {
 
         for source in [decodeSource, sequenceSource] {
             #expect(source.contains("device const float* normWeight [[buffer(5)]]"))
-            #expect(source.contains("1.0f + normWeight[d]"))
+            #expect(source.contains("* rmsScale * normWeight[d]"))
+            #expect(!source.contains("1.0f + normWeight[d]"))
             #expect(!source.contains("bf16_to_float(normWeight[d])"))
         }
     }

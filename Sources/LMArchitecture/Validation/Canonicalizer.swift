@@ -98,6 +98,7 @@ private func canonicalizePrimitiveAttributes(_ attrs: any OperationAttributes) -
             causal: a.causal,
             rope: a.rope.map { canonicalizeRoPE($0) },
             qkNorm: a.qkNorm,
+            qkNormEpsilon: a.qkNormEpsilon,
             valueNorm: a.valueNorm,
             window: a.window,
             implementationHint: nil,

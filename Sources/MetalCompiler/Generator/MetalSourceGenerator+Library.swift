@@ -131,7 +131,7 @@ extension MetalSourceGenerator {
         sources.append(generatePerHeadRMSNorm(name: "per_head_rms_norm_seq_f32", bufferPrecision: prefill, isSequence: true))
         sources.append(generateRoPESeq(name: "rope_seq_f32", bufferPrecision: prefill))
         sources.append(generateConv1dCausalSeq(name: "conv1d_causal_seq_f32", bufferPrecision: prefill, weightFormat: .bfloat16))
-        sources.append(generateExtractConvState(name: "extract_conv_state_f32", bufferPrecision: prefill))
+        sources.append(generateExtractConvState(name: "extract_conv_state_f32", bufferPrecision: prefill, weightFormat: .bfloat16))
         sources.append(generateArgmax(name: "argmax_f32", bufferPrecision: prefill))
 
         // === F16 seq variants (legacy prefill path, non-F32 models) ===
@@ -147,7 +147,7 @@ extension MetalSourceGenerator {
         sources.append(generateQKNormSeq(name: "qk_rms_norm_seq", bufferPrecision: f16, weightFormat: .float16))
         sources.append(generateQKNormSeq(name: "qk_rms_norm_seq_bf16", bufferPrecision: f16, weightFormat: .bfloat16))
         sources.append(generateConv1dCausalSeq(name: "conv1d_causal_seq", bufferPrecision: f16, weightFormat: .bfloat16))
-        sources.append(generateExtractConvState(name: "extract_conv_state", bufferPrecision: f16))
+        sources.append(generateExtractConvState(name: "extract_conv_state", bufferPrecision: f16, weightFormat: .bfloat16))
 
         // === F16 GEMM variants ===
         sources.append(generateGEMM(name: "gemm", bufferPrecision: f16, weightFormat: .float16))

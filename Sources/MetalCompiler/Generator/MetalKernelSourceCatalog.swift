@@ -69,7 +69,7 @@ struct MetalKernelSourceCatalog {
         // BF16 / FP16 dense weights → batched_gemm_bf16_f32s_{count} / batched_gemm_f32s_{count}
         // (MPP matmul2d with shared input A across projections).
         var batchedMPPGEMMRequests: [(name: String, count: Int, weightFormat: MetalSourceGenerator.WeightFormat)] = []
-        if bufferPrecision == .float32 {
+        if bufferPrecision.isPrefillSequencePrecision {
             for entry in entries {
                 let batchedRole: String
                 let batchedCount: Int
@@ -115,7 +115,7 @@ struct MetalKernelSourceCatalog {
                     }
                     // Q4+float32: also generate dequant + BF16 MPP GEMM below.
                     // Other quantized formats: skip the rest (decode GEMV only).
-                    if !(bufferPrecision == .float32 && weightFormat.isQuantized) {
+                    if !(bufferPrecision.isPrefillSequencePrecision && weightFormat.isQuantized) {
                         continue
                     }
                 }
@@ -125,7 +125,7 @@ struct MetalKernelSourceCatalog {
                 // unpacks packed weights into BF16 row-major and then the standard
                 // BF16 MPP path handles GEMM. All quantized formats share the
                 // format-driven unified generator.
-                let needsDequantForAMX = bufferPrecision == .float32 && weightFormat.isQuantized
+                let needsDequantForAMX = bufferPrecision.isPrefillSequencePrecision && weightFormat.isQuantized
                 if needsDequantForAMX, let format = weightFormat.quantizationFormat {
                     let dequantName = MetalSourceGenerator.unifiedDequantKernelName(for: format)
                     if generatedNames.insert(dequantName).inserted {
@@ -137,7 +137,7 @@ struct MetalKernelSourceCatalog {
                 }
                 let effectiveWeightFormat: WeightFormat = needsDequantForAMX ? .bfloat16 : weightFormat
 
-                let decodeFamily = bufferPrecision == .float32
+                let decodeFamily = bufferPrecision.isPrefillSequencePrecision
                     ? nil
                     : DecodeProjectionShapeFamily.resolve(
                         outputDimension: projection.outputDimension,
@@ -152,21 +152,24 @@ struct MetalKernelSourceCatalog {
                         accessPolicyResolver: accessPolicyResolver
                     ) {
                         let baseName = decodeFamily.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
-                        name = effectiveWeightFormat == .bfloat16 ? baseName + "_bf16" : baseName
+                        name = (effectiveWeightFormat == .bfloat16 ? baseName + "_bf16" : baseName)
+                            + bufferPrecision.decodeKernelNameSuffix
                     } else {
-                        name = effectiveWeightFormat == .bfloat16
+                        name = (effectiveWeightFormat == .bfloat16
                             ? decodeFamily.kernelBaseName + "_bf16"
-                            : decodeFamily.kernelBaseName
+                            : decodeFamily.kernelBaseName)
+                            + bufferPrecision.decodeKernelNameSuffix
                     }
                 } else {
-                    name = effectiveWeightFormat == .bfloat16 ? "gemv_bf16" : "gemv"
+                    name = (effectiveWeightFormat == .bfloat16 ? "gemv_bf16" : "gemv")
+                        + bufferPrecision.decodeKernelNameSuffix
                 }
                 let usesSequenceGEMV =
-                    bufferPrecision == .float32
+                    bufferPrecision.isPrefillSequencePrecision
                     && isOutput
                     && projection.field == "weight"
                     && projection.outputDimension > projection.inputDimension
-                let isSequenceKernel = bufferPrecision == .float32 && !usesSequenceGEMV
+                let isSequenceKernel = bufferPrecision.isPrefillSequencePrecision && !usesSequenceGEMV
                 let emittedName = isSequenceKernel
                     ? name.replacingOccurrences(of: "gemv", with: "gemm") + "_f32s"
                     : (usesSequenceGEMV
@@ -363,7 +366,7 @@ struct MetalKernelSourceCatalog {
                                 name: ropeF16, bufferPrecision: bufferPrecision))
                         }
                     }
-                    if bufferPrecision == .float32, let ssmFragment = fragment as? SSMRecurrenceFragment {
+                    if bufferPrecision.isPrefillSequencePrecision, let ssmFragment = fragment as? SSMRecurrenceFragment {
                         let sequenceKernelName = SSMRecurrenceFragment.sequenceKernelName(
                             bufferPrecision: bufferPrecision,
                             weightFormat: weightFormat
@@ -381,7 +384,7 @@ struct MetalKernelSourceCatalog {
                                 valueHeadDimension: ssmFragment.valueHeadDimension))
                         }
                     }
-                    if bufferPrecision != .float32 {
+                    if !bufferPrecision.isPrefillSequencePrecision {
                         let argumentKernelName = MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
                         if argumentKernelName != kernelName, generatedNames.insert(argumentKernelName).inserted {
                             if let argumentVariantSource = generateArgumentTableVariant(
@@ -396,7 +399,7 @@ struct MetalKernelSourceCatalog {
                         }
                     }
                 }
-                if fragment is BatchedProjection, bufferPrecision == .float32 {
+                if fragment is BatchedProjection, bufferPrecision.isPrefillSequencePrecision {
                     let gemmName = weightFormat == .bfloat16 ? "gemm_bf16_f32s" : "gemm_f32s"
                     mppGEMMNames.insert(gemmName)
                     mppGEMMWeightFormat = weightFormat
@@ -407,7 +410,7 @@ struct MetalKernelSourceCatalog {
                             weightFormat: weightFormat))
                     }
                 }
-                if let batch = fragment as? BatchedFragment, bufferPrecision == .float32 {
+                if let batch = fragment as? BatchedFragment, bufferPrecision.isPrefillSequencePrecision {
                     // Batched prefill kernel for QK norm
                     if batch.fragments.count == 2,
                        batch.fragments.allSatisfy({ $0 is QKNormFragment }),
@@ -434,7 +437,7 @@ struct MetalKernelSourceCatalog {
                 // Fused batched QK norm + RoPE for prefill. Emitted alongside the
                 // non-fused batched decode kernel (`batched_qk_rms_norm_2`),
                 // which this fragment still delegates to for the decode path.
-                if fragment is BatchedQKNormRoPEFragment, bufferPrecision == .float32 {
+                if fragment is BatchedQKNormRoPEFragment, bufferPrecision.isPrefillSequencePrecision {
                     let fusedName = weightFormat == .bfloat16
                         ? "batched_qk_rms_norm_rope_seq_bf16_f32"
                         : "batched_qk_rms_norm_rope_seq_f32"
@@ -445,15 +448,16 @@ struct MetalKernelSourceCatalog {
                             weightFormat: weightFormat))
                     }
                 }
-                if fragment.cacheSlots.contains(where: { $0.kind == .conv }) && bufferPrecision == .float32 {
+                if fragment.cacheSlots.contains(where: { $0.kind == .conv }) && bufferPrecision.isPrefillSequencePrecision {
                     let extractName = "extract_conv_state_f32"
                     if generatedNames.insert(extractName).inserted {
                         sources.append(MetalSourceGenerator.generateExtractConvState(
                             name: extractName,
-                            bufferPrecision: bufferPrecision))
+                            bufferPrecision: bufferPrecision,
+                            weightFormat: weightFormat))
                     }
                 }
-                if fragment.cacheSlots.contains(where: { $0.kind == .kv }) && bufferPrecision == .float32 {
+                if fragment.cacheSlots.contains(where: { $0.kind == .kv }) && bufferPrecision.isPrefillSequencePrecision {
                     if let flashAttn = fragment as? FlashAttentionFragment, flashAttn.directScratchMode {
                         // Direct-scratch mode: attention reads K/V from scratch, no KV cache needed.
                         let scratchName = "flash_attn_batch_scratch_f32"
@@ -501,7 +505,7 @@ struct MetalKernelSourceCatalog {
 
         let hiddenCopyName = bufferPrecision == .bfloat16
             ? "hidden_copy_from_float_bf16"
-            : bufferPrecision == .float32
+            : bufferPrecision.isFloat32Storage
             ? "hidden_copy_from_float_f32"
             : "hidden_copy_from_float"
         if generatedNames.insert(hiddenCopyName).inserted {
@@ -513,7 +517,7 @@ struct MetalKernelSourceCatalog {
 
         let hiddenAddName = bufferPrecision == .bfloat16
             ? "hidden_add_from_float_bf16"
-            : bufferPrecision == .float32
+            : bufferPrecision.isFloat32Storage
             ? "hidden_add_from_float_f32"
             : "hidden_add_from_float"
         if generatedNames.insert(hiddenAddName).inserted {
@@ -582,7 +586,7 @@ struct MetalKernelSourceCatalog {
     }
 
     private func sourceGenerationEntries(from entries: [DispatchEntry]) -> [DispatchEntry] {
-        guard bufferPrecision == .float32 else { return entries }
+        guard bufferPrecision.isPrefillSequencePrecision else { return entries }
         return entries.flatMap { entry in
             if let batched = entry.fragment as? BatchedProjection {
                 return batched.projections.map { projection in
@@ -658,7 +662,7 @@ struct MetalKernelSourceCatalog {
         bufferPrecision: BufferPrecision
     ) -> String? {
         guard weightFormat.isQuantized else { return nil }
-        let isPrefill = bufferPrecision == .float32
+        let isPrefill = bufferPrecision.isPrefillSequencePrecision
         // Direct kernel path: Q4/Q8 with a hand-tuned GEMM declare `directGEMMKernel`.
         if isPrefill, let direct = weightFormat.directGEMMKernel() {
             return direct.kernelName
@@ -682,7 +686,7 @@ struct MetalKernelSourceCatalog {
         // declared by each format via `directGEMMKernelSource`. Formats without a
         // direct kernel (e.g. Q2/Q3/Q5/Q6) return nil and route through the
         // dequant→BF16 MPP pipeline.
-        if bufferPrecision == .float32 {
+        if bufferPrecision.isPrefillSequencePrecision {
             return weightFormat.directGEMMKernelSource(
                 name: kernelName,
                 bufferPrecision: bufferPrecision

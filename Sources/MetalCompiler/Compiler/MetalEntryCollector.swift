@@ -58,7 +58,7 @@ struct MetalEntryCollector {
         kernelContext: KernelContext
     ) -> [DispatchEntry] {
         // Only decode is affected (prefill has a separate path).
-        guard kernelContext.bufferPrecision != .float32 else { return entries }
+        guard !kernelContext.bufferPrecision.isPrefillSequencePrecision else { return entries }
         guard let stafWeightStore else { return entries }
 
         return entries.flatMap { entry -> [DispatchEntry] in

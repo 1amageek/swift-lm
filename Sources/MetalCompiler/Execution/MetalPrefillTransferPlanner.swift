@@ -15,7 +15,7 @@ struct MetalPrefillTransferPlanner: Sendable {
         // When decode precision is already F32, a blit copy suffices.
         let hiddenConversionElementCount: Int
         let hiddenBlitCopySize: Int
-        if decodePlan.buffers.bufferPrecision == .float32 {
+        if decodePlan.buffers.bufferPrecision.isFloat32Storage {
             hiddenConversionElementCount = 0
             hiddenBlitCopySize = decodeHiddenSize * decodeElementSize
         } else {
