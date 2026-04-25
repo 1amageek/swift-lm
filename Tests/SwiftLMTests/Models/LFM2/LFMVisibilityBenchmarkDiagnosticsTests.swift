@@ -6,12 +6,8 @@ import Testing
 struct LFMVisibilityBenchmarkDiagnosticsTests {
     @Test("benchmark prompt reports raw-to-visible expansion", .timeLimit(.minutes(10)))
     func benchmarkPromptReportsRawToVisibleExpansion() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = try Self.optionalLFMThinkingDirectory() else {
+            print("[Skip] No local LFM bundle found")
             return
         }
 
@@ -52,12 +48,8 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
 
     @Test("hello prompt reports raw-to-visible expansion", .timeLimit(.minutes(10)))
     func helloPromptReportsRawToVisibleExpansion() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = try Self.optionalLFMThinkingDirectory() else {
+            print("[Skip] No local LFM bundle found")
             return
         }
 
@@ -98,12 +90,8 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
 
     @Test("thinking opt-in surfaces reasoning in streaming and visible token output", .timeLimit(.minutes(10)))
     func thinkingOptInSurfacesReasoningInStreamingAndVisibleOutput() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = try Self.optionalLFMThinkingDirectory() else {
+            print("[Skip] No local LFM bundle found")
             return
         }
 
@@ -155,12 +143,8 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
 
     @Test("thinking separate emits reasoning stream for LFM template semantics", .timeLimit(.minutes(10)))
     func thinkingSeparateEmitsReasoningStream() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = try Self.optionalLFMThinkingDirectory() else {
+            print("[Skip] No local LFM bundle found")
             return
         }
 
@@ -203,5 +187,115 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
         #expect(!answer.contains("<think>"))
         #expect(!reasoning.contains("<think>"))
         #expect(!reasoning.contains("</think>"))
+    }
+
+    @Test("public generate E2E emits reasoning stream for LFM template semantics", .timeLimit(.minutes(10)))
+    func publicGenerateE2EEmitsReasoningStream() async throws {
+        guard let localModelDirectory = try Self.optionalLFMThinkingDirectory() else {
+            print("[Skip] No local LFM bundle found")
+            return
+        }
+
+        let loaded = try await ModelBundleLoader().load(directory: localModelDirectory)
+        let container = try LanguageModelContext(loaded)
+        let parameters = GenerationParameters(
+            maxTokens: 64,
+            streamChunkTokenCount: 1,
+            temperature: 0,
+            reasoning: .separate
+        )
+
+        container.resetState()
+        let stream = try await container.generate(
+            ModelInput(
+                prompt: "Hello",
+                promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
+            ),
+            parameters: parameters
+        )
+
+        var answer = ""
+        var reasoning = ""
+        var eventKinds: [String] = []
+        for await generation in stream {
+            switch generation {
+            case .text(let chunk):
+                answer += chunk
+                eventKinds.append("text")
+            case .reasoning(let chunk):
+                reasoning += chunk
+                eventKinds.append("reasoning")
+            case .completed:
+                break
+            }
+        }
+
+        print("[LFM E2E separate event kinds]")
+        print(eventKinds.joined(separator: ","))
+        print("[LFM E2E separate reasoning prefix]")
+        print(String(reasoning.prefix(400)))
+        print("[LFM E2E separate answer prefix]")
+        print(String(answer.prefix(400)))
+
+        #expect(eventKinds.contains("reasoning"))
+        #expect(!reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(!answer.contains("<think>"))
+        #expect(!answer.contains("</think>"))
+        #expect(!reasoning.contains("<think>"))
+        #expect(!reasoning.contains("</think>"))
+    }
+
+    private static func optionalLFMThinkingDirectory() throws -> URL? {
+        let repositoryRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let directCandidates = [
+            repositoryRoot.appendingPathComponent("TestData/LFM2.5-1.2B-Thinking"),
+            URL(fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking")
+        ]
+        for candidate in directCandidates where try isUsableModelDirectory(candidate) {
+            return candidate
+        }
+
+        let envCandidates = [
+            ProcessInfo.processInfo.environment["SWIFTLM_LFM_THINKING_DIR"],
+            ProcessInfo.processInfo.environment["SWIFTLM_LFM25_THINKING_DIR"]
+        ].compactMap { $0 }
+        for candidate in envCandidates {
+            let url = URL(fileURLWithPath: NSString(string: candidate).expandingTildeInPath)
+            if try isUsableModelDirectory(url) {
+                return url
+            }
+        }
+
+        let cacheRoot = URL(
+            fileURLWithPath: NSString(
+                string: "~/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Thinking"
+            ).expandingTildeInPath
+        )
+        let snapshots = try snapshotDirectories(baseURL: cacheRoot)
+        for snapshot in snapshots where try isUsableModelDirectory(snapshot) {
+            return snapshot
+        }
+        return nil
+    }
+
+    private static func snapshotDirectories(baseURL: URL) throws -> [URL] {
+        let snapshotsURL = baseURL.appendingPathComponent("snapshots")
+        guard FileManager.default.fileExists(atPath: snapshotsURL.path) else {
+            return []
+        }
+        return try FileManager.default.contentsOfDirectory(
+            at: snapshotsURL,
+            includingPropertiesForKeys: nil
+        )
+    }
+
+    private static func isUsableModelDirectory(_ directory: URL) throws -> Bool {
+        let configURL = directory.appendingPathComponent("config.json")
+        return FileManager.default.fileExists(atPath: configURL.path)
     }
 }

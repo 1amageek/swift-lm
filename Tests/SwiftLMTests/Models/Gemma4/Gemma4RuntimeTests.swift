@@ -137,6 +137,57 @@ struct Gemma4RuntimeTests {
         #expect(try #require(result.completion).tokenCount > 0)
     }
 
+    @Test("Real Gemma4 public generate E2E preserves separate reasoning channel", .timeLimit(.minutes(10)))
+    func realGemma4PublicGenerateThinkingSeparateE2E() async throws {
+        guard let container = try await Gemma4TestSupport.realGemma4Container() else {
+            print("[Skip] No local Gemma4 bundle found")
+            return
+        }
+
+        let stream = try await container.generate(
+            ModelInput(
+                chat: [
+                    .user([.text("Hello")])
+                ],
+                promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
+            ),
+            parameters: GenerationParameters(
+                maxTokens: 32,
+                streamChunkTokenCount: 1,
+                temperature: 0,
+                reasoning: .separate
+            )
+        )
+
+        var answer = ""
+        var reasoning = ""
+        var eventKinds: [String] = []
+        for await generation in stream {
+            switch generation {
+            case .text(let chunk):
+                answer += chunk
+                eventKinds.append("text")
+            case .reasoning(let chunk):
+                reasoning += chunk
+                eventKinds.append("reasoning")
+            case .completed:
+                break
+            }
+        }
+
+        print("[Gemma4 E2E separate event kinds]")
+        print(eventKinds.joined(separator: ","))
+        print("[Gemma4 E2E separate answer prefix]")
+        print(String(answer.prefix(400)))
+        print("[Gemma4 E2E separate reasoning prefix]")
+        print(String(reasoning.prefix(400)))
+
+        #expect(!answer.contains("<|channel>thought"))
+        #expect(!answer.contains("<channel|>"))
+        #expect(!reasoning.contains("<|channel>thought"))
+        #expect(!reasoning.contains("<channel|>"))
+    }
+
     @Test("Gemma4 image generation runs end-to-end", .timeLimit(.minutes(2)))
     func imageGeneration() async throws {
         guard let container = try await Gemma4TestSupport.syntheticGemma4Container() else {

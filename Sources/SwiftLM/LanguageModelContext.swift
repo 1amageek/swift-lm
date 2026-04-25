@@ -394,6 +394,44 @@ public final class LanguageModelContext: @unchecked Sendable {
         return parameters.reasoning.visibility == .inline ? nil : thinkingTagPolicy
     }
 
+    private func startsGenerationInsideReasoning(
+        promptTokenIDs: [Int],
+        parameters: GenerationParameters
+    ) -> Bool {
+        guard let policy = visibleThinkingPolicy(for: parameters) else {
+            return false
+        }
+        let decodedPromptTail = modelTokenizer.decode(
+            tokens: Array(promptTokenIDs.suffix(Self.promptStateSamplingTailLimit)),
+            skipSpecialTokens: false
+        )
+        let startsInsideReasoning = endsInsideReasoning(decodedPromptTail, policy: policy)
+        return startsInsideReasoning
+    }
+
+    private func endsInsideReasoning(_ text: String, policy: ThinkingTagPolicy) -> Bool {
+        var index = text.startIndex
+        var insideReasoning = false
+
+        while index < text.endIndex {
+            if text[index...].hasPrefix(policy.openTag) {
+                insideReasoning = true
+                index = text.index(index, offsetBy: policy.openTag.count)
+                continue
+            }
+
+            if text[index...].hasPrefix(policy.closeTag) {
+                insideReasoning = false
+                index = text.index(index, offsetBy: policy.closeTag.count)
+                continue
+            }
+
+            index = text.index(after: index)
+        }
+
+        return insideReasoning
+    }
+
     private func prepareRenderedPrompt(
         _ rendered: String,
         messages: [InputMessage]
@@ -556,6 +594,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         requestStartTime: Double,
         ropePositionOffset: Int,
         parameters: GenerationParameters,
+        startsInsideReasoning: Bool,
         continuation: AsyncStream<GenerationEvent>.Continuation
     ) {
         var samplingState = initialSamplingState
@@ -565,14 +604,16 @@ public final class LanguageModelContext: @unchecked Sendable {
         let visibilityPolicy = visibleThinkingPolicy(for: parameters)
         let maxRawTokens = maxRawTokenCount(
             forVisibleLimit: maxVisibleTokens,
-            visibilityPolicy: visibilityPolicy
+            visibilityPolicy: visibilityPolicy,
+            reasoningVisibility: parameters.reasoning.visibility
         )
         let chunkTokenCount = max(1, parameters.streamChunkTokenCount)
         var bufferedRawTokenIDs: [Int] = []
         var fallbackTokenIDs: [Int] = []
         var visibilityState = GenerationVisibilityState(
             policy: visibilityPolicy,
-            emitsReasoning: parameters.reasoning.visibility == .separate
+            emitsReasoning: parameters.reasoning.visibility == .separate,
+            startsInsideReasoning: startsInsideReasoning
         )
 
         func emitBufferedChunkIfNeeded(force: Bool = false) {
@@ -969,6 +1010,10 @@ public final class LanguageModelContext: @unchecked Sendable {
             firstToken,
             maxContextSize: resolvedParameters.repetitionContextSize
         )
+        let startsInsideReasoning = startsGenerationInsideReasoning(
+            promptTokenIDs: prompt.tokenIDs,
+            parameters: resolvedParameters
+        )
         return AsyncStream { continuation in
             Task {
                 self.streamGeneration(
@@ -979,6 +1024,7 @@ public final class LanguageModelContext: @unchecked Sendable {
                     requestStartTime: startTime,
                     ropePositionOffset: prefillResult.ropePositionOffset,
                     parameters: resolvedParameters,
+                    startsInsideReasoning: startsInsideReasoning,
                     continuation: continuation
                 )
             }
@@ -1013,6 +1059,10 @@ public final class LanguageModelContext: @unchecked Sendable {
             firstToken,
             maxContextSize: resolvedParameters.repetitionContextSize
         )
+        let startsInsideReasoning = startsGenerationInsideReasoning(
+            promptTokenIDs: promptSnapshot.promptTokenTail,
+            parameters: resolvedParameters
+        )
         return AsyncStream { continuation in
             Task {
                 self.streamGeneration(
@@ -1023,6 +1073,7 @@ public final class LanguageModelContext: @unchecked Sendable {
                     requestStartTime: startTime,
                     ropePositionOffset: promptSnapshot.ropePositionOffset,
                     parameters: resolvedParameters,
+                    startsInsideReasoning: startsInsideReasoning,
                     continuation: continuation
                 )
             }
@@ -1468,6 +1519,10 @@ public final class LanguageModelContext: @unchecked Sendable {
             samplingState: streamingSamplingState,
             ropePositionOffset: prefillResult.ropePositionOffset,
             parameters: resolvedParameters,
+            startsInsideReasoning: startsGenerationInsideReasoning(
+                promptTokenIDs: prompt.tokenIDs,
+                parameters: resolvedParameters
+            ),
             collectionMode: .visibleOnly
         )
     }
@@ -1497,6 +1552,10 @@ public final class LanguageModelContext: @unchecked Sendable {
             samplingState: streamingSamplingState,
             ropePositionOffset: promptState.ropePositionOffset,
             parameters: resolvedParameters,
+            startsInsideReasoning: startsGenerationInsideReasoning(
+                promptTokenIDs: promptState.promptTokenTail,
+                parameters: resolvedParameters
+            ),
             collectionMode: .visibleOnly
         )
     }
@@ -1525,6 +1584,7 @@ public final class LanguageModelContext: @unchecked Sendable {
             samplingState: streamingSamplingState,
             ropePositionOffset: prefillResult.ropePositionOffset,
             parameters: resolvedParameters,
+            startsInsideReasoning: false,
             collectionMode: .raw
         )
     }
@@ -2683,6 +2743,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         samplingState initialSamplingState: GenerationSamplingState,
         ropePositionOffset: Int,
         parameters: GenerationParameters,
+        startsInsideReasoning: Bool,
         collectionMode: GeneratedTokenCollectionMode
     ) throws -> [Int] {
         var samplingState = initialSamplingState
@@ -2700,7 +2761,8 @@ public final class LanguageModelContext: @unchecked Sendable {
             ? maxRequestedTokens
             : maxRawTokenCount(
                 forVisibleLimit: maxRequestedTokens,
-                visibilityPolicy: visibilityPolicy
+                visibilityPolicy: visibilityPolicy,
+                reasoningVisibility: parameters.reasoning.visibility
             )
         var rawTokenIDs: [Int] = []
 
@@ -2741,7 +2803,8 @@ public final class LanguageModelContext: @unchecked Sendable {
             }
             var visibilityState = GenerationVisibilityState(
                 policy: visibilityPolicy,
-                emitsReasoning: false
+                emitsReasoning: false,
+                startsInsideReasoning: startsInsideReasoning
             )
             let rawText = self.modelTokenizer.decode(tokens: rawTokenIDs, skipSpecialTokens: false)
             var visibleText = visibilityState.append(decodedText: rawText).answer
@@ -2759,9 +2822,11 @@ public final class LanguageModelContext: @unchecked Sendable {
 
     private func maxRawTokenCount(
         forVisibleLimit visibleLimit: Int,
-        visibilityPolicy: ThinkingTagPolicy?
+        visibilityPolicy: ThinkingTagPolicy?,
+        reasoningVisibility: ReasoningOptions.Visibility
     ) -> Int {
         guard visibilityPolicy != nil else { return visibleLimit }
+        guard reasoningVisibility != .separate else { return visibleLimit }
         return max(visibleLimit * 256, visibleLimit + 1024)
     }
 
@@ -3013,9 +3078,14 @@ struct GenerationVisibilityState {
     private(set) var didSuppressReasoning = false
     private var pendingText = ""
 
-    init(policy: ThinkingTagPolicy?, emitsReasoning: Bool) {
+    init(
+        policy: ThinkingTagPolicy?,
+        emitsReasoning: Bool,
+        startsInsideReasoning: Bool = false
+    ) {
         self.policy = policy
         self.emitsReasoning = emitsReasoning
+        self.suppressingReasoning = policy != nil && startsInsideReasoning
     }
 
     mutating func append(decodedText: String) -> GenerationChannelOutput {

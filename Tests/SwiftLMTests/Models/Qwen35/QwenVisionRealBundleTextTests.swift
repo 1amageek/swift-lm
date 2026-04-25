@@ -92,4 +92,108 @@ struct QwenVisionRealBundleTextTests {
         #expect(streamedText == visibleText)
         #expect(!visibleText.isEmpty)
     }
+
+    @Test("Real Qwen3.5 bundle emits prompt-opened thinking separately", .timeLimit(.minutes(10)))
+    func realBundleChatThinkingSeparate() async throws {
+        guard let directory = try QwenVisionTestSupport.optionalRealQwen3VLDirectory() else {
+            print("[Skip] No local Qwen3.5 snapshot found")
+            return
+        }
+        let loaded = try await ModelBundleLoader().load(directory: directory)
+        let container = try LanguageModelContext(loaded)
+
+        let parameters = GenerationParameters(
+            maxTokens: 32,
+            streamChunkTokenCount: 1,
+            temperature: 0,
+            reasoning: .separate
+        )
+        let prepared = try await container.prepare(ModelInput(
+            chat: [
+                .user([.text("Hello")])
+            ],
+            promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
+        ))
+        print("[Qwen3.5 separate rendered text suffix]")
+        print(String(prepared.renderedText.suffix(120)))
+        let prompt = try ExecutablePrompt(preparedPrompt: prepared, using: container)
+
+        container.resetState()
+        let stream = try container.generate(from: prompt, parameters: parameters)
+        var answer = ""
+        var reasoning = ""
+        for await generation in stream {
+            if let chunk = generation.text {
+                answer += chunk
+            }
+            if let chunk = generation.reasoning {
+                reasoning += chunk
+            }
+        }
+
+        print("[Qwen3.5 separate answer prefix]")
+        print(String(answer.prefix(400)))
+        print("[Qwen3.5 separate reasoning prefix]")
+        print(String(reasoning.prefix(400)))
+
+        #expect(prepared.renderedText.hasSuffix("<think>\n"))
+        #expect(answer.isEmpty)
+        #expect(!reasoning.isEmpty)
+    }
+
+    @Test("Real Qwen3.5 public generate E2E emits prompt-opened thinking separately", .timeLimit(.minutes(10)))
+    func realBundlePublicGenerateThinkingSeparateE2E() async throws {
+        guard let directory = try QwenVisionTestSupport.optionalRealQwen3VLDirectory() else {
+            print("[Skip] No local Qwen3.5 snapshot found")
+            return
+        }
+        let loaded = try await ModelBundleLoader().load(directory: directory)
+        let container = try LanguageModelContext(loaded)
+
+        let parameters = GenerationParameters(
+            maxTokens: 32,
+            streamChunkTokenCount: 1,
+            temperature: 0,
+            reasoning: .separate
+        )
+
+        container.resetState()
+        let stream = try await container.generate(
+            ModelInput(
+                chat: [
+                    .user([.text("Hello")])
+                ],
+                promptOptions: PromptPreparationOptions(isThinkingEnabled: true)
+            ),
+            parameters: parameters
+        )
+
+        var answer = ""
+        var reasoning = ""
+        var eventKinds: [String] = []
+        for await generation in stream {
+            if let chunk = generation.text {
+                answer += chunk
+                eventKinds.append("text")
+            }
+            if let chunk = generation.reasoning {
+                reasoning += chunk
+                eventKinds.append("reasoning")
+            }
+        }
+
+        print("[Qwen3.5 E2E separate event kinds]")
+        print(eventKinds.joined(separator: ","))
+        print("[Qwen3.5 E2E separate answer prefix]")
+        print(String(answer.prefix(400)))
+        print("[Qwen3.5 E2E separate reasoning prefix]")
+        print(String(reasoning.prefix(400)))
+
+        #expect(eventKinds.contains("reasoning"))
+        #expect(answer.isEmpty)
+        #expect(!reasoning.isEmpty)
+        #expect(!reasoning.contains("<think>"))
+        #expect(!reasoning.contains("</think>"))
+    }
+
 }

@@ -29,11 +29,45 @@ struct GenerationThinkingOptionsTests {
         #expect(trailing.answer.isEmpty)
     }
 
+    @Test("separate mode can start inside prompt-opened reasoning")
+    func separateModeStartsInsideReasoning() {
+        var state = GenerationVisibilityState(
+            policy: policy,
+            emitsReasoning: true,
+            startsInsideReasoning: true
+        )
+
+        let emitted = state.append(decodedText: "plan</think>answer")
+        let trailing = state.finalize()
+
+        #expect(emitted.reasoning == "plan")
+        #expect(emitted.answer == "answer")
+        #expect(trailing.reasoning.isEmpty)
+        #expect(trailing.answer.isEmpty)
+    }
+
     @Test("hidden mode suppresses reasoning from visible output")
     func hiddenModeSuppressesReasoning() {
         var state = GenerationVisibilityState(policy: policy, emitsReasoning: false)
 
         let emitted = state.append(decodedText: "<think>plan</think>answer")
+        let trailing = state.finalize()
+
+        #expect(emitted.reasoning.isEmpty)
+        #expect(emitted.answer == "answer")
+        #expect(trailing.reasoning.isEmpty)
+        #expect(trailing.answer.isEmpty)
+    }
+
+    @Test("hidden mode can start inside prompt-opened reasoning")
+    func hiddenModeStartsInsideReasoning() {
+        var state = GenerationVisibilityState(
+            policy: policy,
+            emitsReasoning: false,
+            startsInsideReasoning: true
+        )
+
+        let emitted = state.append(decodedText: "plan</think>answer")
         let trailing = state.finalize()
 
         #expect(emitted.reasoning.isEmpty)
