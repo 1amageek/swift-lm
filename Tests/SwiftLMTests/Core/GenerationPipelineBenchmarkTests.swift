@@ -725,23 +725,7 @@ private enum GenerationPipelineBenchmarkSupport {
     }
 
     static func findModelDirectory() throws -> URL {
-        let directCandidates = [
-            "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking",
-        ]
-
-        for candidate in directCandidates {
-            let directory = URL(fileURLWithPath: candidate)
-            let configPath = directory.appendingPathComponent("config.json")
-            let tokenizerPath = directory.appendingPathComponent("tokenizer.json")
-            do {
-                _ = try Data(contentsOf: configPath)
-                _ = try Data(contentsOf: tokenizerPath)
-            } catch {
-                continue
-            }
-            return directory
-        }
-
+        // Resolve from HF cache only — model bundles live under ~/.cache/huggingface/hub/.
         let candidates = [
             "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct",
             "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B",

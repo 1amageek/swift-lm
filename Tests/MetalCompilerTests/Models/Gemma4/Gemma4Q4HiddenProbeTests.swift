@@ -20,8 +20,12 @@ import ModelDeclarations
 @Suite("Gemma4 Q4 Hidden Probe", .serialized)
 struct Gemma4Q4HiddenProbeTests {
 
-    static let bf16BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it"
-    static let q4BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it-4bit"
+    static var bf16BundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--google--gemma-4-E2B-it") ?? ""
+    }
+    static var q4BundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--mlx-community--gemma-4-e2b-it-4bit") ?? ""
+    }
 
     @Test("Q4 vs BF16 per-layer hidden divergence (prompt_A)")
     func q4LayerDivergence() throws {

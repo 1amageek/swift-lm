@@ -6,8 +6,10 @@ import Testing
 #if ENABLE_METAL_PROBES
 @Suite("Decode ConvState Diagnostics", .serialized)
 struct DecodeConvStateDiagnosticTests {
-    private static let referencePath = "/Users/1amageek/Desktop/swift-lm/TestData/lfm2_reference.safetensors"
-    private static let stafPath = "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf"
+    private static var referencePath: String {
+        "\(BenchmarkSupport.testDataPath)/lfm2_reference.safetensors"
+    }
+    private static var stafPath: String { BenchmarkSupport.stafPath }
     private static let promptTokens: [Int32] = [1, 1, 6, 6423, 708]
 
     private struct TestEnvironment {

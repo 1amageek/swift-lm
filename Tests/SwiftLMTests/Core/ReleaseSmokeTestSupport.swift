@@ -1,23 +1,17 @@
 import Foundation
 
 enum ReleaseSmokeTestSupport {
-    static let localModelDirectory = URL(
-        fileURLWithPath: #filePath
-    )
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .deletingLastPathComponent()
-    .appendingPathComponent("TestData/LFM2.5-1.2B-Thinking")
-
+    /// Resolves the LFM2.5-1.2B-Thinking bundle from the HuggingFace cache
+    /// (`~/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Thinking/...`).
+    /// Returns `nil` when the bundle has not been downloaded so callers can
+    /// skip — never substitute a project-local path per CLAUDE.md.
     static func readableLocalModelDirectoryOrSkip() -> URL? {
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        do {
-            _ = try Data(contentsOf: configURL)
-            return localModelDirectory
-        } catch {
-            print("[Skip] Local release smoke bundle is not readable at \(localModelDirectory.path): \(error)")
+        guard let snapshot = HFCacheLocator.resolveSnapshotPath(
+            repoDirectoryName: "models--LiquidAI--LFM2.5-1.2B-Thinking"
+        ) else {
+            print("[Skip] LFM2.5-1.2B-Thinking not cached. Run `huggingface-cli download LiquidAI/LFM2.5-1.2B-Thinking`.")
             return nil
         }
+        return URL(fileURLWithPath: snapshot)
     }
 }

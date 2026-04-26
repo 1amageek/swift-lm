@@ -30,13 +30,31 @@ public struct ModelBundleLoader: Sendable {
 
     public init() {}
 
+    /// HuggingFace Hub の標準キャッシュルート (`~/.cache/huggingface/hub/`)。
+    ///
+    /// swift-transformers の `HubApi` はデフォルトで `~/Documents/huggingface/`
+    /// に書き込むが、macOS では Documents が TCC 保護下にあり sandbox アプリから
+    /// 書き込めない。Python の `huggingface_hub` と同じレイアウトに揃えること
+    /// で、Swift / Python / 他言語ランタイム間でモデルキャッシュを共有できる。
+    private static let huggingFaceHubRoot: URL = {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        return home
+            .appendingPathComponent(".cache", isDirectory: true)
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("hub", isDirectory: true)
+    }()
+
+    private static func makeHubApi() -> HubApi {
+        HubApi(downloadBase: huggingFaceHubRoot)
+    }
+
     /// Load a model from a HuggingFace repository.
     public func load(
         repo: String,
         inferencePolicy: InferencePolicy = .default,
         progress: Progress? = nil
     ) async throws -> LanguageModelContainer {
-        let hubApi = HubApi()
+        let hubApi = Self.makeHubApi()
         let repoId = Hub.Repo(id: repo)
         let directory = try await hubApi.snapshot(from: repoId, matching: [
             "config.json", "tokenizer.json", "tokenizer_config.json",
@@ -55,7 +73,7 @@ public struct ModelBundleLoader: Sendable {
         inferencePolicy: InferencePolicy = .default,
         progress: Progress? = nil
     ) async throws -> TextEmbeddingContainer {
-        let hubApi = HubApi()
+        let hubApi = Self.makeHubApi()
         let repoId = Hub.Repo(id: repo)
         let directory = try await hubApi.snapshot(
             from: repoId,

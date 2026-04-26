@@ -6,12 +6,16 @@ import Testing
 #if ENABLE_METAL_PROBES
 /// Gemma 4 E2B Q4-weight benchmarks.
 ///
-/// Source bundle: mlx-community/gemma-4-e2b-it-4bit (Q4 affine, group_size=64).
+/// Source bundle: mlx-community/gemma-4-e2b-it-4bit (Q4 affine, group_size=64),
+/// resolved from the HuggingFace cache. Run
+/// `huggingface-cli download mlx-community/gemma-4-e2b-it-4bit` if missing.
 /// Paired with Gemma4BenchmarkTests (BF16) for A/B weight-quantization comparison.
 @Suite("Gemma4 Q4 Benchmark", .serialized)
 struct Gemma4Q4BenchmarkTests {
 
-    static let bundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it-4bit"
+    static var bundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--mlx-community--gemma-4-e2b-it-4bit") ?? ""
+    }
     static let modelLabel = "Gemma4-E2B-Q4"
 
     @Test("MLX-aligned prefill + decode throughput (3-run median)")

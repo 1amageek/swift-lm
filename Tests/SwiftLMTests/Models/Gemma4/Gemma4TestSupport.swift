@@ -18,22 +18,6 @@ enum Gemma4TestSupport {
     }
 
     static func optionalRealGemma4Directory() throws -> URL? {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let directCandidates = [
-            repositoryRoot.appendingPathComponent("TestData/gemma-4-E2B-it").path,
-        ]
-        for candidate in directCandidates {
-            let directory = URL(fileURLWithPath: candidate)
-            if try isUsableModelDirectory(directory) {
-                return directory
-            }
-        }
-
         let envCandidates = [
             ProcessInfo.processInfo.environment["SWIFTLM_GEMMA4_DIR"],
             ProcessInfo.processInfo.environment["SWIFTLM_GEMMA4_E2B_DIR"],
@@ -45,11 +29,7 @@ enum Gemma4TestSupport {
             }
         }
 
-        let hubRoot = URL(
-            fileURLWithPath: NSString(
-                string: "~/.cache/huggingface/hub"
-            ).expandingTildeInPath
-        )
+        let hubRoot = URL(fileURLWithPath: HFCacheLocator.hubRoot)
         guard FileManager.default.fileExists(atPath: hubRoot.path) else {
             return nil
         }

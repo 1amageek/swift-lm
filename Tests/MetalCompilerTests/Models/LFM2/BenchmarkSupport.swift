@@ -66,13 +66,30 @@ enum BenchmarkSupport {
         .deletingLastPathComponent()
         .deletingLastPathComponent()
 
+    /// `TestData/` is the in-tree (git-ignored) holding pen for **reference
+    /// tensors and diagnostic outputs only** — never model bundles. Model
+    /// bundles must live under `~/.cache/huggingface/hub/` per CLAUDE.md.
     static let testDataPath = repositoryRoot.appendingPathComponent("TestData").path
-    static let lfmBundlePath = repositoryRoot
-        .appendingPathComponent("TestData/LFM2.5-1.2B-Thinking")
-        .path
-    static let stafPath = repositoryRoot
-        .appendingPathComponent("TestData/LFM2.5-1.2B-Thinking/model.staf")
-        .path
+
+    /// LFM2.5-1.2B-Thinking 推論バンドルの HF cache 上の snapshot ディレクトリ。
+    /// `huggingface-cli download LiquidAI/LFM2.5-1.2B-Thinking` でダウンロードされた
+    /// 標準レイアウト (`models--LiquidAI--LFM2.5-1.2B-Thinking/snapshots/<sha>/`)
+    /// を辿る。未取得なら `nil` を返し、呼び出し側で skip する。
+    static var lfmBundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--LiquidAI--LFM2.5-1.2B-Thinking")
+            ?? "" // empty path → FileManager.fileExists will return false → skip
+    }
+
+    /// STAF 実行キャッシュは snapshot ディレクトリ内に書く (`model.staf`)。
+    /// HF symlink レイアウトと共存するが、書き込み対象は snapshot ディレクトリ
+    /// 自身であり symlink を経由しないため副作用はない。
+    static var stafPath: String {
+        let bundle = lfmBundlePath
+        return bundle.isEmpty ? "" : "\(bundle)/model.staf"
+    }
+
+    /// Diagnostic output is allowed in `TestData/` per the placement rule
+    /// (reference tensors and diagnostic outputs only).
     static let outputPath = repositoryRoot
         .appendingPathComponent("TestData/benchmark.txt")
         .path

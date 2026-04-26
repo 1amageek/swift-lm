@@ -5,10 +5,13 @@ import Testing
 
 @Suite("Chat Template Rendering", .serialized)
 struct ChatTemplateRenderingTests {
-    private static let lfmDirectory = ReleaseSmokeTestSupport.localModelDirectory
-    private static let gemmaDirectory = URL(
-        fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it"
-    )
+    private static var lfmDirectory: URL? {
+        ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip()
+    }
+    private static var gemmaDirectory: URL? {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--google--gemma-4-E2B-it")
+            .map(URL.init(fileURLWithPath:))
+    }
 
     @Test("Synthesized Gemma4 template preserves official turn markers and thinking control")
     func synthesizedGemma4TemplatePreservesOfficialMarkers() throws {
@@ -71,9 +74,13 @@ struct ChatTemplateRenderingTests {
 
     @Test("Official Gemma4 template injects think control in the first system turn")
     func officialGemma4TemplateInjectsThinkControl() throws {
-        let templateURL = Self.gemmaDirectory.appendingPathComponent("chat_template.jinja")
+        guard let gemmaDirectory = Self.gemmaDirectory else {
+            print("[Skip] gemma-4-E2B-it not cached. Run `huggingface-cli download google/gemma-4-E2B-it`.")
+            return
+        }
+        let templateURL = gemmaDirectory.appendingPathComponent("chat_template.jinja")
         guard FileManager.default.fileExists(atPath: templateURL.path) else {
-            print("[Skip] No local official Gemma4 chat_template.jinja found")
+            print("[Skip] No official Gemma4 chat_template.jinja in snapshot")
             return
         }
 
@@ -99,14 +106,18 @@ struct ChatTemplateRenderingTests {
 
     @Test("prepare rejects conflicting thinking controls between prompt options and template variables", .timeLimit(.minutes(2)))
     func prepareRejectsConflictingThinkingControls() async throws {
-        let configURL = Self.gemmaDirectory.appendingPathComponent("config.json")
+        guard let gemmaDirectory = Self.gemmaDirectory else {
+            print("[Skip] gemma-4-E2B-it not cached. Run `huggingface-cli download google/gemma-4-E2B-it`.")
+            return
+        }
+        let configURL = gemmaDirectory.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local Gemma4 bundle found at \(Self.gemmaDirectory.path)")
+            print("[Skip] No Gemma4 config.json in snapshot at \(gemmaDirectory.path)")
             return
         }
 
         let loader = ModelBundleLoader()
-        let session = try await loader.load(directory: Self.gemmaDirectory)
+        let session = try await loader.load(directory: gemmaDirectory)
 
         do {
             _ = try await session.prepare(
@@ -131,14 +142,15 @@ struct ChatTemplateRenderingTests {
 
     @Test("LFM Jinja chat template renders plain text content, not JSON payloads", .timeLimit(.minutes(2)))
     func lfmJinjaTemplateRendersPlainTextContent() async throws {
-        let configURL = Self.lfmDirectory.appendingPathComponent("config.json")
+        guard let lfmDirectory = Self.lfmDirectory else { return }
+        let configURL = lfmDirectory.appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(Self.lfmDirectory.path)")
+            print("[Skip] No LFM config.json in snapshot at \(lfmDirectory.path)")
             return
         }
 
         let loader = ModelBundleLoader()
-        let container = try await loader.load(directory: Self.lfmDirectory)
+        let container = try await loader.load(directory: lfmDirectory)
         let prepared = try await container.prepare( ModelInput(chat: [
                 .user([.text("What is the capital of Japan? Answer with exactly one word.")])
             ])

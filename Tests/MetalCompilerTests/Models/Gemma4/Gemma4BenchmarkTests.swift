@@ -7,11 +7,15 @@ import Testing
 /// Gemma 4 E2B throughput benchmarks.
 ///
 /// Mirrors the LFM2.5 benchmark suite structure so results are directly comparable.
-/// The model bundle is expected at TestData/gemma-4-E2B-it/.
+/// The model bundle is resolved from the HuggingFace cache
+/// (`~/.cache/huggingface/hub/models--google--gemma-4-E2B-it/...`).
+/// Run `huggingface-cli download google/gemma-4-E2B-it` if missing.
 @Suite("Gemma4 Benchmark", .serialized)
 struct Gemma4BenchmarkTests {
 
-    static let bundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it"
+    static var bundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--google--gemma-4-E2B-it") ?? ""
+    }
     static let modelLabel = "Gemma4-E2B"
 
     @Test("Prefill throughput (tok/s)")

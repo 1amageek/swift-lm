@@ -17,8 +17,12 @@ import Testing
 @Suite("Gemma4 Q6 Agreement", .serialized)
 struct Gemma4Q6AgreementTests {
 
-    static let bf16BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it"
-    static let q6BundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it-6bit"
+    static var bf16BundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--google--gemma-4-E2B-it") ?? ""
+    }
+    static var q6BundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--local--gemma-4-E2B-it-6bit") ?? ""
+    }
 
     @Test("Q6 vs BF16 token diversity (3 prompts × 30 decode steps)")
     func q6VersusBFloat16Agreement() throws {

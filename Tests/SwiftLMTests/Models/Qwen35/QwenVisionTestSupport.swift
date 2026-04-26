@@ -116,17 +116,7 @@ enum QwenVisionTestSupport {
     }
 
     static func localTextBundleDirectory() throws -> URL? {
-        let directCandidates = [
-            "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking",
-        ]
-
-        for candidate in directCandidates {
-            let directory = URL(fileURLWithPath: candidate)
-            if try isUsableModelDirectory(directory) {
-                return directory
-            }
-        }
-
+        // Resolve from HF cache only — model bundles live under ~/.cache/huggingface/hub/.
         let cacheCandidates = [
             "~/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Thinking",
             "~/.cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B",

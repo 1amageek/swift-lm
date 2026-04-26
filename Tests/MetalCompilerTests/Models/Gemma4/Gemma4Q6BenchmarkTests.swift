@@ -6,13 +6,17 @@ import Testing
 #if ENABLE_METAL_PROBES
 /// Gemma 4 E2B Q6-weight benchmarks.
 ///
-/// Source bundle: locally converted gemma-4-E2B-it Q6 (affine, group_size=32).
+/// Source bundle: locally converted gemma-4-E2B-it Q6 (affine, group_size=32),
+/// placed in HF cache layout under
+/// `~/.cache/huggingface/hub/models--local--gemma-4-E2B-it-6bit/snapshots/<sha>/`.
 /// Paired with Gemma4BenchmarkTests (BF16) and Gemma4Q4BenchmarkTests (Q4) for
 /// A/B weight-quantization comparison.
 @Suite("Gemma4 Q6 Benchmark", .serialized)
 struct Gemma4Q6BenchmarkTests {
 
-    static let bundlePath = "/Users/1amageek/Desktop/swift-lm/TestData/gemma-4-E2B-it-6bit"
+    static var bundlePath: String {
+        HFCacheLocator.resolveSnapshotPath(repoDirectoryName: "models--local--gemma-4-E2B-it-6bit") ?? ""
+    }
     static let modelLabel = "Gemma4-E2B-Q6"
 
     @Test("MLX-aligned prefill + decode throughput (3-run median)")

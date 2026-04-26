@@ -10,7 +10,9 @@ import LMIR
 ///
 /// Prerequisites:
 ///   1. Generate reference: `python3 scripts/hf/dump_lfm2_reference.py`
-///   2. Have the STAF file in TestData/LFM2.5-1.2B-Thinking/model.staf
+///   2. Have LFM2.5-1.2B-Thinking cached in HF hub:
+///      `huggingface-cli download LiquidAI/LFM2.5-1.2B-Thinking`
+///      The STAF file is generated lazily next to the snapshot.
 #if ENABLE_METAL_PROBES
 @Suite("Reference Comparison", .serialized)
 struct ReferenceComparisonTests {

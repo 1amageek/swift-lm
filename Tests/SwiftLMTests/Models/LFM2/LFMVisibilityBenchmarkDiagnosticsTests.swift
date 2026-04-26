@@ -246,20 +246,6 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
     }
 
     private static func optionalLFMThinkingDirectory() throws -> URL? {
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let directCandidates = [
-            repositoryRoot.appendingPathComponent("TestData/LFM2.5-1.2B-Thinking"),
-            URL(fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking")
-        ]
-        for candidate in directCandidates where try isUsableModelDirectory(candidate) {
-            return candidate
-        }
-
         let envCandidates = [
             ProcessInfo.processInfo.environment["SWIFTLM_LFM_THINKING_DIR"],
             ProcessInfo.processInfo.environment["SWIFTLM_LFM25_THINKING_DIR"]
@@ -271,16 +257,7 @@ struct LFMVisibilityBenchmarkDiagnosticsTests {
             }
         }
 
-        let cacheRoot = URL(
-            fileURLWithPath: NSString(
-                string: "~/.cache/huggingface/hub/models--LiquidAI--LFM2.5-1.2B-Thinking"
-            ).expandingTildeInPath
-        )
-        let snapshots = try snapshotDirectories(baseURL: cacheRoot)
-        for snapshot in snapshots where try isUsableModelDirectory(snapshot) {
-            return snapshot
-        }
-        return nil
+        return ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip()
     }
 
     private static func snapshotDirectories(baseURL: URL) throws -> [URL] {

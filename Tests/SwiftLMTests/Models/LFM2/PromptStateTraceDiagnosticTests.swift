@@ -6,12 +6,7 @@ import Testing
 struct PromptStateTraceDiagnosticTests {
     @Test("Inspect LFM prompt-state trace", .timeLimit(.minutes(10)))
     func inspectLFMPromptStateTrace() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else {
             return
         }
 
@@ -62,12 +57,7 @@ struct PromptStateTraceDiagnosticTests {
 
     @Test("Inspect LFM repeated greedy determinism", .timeLimit(.minutes(10)))
     func inspectLFMRepeatedGreedyDeterminism() async throws {
-        let localModelDirectory = URL(
-            fileURLWithPath: "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking"
-        )
-        let configURL = localModelDirectory.appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configURL.path) else {
-            print("[Skip] No local LFM bundle found at \(localModelDirectory.path)")
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else {
             return
         }
 

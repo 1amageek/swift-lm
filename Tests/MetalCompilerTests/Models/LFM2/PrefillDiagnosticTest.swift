@@ -11,9 +11,13 @@ import LMIR
 @Suite("Prefill Diagnostic")
 struct PrefillDiagnosticTest {
 
-    private static let referencePath = "/Users/1amageek/Desktop/swift-lm/TestData/lfm2_reference.safetensors"
-    private static let stafPath = "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf"
-    private static let outputPath = "/Users/1amageek/Desktop/swift-lm/TestData/prefill_diagnostic.txt"
+    private static var referencePath: String {
+        "\(BenchmarkSupport.testDataPath)/lfm2_reference.safetensors"
+    }
+    private static var stafPath: String { BenchmarkSupport.stafPath }
+    private static var outputPath: String {
+        "\(BenchmarkSupport.testDataPath)/prefill_diagnostic.txt"
+    }
 
     @Test("Step-by-step prefill diagnostic with per-layer comparison",
           .disabled("Pre-migration diagnostic: accesses storageModePrivate scratch buffer via contents()"))

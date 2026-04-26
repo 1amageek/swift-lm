@@ -6,8 +6,10 @@ import Foundation
 #if ENABLE_METAL_PROBES
 @Suite("Decode Precision Diagnostics", .serialized)
 struct DecodePrecisionDiagnosticTests {
-    private static let referencePath = "/Users/1amageek/Desktop/swift-lm/TestData/lfm2_reference.safetensors"
-    private static let stafPath = "/Users/1amageek/Desktop/swift-lm/TestData/LFM2.5-1.2B-Thinking/model.staf"
+    private static var referencePath: String {
+        "\(BenchmarkSupport.testDataPath)/lfm2_reference.safetensors"
+    }
+    private static var stafPath: String { BenchmarkSupport.stafPath }
 
     private struct TestEnvironment {
         var model: MetalInferenceModel
