@@ -1,19 +1,36 @@
 import Metal
+import CryptoKit
 
+/// Process-wide pipeline cache keyed by `(MSL source hash, function name)`.
+///
+/// Sharing pipelines across containers requires that the cache key uniquely
+/// identifies the compiled bytecode. Keying by function name alone is unsafe
+/// because two unrelated containers (e.g. a synthetic test container and a
+/// real model container) can emit functions with the same name but different
+/// MSL bodies, dimensions, or threadgroup parameters. Returning a pipeline
+/// compiled for one library to a caller using the other produces deterministic
+/// data corruption — the GPU happily runs the wrong code with the wrong
+/// constants. Hashing the full source guarantees pipelines are reused only
+/// when the producing MSL is byte-identical.
 private enum SharedPipelineCache {
     private static let lock = NSLock()
     nonisolated(unsafe) private static var pipelines: [String: MTLComputePipelineState] = [:]
 
-    static func pipeline(named name: String) -> MTLComputePipelineState? {
+    static func pipeline(forKey key: String) -> MTLComputePipelineState? {
         lock.lock()
         defer { lock.unlock() }
-        return pipelines[name]
+        return pipelines[key]
     }
 
-    static func store(_ pipeline: MTLComputePipelineState, named name: String) {
+    static func store(_ pipeline: MTLComputePipelineState, forKey key: String) {
         lock.lock()
-        pipelines[name] = pipeline
+        pipelines[key] = pipeline
         lock.unlock()
+    }
+
+    static func sourceDigest(_ source: String) -> String {
+        let digest = SHA256.hash(data: Data(source.utf8))
+        return digest.lazy.map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -40,8 +57,9 @@ struct MetalPipelineCompiler {
             generated: generated,
             library: baseLibrary
         )
+        let baseSourceDigest = SharedPipelineCache.sourceDigest(generated.baseSource)
         let basePipelineStart = CFAbsoluteTimeGetCurrent()
-        let baseResult = try makeBasePipelineCache(from: baseLibrary)
+        let baseResult = try makeBasePipelineCache(from: baseLibrary, sourceDigest: baseSourceDigest)
         let basePipelineTime = CFAbsoluteTimeGetCurrent() - basePipelineStart
         InternalLog.info("[Prewarm/Pipeline] \(label) base PSO loop: \(String(format: "%.3f", basePipelineTime))s (\(baseResult.cacheHits) hits, \(baseResult.cacheMisses) misses)")
         var pipelineCache = baseResult.cache
@@ -68,14 +86,20 @@ struct MetalPipelineCompiler {
         }
 
         do {
+            let mppSource = generated.mppSources.joined(separator: "\n\n")
             let mppLibStart = CFAbsoluteTimeGetCurrent()
             let mppLibrary = try makeLibrary(
-                source: generated.mppSources.joined(separator: "\n\n"),
+                source: mppSource,
                 options: mppCompileOptions())
             let mppLibTime = CFAbsoluteTimeGetCurrent() - mppLibStart
             InternalLog.info("[Prewarm/Pipeline] \(label) mpp makeLibrary: \(String(format: "%.3f", mppLibTime))s (\(mppLibrary.functionNames.count) functions)")
+            let mppSourceDigest = SharedPipelineCache.sourceDigest(mppSource)
             let mppPipelineStart = CFAbsoluteTimeGetCurrent()
-            let mppStats = try mergeMPPipelines(from: mppLibrary, into: &pipelineCache)
+            let mppStats = try mergeMPPipelines(
+                from: mppLibrary,
+                sourceDigest: mppSourceDigest,
+                into: &pipelineCache
+            )
             let mppPipelineTime = CFAbsoluteTimeGetCurrent() - mppPipelineStart
             InternalLog.info("[Prewarm/Pipeline] \(label) mpp PSO loop: \(String(format: "%.3f", mppPipelineTime))s (\(mppStats.cacheHits) hits, \(mppStats.cacheMisses) misses)")
             argumentEncoderCache.merge(
@@ -161,13 +185,16 @@ struct MetalPipelineCompiler {
     }
 
     private func makeBasePipelineCache(
-        from library: MTLLibrary
+        from library: MTLLibrary,
+        sourceDigest: String
     ) throws -> PipelineCacheResult {
         var pipelineCache: [String: MTLComputePipelineState] = [:]
         var hits = 0
         var misses = 0
+        let disableCache = ProcessInfo.processInfo.environment["SWIFTLM_DISABLE_PIPELINE_CACHE"] == "1"
         for name in library.functionNames {
-            if let cached = SharedPipelineCache.pipeline(named: name) {
+            let cacheKey = "\(sourceDigest)::\(name)"
+            if !disableCache, let cached = SharedPipelineCache.pipeline(forKey: cacheKey) {
                 pipelineCache[name] = cached
                 hits += 1
                 continue
@@ -177,7 +204,9 @@ struct MetalPipelineCompiler {
             }
             let pipeline = try makePipeline(function: function, label: name)
             pipelineCache[name] = pipeline
-            SharedPipelineCache.store(pipeline, named: name)
+            if !disableCache {
+                SharedPipelineCache.store(pipeline, forKey: cacheKey)
+            }
             misses += 1
         }
         return PipelineCacheResult(cache: pipelineCache, cacheHits: hits, cacheMisses: misses)
@@ -185,13 +214,15 @@ struct MetalPipelineCompiler {
 
     private func mergeMPPipelines(
         from library: MTLLibrary,
+        sourceDigest: String,
         into pipelineCache: inout [String: MTLComputePipelineState]
     ) throws -> PipelineCacheStats {
         var hits = 0
         var misses = 0
+        let disableCache = ProcessInfo.processInfo.environment["SWIFTLM_DISABLE_PIPELINE_CACHE"] == "1"
         for name in library.functionNames {
-            let cacheKey = "mpp::\(name)"
-            if let cached = SharedPipelineCache.pipeline(named: cacheKey) {
+            let cacheKey = "\(sourceDigest)::mpp::\(name)"
+            if !disableCache, let cached = SharedPipelineCache.pipeline(forKey: cacheKey) {
                 pipelineCache[name] = cached
                 hits += 1
                 continue
@@ -201,7 +232,9 @@ struct MetalPipelineCompiler {
             }
             let pipeline = try makePipeline(function: function, label: name)
             pipelineCache[name] = pipeline
-            SharedPipelineCache.store(pipeline, named: cacheKey)
+            if !disableCache {
+                SharedPipelineCache.store(pipeline, forKey: cacheKey)
+            }
             misses += 1
         }
         return PipelineCacheStats(cacheHits: hits, cacheMisses: misses)

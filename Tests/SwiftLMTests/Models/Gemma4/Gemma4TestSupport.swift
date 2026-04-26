@@ -14,7 +14,12 @@ enum Gemma4TestSupport {
     }
 
     static func realGemma4Container() async throws -> LanguageModelContext? {
-        try await Gemma4RealBundleCache.shared.container()
+        // Release the synthetic container before building the real one so
+        // sequential tests don't keep two large MTLBuffer-backed containers
+        // resident in unified memory simultaneously. Correctness no longer
+        // depends on this — SharedPipelineCache is keyed by MSL source hash.
+        await Gemma4SyntheticContainerCache.shared.releaseCachedContainer()
+        return try await Gemma4RealBundleCache.shared.container()
     }
 
     static func optionalRealGemma4Directory() throws -> URL? {
@@ -421,8 +426,17 @@ enum Gemma4TestSupport {
 
 private actor Gemma4SyntheticContainerCache {
     static let shared = Gemma4SyntheticContainerCache()
+    private var cachedContainer: LanguageModelContext?
+
+    func releaseCachedContainer() {
+        cachedContainer = nil
+    }
 
     func container() async throws -> LanguageModelContext? {
+        if let cachedContainer {
+            cachedContainer.resetState()
+            return cachedContainer
+        }
         guard let device = MTLCreateSystemDefaultDevice() else {
             return nil
         }
@@ -473,6 +487,7 @@ private actor Gemma4SyntheticContainerCache {
             vocabularySize: config.vocabSize,
             gemma4Runtime: try Gemma4TestSupport.syntheticRuntime(hiddenSize: hiddenSize)
         )
+        cachedContainer = container
         return container
     }
 }

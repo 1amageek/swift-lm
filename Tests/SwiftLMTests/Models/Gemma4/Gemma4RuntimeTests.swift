@@ -226,6 +226,14 @@ struct Gemma4RuntimeTests {
 
         #expect(reasoningChunks == 0, "hidden mode must not emit reasoning chunks")
         #expect(!answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(
+            answer.contains("Hello"),
+            "hidden answer must contain greeting reply; garbage output indicates state pollution from prior tests"
+        )
+        #expect(
+            !answer.contains("\u{FFFD}"),
+            "hidden answer must not contain replacement character; indicates corrupted decode"
+        )
         #expect(!answer.contains("<|channel>thought"))
         #expect(!answer.contains("<channel|>"))
         #expect(!answer.contains("<|think|>"))
@@ -285,10 +293,14 @@ struct Gemma4RuntimeTests {
             "Thinking model must emit reasoning content; an empty reasoning channel means thinking did not run."
         )
         #expect(!answer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        #expect(
+            answer.contains("Hello") || answer.contains("hello"),
+            "separate answer must contain greeting reply; garbage output indicates state pollution from prior tests"
+        )
         #expect(!answer.contains("<|channel>thought"))
         #expect(!answer.contains("<channel|>"))
         #expect(!answer.contains("<turn|>"))
-        #expect(!answer.contains("�"))
+        #expect(!answer.contains("\u{FFFD}"))
         #expect(!reasoning.contains("<|channel>thought"))
         #expect(!reasoning.contains("<channel|>"))
     }
