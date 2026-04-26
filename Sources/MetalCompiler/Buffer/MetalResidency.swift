@@ -21,11 +21,18 @@ struct MetalResidencyLease: @unchecked Sendable {
         let descriptor = MTLResidencySetDescriptor()
         descriptor.label = label
         let residencySet = try device.makeResidencySet(descriptor: descriptor)
+        let addStart = CFAbsoluteTimeGetCurrent()
         for buffer in uniqueBuffers {
             residencySet.addAllocation(buffer)
         }
+        let addTime = CFAbsoluteTimeGetCurrent() - addStart
+        let commitStart = CFAbsoluteTimeGetCurrent()
         residencySet.commit()
+        let commitTime = CFAbsoluteTimeGetCurrent() - commitStart
+        let requestStart = CFAbsoluteTimeGetCurrent()
         residencySet.requestResidency()
+        let requestTime = CFAbsoluteTimeGetCurrent() - requestStart
+        InternalLog.info("[Prewarm/Residency.\(label)] addAllocation: \(String(format: "%.3f", addTime))s  commit: \(String(format: "%.3f", commitTime))s  requestResidency: \(String(format: "%.3f", requestTime))s")
         return MetalResidencyLease(
             label: label,
             sets: [residencySet],
@@ -100,6 +107,7 @@ struct MetalStableResidencyRegistry: @unchecked Sendable {
         compiledModel: MetalCompiledModel,
         hiddenOverrideConstantBuffer: MTLBuffer
     ) throws {
+        let pruneStart = CFAbsoluteTimeGetCurrent()
         let runtimeBuffers = Self.prune(
             compiledModel.stableRuntimeResidencyBuffers(hiddenOverrideConstantBuffer: hiddenOverrideConstantBuffer),
             excluding: [],
@@ -115,22 +123,35 @@ struct MetalStableResidencyRegistry: @unchecked Sendable {
             excluding: runtimeBuffers + weightBuffers,
             queuePolicy: .allBuffers
         )
+        let pruneTime = CFAbsoluteTimeGetCurrent() - pruneStart
+        InternalLog.info("[Prewarm/Residency] prune: \(String(format: "%.3f", pruneTime))s (runtime=\(runtimeBuffers.count) weights=\(weightBuffers.count) supplemental=\(supplementalBuffers.count))")
 
+        let runtimeStart = CFAbsoluteTimeGetCurrent()
         self.runtimeLease = try MetalResidencyLease.required(
             device: device,
             label: "swift-lm.runtime",
             buffers: runtimeBuffers
         )
+        let runtimeTime = CFAbsoluteTimeGetCurrent() - runtimeStart
+        InternalLog.info("[Prewarm/Residency] runtime lease: \(String(format: "%.3f", runtimeTime))s (\(runtimeBuffers.count) buffers)")
+
+        let weightStart = CFAbsoluteTimeGetCurrent()
         self.weightLease = try MetalResidencyLease.required(
             device: device,
             label: "swift-lm.weights",
             buffers: weightBuffers
         )
+        let weightTime = CFAbsoluteTimeGetCurrent() - weightStart
+        InternalLog.info("[Prewarm/Residency] weight lease: \(String(format: "%.3f", weightTime))s (\(weightBuffers.count) buffers)")
+
+        let supplementalStart = CFAbsoluteTimeGetCurrent()
         self.supplementalLease = try MetalResidencyLease.required(
             device: device,
             label: "swift-lm.supplemental",
             buffers: supplementalBuffers
         )
+        let supplementalTime = CFAbsoluteTimeGetCurrent() - supplementalStart
+        InternalLog.info("[Prewarm/Residency] supplemental lease: \(String(format: "%.3f", supplementalTime))s (\(supplementalBuffers.count) buffers)")
     }
 
     func register(on queue: MTL4CommandQueue) {

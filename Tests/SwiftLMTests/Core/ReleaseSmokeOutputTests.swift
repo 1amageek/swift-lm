@@ -71,6 +71,26 @@ struct ReleaseSmokeOutputTests {
         #expect(rawText.hasPrefix("<think> Okay"))
     }
 
+    @Test("Container.generate reuses prototype context across sequential calls", .timeLimit(.minutes(2)))
+    func containerGenerateReusesPrototypeAcrossSequentialCalls() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else { return }
+
+        let loader = ModelBundleLoader()
+        let container = try await loader.load(directory: localModelDirectory)
+
+        for callIndex in 0..<2 {
+            let stream = try await container.generate(
+                ModelInput(prompt: "hi"),
+                parameters: GenerationParameters(maxTokens: 4, streamChunkTokenCount: 1)
+            )
+            var produced = ""
+            for await event in stream {
+                if case .text(let chunk) = event { produced += chunk }
+            }
+            print("[ContainerGenerate.call#\(callIndex)] produced \(produced.count) chars")
+        }
+    }
+
     @Test("Local LFM hidden thinking chat emits visible final answer", .timeLimit(.minutes(10)))
     func localLFMHiddenThinkingChatEmitsVisibleFinalAnswer() async throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLocalModelDirectoryOrSkip() else { return }

@@ -159,32 +159,62 @@ public struct MetalInferenceModel: @unchecked Sendable {
     }
 
     public init(compiledModel: MetalCompiledModel, device: MTLDevice) throws {
+        let prewarmStart = CFAbsoluteTimeGetCurrent()
         self.compiledModel = compiledModel
+        let submissionStart = CFAbsoluteTimeGetCurrent()
         self.submission = try MetalSubmissionContext(device: device)
+        let submissionTime = CFAbsoluteTimeGetCurrent() - submissionStart
+        InternalLog.info("[Prewarm/Model] submission context: \(String(format: "%.3f", submissionTime))s")
+
+        let prefillExecStart = CFAbsoluteTimeGetCurrent()
         self.prefillExecutor = MetalPrefillExecutor(
             hiddenConversionPipeline: Self.resolveHiddenConversionPipeline(compiledModel),
             kvTransferPipeline: Self.resolveKVTransferPipeline(compiledModel),
             kvTransferConstantBuffer: try Self.makeKVTransferConstantBuffer(device: device)
         )
+        let prefillExecTime = CFAbsoluteTimeGetCurrent() - prefillExecStart
+        InternalLog.info("[Prewarm/Model] prefill executor init: \(String(format: "%.3f", prefillExecTime))s")
+
         self.hiddenOverrideConstantBuffer = try Self.makeHiddenOverrideConstantBuffer(device: device)
+        let registryStart = CFAbsoluteTimeGetCurrent()
         self.stableResidencyRegistry = try MetalStableResidencyRegistry(
             device: device,
             compiledModel: self.compiledModel,
             hiddenOverrideConstantBuffer: self.hiddenOverrideConstantBuffer
         )
+        let registryTime = CFAbsoluteTimeGetCurrent() - registryStart
+        InternalLog.info("[Prewarm/Model] stable residency registry init: \(String(format: "%.3f", registryTime))s")
+
+        let registerStart = CFAbsoluteTimeGetCurrent()
         self.stableResidencyRegistry.register(on: self.submission.queue)
+        let registerTime = CFAbsoluteTimeGetCurrent() - registerStart
+        InternalLog.info("[Prewarm/Model] stable residency register: \(String(format: "%.3f", registerTime))s")
+
+        let zeroDecodeStart = CFAbsoluteTimeGetCurrent()
         try Self.zeroStateBuffers(
             compiledModel.decodePlan.buffers,
             submission: &self.submission,
             residency: self.stableResidencyLease
         )
+        let zeroDecodeTime = CFAbsoluteTimeGetCurrent() - zeroDecodeStart
+        InternalLog.info("[Prewarm/Model] zero decode buffers: \(String(format: "%.3f", zeroDecodeTime))s")
+
         if let prefillPlan = compiledModel.prefillPlan {
+            let zeroPrefillStart = CFAbsoluteTimeGetCurrent()
             try Self.zeroStateBuffers(
                 prefillPlan.buffers,
                 submission: &self.submission,
                 residency: self.stableResidencyLease
             )
+            let zeroPrefillTime = CFAbsoluteTimeGetCurrent() - zeroPrefillStart
+            InternalLog.info("[Prewarm/Model] zero prefill buffers: \(String(format: "%.3f", zeroPrefillTime))s")
         }
+
+        // At this point all GPU command buffers above have completed (waitUntilCompleted: true),
+        // so weight residency promotion / IOMMU mapping is fully paid here in prewarm phase.
+        // First inference call sees pure compute cost only.
+        let prewarmTime = CFAbsoluteTimeGetCurrent() - prewarmStart
+        InternalLog.info("[Prewarm/Model] TOTAL: \(String(format: "%.3f", prewarmTime))s (residency confirmed via GPU sync)")
     }
 
     public init(plan: MetalCompiledModel, device: MTLDevice) throws {

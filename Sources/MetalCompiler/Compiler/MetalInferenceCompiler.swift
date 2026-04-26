@@ -119,9 +119,9 @@ public struct MetalInferenceCompiler: Sendable {
                 .filter { $0.contains("embedding_lookup") || $0.contains("gather") }
                 .sorted()
             if !relatedKernelNames.isEmpty {
-                InternalLog.error("[Compiler] missing kernel '\(resolvedKernelName)'; related compiled kernels: \(relatedKernelNames)")
+                InternalLog.error("[Prewarm/Compiler] missing kernel '\(resolvedKernelName)'; related compiled kernels: \(relatedKernelNames)")
             } else {
-                InternalLog.error("[Compiler] missing kernel '\(resolvedKernelName)'; no embedding-related kernels compiled")
+                InternalLog.error("[Prewarm/Compiler] missing kernel '\(resolvedKernelName)'; no embedding-related kernels compiled")
             }
             throw MetalCompilerError.kernelNotFound(resolvedKernelName)
         }
@@ -534,13 +534,21 @@ public struct MetalInferenceCompiler: Sendable {
             inferencePolicy: inferencePolicy,
             stafWeightStore: stafWeightStore,
             device: device)
+        let walk1Start = CFAbsoluteTimeGetCurrent()
         let initialOptimization = entryCollector.collect(using: initialContext, kernelContext: initialContext.decodeKernelContext)
+        let walk1Time = CFAbsoluteTimeGetCurrent() - walk1Start
+        InternalLog.info("[Prewarm/Compiler] decode walk #1 (initial): \(String(format: "%.3f", walk1Time))s")
+
+        let specializeStart = CFAbsoluteTimeGetCurrent()
         let specializedWeightStore = try prepareSpecializedWeightStore(
             initialContext.stafWeightStore,
             for: initialOptimization.fusedEntries,
             device: initialContext.device,
             accessPolicyResolver: initialContext.accessPolicyResolver
         )
+        let specializeTime = CFAbsoluteTimeGetCurrent() - specializeStart
+        InternalLog.info("[Prewarm/Compiler] specialize weight store: \(String(format: "%.3f", specializeTime))s")
+
         let context = makeCompileContext(
             graph: graph,
             hiddenSize: hiddenSize,
@@ -549,28 +557,42 @@ public struct MetalInferenceCompiler: Sendable {
             inferencePolicy: inferencePolicy,
             stafWeightStore: specializedWeightStore,
             device: device)
+        let walk2Start = CFAbsoluteTimeGetCurrent()
         let optimization = entryCollector.collect(using: context, kernelContext: context.decodeKernelContext)
+        let walk2Time = CFAbsoluteTimeGetCurrent() - walk2Start
+        InternalLog.info("[Prewarm/Compiler] decode walk #2 (final): \(String(format: "%.3f", walk2Time))s")
+
         let walkContext = optimization.walkContext
         let unfusedCount = optimization.unfusedCount
         let fusedEntries = optimization.fusedEntries
 
         // Phase 3: Compile only the kernels needed by this model's dispatch entries
         // Decode uses F16 buffers (single token, no accumulation)
+        let pipelineStart = CFAbsoluteTimeGetCurrent()
         let (pipelineCache, argumentEncoderCache, quantizationCapabilities) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: context.stafWeightStore,
-            bufferPrecision: context.decodeBufferPrecision, device: context.device)
+            bufferPrecision: context.decodeBufferPrecision, device: context.device,
+            label: "decode")
+        let pipelineTime = CFAbsoluteTimeGetCurrent() - pipelineStart
+        InternalLog.info("[Prewarm/Compiler] decode compilePipelineCache: \(String(format: "%.3f", pipelineTime))s")
+
         let planBuildContext = makePlanBuildContext(
             compileContext: context,
             kernelContext: context.decodeKernelContext,
             pipelineCache: pipelineCache,
             quantizationCapabilities: quantizationCapabilities)
+        let allocStart = CFAbsoluteTimeGetCurrent()
         let allocation = try bufferAllocator.makeDecodeBufferAllocation(
             compileContext: context,
             walkContext: walkContext,
             fusedEntries: fusedEntries)
+        let allocTime = CFAbsoluteTimeGetCurrent() - allocStart
+        InternalLog.info("[Prewarm/Compiler] decode buffer allocation: \(String(format: "%.3f", allocTime))s")
+
         let bufferSet = allocation.bufferSet
         let decodeSlotDimension = allocation.slotDimension
-        InternalLog.info("[Compiler] \(fusedEntries.count) dispatch entries")
+        InternalLog.info("[Prewarm/Compiler] \(fusedEntries.count) dispatch entries")
+        let planStart = CFAbsoluteTimeGetCurrent()
         let decodePlan = try dispatchStepBuilder.buildDecodePlan(
             fusedEntries: fusedEntries,
             unfusedCount: unfusedCount,
@@ -583,6 +605,8 @@ public struct MetalInferenceCompiler: Sendable {
             argumentEncoders: argumentEncoderCache,
             resolveDispatch: { try resolvedDispatch(for: $0, using: planBuildContext) }
         )
+        let planTime = CFAbsoluteTimeGetCurrent() - planStart
+        InternalLog.info("[Prewarm/Compiler] decode plan build: \(String(format: "%.3f", planTime))s")
         return MetalCompiledModel(
             decodePlan: decodePlan,
             prefillPlan: nil,
@@ -624,21 +648,29 @@ public struct MetalInferenceCompiler: Sendable {
             inferencePolicy: inferencePolicy,
             stafWeightStore: stafWeightStore,
             device: device)
+        let walkStart = CFAbsoluteTimeGetCurrent()
         let optimization = entryCollector.collect(using: context, kernelContext: context.prefillKernelContext)
+        let walkTime = CFAbsoluteTimeGetCurrent() - walkStart
+        InternalLog.info("[Prewarm/Compiler] prefill walk: \(String(format: "%.3f", walkTime))s")
         let walkContext = optimization.walkContext
         let fusedEntries = optimization.fusedEntries
 
         // Compile only the kernels needed by this model's prefill dispatch entries
         // For prefill (F32), attempts Metal 4 MPP GEMM with fallback to naive GEMM.
+        let pipelineStart = CFAbsoluteTimeGetCurrent()
         let (pipelineCache, _, quantizationCapabilities) = try compilePipelineCache(
             entries: fusedEntries, stafWeightStore: context.stafWeightStore,
-            bufferPrecision: .float32, device: context.device)
+            bufferPrecision: .float32, device: context.device,
+            label: "prefill")
+        let pipelineTime = CFAbsoluteTimeGetCurrent() - pipelineStart
+        InternalLog.info("[Prewarm/Compiler] prefill compilePipelineCache: \(String(format: "%.3f", pipelineTime))s")
         let prefillUsesMPP = quantizationCapabilities.prefillProjectionAcceleration.isEnabled
         let planBuildContext = makePlanBuildContext(
             compileContext: context,
             kernelContext: context.prefillKernelContext,
             pipelineCache: pipelineCache,
             quantizationCapabilities: quantizationCapabilities)
+        let allocStart = CFAbsoluteTimeGetCurrent()
         let allocation = try bufferAllocator.makePrefillBufferAllocation(
             compileContext: context,
             walkContext: walkContext,
@@ -649,10 +681,14 @@ public struct MetalInferenceCompiler: Sendable {
             sharedConvStateKernelSize: sharedConvStateKernelSize,
             sharedRecurrentState: sharedRecurrentState,
             sharedRecurrentStateBytesPerLayer: sharedRecurrentStateBytesPerLayer)
+        let allocTime = CFAbsoluteTimeGetCurrent() - allocStart
+        InternalLog.info("[Prewarm/Compiler] prefill buffer allocation: \(String(format: "%.3f", allocTime))s")
         let prefillBuffers = allocation.bufferSet
         let slotDimension = allocation.slotDimension
         let maxSeq = allocation.maximumSequenceLength
-        return try prefillStepBuilder.buildPrefillPlan(
+        InternalLog.info("[Prewarm/Compiler] prefill \(fusedEntries.count) dispatch entries")
+        let planStart = CFAbsoluteTimeGetCurrent()
+        let plan = try prefillStepBuilder.buildPrefillPlan(
             fusedEntries: fusedEntries,
             buffers: prefillBuffers,
             slotDimension: slotDimension,
@@ -663,6 +699,9 @@ public struct MetalInferenceCompiler: Sendable {
             planBuildContext: planBuildContext,
             resolveDispatch: { try resolvedDispatch(for: $0, using: planBuildContext) }
         )
+        let planTime = CFAbsoluteTimeGetCurrent() - planStart
+        InternalLog.info("[Prewarm/Compiler] prefill plan build: \(String(format: "%.3f", planTime))s")
+        return plan
     }
 
     // MARK: - Metal Library Cache
@@ -677,7 +716,8 @@ public struct MetalInferenceCompiler: Sendable {
         entries: [DispatchEntry],
         stafWeightStore: STAFWeightStore?,
         bufferPrecision: MetalSourceGenerator.BufferPrecision,
-        device: MTLDevice
+        device: MTLDevice,
+        label: String
     ) throws -> (
         pipelines: [String: MTLComputePipelineState],
         argumentEncoders: [String: MTLArgumentEncoder],
@@ -696,8 +736,11 @@ public struct MetalInferenceCompiler: Sendable {
             ),
             kernelNameResolver: kernelNameResolver
         )
+        let generateStart = CFAbsoluteTimeGetCurrent()
         let generated = sourceCatalog.generateSources(entries: entries)
-        let pipelineCompiler = MetalPipelineCompiler(device: device)
+        let generateTime = CFAbsoluteTimeGetCurrent() - generateStart
+        InternalLog.info("[Prewarm/Compiler] \(label) generateSources: \(String(format: "%.3f", generateTime))s")
+        let pipelineCompiler = MetalPipelineCompiler(device: device, label: label)
         return try pipelineCompiler.compile(generated)
     }
 

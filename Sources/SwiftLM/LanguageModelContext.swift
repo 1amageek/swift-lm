@@ -695,9 +695,15 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
 
         let totalTime = CFAbsoluteTimeGetCurrent() - requestStartTime
-        let tokensPerSecond = totalTime > 0 ? Double(visibleTokenCount) / totalTime : 0
+        let decodeTime = max(0, totalTime - preparationTime)
+        let decodeTokens = max(0, rawTokenCount - 1)  // first token came from prefill
+        let decodeTokPerSec = decodeTime > 0 ? Double(decodeTokens) / decodeTime : 0
         let preparationTokPerSec = preparationTime > 0 ? Double(promptTokenCount) / preparationTime : 0
-        InternalLog.info("[LanguageModelContext] \(visibleTokenCount) tokens (\(String(format: "%.0f", preparationTokPerSec)) prefill, \(String(format: "%.1f", tokensPerSecond)) decode tok/s) [\(String(format: "%.1f", totalTime))s]")
+        let tokensPerSecond = totalTime > 0 ? Double(visibleTokenCount) / totalTime : 0
+        // [Inference] phase: pure compute cost, excludes all prewarm (load/compile/residency).
+        InternalLog.info("[Inference] prefill: \(String(format: "%.3f", preparationTime))s (\(promptTokenCount) tokens, \(String(format: "%.0f", preparationTokPerSec)) tok/s) — TTFT")
+        InternalLog.info("[Inference] decode: \(String(format: "%.3f", decodeTime))s (\(decodeTokens) tokens, \(String(format: "%.1f", decodeTokPerSec)) tok/s)")
+        InternalLog.info("[Inference] TOTAL: \(String(format: "%.3f", totalTime))s (\(visibleTokenCount) visible tokens, \(String(format: "%.1f", tokensPerSecond)) tok/s aggregate)")
         continuation.yield(.completed(CompletionInfo(
             tokenCount: visibleTokenCount,
             tokensPerSecond: tokensPerSecond,

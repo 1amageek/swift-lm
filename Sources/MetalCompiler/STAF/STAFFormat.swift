@@ -32,7 +32,22 @@ public enum STAF {
     public static let currentMetadataSchemaVersion: UInt32 = 1
 
     /// Current STAF converter metadata version.
-    public static let currentConverterVersion: UInt32 = 2
+    ///
+    /// Bump this whenever `STAFPayloadConverter` changes observable byte
+    /// semantics. Existing caches whose stored converter version is older
+    /// fail the `STAFValidator.containsAllValues` check and are regenerated
+    /// from safetensors with the current converter.
+    ///
+    /// Version history:
+    /// * 1 — initial.
+    /// * 2 — earlier converter revision.
+    /// * 3 — Qwen3.5 MLX bundle support. Subtract 1.0 from baked
+    ///       `language_model.model.layers.*.{input_layernorm,
+    ///       post_attention_layernorm}.weight` (MLX bakes Gemma's `+1.0`
+    ///       offset that the RMSNorm kernel re-applies via `weightBias=1`).
+    ///       Promote `*.linear_attn.norm.weight` to F32 (the SSM kernel
+    ///       hardcodes `device const float* normWeight`).
+    public static let currentConverterVersion: UInt32 = 3
 
     /// File header size in bytes (packed, no alignment padding).
     public static let headerSize: Int = 64

@@ -104,10 +104,11 @@ public struct ModelBundleLoader: Sendable {
         )
 
         let loadTime = CFAbsoluteTimeGetCurrent() - startTime
-        InternalLog.info("[ModelBundleLoader] loaded: tokenizer + STAF [\(String(format: "%.3f", loadTime))s]")
+        InternalLog.info("[Prewarm/Loader] loaded: tokenizer + STAF [\(String(format: "%.3f", loadTime))s]")
 
         // 3. Build IR + resolve parameter bindings
         let compileStart = CFAbsoluteTimeGetCurrent()
+        let irStart = CFAbsoluteTimeGetCurrent()
         let graphResolver = ModelGraphResolver()
         let graph = try graphResolver.resolveModelGraph(
             modelType: resources.modelType,
@@ -115,6 +116,8 @@ public struct ModelBundleLoader: Sendable {
         )
         let convention = graphResolver.namingConvention(for: resources.modelType)
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: convention)
+        let irTime = CFAbsoluteTimeGetCurrent() - irStart
+        InternalLog.info("[Prewarm/Loader] IR resolve: \(String(format: "%.3f", irTime))s")
 
         // 4. Compile IR → MetalCompiledModel (includes Metal pipeline compilation)
         let compiler = Self.makeInferenceCompiler()
@@ -123,6 +126,7 @@ public struct ModelBundleLoader: Sendable {
             for: resolvedGraph
         )
         let prefillInferencePolicy = Self.prefillInferencePolicy(for: resolvedInferencePolicy)
+        let decodeCompileStart = CFAbsoluteTimeGetCurrent()
         var compiledModel = try compiler.compile(
             graph: resolvedGraph,
             hiddenSize: resources.config.hiddenSize,
@@ -132,8 +136,11 @@ public struct ModelBundleLoader: Sendable {
             stafWeightStore: weightStore,
             device: device
         )
+        let decodeCompileTime = CFAbsoluteTimeGetCurrent() - decodeCompileStart
+        InternalLog.info("[Prewarm/Loader] compile (decode): \(String(format: "%.3f", decodeCompileTime))s")
 
         // 4b. Compile prefill plan (sequence graph — step count independent of token count)
+        let prefillCompileStart = CFAbsoluteTimeGetCurrent()
         let prefillPlan = try compiler.compilePrefill(
             graph: resolvedGraph,
             hiddenSize: resources.config.hiddenSize,
@@ -153,12 +160,17 @@ public struct ModelBundleLoader: Sendable {
             device: device
         )
         compiledModel = compiledModel.withPrefillPlan(prefillPlan)
+        let prefillCompileTime = CFAbsoluteTimeGetCurrent() - prefillCompileStart
+        InternalLog.info("[Prewarm/Loader] compile (prefill): \(String(format: "%.3f", prefillCompileTime))s")
 
         let compileTime = CFAbsoluteTimeGetCurrent() - compileStart
-        InternalLog.info("[ModelBundleLoader] compiled: \(compiledModel.fusedEntryCount) dispatches, prefill \(prefillPlan.stepCount) steps [\(String(format: "%.3f", compileTime))s]")
+        InternalLog.info("[Prewarm/Loader] compiled: \(compiledModel.fusedEntryCount) dispatches, prefill \(prefillPlan.stepCount) steps [\(String(format: "%.3f", compileTime))s]")
 
         // 5. Assemble LanguageModelContainer
+        let modelInitStart = CFAbsoluteTimeGetCurrent()
         let inferenceModel = try MetalInferenceModel(plan: compiledModel, device: device)
+        let modelInitTime = CFAbsoluteTimeGetCurrent() - modelInitStart
+        InternalLog.info("[Prewarm/Loader] MetalInferenceModel.init: \(String(format: "%.3f", modelInitTime))s")
 
         var modelConfig = ModelConfiguration(
             name: resources.modelType,
@@ -211,7 +223,7 @@ public struct ModelBundleLoader: Sendable {
         Self.insertChatStopTokenIDs(from: tokenizer, into: &modelConfig.eosTokenIds)
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-        InternalLog.info("[ModelBundleLoader] ready: \(modelConfig.name) [\(String(format: "%.3f", totalTime))s]")
+        InternalLog.info("[Prewarm] TOTAL: \(String(format: "%.3f", totalTime))s — \(modelConfig.name) ready")
 
         let prototypeContext = LanguageModelContext(
             inferenceModel: inferenceModel,
@@ -278,7 +290,7 @@ public struct ModelBundleLoader: Sendable {
             )
         } catch {
             // Log but fall back to CPU path if GPU post-processor compilation fails
-            InternalLog.error("[ModelBundleLoader] GPU embedding post-processor unavailable, using CPU fallback: \(error)")
+            InternalLog.error("[Prewarm/Loader] GPU embedding post-processor unavailable, using CPU fallback: \(error)")
             postProcessor = nil
         }
 
@@ -297,7 +309,7 @@ public struct ModelBundleLoader: Sendable {
         }
 
         let totalTime = CFAbsoluteTimeGetCurrent() - startTime
-        InternalLog.info("[ModelBundleLoader] embedding bundle ready: \(configuration.name) [\(String(format: "%.3f", totalTime))s]")
+        InternalLog.info("[Prewarm] TOTAL: \(String(format: "%.3f", totalTime))s — embedding bundle \(configuration.name) ready")
 
         return TextEmbeddingContainer(
             prefillPlan: prefillPlan,
@@ -313,14 +325,27 @@ public struct ModelBundleLoader: Sendable {
         directory: URL,
         device: MTLDevice
     ) async throws -> (ModelBundleResources, any Tokenizer, STAFWeightStore) {
+        let inspectStart = CFAbsoluteTimeGetCurrent()
         let inspector = ModelBundleInspector()
         let resources = try inspector.inspect(directory: directory)
+        let inspectTime = CFAbsoluteTimeGetCurrent() - inspectStart
+        InternalLog.info("[Prewarm/Loader] inspect: \(String(format: "%.3f", inspectTime))s")
 
-        async let tokenizerTask = AutoTokenizer.from(modelFolder: directory)
-        async let weightStoreTask = STAFCacheLoader().load(resources: resources, device: device)
+        async let tokenizerTask: (any Tokenizer, Double) = {
+            let start = CFAbsoluteTimeGetCurrent()
+            let tokenizer = try await AutoTokenizer.from(modelFolder: directory)
+            return (tokenizer, CFAbsoluteTimeGetCurrent() - start)
+        }()
+        async let weightStoreTask: (STAFWeightStore, Double) = {
+            let start = CFAbsoluteTimeGetCurrent()
+            let store = try STAFCacheLoader().load(resources: resources, device: device)
+            return (store, CFAbsoluteTimeGetCurrent() - start)
+        }()
 
-        let tokenizer = try await tokenizerTask
-        let weightStore = try await weightStoreTask
+        let (tokenizer, tokenizerTime) = try await tokenizerTask
+        let (weightStore, weightStoreTime) = try await weightStoreTask
+        InternalLog.info("[Prewarm/Loader] tokenizer: \(String(format: "%.3f", tokenizerTime))s")
+        InternalLog.info("[Prewarm/Loader] STAF: \(String(format: "%.3f", weightStoreTime))s")
         return (resources, tokenizer, weightStore)
     }
 
