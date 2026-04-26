@@ -3,13 +3,31 @@ import Foundation
 struct STAFPayloadConverter: Sendable {
 
     func convertPayload(for entry: STAFConversionEntry) throws -> Data {
-        let tensorData = try loadRawTensorData(entry: entry)
+        var tensorData = try loadRawTensorData(entry: entry)
+
+        // MLX VLM bundles bake the `+1.0` offset into Gemma-style layernorm
+        // weights for `input_layernorm` and `post_attention_layernorm`. Because
+        // swift-lm's RMSNorm kernel applies the offset itself via
+        // `weightBias = 1` (see Reduction.swift), passing the MLX storage as-is
+        // doubles the offset — every layer's norm scale becomes `1 + (1 + δ)`
+        // instead of `1 + δ`, which collapses the residual stream and produces
+        // garbage tokens. Subtract 1.0 here so downstream consumers see the
+        // canonical raw delta convention shared by HuggingFace bundles.
+        //
+        // The SSM `linear_attn.norm.weight` is exempt: both HF and MLX store it
+        // with the standard (`weightBias = 0`) convention.
+        if needsMLXLayerNormBiasCorrection(entry: entry) {
+            tensorData = try subtractOneFromLayerNormWeights(
+                tensorData, dtype: entry.info.dtype, name: entry.name)
+        }
 
         switch entry.schemeIdentifier {
         case .fp16RowMajor, .passthrough:
             return try convertDensePayload(entry: entry, tensorData: tensorData)
-        case .bf16RowMajor, .fp32RowMajor:
+        case .bf16RowMajor:
             return tensorData
+        case .fp32RowMajor:
+            return try convertToFloat32(entry: entry, tensorData: tensorData)
         case .q2Group16ScaleF16, .q2Group32ScaleF16,
              .q3Group16ScaleF16, .q3Group32ScaleF16, .q3Group64ScaleF16,
              .q4Group64ScaleF16, .q4Group128ScaleF16, .q4Group128ScaleF16Zero,
@@ -20,6 +38,86 @@ struct STAFPayloadConverter: Sendable {
         default:
             return tensorData
         }
+    }
+
+    /// Detect MLX VLM layernorm tensors whose stored values bake in the
+    /// `+1.0` Gemma-style offset that swift-lm's RMSNorm kernel adds itself.
+    ///
+    /// Returns `true` only for `input_layernorm.weight` and
+    /// `post_attention_layernorm.weight` whose source name carries the
+    /// `language_model.model.` prefix (the MLX VLM marker). The SSM
+    /// `linear_attn.norm.weight` is excluded — both HF and MLX store it with
+    /// the standard (no-offset) convention.
+    private func needsMLXLayerNormBiasCorrection(entry: STAFConversionEntry) -> Bool {
+        guard entry.sourceName.hasPrefix("language_model.model.layers.") else {
+            return false
+        }
+        return entry.sourceName.hasSuffix(".input_layernorm.weight")
+            || entry.sourceName.hasSuffix(".post_attention_layernorm.weight")
+    }
+
+    private func subtractOneFromLayerNormWeights(
+        _ data: Data, dtype: SafetensorsDType, name: String
+    ) throws -> Data {
+        switch dtype {
+        case .bfloat16:
+            let elementCount = data.count / 2
+            var output = Data(count: data.count)
+            data.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    let bf16In = source.bindMemory(to: UInt16.self)
+                    let bf16Out = destination.bindMemory(to: UInt16.self)
+                    for index in 0..<elementCount {
+                        let widened = UInt32(bf16In[index]) << 16
+                        let asFloat = Float(bitPattern: widened) - 1.0
+                        bf16Out[index] = Self.bfloat16Bits(from: asFloat)
+                    }
+                }
+            }
+            return output
+        case .float16:
+            let elementCount = data.count / MemoryLayout<Float16>.size
+            var output = Data(count: data.count)
+            data.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    let fp16In = source.bindMemory(to: Float16.self)
+                    let fp16Out = destination.bindMemory(to: Float16.self)
+                    for index in 0..<elementCount {
+                        fp16Out[index] = fp16In[index] - 1.0
+                    }
+                }
+            }
+            return output
+        case .float32:
+            let elementCount = data.count / MemoryLayout<Float>.size
+            var output = Data(count: data.count)
+            data.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    let f32In = source.bindMemory(to: Float.self)
+                    let f32Out = destination.bindMemory(to: Float.self)
+                    for index in 0..<elementCount {
+                        f32Out[index] = f32In[index] - 1.0
+                    }
+                }
+            }
+            return output
+        default:
+            fatalError(
+                "Cannot apply MLX layernorm bias correction for tensor \(name): " +
+                "unsupported source dtype \(dtype.rawValue). Expected BF16, F16, or F32.")
+        }
+    }
+
+    /// Round a Float32 to BF16 with round-to-nearest-even.
+    ///
+    /// BF16 = upper 16 bits of Float32. Naive truncation introduces a
+    /// downward bias; tiebreak using the LSB of the surviving mantissa keeps
+    /// the round unbiased so the per-tensor mean is preserved within ULP.
+    private static func bfloat16Bits(from value: Float) -> UInt16 {
+        let bits = value.bitPattern
+        let lsb = (bits >> 16) & 1
+        let rounded = bits &+ UInt32(0x7FFF) &+ lsb
+        return UInt16(rounded >> 16)
     }
 
     private func convertDensePayload(entry: STAFConversionEntry, tensorData: Data) throws -> Data {
@@ -39,6 +137,55 @@ struct STAFPayloadConverter: Sendable {
             }
         }
         return output
+    }
+
+    /// Promote a tensor to Float32 storage regardless of source dtype.
+    ///
+    /// Some Metal kernels (notably the SSM/DeltaNet per-head RMS norm) bind
+    /// their scale buffer with a hardcoded `device const float*` signature.
+    /// When a bundle stores the same tensor as bfloat16 (MLX) or float16, the
+    /// raw bytes must be widened so the kernel sees correct values. Float32
+    /// sources pass through unchanged.
+    private func convertToFloat32(entry: STAFConversionEntry, tensorData: Data) throws -> Data {
+        switch entry.info.dtype {
+        case .float32:
+            return tensorData
+        case .bfloat16:
+            let elementCount = tensorData.count / 2
+            var output = Data(count: elementCount * MemoryLayout<Float>.size)
+            tensorData.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    let bf16Words = source.bindMemory(to: UInt16.self)
+                    let floats = destination.bindMemory(to: Float.self)
+                    for index in 0..<elementCount {
+                        let widened = UInt32(bf16Words[index]) << 16
+                        floats[index] = Float(bitPattern: widened)
+                    }
+                }
+            }
+            return output
+        case .float16:
+            let elementCount = tensorData.count / MemoryLayout<Float16>.size
+            var output = Data(count: elementCount * MemoryLayout<Float>.size)
+            tensorData.withUnsafeBytes { source in
+                output.withUnsafeMutableBytes { destination in
+                    let halfs = source.bindMemory(to: Float16.self)
+                    let floats = destination.bindMemory(to: Float.self)
+                    for index in 0..<elementCount {
+                        floats[index] = Float(halfs[index])
+                    }
+                }
+            }
+            return output
+        default:
+            // Float32 promotion is constrained to F16/BF16/F32 sources. Any
+            // other dtype on a tensor declared as `.fp32RowMajor` indicates a
+            // malformed conversion plan — fail loudly rather than silently
+            // copying mismatched bytes into a buffer the kernel binds as f32.
+            fatalError(
+                "Unsupported source dtype for f32 promotion: \(entry.info.dtype.rawValue) " +
+                "(tensor: \(entry.name)). Expected F16, BF16, or F32.")
+        }
     }
 
     private func loadRawTensorData(entry: STAFConversionEntry) throws -> Data {

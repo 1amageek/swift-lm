@@ -116,12 +116,27 @@ struct STAFConversionPlanner: Sendable {
             return .passthrough
         }
 
+        // The SSM (DeltaNet) per-head RMS norm weight is read by the Metal
+        // recurrence kernel via a hardcoded `device const float* normWeight`
+        // signature. HF Qwen3.5 stores this tensor as float32 (matches), but
+        // MLX bundles (incl. quantized variants) collapse it to bfloat16.
+        // Reading bf16 bytes as f32 produces garbage scales and corrupts the
+        // DeltaNet output. Force f32 storage here so the kernel contract holds
+        // regardless of source dtype.
+        if isSSMNormWeight(name: name) {
+            return .fp32RowMajor
+        }
+
         switch info.dtype {
         case .float16: return .fp16RowMajor
         case .bfloat16: return .bf16RowMajor
         case .float32: return .fp32RowMajor
         default: return .passthrough
         }
+    }
+
+    private func isSSMNormWeight(name: String) -> Bool {
+        name.hasSuffix(".linear_attn.norm.weight")
     }
 
     /// Confirm that the tensor shapes are consistent with the quantization hint.

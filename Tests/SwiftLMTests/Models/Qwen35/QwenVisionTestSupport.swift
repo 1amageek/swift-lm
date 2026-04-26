@@ -171,6 +171,37 @@ enum QwenVisionTestSupport {
         return nil
     }
 
+    static func optionalQwen35MLXBundleDirectory(name: String) throws -> URL? {
+        let envVar = "SWIFTLM_QWEN35_MLX_\(name.replacingOccurrences(of: "-", with: "_").replacingOccurrences(of: ".", with: "_").uppercased())_DIR"
+        if let envValue = ProcessInfo.processInfo.environment[envVar] {
+            let url = URL(fileURLWithPath: NSString(string: envValue).expandingTildeInPath)
+            if try isUsableModelDirectory(url) {
+                return url
+            }
+        }
+
+        let hubCandidate = NSString(
+            string: "~/.cache/huggingface/hub/models--mlx-community--\(name)"
+        ).expandingTildeInPath
+        let hubSnapshots = try snapshotDirectories(
+            baseURL: URL(fileURLWithPath: hubCandidate)
+        )
+        for snapshot in hubSnapshots where try isUsableModelDirectory(snapshot) {
+            return snapshot
+        }
+
+        let flatCandidate = URL(
+            fileURLWithPath: NSString(
+                string: "~/Library/Caches/huggingface/models/mlx-community/\(name)"
+            ).expandingTildeInPath
+        )
+        if try isUsableModelDirectory(flatCandidate) {
+            return flatCandidate
+        }
+
+        return nil
+    }
+
     static func optionalRealQwen35RepoID() -> String? {
         let candidates = [
             ProcessInfo.processInfo.environment["SWIFTLM_QWEN35_VL_REPO"],
