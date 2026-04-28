@@ -21,7 +21,7 @@ LMIR (IR モジュール — backend 非依存)
     │   └── @_exported import LMIR
     │
     ├── ModelDeclarations (depends: LMArchitecture)
-    │   └── Transformer, Qwen35, LFM2, Cohere
+    │   └── Transformer, Cohere, EmbeddingGemma, Gemma3, Gemma4, LFM2, Qwen35
     │
     ├── MetalCompiler (depends: LMIR only — no MLX)
     │   ├── MetalCompilable protocol (IR → Metal bridge: query interface)
@@ -37,7 +37,7 @@ LMIR (IR モジュール — backend 非依存)
     └── SwiftLM (consumer API — depends: LMArchitecture, MetalCompiler, ModelDeclarations)
         ├── ModelBundleLoader (HF download → STAF → compile(inferencePolicy:) → LanguageModelContainer / TextEmbeddingContainer)
         ├── LanguageModelContainer / LanguageModelContext
-        ├── TextEmbeddingContainer / TextEmbeddingContext
+        ├── TextEmbeddingContainer
         ├── ModelInput, PreparedPrompt, ExecutablePrompt, PromptSnapshot, GenerationParameters, GenerationEvent
         └── InputMessage, InputImage, InputVideo, TextEmbeddingInput, ModelConfiguration
 ```
@@ -301,7 +301,7 @@ Buffer routing (MetalPrefillStepBuilder / decode bindings)
 
 - `xcodebuild` の単発失敗だけで実装バグと断定しない。`unexpected exit` や suite restart はテストプロセスの不安定さで起きることがある。
 - 実 bundle を読む suite は `build-for-testing` 後に `test-without-building` で 1 suite ずつ回す。
-- 不安定な suite は [`scripts/xcodebuild/test-timeout.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild/test-timeout.sh) または [`scripts/xcodebuild/test-hang-guard.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild/test-hang-guard.sh) で再現性を確認する。
+- 不安定な suite は [`scripts/xcodebuild/test-timeout.sh`](/Users/1amageek/Desktop/Robot/swift-lm/scripts/xcodebuild/test-timeout.sh) または [`scripts/xcodebuild/test-hang-guard.sh`](/Users/1amageek/Desktop/Robot/swift-lm/scripts/xcodebuild/test-hang-guard.sh) で再現性を確認する。
 - suite-level filter で切り分けられるように、重い smoke tests は output / prompt-state / capability などの関心ごとごとに分割する。
 - **ベンチマーク反復や `/loop` の `ScheduleWakeup` で 5 分 (300s) 以上の間隔を空けない** — Anthropic prompt cache の TTL が 5 分のため、それ以上空けると次回起動時にコンテキストを uncached で読み直すことになりコスト・応答速度が悪化する。cool-state を取る場合も 270s 未満で刻む。
 
@@ -344,9 +344,7 @@ walkRegion(region):
       walkRegion(selectedBody)  // compile-time 分岐
 ```
 
-#### Phase 2: Automatic kernel fusion
-
-上述の「Phase 2: Automatic kernel fusion (fuseCrossComponent)」セクションを参照。
+Phase 2 (自動 fusion) は上述の「Compiler の end-to-end パイプライン」を参照。
 
 #### Phase 3: Prefill dispatch plan 生成 (buildPrefillSteps)
 
@@ -575,20 +573,6 @@ Random rotation provides measurable quality improvement for Q8. Q4 information l
 6. MetalSourceGenerator に `generateXxx()` や `generateFusedXxx()` を追加してはならない — fragment が `kernelBody()` で自分自身を記述する
 7. `MetalCompilable` に対応しない OperationAttributes は fatalError — silent fallback 禁止
 
-## Module Dependencies
-
-```
-LMIR (IR — 依存なし)
-    │
-    ├── LMArchitecture (DSL + Validation — depends: LMIR)
-    │
-    ├── ModelDeclarations (depends: LMArchitecture)
-    │
-    ├── MetalCompiler (depends: LMIR only)
-    │
-    └── SwiftLM (consumer API — depends: LMArchitecture, MetalCompiler, ModelDeclarations)
-```
-
 ## Build & Test
 
 ```bash
@@ -802,7 +786,7 @@ Qwen3.5 の vision encoder は画像・動画の両方をサポートし、tempo
 
 `hazardTrackingModeUntracked` バッファは明示的な barrier が必要。バリアは GPU を同期させるため、不要バリアは深刻なパフォーマンス劣化を起こす。
 
-**Gemma4-E2B 実測値 (564 decode steps, AggressiveOptimizer + RoPE fusion):**
+**Gemma4-E2B 実測値 (564 decode steps, Q/K/V batch + RoPE fusion):**
 - GPU kernel 計算時間: ~2.9ms
 - バリア同期 overhead: ~17ms（~30μs × 528 barriers）
 - 1 バリアあたり ~30μs — kernel 1 つの平均実行時間 5μs より遥かに大きい
@@ -813,7 +797,7 @@ Qwen3.5 の vision encoder は画像・動画の両方をサポートし、tempo
 |---|---|---|---|---|
 | conservative (全 read+write) | 705 | 669 (95%) | ~2000 | 20.93ms |
 | BufferRegion + writeBufferIndices | 705 | 564 (80%) | ~1900 | 20.46ms |
-| + AggressiveOptimizer (Q/K/V batch) | 599 | 563 (94%) | ~1900 | 20.60ms |
+| + Q/K/V batch (auto-fusion) | 599 | 563 (94%) | ~1900 | 20.60ms |
 | + `memoryBarrier(resources:)` | 599 | 563 (94%) | **~580** | **20.00ms** |
 | + RoPE + flash_attn fusion | 564 | 528 (94%) | ~540 | ~20.5ms |
 
@@ -906,5 +890,5 @@ Q4 が BF16 より遅い理由: prefill は GEMM (compute-bound) であり、Q4 
 
 - Family: 計算グラフ上の再利用可能な単位 (DeltaNet, MoE, parallel attention+MLP)
 - Model: family の組み合わせ + 設定 (Qwen35, LFM2, Cohere)
-- `SwiftLM/Declaration` と `LMInference/Bridge` には family 名のみ
+- `LMArchitecture/Declaration` には family 名のみ
 - 固有名は `Sources/Models/` のみ
