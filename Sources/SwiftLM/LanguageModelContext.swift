@@ -547,8 +547,9 @@ public final class LanguageModelContext: @unchecked Sendable {
         var rawTokenCount = 0
         let maxVisibleTokens = parameters.maxTokens ?? 1024
         let visibilityPolicy = visibleThinkingPolicy(for: parameters)
-        let maxRawTokens = maxRawTokenCount(
+        let maxRawTokens = Self.maxRawTokenCount(
             forVisibleLimit: maxVisibleTokens,
+            maxReasoningTokens: parameters.maxReasoningTokens,
             visibilityPolicy: visibilityPolicy,
             reasoningVisibility: parameters.reasoning.visibility
         )
@@ -2741,8 +2742,9 @@ public final class LanguageModelContext: @unchecked Sendable {
         let visibilityPolicy = visibleThinkingPolicy(for: parameters)
         let maxRawTokens = collectionMode == .raw
             ? maxRequestedTokens
-            : maxRawTokenCount(
+            : Self.maxRawTokenCount(
                 forVisibleLimit: maxRequestedTokens,
+                maxReasoningTokens: parameters.maxReasoningTokens,
                 visibilityPolicy: visibilityPolicy,
                 reasoningVisibility: parameters.reasoning.visibility
             )
@@ -2802,13 +2804,17 @@ public final class LanguageModelContext: @unchecked Sendable {
         }
     }
 
-    private func maxRawTokenCount(
+    internal static func maxRawTokenCount(
         forVisibleLimit visibleLimit: Int,
+        maxReasoningTokens: Int?,
         visibilityPolicy: ThinkingTagPolicy?,
         reasoningVisibility: ReasoningOptions.Visibility
     ) -> Int {
         guard visibilityPolicy != nil else { return visibleLimit }
         guard reasoningVisibility != .inline else { return visibleLimit }
+        if let maxReasoningTokens, maxReasoningTokens >= 0 {
+            return visibleLimit + maxReasoningTokens
+        }
         return max(visibleLimit * 16, visibleLimit + 256)
     }
 

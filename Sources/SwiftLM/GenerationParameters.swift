@@ -1,7 +1,15 @@
 /// Parameters controlling text generation.
 public struct GenerationParameters: Sendable {
-    /// Maximum tokens to generate. nil uses the runtime default cap.
+    /// Maximum visible (answer) tokens to generate. nil uses the runtime default cap.
     public var maxTokens: Int?
+    /// Hard cap on tokens generated inside the reasoning channel before the
+    /// model must close `</think>` (or equivalent). Combined with `maxTokens`
+    /// it bounds total raw generation as `maxTokens + maxReasoningTokens`.
+    /// When nil and the model exposes a thinking-tag policy, the runtime
+    /// falls back to the historical generous multiplier
+    /// (`max(maxTokens * 16, maxTokens + 256)`) — set this explicitly to make
+    /// runaway reasoning loops fail fast instead of running to that cap.
+    public var maxReasoningTokens: Int?
     /// Maximum number of tokens to coalesce into one streamed text chunk.
     public var streamChunkTokenCount: Int
     /// Sampling temperature. 0 = greedy.
@@ -23,6 +31,7 @@ public struct GenerationParameters: Sendable {
 
     public init(
         maxTokens: Int? = nil,
+        maxReasoningTokens: Int? = nil,
         streamChunkTokenCount: Int = 8,
         temperature: Float = 0.6,
         topP: Float = 1.0,
@@ -34,6 +43,7 @@ public struct GenerationParameters: Sendable {
         reasoning: ReasoningOptions = .hidden
     ) {
         self.maxTokens = maxTokens
+        self.maxReasoningTokens = maxReasoningTokens
         self.streamChunkTokenCount = streamChunkTokenCount
         self.temperature = temperature
         self.topP = topP
