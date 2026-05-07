@@ -672,6 +672,113 @@ public static func generateUnifiedQuantizedSequenceGEMV(
     """
 }
 
+/// Generate a sequence GEMV kernel for packed quantized weights that covers
+/// multiple adjacent sequence positions per threadgroup.
+///
+/// Each SIMD group still owns one output row for one sequence position. The
+/// sequence tile only reduces grid height and amortizes input staging across
+/// adjacent tokens, while preserving the single row-token reduction contract.
+public static func generateTiledQuantizedSequenceGEMV(
+    name: String,
+    format: any QuantizationFormat,
+    bufferPrecision: BufferPrecision,
+    sequenceTile: Int,
+    tileElements: Int = 256
+) -> String {
+    precondition(sequenceTile >= 1, "sequence tile must be positive")
+    precondition(
+        format.isQuantized,
+        "generateTiledQuantizedSequenceGEMV requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    let bt = bufferPrecision.metalType
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
+    let storeValue = MetalSourceGenerator.sequenceStorageValue("sum", weightFormat: .float16)
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input              [[buffer(0)]],
+        device const uchar* weight            [[buffer(1)]],
+        device \(bt)* output                  [[buffer(2)]],
+        constant uint& inputDimension         [[buffer(3)]],
+        constant uint& outputDimension        [[buffer(4)]],
+        constant uint& sequenceLength         [[buffer(5)]],
+        constant uint& inputRowStride         [[buffer(6)]],
+        constant uint& outputRowStride        [[buffer(7)]],
+        uint2 gid                             [[threadgroup_position_in_grid]],
+        uint tid                              [[thread_index_in_threadgroup]],
+        uint tiisg                            [[thread_index_in_simdgroup]],
+        uint sgitg                            [[simdgroup_index_in_threadgroup]],
+        uint2 threadsPerThreadgroup           [[threads_per_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint TILE_ELEMENTS = \(tileElements);
+        const uint sequenceTile = \(sequenceTile);
+        const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+        const uint rowsPerThreadgroup = max(1u, simdgroupsPerThreadgroup / sequenceTile);
+        const uint localSeq = min(sequenceTile - 1u, sgitg / rowsPerThreadgroup);
+        const uint localRow = sgitg - localSeq * rowsPerThreadgroup;
+        const uint row = gid.x * rowsPerThreadgroup + localRow;
+        const uint seqPos = gid.y * sequenceTile + localSeq;
+        const bool validSeq = seqPos < sequenceLength;
+        const bool validRow = row < outputDimension;
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        threadgroup \(bt) inputTile[\(sequenceTile * tileElements)];
+        float sum = 0.0f;
+
+        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
+            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
+            if (localRow == 0u && validSeq) {
+                device const \(bt)* inputRow = input + seqPos * inputRowStride;
+                threadgroup \(bt)* tile = inputTile + localSeq * TILE_ELEMENTS;
+                for (uint j = tiisg; j < TILE_ELEMENTS; j += SIMD_WIDTH) {
+                    const uint inputIndex = base + j;
+                    tile[j] = inputIndex < inputDimension ? inputRow[inputIndex] : \(bt)(0.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (validSeq && validRow) {
+                device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
+                threadgroup \(bt)* tile = inputTile + localSeq * TILE_ELEMENTS;
+                const uint blockBase = base / WEIGHTS_PER_BLOCK;
+                const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                        float w = \(readExpression);
+                        sum += w * float(tile[tileOffset + k]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (validSeq && validRow) {
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storeValue));
+            }
+        }
+    }
+    """
+}
+
 /// Generate a batched sequence GEMV kernel for multiple packed quantized
 /// projections sharing the same sequence input.
 ///

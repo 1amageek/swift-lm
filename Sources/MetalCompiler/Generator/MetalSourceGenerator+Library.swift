@@ -192,6 +192,9 @@ extension MetalSourceGenerator {
         sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g16_f32s", format: AffineQ3Group16Format(), bufferPrecision: prefill))
         sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g32_f32s", format: AffineQ3Group32Format(), bufferPrecision: prefill))
         sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g64_f32s", format: AffineQ3Group64Format(), bufferPrecision: prefill))
+        sources.append(generateTiledQuantizedSequenceGEMV(name: "gemv_seq_q3_g16_f32s_tile4", format: AffineQ3Group16Format(), bufferPrecision: prefill, sequenceTile: 4))
+        sources.append(generateTiledQuantizedSequenceGEMV(name: "gemv_seq_q3_g32_f32s_tile4", format: AffineQ3Group32Format(), bufferPrecision: prefill, sequenceTile: 4))
+        sources.append(generateTiledQuantizedSequenceGEMV(name: "gemv_seq_q3_g64_f32s_tile4", format: AffineQ3Group64Format(), bufferPrecision: prefill, sequenceTile: 4))
         for count in 2...4 {
             sources.append(generateBatchedQuantizedSequenceGEMV(name: "batched_gemv\(count)_seq_q3_g16_f32s", count: count, format: AffineQ3Group16Format(), bufferPrecision: prefill))
             sources.append(generateBatchedQuantizedSequenceGEMV(name: "batched_gemv\(count)_seq_q3_g32_f32s", count: count, format: AffineQ3Group32Format(), bufferPrecision: prefill))

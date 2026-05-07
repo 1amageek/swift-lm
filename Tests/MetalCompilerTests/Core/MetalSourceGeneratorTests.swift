@@ -367,6 +367,20 @@ struct MetalSourceGeneratorTests {
         try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group64Format())
     }
 
+    @Test("Q3 tiled sequence GEMV matches decode-rounded CPU reference for all group sizes")
+    func q3TiledSequenceGEMVMatchesDecodeRoundedCPUReferenceForAllGroupSizes() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group16Format(), tiled: true)
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group32Format(), tiled: true)
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group64Format(), tiled: true)
+    }
+
     @Test("Q3 batched sequence GEMV matches decode-rounded CPU reference for all counts and group sizes")
     func q3BatchedSequenceGEMVMatchesDecodeRoundedCPUReferenceForAllCountsAndGroupSizes() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -397,7 +411,8 @@ struct MetalSourceGeneratorTests {
 
     private func runQ3SequenceGEMVReferenceTest(
         device: MTLDevice,
-        format: any QuantizationFormat
+        format: any QuantizationFormat,
+        tiled: Bool = false
     ) throws {
         let inputDimension = 128
         let outputDimension = 7
@@ -447,13 +462,18 @@ struct MetalSourceGeneratorTests {
             options: .storageModeShared
         ))
 
-        let kernelName = "test_gemv_seq_\(suffix)_f32s"
+        let kernelName = tiled ? "test_gemv_seq_\(suffix)_f32s_tile4" : "test_gemv_seq_\(suffix)_f32s"
         let source = MetalSourceGenerator.commonHeader + "\n\n"
-            + MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
+            + (tiled ? MetalSourceGenerator.generateTiledQuantizedSequenceGEMV(
+                name: kernelName,
+                format: format,
+                bufferPrecision: .float32,
+                sequenceTile: 4
+            ) : MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                 name: kernelName,
                 format: format,
                 bufferPrecision: .float32
-            )
+            ))
         let options = MTLCompileOptions()
         options.languageVersion = .version4_0
         let library = try device.makeLibrary(source: source, options: options)
@@ -480,9 +500,16 @@ struct MetalSourceGeneratorTests {
         encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
         encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 7)
         encoder.dispatchThreadgroups(
-            MTLSize(width: (outputDimension + 1) / 2, height: sequenceLength, depth: 1),
+            MTLSize(
+                width: (outputDimension + 1) / 2,
+                height: tiled ? (sequenceLength + 3) / 4 : sequenceLength,
+                depth: 1
+            ),
             threadsPerThreadgroup: MTLSize(
-                width: min(pipeline.threadExecutionWidth * 2, pipeline.maxTotalThreadsPerThreadgroup),
+                width: min(
+                    pipeline.threadExecutionWidth * (tiled ? 8 : 2),
+                    pipeline.maxTotalThreadsPerThreadgroup
+                ),
                 height: 1,
                 depth: 1
             )
@@ -507,7 +534,7 @@ struct MetalSourceGeneratorTests {
                 let actual = actualPointer[seq * outputRowStride + row]
                 #expect(
                     abs(actual - expected) < 0.0001,
-                    "\(suffix) sequence GEMV mismatch seq=\(seq) row=\(row): actual=\(actual) expected=\(expected)"
+                    "\(suffix) \(tiled ? "tiled " : "")sequence GEMV mismatch seq=\(seq) row=\(row): actual=\(actual) expected=\(expected)"
                 )
             }
         }

@@ -178,17 +178,61 @@ not a release-grade throughput claim.
 
 | Sequence length | Sequence prefill | Sequential ingestion | Speedup |
 |---:|---:|---:|---:|
-| 16 | 201.72 ms | 318.88 ms | 1.58x |
-| 64 | 761.92 ms | 1322.05 ms | 1.74x |
-| 128 | 1504.15 ms | 2801.73 ms | 1.86x |
+| 16 | 206.76 ms | 322.11 ms | 1.56x |
+| 64 | 769.38 ms | 1343.48 ms | 1.75x |
+| 128 | 1510.55 ms | 2829.22 ms | 1.87x |
 
 Kernel families confirmed in the Q3 plan:
 
-| Kernel group | Count |
+| Kernel | Count |
 |---|---:|
-| All Q3 sequence GEMV entries | 96 |
-| Batched Q3 sequence GEMV entries | 48 |
-| Single Q3 sequence GEMV entries | 48 |
+| `batched_gemv2_seq_q3_g64_f32s` | 24 |
+| `batched_gemv3_seq_q3_g64_f32s` | 6 |
+| `batched_gemv4_seq_q3_g64_f32s` | 18 |
+| `gemv_seq_q3_g64_f32s` | 48 |
+
+The remaining single Q3 sequence GEMV entries are dependent projections, not
+missed sibling batches:
+
+| Projection role | Count |
+|---|---:|
+| `linear_attn.out_proj` | 18 |
+| `mlp.down_proj` | 24 |
+| `self_attn.o_proj` | 6 |
+
+This closes the current BatchedProjection routing gap for Q3 sequence prefill.
+The next Q3 speed target is the single-projection kernel/fusion path rather
+than additional sibling batching.
+
+A Q3 single sequence tile4 kernel was added and reference-tested, then tried as
+the production routing for the single projection entries. It stayed
+decode-equivalent but did not improve the Qwen3.5 Q3 smoke profile:
+
+| Sequence length | Base sequence prefill | Tile4 sequence prefill | Decision |
+|---:|---:|---:|---|
+| 16 | 206.76 ms | 207.48 ms | keep base |
+| 64 | 769.38 ms | 773.49 ms | keep base |
+| 128 | 1510.55 ms | 1523.47 ms | keep base |
+
+The tile4 kernel remains in the generator as a tested experiment, but planner
+routing stays on the base Q3 sequence GEMV path.
+
+## Prefill Profile Harness
+
+The profiling path is now shared instead of Qwen-specific. `MetalPrefillProfileHarness`
+records both step-level and pass-level prefill timing with:
+
+| Field group | Contents |
+|---|---|
+| Timing | GPU feedback time and wall-clock submit+wait time |
+| Dispatch shape | grid, threadgroup size, threadgroup memory, estimated dispatch count |
+| Routing | kernel name, category, mode, layer index, entry index, weight tensor name |
+| Binding size | buffer binding count, inline constant bytes, unique bound buffer bytes |
+| Artifacts | JSON and CSV under `.test-artifacts/prefill-profile/` |
+
+The focused Qwen profile test writes one step profile and one pass profile per
+sequence length. The artifacts are diagnostic evidence only; performance claims
+still require a correctness-green run for the same model path.
 
 ## M1 Outcome
 

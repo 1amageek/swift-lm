@@ -607,6 +607,14 @@ struct MetalKernelSourceCatalog {
                     bufferPrecision: bufferPrecision
                 ))
             }
+            if generatedNames.insert("gemv_seq_q3_g16_f32s_tile4").inserted {
+                sources.append(MetalSourceGenerator.generateTiledQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g16_f32s_tile4",
+                    format: AffineQ3Group16Format(),
+                    bufferPrecision: bufferPrecision,
+                    sequenceTile: 4
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g32_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g32_f32s",
@@ -614,11 +622,27 @@ struct MetalKernelSourceCatalog {
                     bufferPrecision: bufferPrecision
                 ))
             }
+            if generatedNames.insert("gemv_seq_q3_g32_f32s_tile4").inserted {
+                sources.append(MetalSourceGenerator.generateTiledQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g32_f32s_tile4",
+                    format: AffineQ3Group32Format(),
+                    bufferPrecision: bufferPrecision,
+                    sequenceTile: 4
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g64_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g64_f32s",
                     format: AffineQ3Group64Format(),
                     bufferPrecision: bufferPrecision
+                ))
+            }
+            if generatedNames.insert("gemv_seq_q3_g64_f32s_tile4").inserted {
+                sources.append(MetalSourceGenerator.generateTiledQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g64_f32s_tile4",
+                    format: AffineQ3Group64Format(),
+                    bufferPrecision: bufferPrecision,
+                    sequenceTile: 4
                 ))
             }
             for count in 2...4 {

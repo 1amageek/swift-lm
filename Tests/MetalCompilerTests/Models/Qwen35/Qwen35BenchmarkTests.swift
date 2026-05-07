@@ -133,6 +133,7 @@ struct Qwen35BenchmarkTests {
         print("bundle: \(bundlePath)")
         print("q3 sequence gemv kernels: \(Self.q3SequenceGEMVKernelCount(in: prefillPlan))")
         print("q3 batched sequence gemv kernels: \(Self.q3BatchedSequenceGEMVKernelCount(in: prefillPlan))")
+        Self.printQ3SequenceKernelBreakdown(in: prefillPlan)
         print("runs per measurement: 2")
         print()
 
@@ -210,6 +211,44 @@ struct Qwen35BenchmarkTests {
             let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
             return name.hasPrefix("batched_gemv") && name.contains("_seq_q3_g")
         }
+    }
+
+    private static func printQ3SequenceKernelBreakdown(in prefillPlan: MetalPrefillPlan) {
+        var kernelCounts: [String: Int] = [:]
+        var singleProjectionCounts: [String: Int] = [:]
+        for step in prefillPlan.steps {
+            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
+            guard name.hasPrefix("gemv_seq_q3_g")
+                || (name.hasPrefix("batched_gemv") && name.contains("_seq_q3_g")) else {
+                continue
+            }
+            kernelCounts[name, default: 0] += 1
+            if name.hasPrefix("gemv_seq_q3_g") {
+                let summary = step.metadata.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
+                singleProjectionCounts[summary, default: 0] += 1
+            }
+        }
+
+        print("q3 sequence kernel breakdown:")
+        for (name, count) in kernelCounts.sorted(by: { $0.key < $1.key }) {
+            print("  \(count)× \(name)")
+        }
+        print("q3 single sequence projection breakdown:")
+        for (role, count) in singleProjectionCounts.sorted(by: { $0.key < $1.key }) {
+            print("  \(count)× \(role)")
+        }
+    }
+
+    private static func weightRoleSummary(_ tensorName: String) -> String {
+        var components = tensorName.split(separator: ".").map(String.init)
+        if components.last == "weight" {
+            components.removeLast()
+        }
+        if let layerIndex = components.firstIndex(of: "layers"),
+           layerIndex + 2 < components.count {
+            return components[(layerIndex + 2)...].joined(separator: ".")
+        }
+        return components.suffix(3).joined(separator: ".")
     }
 
     private static func measurePrefill(

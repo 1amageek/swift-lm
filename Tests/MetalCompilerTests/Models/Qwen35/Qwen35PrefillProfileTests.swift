@@ -65,18 +65,41 @@ struct Qwen35PrefillProfileTests {
         )
         var submission = try MetalSubmissionContext(device: device)
 
-        // Profile at each sequence length and print category breakdown
-        var profilesByLength: [Int: [StepProfile]] = [:]
+        let harness = MetalPrefillProfileHarness()
+        let artifactDirectory = try artifactDirectory()
+
+        // Profile at each sequence length and print category breakdown.
+        var profilesByLength: [Int: [MetalPrefillProfile.Entry]] = [:]
         for seqLen in Self.sequenceLengths {
-            let profiles = try profileAll(
+            let profile = try harness.profileSteps(
                 plan: isolatedPlan,
                 submission: &submission,
                 sequenceLength: seqLen,
                 iterations: Self.iterations,
-                residency: residency
+                warmupIterations: 1,
+                ephemeralResidency: residency
             )
+            let stepArtifacts = try profile.writeArtifacts(
+                directory: artifactDirectory,
+                basename: "qwen35-prefill-steps-seq\(seqLen)"
+            )
+            let passProfile = try harness.profilePasses(
+                plan: isolatedPlan,
+                submission: &submission,
+                sequenceLength: seqLen,
+                iterations: max(1, min(Self.iterations, 3)),
+                warmupIterations: 1,
+                ephemeralResidency: residency
+            )
+            let passArtifacts = try passProfile.writeArtifacts(
+                directory: artifactDirectory,
+                basename: "qwen35-prefill-passes-seq\(seqLen)"
+            )
+            let profiles = profile.entries
             profilesByLength[seqLen] = profiles
             printCategoryBreakdown(profiles: profiles, iterations: Self.iterations, seqLen: seqLen)
+            print("  artifacts: \(stepArtifacts.map(\.path).joined(separator: ", "))")
+            print("  pass artifacts: \(passArtifacts.map(\.path).joined(separator: ", "))")
         }
 
         // Scaling report: for each step, show time at 16 / 64 / 128 and ratio 128/16
@@ -105,6 +128,22 @@ struct Qwen35PrefillProfileTests {
         return nil
     }
 
+    private func artifactDirectory() throws -> URL {
+        let root = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/prefill-profile", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        return root
+    }
+
+    private func repositoryRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
     // MARK: - Step summary
 
     private func printStepSummary(plan: MetalPrefillPlan) {
@@ -119,172 +158,14 @@ struct Qwen35PrefillProfileTests {
         }
     }
 
-    // MARK: - Profile types
-
-    private struct StepProfile {
-        let index: Int
-        let kernelName: String
-        let category: String
-        let mode: PrefillStepMode
-        let gridWidth: Int
-        let gridHeight: Int
-        let threadgroupWidth: Int
-        var totalMicroseconds: Double
-    }
-
-    private func classify(_ kernelName: String) -> String {
-        let name = kernelName.lowercased()
-        if name.hasPrefix("embedding_lookup") || name.contains("gather") { return "embedding" }
-        if name.hasPrefix("gemm_") || name.hasPrefix("gemv_") || name.contains("mpp") { return "projection" }
-        if name.contains("ssm") || name.contains("delta") || name.contains("recurrence") { return "ssm_recurrence" }
-        if name.hasPrefix("rms_norm") || name.contains("qk_rms_norm") || name.contains("_norm_") { return "reduction" }
-        if name.hasPrefix("flash_attn") || name.hasPrefix("sdpa") { return "attention" }
-        if name.hasPrefix("conv1d") || name.hasPrefix("conv_") { return "conv1d" }
-        if name.contains("rope") { return "rope" }
-        if name.contains("swiglu") || name.contains("silu") || name.contains("sigmoid") { return "elementwise" }
-        if name.hasPrefix("copy_") || name.hasPrefix("add_") || name.hasPrefix("residual_") ||
-           name.hasPrefix("fused_") || name.hasPrefix("kv_cache_") { return "structural" }
-        return "other"
-    }
-
-    // MARK: - Profiling
-
-    private func profileAll(
-        plan: MetalPrefillPlan,
-        submission: inout MetalSubmissionContext,
-        sequenceLength: Int,
-        iterations: Int,
-        residency: MetalResidencyLease
-    ) throws -> [StepProfile] {
-        populateInputs(plan: plan, sequenceLength: sequenceLength)
-
-        var profiles: [StepProfile] = plan.steps.enumerated().map { index, step in
-            let kernelName = step.metadata.kernelName ?? step.pipeline.label ?? "(unlabeled)"
-            let grid = step.resolvedGridSize(sequenceLength: sequenceLength)
-            return StepProfile(
-                index: index,
-                kernelName: kernelName,
-                category: classify(kernelName),
-                mode: step.mode,
-                gridWidth: grid.width,
-                gridHeight: grid.height,
-                threadgroupWidth: step.threadgroupSize.width,
-                totalMicroseconds: 0
-            )
-        }
-
-        let runtimeConstantBuffer = plan.buffers.runtimeConstantBuffer
-
-        // Warmup (one full pass)
-        for step in plan.steps {
-            _ = try submission.withComputeTimed(ephemeralResidency: residency) { encoder, argumentTable in
-                encodeSingleStep(
-                    step,
-                    encoder: encoder,
-                    argumentTable: argumentTable,
-                    runtimeConstantBuffer: runtimeConstantBuffer,
-                    sequenceLength: sequenceLength
-                )
-            }
-        }
-
-        // Measured iterations
-        for _ in 0..<iterations {
-            for (index, step) in plan.steps.enumerated() {
-                let timing = try submission.withComputeTimed(ephemeralResidency: residency) { encoder, argumentTable in
-                    encodeSingleStep(
-                        step,
-                        encoder: encoder,
-                        argumentTable: argumentTable,
-                        runtimeConstantBuffer: runtimeConstantBuffer,
-                        sequenceLength: sequenceLength
-                    )
-                }
-                let microseconds = (timing.gpuEndTime - timing.gpuStartTime) * 1_000_000
-                profiles[index].totalMicroseconds += microseconds
-            }
-        }
-
-        return profiles
-    }
-
-    private func populateInputs(plan: MetalPrefillPlan, sequenceLength: Int) {
-        let tokenPointer = plan.buffers.tokenIDs.contents()
-            .bindMemory(to: Int32.self, capacity: sequenceLength)
-        let positionPointer = plan.buffers.positions.contents()
-            .bindMemory(to: UInt32.self, capacity: sequenceLength)
-        let ropeAxesPointer = plan.buffers.ropePositionAxes.contents()
-            .bindMemory(to: UInt32.self, capacity: sequenceLength * 3)
-        for index in 0..<sequenceLength {
-            tokenPointer[index] = Int32(index + 1)
-            let position = UInt32(index)
-            positionPointer[index] = position
-            ropeAxesPointer[index * 3] = position
-            ropeAxesPointer[index * 3 + 1] = position
-            ropeAxesPointer[index * 3 + 2] = position
-        }
-        let constantPointer = plan.buffers.runtimeConstantBuffer.contents()
-        constantPointer
-            .advanced(by: PrefillBufferSet.sequenceLengthOffset)
-            .bindMemory(to: UInt32.self, capacity: 1)
-            .pointee = UInt32(sequenceLength)
-        constantPointer
-            .advanced(by: PrefillBufferSet.hiddenConversionCountOffset)
-            .bindMemory(to: UInt32.self, capacity: 1)
-            .pointee = 0
-        for index in 0..<sequenceLength {
-            constantPointer
-                .advanced(by: PrefillBufferSet.positionOffset(at: index))
-                .bindMemory(to: UInt32.self, capacity: 1)
-                .pointee = UInt32(index)
-        }
-    }
-
-    private func encodeSingleStep(
-        _ step: MetalPrefillStep,
-        encoder: MTL4ComputeCommandEncoder,
-        argumentTable: MTL4ArgumentTable,
-        runtimeConstantBuffer: MTLBuffer,
-        sequenceLength: Int
-    ) {
-        switch step.mode {
-        case .batch:
-            step.bindings.bind(to: argumentTable)
-            step.bindRuntimeArguments(
-                argumentTable: argumentTable,
-                runtimeConstantBuffer: runtimeConstantBuffer,
-                sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
-            )
-            let gridSize = step.resolvedGridSize(sequenceLength: sequenceLength)
-            let descriptor = step.resolvedDescriptor(sequenceLength: sequenceLength)
-            descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: gridSize)
-        case .lastToken:
-            let lastPosition = sequenceLength - 1
-            step.bindStaticArguments(argumentTable: argumentTable, position: lastPosition)
-            step.descriptor.encode(on: encoder, argumentTable: argumentTable)
-        case .perPosition:
-            for positionOffset in 0..<sequenceLength {
-                step.bindStaticArguments(argumentTable: argumentTable, position: positionOffset)
-                if let positionBufferIndex = step.positionBufferIndex {
-                    argumentTable.setAddress(
-                        runtimeConstantBuffer.gpuAddress
-                            + UInt64(PrefillBufferSet.positionOffset(at: positionOffset)),
-                        index: positionBufferIndex
-                    )
-                }
-                step.descriptor.encode(on: encoder, argumentTable: argumentTable)
-            }
-        }
-    }
-
     // MARK: - Reporting
 
-    private func printCategoryBreakdown(profiles: [StepProfile], iterations: Int, seqLen: Int) {
+    private func printCategoryBreakdown(profiles: [MetalPrefillProfile.Entry], iterations: Int, seqLen: Int) {
         struct Entry { var steps: Int = 0; var totalMicros: Double = 0 }
         var byCategory: [String: Entry] = [:]
         var total: Double = 0
         for p in profiles {
-            let avg = p.totalMicroseconds / Double(iterations)
+            let avg = p.averageGpuMicroseconds
             var e = byCategory[p.category] ?? Entry()
             e.steps += 1
             e.totalMicros += avg
@@ -302,7 +183,7 @@ struct Qwen35PrefillProfileTests {
         }
     }
 
-    private func printScalingReport(profilesByLength: [Int: [StepProfile]], iterations: Int) {
+    private func printScalingReport(profilesByLength: [Int: [MetalPrefillProfile.Entry]], iterations: Int) {
         print()
         print("=== Per-kernel scaling (seqLen 16 → 128) ===")
         // Aggregate by kernel name across all steps
@@ -317,7 +198,7 @@ struct Qwen35PrefillProfileTests {
         for (seqLen, profiles) in profilesByLength {
             for p in profiles {
                 var row = rows[p.kernelName] ?? Row(kernelName: p.kernelName, category: p.category)
-                let avg = p.totalMicroseconds / Double(iterations)
+                let avg = p.averageGpuMicroseconds
                 row.times[seqLen, default: 0] += avg
                 row.counts[seqLen, default: 0] += 1
                 if row.firstGrid == nil {
