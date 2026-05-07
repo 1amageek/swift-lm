@@ -22,6 +22,40 @@ performance win for hybrid models, the stateful sequence path must produce the
 same first token and short decode trace as `prefillPlan = nil` sequential
 ingestion on the same prompt for the model family being claimed.
 
+### Current decode submission status
+
+Decode submission now reuses the resident `MTL4ArgumentTable` by default for
+synchronous decode submissions. Command buffers are still created per
+submission; replayable command-buffer reuse is intentionally not claimed until
+prompt-state restore, real-bundle decode, and asynchronous submission
+correctness are proven together.
+
+| Item | Current status | Evidence / guard |
+|---|---|---|
+| Argument table reuse | Enabled for synchronous submissions | Falls back to a fresh table when `waitUntilCompleted == false` |
+| Fresh-table diagnostic path | Available | `SWIFTLM_METAL_FRESH_ARGUMENT_TABLE=1` or `SWIFTLM_METAL_FRESH_SUBMISSION=1` |
+| Command buffer replay | Pending | Not enabled; correctness risk remains higher than the measured benefit |
+
+### Current quantized decode batching status
+
+Quantized decode no longer decomposes every `BatchedProjection` back into
+individual `LinearFragment` entries just because a sibling projection uses a
+block-quantized weight format. The compiler can now emit batched quantized GEMV
+kernels such as `batched_gemv3_q4_g64`, preserving Q/K/V and gate/up dispatch
+reduction for decode.
+
+This is kernel/planner support, not a broad model-quality claim. Synthetic
+kernel tests cover Q3/Q4 batched GEMV correctness and planning tests verify that
+Q4 sibling projections remain batched. Qwen3.5 quantized agreement remains a
+separate real-bundle quality gate and must stay marked unsupported until that
+suite is green.
+
+| Path | Current status | Release claim |
+|---|---|---|
+| Dense BF16/FP16 decode batching | Supported | Yes, where real-bundle gates pass |
+| Quantized batched decode kernels | Implemented for generic 2-4 projection GEMV | Kernel/planner evidence only |
+| Qwen3.5 Q3/Q4 real-bundle decode quality | Still not release-ready | No |
+
 ### Profile Data (LFM2.5-1.2B, current implementation)
 
 ```
@@ -31,19 +65,39 @@ Decode (single token):  ~110 tok/s, 8.4 ms/tok
   Fused Norm: 2.2%
   Other:      2.5%
 
-Prefill (64 tokens):  ~316 tok/s, 3.16 ms/tok
-  GEMM: dominant (naive row-by-row implementation)
+Prefill (64 tokens):  historical snapshot; re-benchmark required
+  GEMM: routes through Metal 4 MPP matmul2d where eligible, with direct
+        quantized fallbacks for unsupported layouts.
 ```
 
 ### Key Constraints
 
 - **Decode GEMV is at memory bandwidth ceiling.** Kernel-level optimization (threadgroup cache, vectorized loads) showed no improvement or regression. Apple Silicon L2 cache already handles input vector reuse.
-- **Prefill GEMM is naive.** Each row computed independently via simd_sum. No tiling, no AMX utilization.
+- **Prefill GEMM uses Metal 4 MPP where eligible.** Dense BF16/FP16/FP32 and compatible
+  dequantized quantized projections route through `matmul2d`; unsupported strides or
+  schemes use explicit direct kernels/fallback reasons.
+- **Short sequence tile selection matters.** MPP GEMM kernels are emitted with
+  `_mtile16`, `_mtile32`, and `_mtile64` variants, and runtime dispatch selects
+  the smallest available tile that covers the actual prompt length. `_mtile128`
+  is intentionally not in the default set until benchmark data proves it helps.
+- **Hybrid decode-equivalent prefill is not always MPP.** Qwen-style
+  conv/recurrent sequence prefill intentionally keeps dense BF16/FP16
+  projections on decode-equivalent sequence GEMV kernels so state seeding stays
+  trace-gated. The batched sequence GEMV path now processes two output rows per
+  threadgroup, preserving per-row SIMD reduction order while reducing grid
+  width for Q/K/V and gate/up projections. These sequence GEMV kernels and
+  synthesized fused sequence kernels write decode-rounded storage values
+  directly, so the planner does not emit an immediate `round_bf16_seq_f32` /
+  `round_f16_seq_f32` pass after them. A larger 1024-element sequence GEMV tile
+  was tested and rejected because it regressed the focused Qwen prefill profile.
 - **Metal 4 matmul2d** uses Apple's internal optimized paths (likely AMX). Supports BF16×BF16→float natively.
 
 ## Strategy: Metal 4 Prefill GEMM
 
-Replace the naive `generateGEMM` kernel with Metal 4 `matmul2d_descriptor` + `tensor_inline`.
+The current implementation replaces eligible prefill `generateGEMM` dispatches
+with Metal 4 `matmul2d_descriptor` + `tensor_inline`. This section remains the
+design reference for extending that path, not a statement that all prefill GEMM
+uses MPP.
 
 ### Why Prefill GEMM Only
 
@@ -249,9 +303,10 @@ MetalCompiler/
 ## Scope
 
 ### Phase 1: Prefill GEMM with matmul2d
-- Pre-compile MPP GEMM kernel to metallib
-- Runtime: detect Metal 4, load metallib, use for prefill projections
-- Fallback: existing naive GEMM for Metal 3
+- Implemented for eligible dense and dequantized prefill projections.
+- Runtime sequence length adjusts grid height, and MPP tile variants are preserved
+  through barrier optimization, resident-constant conversion, and runtime isolation.
+- Remaining work: model-level Qwen/LFM/Gemma benchmark refresh after correctness gates.
 
 ### Phase 2: MTL4CommandBuffer for Decode
 - Reuse command buffer across decode steps (eliminate per-step allocation)

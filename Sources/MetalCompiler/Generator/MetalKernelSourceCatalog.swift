@@ -101,6 +101,20 @@ struct MetalKernelSourceCatalog {
                             ))
                         }
                     }
+                    if let tiledBatchedSequenceName = tiledBatchedSequenceGEMVKernelName(
+                        for: weightFormat,
+                        count: batchedCount
+                    ) {
+                        if generatedNames.insert(tiledBatchedSequenceName).inserted {
+                            sources.append(MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                                name: tiledBatchedSequenceName,
+                                count: batchedCount,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat,
+                                sequenceTile: 4
+                            ))
+                        }
+                    }
                     if let batchedMPPName = batchedMPPGEMMKernelName(for: weightFormat, count: batchedCount) {
                         if generatedNames.insert(batchedMPPName).inserted {
                             batchedMPPGEMMRequests.append((name: batchedMPPName, count: batchedCount, weightFormat: weightFormat))
@@ -560,6 +574,15 @@ struct MetalKernelSourceCatalog {
                     tileElements: 256
                 ))
             }
+            if generatedNames.insert("gemv_seq_f32s_tile4").inserted {
+                sources.append(MetalSourceGenerator.generateTiledSequenceGEMV(
+                    name: "gemv_seq_f32s_tile4",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .float16,
+                    sequenceTile: 4,
+                    tileElements: 256
+                ))
+            }
             if generatedNames.insert("gemv_seq_bf16_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateSequenceGEMV(
                     name: "gemv_seq_bf16_f32s",
@@ -567,6 +590,65 @@ struct MetalKernelSourceCatalog {
                     weightFormat: .bfloat16,
                     tileElements: 256
                 ))
+            }
+            if generatedNames.insert("gemv_seq_bf16_f32s_tile4").inserted {
+                sources.append(MetalSourceGenerator.generateTiledSequenceGEMV(
+                    name: "gemv_seq_bf16_f32s_tile4",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    sequenceTile: 4,
+                    tileElements: 256
+                ))
+            }
+            if generatedNames.insert("gemv_seq_q3_g16_f32s").inserted {
+                sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g16_f32s",
+                    format: AffineQ3Group16Format(),
+                    bufferPrecision: bufferPrecision
+                ))
+            }
+            if generatedNames.insert("gemv_seq_q3_g32_f32s").inserted {
+                sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g32_f32s",
+                    format: AffineQ3Group32Format(),
+                    bufferPrecision: bufferPrecision
+                ))
+            }
+            if generatedNames.insert("gemv_seq_q3_g64_f32s").inserted {
+                sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
+                    name: "gemv_seq_q3_g64_f32s",
+                    format: AffineQ3Group64Format(),
+                    bufferPrecision: bufferPrecision
+                ))
+            }
+            for count in 2...4 {
+                let g16Name = "batched_gemv\(count)_seq_q3_g16_f32s"
+                if generatedNames.insert(g16Name).inserted {
+                    sources.append(MetalSourceGenerator.generateBatchedQuantizedSequenceGEMV(
+                        name: g16Name,
+                        count: count,
+                        format: AffineQ3Group16Format(),
+                        bufferPrecision: bufferPrecision
+                    ))
+                }
+                let g32Name = "batched_gemv\(count)_seq_q3_g32_f32s"
+                if generatedNames.insert(g32Name).inserted {
+                    sources.append(MetalSourceGenerator.generateBatchedQuantizedSequenceGEMV(
+                        name: g32Name,
+                        count: count,
+                        format: AffineQ3Group32Format(),
+                        bufferPrecision: bufferPrecision
+                    ))
+                }
+                let g64Name = "batched_gemv\(count)_seq_q3_g64_f32s"
+                if generatedNames.insert(g64Name).inserted {
+                    sources.append(MetalSourceGenerator.generateBatchedQuantizedSequenceGEMV(
+                        name: g64Name,
+                        count: count,
+                        format: AffineQ3Group64Format(),
+                        bufferPrecision: bufferPrecision
+                    ))
+                }
             }
         }
 
@@ -661,6 +743,9 @@ struct MetalKernelSourceCatalog {
         let argumentBufferIndex = MetalInferenceCompiler.argumentTableBindingIndex
 
         if let batched = fragment as? BatchedProjection {
+            guard !weightFormat.isQuantized else {
+                return nil
+            }
             switch batched.projections.count {
             case 2:
                 return MetalSourceGenerator.generateBatchedGEMV2ArgumentTableVariant(
@@ -767,6 +852,19 @@ struct MetalKernelSourceCatalog {
         if weightFormat.isFloat16 { return "batched_gemv\(count)_seq_f32s" }
         if weightFormat.isFloat32 { return "batched_gemv\(count)_seq_fp32_f32s" }
         return nil
+    }
+
+    func tiledBatchedSequenceGEMVKernelName(
+        for weightFormat: MetalSourceGenerator.WeightFormat,
+        count: Int
+    ) -> String? {
+        guard let baseName = batchedSequenceGEMVKernelName(
+            for: weightFormat,
+            count: count
+        ) else {
+            return nil
+        }
+        return "\(baseName)_tile4"
     }
 
     /// Kernel name for the batched MPP GEMM kernel that handles multiple dense-weight

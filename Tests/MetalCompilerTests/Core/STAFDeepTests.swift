@@ -679,7 +679,7 @@ struct STAFDeepTests {
         // Dense formats
         #expect(store.entries["dense_fp16.weight"]?.schemeIdentifier == .fp16RowMajor)
         #expect(store.entries["dense_bf16.weight"]?.schemeIdentifier == .bf16RowMajor)
-        #expect(store.entries["dense_fp32.weight"]?.schemeIdentifier == .fp16RowMajor)  // F32→F16
+        #expect(store.entries["dense_fp32.weight"]?.schemeIdentifier == .fp32RowMajor)
 
         // Quantized formats
         #expect(store.entries["quant_g64.weight"]?.schemeIdentifier == .q4Group64ScaleF16)

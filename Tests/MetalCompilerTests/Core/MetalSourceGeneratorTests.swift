@@ -181,8 +181,8 @@ struct MetalSourceGeneratorTests {
         #expect(maxError < 0.01, "MPP GEMM drifted: maxError=\(maxError)")
     }
 
-    @Test("Q3G64 dequant then MPP GEMM matches CPU reference")
-    func q3Group64DequantThenMPPGEMMMatchesCPUReference() throws {
+    @Test("Q3 dequant then MPP GEMM matches CPU reference for all group sizes")
+    func q3DequantThenMPPGEMMMatchesCPUReferenceForAllGroupSizes() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -190,11 +190,20 @@ struct MetalSourceGeneratorTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let format = AffineQ3Group64Format()
+        try runQ3DequantThenMPPGEMMReferenceTest(device: device, format: AffineQ3Group16Format())
+        try runQ3DequantThenMPPGEMMReferenceTest(device: device, format: AffineQ3Group32Format())
+        try runQ3DequantThenMPPGEMMReferenceTest(device: device, format: AffineQ3Group64Format())
+    }
+
+    private func runQ3DequantThenMPPGEMMReferenceTest(
+        device: MTLDevice,
+        format: any QuantizationFormat
+    ) throws {
         let inputDimension = 128
         let outputDimension = 5
         let sequenceLength = 4
         let blocksPerRow = inputDimension / format.groupSize
+        let suffix = q3KernelSuffix(for: format.schemeIdentifier)
 
         var packedWeights: [UInt8] = []
         var dequantizedWeights: [Float] = []
@@ -241,8 +250,8 @@ struct MetalSourceGeneratorTests {
             options: .storageModeShared
         ))
 
-        let dequantName = "test_dequant_q3_g64_bf16"
-        let gemmName = "test_mpp_q3_g64_bf16_f32s"
+        let dequantName = "test_dequant_\(suffix)_bf16"
+        let gemmName = "test_mpp_\(suffix)_bf16_f32s"
         let source = MetalSourceGenerator.commonHeader + "\n\n"
             + MetalSourceGenerator.generateUnifiedDequantToBFloat(
                 name: dequantName,
@@ -328,7 +337,329 @@ struct MetalSourceGeneratorTests {
         let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
             max(partial, abs(pair.0 - pair.1))
         }
-        #expect(maxError < 0.02, "Q3G64 dequant to MPP GEMM drifted: maxError=\(maxError)")
+        #expect(maxError < 0.02, "\(suffix) dequant to MPP GEMM drifted: maxError=\(maxError)")
+    }
+
+    private func q3KernelSuffix(for scheme: QuantizationSchemeIdentifier) -> String {
+        switch scheme {
+        case .q3Group16ScaleF16:
+            return "q3_g16"
+        case .q3Group32ScaleF16:
+            return "q3_g32"
+        case .q3Group64ScaleF16:
+            return "q3_g64"
+        default:
+            preconditionFailure("Unexpected Q3 scheme: \(scheme)")
+        }
+    }
+
+    @Test("Q3 sequence GEMV matches decode-rounded CPU reference for all group sizes")
+    func q3SequenceGEMVMatchesDecodeRoundedCPUReferenceForAllGroupSizes() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group16Format())
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group32Format())
+        try runQ3SequenceGEMVReferenceTest(device: device, format: AffineQ3Group64Format())
+    }
+
+    @Test("Q3 batched sequence GEMV matches decode-rounded CPU reference for all counts and group sizes")
+    func q3BatchedSequenceGEMVMatchesDecodeRoundedCPUReferenceForAllCountsAndGroupSizes() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        for count in 2...4 {
+            try runQ3BatchedSequenceGEMVReferenceTest(
+                device: device,
+                count: count,
+                format: AffineQ3Group16Format()
+            )
+            try runQ3BatchedSequenceGEMVReferenceTest(
+                device: device,
+                count: count,
+                format: AffineQ3Group32Format()
+            )
+            try runQ3BatchedSequenceGEMVReferenceTest(
+                device: device,
+                count: count,
+                format: AffineQ3Group64Format()
+            )
+        }
+    }
+
+    private func runQ3SequenceGEMVReferenceTest(
+        device: MTLDevice,
+        format: any QuantizationFormat
+    ) throws {
+        let inputDimension = 128
+        let outputDimension = 7
+        let sequenceLength = 5
+        let outputRowStride = 16
+        let blocksPerRow = inputDimension / format.groupSize
+        let suffix = q3KernelSuffix(for: format.schemeIdentifier)
+
+        var packedWeights: [UInt8] = []
+        var dequantizedWeights: [Float] = []
+        for row in 0..<outputDimension {
+            for block in 0..<blocksPerRow {
+                let scale = 0.03125 * Float(block + 1) + 0.0078125 * Float(row)
+                let zero = -0.125 + 0.0625 * Float(row) - 0.015625 * Float(block)
+                let weights = (0..<format.groupSize).map {
+                    UInt32(($0 + block * 3 + row * 5) % 8)
+                }
+                packedWeights.append(contentsOf: makeQuantizedBlock(
+                    weights: weights,
+                    bits: format.bits,
+                    scale: scale,
+                    zero: zero,
+                    payloadByteCount: format.bytesPerBlock - 4
+                ))
+                dequantizedWeights.append(contentsOf: weights.map { scale * Float($0) + zero })
+            }
+        }
+
+        var input: [Float] = (0..<(inputDimension * sequenceLength)).map {
+            Float(($0 % 19) - 9) * 0.03125
+        }
+        var output = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: &input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let packedBuffer = try #require(device.makeBuffer(
+            bytes: packedWeights,
+            length: packedWeights.count,
+            options: .storageModeShared
+        ))
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+
+        let kernelName = "test_gemv_seq_\(suffix)_f32s"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
+                name: kernelName,
+                format: format,
+                bufferPrecision: .float32
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        var inDim = UInt32(inputDimension)
+        var outDim = UInt32(outputDimension)
+        var seqLen = UInt32(sequenceLength)
+        var inputRowStride = UInt32(inputDimension)
+        var rowStride = UInt32(outputRowStride)
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(packedBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + 1) / 2, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(pipeline.threadExecutionWidth * 2, pipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let actualPointer = outputBuffer.contents().bindMemory(to: Float.self, capacity: output.count)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                var sum: Float = 0
+                for column in 0..<inputDimension {
+                    sum += input[seq * inputDimension + column]
+                        * dequantizedWeights[row * inputDimension + column]
+                }
+                let expected = Float(Float16(sum))
+                let actual = actualPointer[seq * outputRowStride + row]
+                #expect(
+                    abs(actual - expected) < 0.0001,
+                    "\(suffix) sequence GEMV mismatch seq=\(seq) row=\(row): actual=\(actual) expected=\(expected)"
+                )
+            }
+        }
+    }
+
+    private func runQ3BatchedSequenceGEMVReferenceTest(
+        device: MTLDevice,
+        count: Int,
+        format: any QuantizationFormat
+    ) throws {
+        let inputDimension = 128
+        let sequenceLength = 4
+        let outputRowStride = 16
+        let outputDimensions = Array([3, 5, 7, 9].prefix(count))
+        let blocksPerRow = inputDimension / format.groupSize
+        let suffix = q3KernelSuffix(for: format.schemeIdentifier)
+
+        var packedByProjection: [[UInt8]] = []
+        var dequantizedByProjection: [[Float]] = []
+        for projection in 0..<count {
+            let outputDimension = outputDimensions[projection]
+            var packedWeights: [UInt8] = []
+            var dequantizedWeights: [Float] = []
+            for row in 0..<outputDimension {
+                for block in 0..<blocksPerRow {
+                    let scale = 0.0234375 * Float(block + 1)
+                        + 0.005859375 * Float(row + projection)
+                    let zero = -0.1875
+                        + 0.03125 * Float(row)
+                        - 0.01171875 * Float(block + projection)
+                    let weights = (0..<format.groupSize).map {
+                        UInt32(($0 + block * 3 + row * 5 + projection * 7) % 8)
+                    }
+                    packedWeights.append(contentsOf: makeQuantizedBlock(
+                        weights: weights,
+                        bits: format.bits,
+                        scale: scale,
+                        zero: zero,
+                        payloadByteCount: format.bytesPerBlock - 4
+                    ))
+                    dequantizedWeights.append(contentsOf: weights.map { scale * Float($0) + zero })
+                }
+            }
+            packedByProjection.append(packedWeights)
+            dequantizedByProjection.append(dequantizedWeights)
+        }
+
+        var input: [Float] = (0..<(inputDimension * sequenceLength)).map {
+            Float(($0 % 23) - 11) * 0.02734375
+        }
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: &input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        var packedBuffers: [MTLBuffer] = []
+        for packed in packedByProjection {
+            let buffer = try #require(device.makeBuffer(
+                bytes: packed,
+                length: packed.count,
+                options: .storageModeShared
+            ))
+            packedBuffers.append(buffer)
+        }
+        var outputBuffers: [MTLBuffer] = []
+        for _ in 0..<count {
+            var output = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+            let buffer = try #require(device.makeBuffer(
+                bytes: &output,
+                length: output.count * MemoryLayout<Float>.stride,
+                options: .storageModeShared
+            ))
+            outputBuffers.append(buffer)
+        }
+
+        let kernelName = "test_batched_gemv\(count)_seq_\(suffix)_f32s"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateBatchedQuantizedSequenceGEMV(
+                name: kernelName,
+                count: count,
+                format: format,
+                bufferPrecision: .float32
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        for i in 0..<count {
+            encoder.setBuffer(packedBuffers[i], offset: 0, index: 1 + i)
+            encoder.setBuffer(outputBuffers[i], offset: 0, index: 1 + count + i)
+        }
+        var inDim = UInt32(inputDimension)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.stride, index: 1 + 2 * count)
+        for i in 0..<count {
+            var outDim = UInt32(outputDimensions[i])
+            encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.stride, index: 2 + 2 * count + i)
+        }
+        var seqLen = UInt32(sequenceLength)
+        var inputRowStride = UInt32(inputDimension)
+        var rowStride = UInt32(outputRowStride)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 2 + 3 * count)
+        encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: 3 + 3 * count)
+        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 4 + 3 * count)
+
+        let totalRows = outputDimensions.reduce(0, +)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (totalRows + 1) / 2, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(pipeline.threadExecutionWidth * 2, pipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        for projection in 0..<count {
+            let outputDimension = outputDimensions[projection]
+            let actualPointer = outputBuffers[projection]
+                .contents()
+                .bindMemory(to: Float.self, capacity: outputRowStride * sequenceLength)
+            let dequantizedWeights = dequantizedByProjection[projection]
+            for seq in 0..<sequenceLength {
+                for row in 0..<outputDimension {
+                    var sum: Float = 0
+                    for column in 0..<inputDimension {
+                        sum += input[seq * inputDimension + column]
+                            * dequantizedWeights[row * inputDimension + column]
+                    }
+                    let expected = Float(Float16(sum))
+                    let actual = actualPointer[seq * outputRowStride + row]
+                    #expect(
+                        abs(actual - expected) < 0.0001,
+                        "\(suffix) batched sequence GEMV mismatch count=\(count) projection=\(projection) seq=\(seq) row=\(row): actual=\(actual) expected=\(expected)"
+                    )
+                }
+            }
+        }
     }
 
     @Test("MPP GEMM matches CPU reference for FP16 prefill projection")

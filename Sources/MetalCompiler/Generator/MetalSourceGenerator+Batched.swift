@@ -533,6 +533,124 @@ public static func generateBatchedSequenceGEMV(
     """
 }
 
+public static func generateTiledBatchedSequenceGEMV(
+    name: String,
+    count: Int,
+    bufferPrecision: BufferPrecision,
+    weightFormat: WeightFormat,
+    sequenceTile: Int,
+    tileElements: Int = 256
+) -> String {
+    precondition((2...4).contains(count), "batched sequence GEMV supports 2...4 projections")
+    precondition(sequenceTile >= 1, "sequence tile must be positive")
+    let bt = bufferPrecision.metalType
+    let wt = weightFormat.bufferType
+    let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+    let storeValue: (String) -> String = { expr in
+        bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue(expr, weightFormat: weightFormat)
+            : expr
+    }
+
+    let weightBindings = (0..<count).map { i in
+        "device const \(wt)* weight\(i)        [[buffer(\(1 + i))]],"
+    }.joined(separator: "\n        ")
+    let outputBindings = (0..<count).map { i in
+        "device \(bt)* output\(i)              [[buffer(\(1 + count + i))]],"
+    }.joined(separator: "\n        ")
+    let outputDimBindings = (0..<count).map { i in
+        "constant uint& outputDim\(i)          [[buffer(\(2 + 2 * count + i))]],"
+    }.joined(separator: "\n        ")
+
+    let totalRows = (0..<count).map { "outputDim\($0)" }.joined(separator: " + ")
+    let branchBlocks = (0..<count).map { i -> String in
+        let condition: String
+        if i == 0 {
+            condition = "if (globalRow < outputDim0)"
+        } else if i == count - 1 {
+            condition = "else"
+        } else {
+            let cumulative = (0...i).map { "outputDim\($0)" }.joined(separator: " + ")
+            condition = "else if (globalRow < \(cumulative))"
+        }
+        let prior = i == 0 ? "0u" : (0..<i).map { "outputDim\($0)" }.joined(separator: " + ")
+        return """
+                \(condition) {
+                    weight = weight\(i); output = output\(i); outputDimension = outputDim\(i);
+                    localRow = globalRow - (\(prior));
+                }
+        """
+    }.joined(separator: "\n        ")
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input              [[buffer(0)]],
+        \(weightBindings)
+        \(outputBindings)
+        constant uint& inputDimension          [[buffer(\(1 + 2 * count))]],
+        \(outputDimBindings)
+        constant uint& sequenceLength          [[buffer(\(2 + 3 * count))]],
+        constant uint& inputRowStride          [[buffer(\(3 + 3 * count))]],
+        constant uint& outputRowStride         [[buffer(\(4 + 3 * count))]],
+        uint2 gid                              [[threadgroup_position_in_grid]],
+        uint tid                               [[thread_index_in_threadgroup]],
+        uint tiisg                             [[thread_index_in_simdgroup]],
+        uint sgitg                             [[simdgroup_index_in_threadgroup]],
+        uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+    ) {
+        const uint tileElements = \(tileElements);
+        const uint sequenceTile = \(sequenceTile);
+        const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+        const uint rowsPerThreadgroup = max(1u, simdgroupsPerThreadgroup / sequenceTile);
+        const uint localSeq = min(sequenceTile - 1u, sgitg / rowsPerThreadgroup);
+        const uint localRowInGroup = sgitg - localSeq * rowsPerThreadgroup;
+        const uint globalRow = gid.x * rowsPerThreadgroup + localRowInGroup;
+        const uint seqPos = gid.y * sequenceTile + localSeq;
+        const uint totalRows = \(totalRows);
+        const bool validSeq = seqPos < sequenceLength;
+        const bool validRow = globalRow < totalRows;
+
+        device const \(wt)* weight = weight0;
+        device \(bt)* output = output0;
+        uint outputDimension = outputDim0;
+        uint localRow = globalRow;
+        if (validRow) {
+            \(branchBlocks)
+        }
+
+        threadgroup \(bt) inputTile[\(sequenceTile * tileElements)];
+        float sum = 0.0f;
+        for (uint base = 0; base < inputDimension; base += tileElements) {
+            if (localRowInGroup == 0u && validSeq) {
+                device const \(bt)* inputRow = input + seqPos * inputRowStride;
+                threadgroup \(bt)* tile = inputTile + localSeq * tileElements;
+                for (uint j = tiisg; j < tileElements; j += SIMD_WIDTH) {
+                    const uint inputIndex = base + j;
+                    tile[j] = inputIndex < inputDimension ? inputRow[inputIndex] : \(bt)(0.0f);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (validSeq && validRow) {
+                device const \(wt)* weightRow = weight + localRow * inputDimension;
+                threadgroup \(bt)* tile = inputTile + localSeq * tileElements;
+                const uint tileCount = min(tileElements, inputDimension - base);
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(tile[j]);
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (validSeq && validRow) {
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + localRow] = \(bt)(\(storeValue("sum")));
+            }
+        }
+    }
+    """
+}
+
 // MARK: - Batched Per-Head Fragment
 
 /// Generate batched per-head kernel for 2 independent in-place operations.

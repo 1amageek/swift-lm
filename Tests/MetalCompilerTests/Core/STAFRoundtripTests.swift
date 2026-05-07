@@ -20,7 +20,13 @@ struct STAFRoundtripTests {
         let tempDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent("staf_test_\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: tempDirectory) }
+        defer {
+            do {
+                try FileManager.default.removeItem(at: tempDirectory)
+            } catch {
+                Issue.record("Failed to remove temporary STAF directory: \(error)")
+            }
+        }
 
         // Known Float16 values: simple sequence [1.0, 2.0, ..., 128.0]
         let elementCount = 128
@@ -119,10 +125,10 @@ struct STAFRoundtripTests {
         }
     }
 
-    // MARK: - Float32 → Float16 Conversion
+    // MARK: - Float32 Preservation
 
-    @Test("Float32 tensor is converted to Float16 in STAF")
-    func float32ToFloat16Conversion() throws {
+    @Test("Float32 tensor is preserved as Float32 in STAF")
+    func float32Preservation() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -133,7 +139,6 @@ struct STAFRoundtripTests {
         try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: tempDirectory) }
 
-        // Float32 values
         var f32Values: [Float] = [1.0, 2.0, 3.0, 4.0, 0.5, -1.0, 0.0, 100.0]
         let elementCount = f32Values.count
 
@@ -155,20 +160,18 @@ struct STAFRoundtripTests {
             return
         }
 
-        // Should be stored as FP16
-        #expect(entry.schemeIdentifier == .fp16RowMajor)
-        #expect(entry.payloadSize == elementCount * 2)
+        #expect(entry.schemeIdentifier == .fp32RowMajor)
+        #expect(entry.payloadSize == elementCount * MemoryLayout<Float>.size)
 
         let bufferPointer = store.buffer.contents() + entry.bufferOffset
-        let loadedFP16 = UnsafeBufferPointer(
-            start: bufferPointer.bindMemory(to: Float16.self, capacity: elementCount),
+        let loadedFP32 = UnsafeBufferPointer(
+            start: bufferPointer.bindMemory(to: Float.self, capacity: elementCount),
             count: elementCount)
 
         for i in 0..<elementCount {
-            let expected = Float16(f32Values[i])
             #expect(
-                loadedFP16[i] == expected,
-                "FP32→FP16 mismatch at index \(i): loaded=\(loadedFP16[i]) expected=\(expected)")
+                loadedFP32[i] == f32Values[i],
+                "FP32 mismatch at index \(i): loaded=\(loadedFP32[i]) expected=\(f32Values[i])")
         }
     }
 
@@ -752,7 +755,7 @@ struct STAFRoundtripTests {
         let store = try STAFLoader().load(at: stafURL, device: device)
 
         #expect(store.metadata[STAFMetadataKey.sourceFormat] == .string("safetensors"))
-        #expect(store.metadata[STAFMetadataKey.converterVersion] == .uint32(1))
+        #expect(store.metadata[STAFMetadataKey.converterVersion] == .uint32(STAF.currentConverterVersion))
         #expect(store.metadata[STAFMetadataKey.sourceShardCount] == .uint64(1))
         #expect(store.metadata[STAFMetadataKey.metadataSchemaVersion] == .uint32(1))
         #expect(store.metadata["model.architecture_family"] == .string("transformer"))
@@ -761,6 +764,46 @@ struct STAFRoundtripTests {
         #expect(store.metadata["model.tied_embeddings"] == .bool(true))
         #expect(store.metadata["model.rope_theta"] == .float64(10000.0))
         #expect(store.metadata["model.norm_eps"] == .float32(1e-5))
+    }
+
+    @Test("isValid rejects stale converter metadata without explicit expected metadata")
+    func isValidRejectsStaleConverterMetadataByDefault() throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("staf_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer {
+            do {
+                try FileManager.default.removeItem(at: tempDirectory)
+            } catch {
+                Issue.record("Failed to remove temporary STAF directory: \(error)")
+            }
+        }
+
+        var values: [Float16] = [1, 2, 3, 4]
+        let safetensorsURL = tempDirectory.appendingPathComponent("model.safetensors")
+        try writeSafetensors(
+            tensors: [
+                TestTensor(name: "test.weight", dtype: "F16", shape: [4],
+                           data: Data(bytes: &values, count: values.count * 2))
+            ],
+            to: safetensorsURL)
+
+        let staleVersion = STAF.currentConverterVersion == 0 ? 0 : STAF.currentConverterVersion - 1
+        let staleMetadata = STAFFileMetadata(values: [
+            STAFMetadataKey.converterVersion: .uint32(staleVersion)
+        ])
+        let stafURL = tempDirectory.appendingPathComponent("model.staf")
+        try STAFConverter().convert(
+            safetensorsURLs: [safetensorsURL],
+            outputURL: stafURL,
+            metadata: staleMetadata
+        )
+
+        let isValid = try STAFConverter().isValid(
+            stafURL: stafURL,
+            safetensorsURLs: [safetensorsURL]
+        )
+        #expect(!isValid, "STAF should be invalid when converter metadata is stale")
     }
 
     // MARK: - Helpers

@@ -337,7 +337,7 @@ struct MetalBufferAllocator {
     }
 
     /// Maximum weight element count (outputDim × inputDim) across all projections.
-    /// Used to size the dequant scratch buffer for Q4→BF16 unpacking.
+    /// Used to size the dequant scratch buffer for quantized→BF16 unpacking.
     private func maximumProjectionWeightElementCount(in entries: [DispatchEntry]) -> Int {
         entries.reduce(into: 0) { maxElements, entry in
             guard let projection = entry.fragment as? ProjectionDescribing else { return }

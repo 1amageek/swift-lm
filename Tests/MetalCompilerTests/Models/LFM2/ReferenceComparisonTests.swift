@@ -97,7 +97,8 @@ struct ReferenceComparisonTests {
                 sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
             )
             let grid = step.resolvedGridSize(sequenceLength: seqLen)
-            step.descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
+            let descriptor = step.resolvedDescriptor(sequenceLength: seqLen)
+            descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
         }
 
         // Read embedding output from hidden buffer (F32 in prefill, last token)
@@ -283,7 +284,8 @@ struct ReferenceComparisonTests {
                         sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
                     )
                     let grid = step.resolvedGridSize(sequenceLength: seqLen)
-                    step.descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
+                    let descriptor = step.resolvedDescriptor(sequenceLength: seqLen)
+                    descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
                 case .perPosition:
                     for pos in 0..<seqLen {
                         step.bindStaticArguments(argumentTable: argumentTable, position: pos)
@@ -795,7 +797,8 @@ struct ReferenceComparisonTests {
                         sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
                     )
                     let grid = step.resolvedGridSize(sequenceLength: 1)
-                    step.descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
+                    let descriptor = step.resolvedDescriptor(sequenceLength: 1)
+                    descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
                 case .lastToken:
                     step.bindStaticArguments(argumentTable: argumentTable, position: sequenceLength - 1)
                     step.descriptor.encode(on: encoder, argumentTable: argumentTable)
@@ -1374,7 +1377,8 @@ struct ReferenceComparisonTests {
                         sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
                     )
                     let grid = step.resolvedGridSize(sequenceLength: seqLen)
-                    step.descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
+                    let descriptor = step.resolvedDescriptor(sequenceLength: seqLen)
+                    descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: grid)
                 case .perPosition:
                     for pos in 0..<seqLen {
                         step.bindStaticArguments(argumentTable: argumentTable, position: pos)

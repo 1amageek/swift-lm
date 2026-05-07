@@ -189,6 +189,14 @@ extension MetalSourceGenerator {
         sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q4_g128", format: AffineQ4Group128Format(), bufferPrecision: decode))
         sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q8_g32", format: AffineQ8Group32Format(), bufferPrecision: decode))
         sources.append(generateUnifiedQuantizedGEMV(name: "gemv_q8_g64", format: AffineQ8Group64Format(), bufferPrecision: decode))
+        sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g16_f32s", format: AffineQ3Group16Format(), bufferPrecision: prefill))
+        sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g32_f32s", format: AffineQ3Group32Format(), bufferPrecision: prefill))
+        sources.append(generateUnifiedQuantizedSequenceGEMV(name: "gemv_seq_q3_g64_f32s", format: AffineQ3Group64Format(), bufferPrecision: prefill))
+        for count in 2...4 {
+            sources.append(generateBatchedQuantizedSequenceGEMV(name: "batched_gemv\(count)_seq_q3_g16_f32s", count: count, format: AffineQ3Group16Format(), bufferPrecision: prefill))
+            sources.append(generateBatchedQuantizedSequenceGEMV(name: "batched_gemv\(count)_seq_q3_g32_f32s", count: count, format: AffineQ3Group32Format(), bufferPrecision: prefill))
+            sources.append(generateBatchedQuantizedSequenceGEMV(name: "batched_gemv\(count)_seq_q3_g64_f32s", count: count, format: AffineQ3Group64Format(), bufferPrecision: prefill))
+        }
 
         // === Quantized GEMM (prefill) ===
         sources.append(generateQuantizedGEMM_Q4(name: "gemm_q4_g64", bufferPrecision: decode, groupSize: 64))

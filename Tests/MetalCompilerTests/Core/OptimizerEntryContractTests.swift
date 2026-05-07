@@ -3912,7 +3912,8 @@ struct OptimizerEntryContractTests {
                 sequenceLengthPolicy: step.sequenceLengthPolicy,
                 positionBufferIndex: step.positionBufferIndex,
                 perPositionStrides: step.perPositionStrides,
-                metadata: step.metadata
+                metadata: step.metadata,
+                tileVariants: step.tileVariants
             )
         }
         return MetalPrefillPlan(

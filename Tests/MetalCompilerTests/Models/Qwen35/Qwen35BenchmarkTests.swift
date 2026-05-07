@@ -18,6 +18,7 @@ import Testing
 struct Qwen35BenchmarkTests {
 
     static let modelLabel = "Qwen3.5-0.8B"
+    static let q3ModelLabel = "Qwen3.5-0.8B Q3"
 
     @Test("MLX-aligned prefill + decode throughput (3-run median)")
     func mlxAlignedBenchmark() throws {
@@ -96,6 +97,65 @@ struct Qwen35BenchmarkTests {
         print()
     }
 
+    @Test("Q3 sequence prefill smoke benchmark")
+    func q3SequencePrefillSmokeBenchmark() throws {
+        guard let bundlePath = try Self.resolveBundle(repoName: "mlx-community--Qwen3.5-0.8B-3bit") else {
+            Issue.record("Q3 bundle not found. Expected ~/.cache/huggingface/hub/models--mlx-community--Qwen3.5-0.8B-3bit.")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let (model, _, _) = try BenchmarkSupport.setupFromBundle(
+            bundlePath: bundlePath,
+            maximumPrefillLength: 128
+        )
+        let prefillPlan = try #require(model.prefillPlan)
+        #expect(!prefillPlan.requiresSequentialPromptIngestion)
+        #expect(prefillPlan.sequencePrefillFallbackReason == nil)
+        #expect(
+            Self.q3SequenceGEMVKernelCount(in: prefillPlan) > 0,
+            "Q3 prefill must include packed Q3 sequence GEMV kernels."
+        )
+
+        var inferenceModel = model
+        let warmupTokens: [Int32] = Array(repeating: 1, count: 8)
+        _ = inferenceModel.prefill(tokens: warmupTokens)
+        inferenceModel.resetState()
+
+        var sequentialModel = model
+        sequentialModel.prefillPlan = nil
+        _ = sequentialModel.prefill(tokens: warmupTokens)
+        sequentialModel.resetState()
+
+        print("=== \(Self.q3ModelLabel) swift-lm sequence prefill smoke ===")
+        print("bundle: \(bundlePath)")
+        print("q3 sequence gemv kernels: \(Self.q3SequenceGEMVKernelCount(in: prefillPlan))")
+        print("q3 batched sequence gemv kernels: \(Self.q3BatchedSequenceGEMVKernelCount(in: prefillPlan))")
+        print("runs per measurement: 2")
+        print()
+
+        let prefillLengths = [16, 64, 128]
+        for length in prefillLengths {
+            let sequence = Self.measurePrefill(model: &inferenceModel, length: length, runs: 2)
+            let sequential = Self.measurePrefill(model: &sequentialModel, length: length, runs: 2)
+            let speedup = sequential.milliseconds.median / sequence.milliseconds.median
+            #expect(
+                sequence.milliseconds.median < sequential.milliseconds.median,
+                "Q3 sequence prefill should stay faster than sequential prompt ingestion at length \(length)."
+            )
+            print(String(
+                format: "  len %3d: sequence %.2f ms, sequential %.2f ms, speedup %.2fx | sequence median %.1f tok/s",
+                length,
+                sequence.milliseconds.median,
+                sequential.milliseconds.median,
+                speedup,
+                sequence.tokensPerSecond.median))
+        }
+        print()
+    }
+
     // MARK: - Bundle resolution
 
     private static func resolveBundlePath() throws -> String? {
@@ -114,6 +174,69 @@ struct Qwen35BenchmarkTests {
             }
         }
         return nil
+    }
+
+    private static func resolveBundle(repoName: String) throws -> String? {
+        let hubRoot = NSString(string: "~/.cache/huggingface/hub").expandingTildeInPath
+        let snapshotsDir = "\(hubRoot)/models--\(repoName)/snapshots"
+        guard FileManager.default.fileExists(atPath: snapshotsDir) else { return nil }
+        let entries = try FileManager.default.contentsOfDirectory(atPath: snapshotsDir).sorted()
+        for entry in entries {
+            let candidate = "\(snapshotsDir)/\(entry)"
+            if FileManager.default.fileExists(atPath: "\(candidate)/config.json") {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private static func prefillKernelCount(prefix: String, in prefillPlan: MetalPrefillPlan) -> Int {
+        prefillPlan.steps.count { step in
+            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
+            return name.hasPrefix(prefix)
+        }
+    }
+
+    private static func q3SequenceGEMVKernelCount(in prefillPlan: MetalPrefillPlan) -> Int {
+        prefillPlan.steps.count { step in
+            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
+            return name.hasPrefix("gemv_seq_q3_g")
+                || (name.hasPrefix("batched_gemv") && name.contains("_seq_q3_g"))
+        }
+    }
+
+    private static func q3BatchedSequenceGEMVKernelCount(in prefillPlan: MetalPrefillPlan) -> Int {
+        prefillPlan.steps.count { step in
+            let name = step.metadata.kernelName ?? step.pipeline.label ?? ""
+            return name.hasPrefix("batched_gemv") && name.contains("_seq_q3_g")
+        }
+    }
+
+    private static func measurePrefill(
+        model: inout MetalInferenceModel,
+        length: Int,
+        runs: Int
+    ) -> PrefillMeasurement {
+        var tps: [Double] = []
+        var msList: [Double] = []
+        for _ in 0..<runs {
+            model.resetState()
+            let tokens = [Int32](repeating: 1, count: length)
+            let start = CFAbsoluteTimeGetCurrent()
+            _ = model.prefill(tokens: tokens)
+            let elapsed = CFAbsoluteTimeGetCurrent() - start
+            tps.append(Double(length) / elapsed)
+            msList.append(elapsed * 1000)
+        }
+        return PrefillMeasurement(
+            tokensPerSecond: BenchStats(tps),
+            milliseconds: BenchStats(msList)
+        )
+    }
+
+    private struct PrefillMeasurement {
+        let tokensPerSecond: BenchStats
+        let milliseconds: BenchStats
     }
 
     private struct BenchStats {

@@ -61,6 +61,23 @@ Real-bundle end-to-end correctness (weight load + decode token quality) is
 tracked separately in the "Per-Model Support Matrix" below — registry presence
 alone does not imply a published bundle has been validated end-to-end.
 
+### Decode Batching Coverage
+
+Quantized decode supports generic batched GEMV kernels for 2-4 sibling
+projections, preserving dispatch batching for shapes such as Q/K/V and gate/up
+when all involved weights share the same quantized block format. Kernel names
+carry the format explicitly, for example `batched_gemv3_q4_g64`.
+
+| Coverage layer | Status | Evidence |
+|---|---|---|
+| Synthetic batched Q3/Q4 GEMV correctness | ✅ Covered | `BatchedQuantizedGEMVTests` |
+| Planner keeps Q4 sibling projections batched | ✅ Covered | `QuantizationPlanningTests` |
+| Real-bundle model quality for each family | Per-family | See support matrix below |
+
+This table does not upgrade any model-family row by itself. A model/format
+combination remains unsupported until a real-bundle correctness test passes for
+that exact combination.
+
 ## KV Cache Schemes
 
 Declared via `KVCachePolicy.keyScheme` / `KVCachePolicy.valueScheme` on

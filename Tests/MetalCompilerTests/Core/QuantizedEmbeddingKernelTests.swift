@@ -59,14 +59,25 @@ struct QuantizedEmbeddingKernelTests {
         #expect(output.allSatisfy { abs($0 - 6) < 0.001 })
     }
 
-    @Test("Q3G64 sequence embedding lookup matches affine reference")
-    func q3Group64SequenceEmbeddingExecution() throws {
+    @Test("Q3 sequence embedding lookup matches affine reference for all group sizes")
+    func q3SequenceEmbeddingExecutionMatchesReferenceForAllGroupSizes() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw MetalCompilerError.deviceSetupFailed("No Metal device")
         }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
 
-        let format = AffineQ3Group64Format()
-        let kernelName = "test_embedding_lookup_seq_q3_g64"
+        try runQ3SequenceEmbeddingReferenceTest(device: device, format: AffineQ3Group16Format())
+        try runQ3SequenceEmbeddingReferenceTest(device: device, format: AffineQ3Group32Format())
+        try runQ3SequenceEmbeddingReferenceTest(device: device, format: AffineQ3Group64Format())
+    }
+
+    private func runQ3SequenceEmbeddingReferenceTest(
+        device: MTLDevice,
+        format: any QuantizationFormat
+    ) throws {
+        let suffix = q3KernelSuffix(for: format.schemeIdentifier)
+        let kernelName = "test_embedding_lookup_seq_\(suffix)"
         let source = MetalSourceGenerator.commonHeader + "\n"
             + MetalSourceGenerator.generateUnifiedQuantizedEmbeddingLookup(
                 name: kernelName,
@@ -143,9 +154,22 @@ struct QuantizedEmbeddingKernelTests {
                 let expected = rows[rowIndex].values[dim]
                 #expect(
                     abs(actual - expected) < 0.01,
-                    "Q3 embedding mismatch seq=\(seq) dim=\(dim): actual=\(actual) expected=\(expected)"
+                    "\(suffix) embedding mismatch seq=\(seq) dim=\(dim): actual=\(actual) expected=\(expected)"
                 )
             }
+        }
+    }
+
+    private func q3KernelSuffix(for scheme: QuantizationSchemeIdentifier) -> String {
+        switch scheme {
+        case .q3Group16ScaleF16:
+            return "q3_g16"
+        case .q3Group32ScaleF16:
+            return "q3_g32"
+        case .q3Group64ScaleF16:
+            return "q3_g64"
+        default:
+            preconditionFailure("Unexpected Q3 scheme: \(scheme)")
         }
     }
 
@@ -248,7 +272,6 @@ struct QuantizedEmbeddingKernelTests {
         embeddingDim: Int,
         groupSize: Int
     ) -> [(bytes: [UInt8], values: [Float])] {
-        precondition(groupSize == 64)
         precondition(embeddingDim % groupSize == 0)
         return (0..<tokenCount).map { token in
             var rowBytes: [UInt8] = []
@@ -262,7 +285,7 @@ struct QuantizedEmbeddingKernelTests {
                     bits: 3,
                     scale: scale,
                     zero: zero,
-                    payloadByteCount: 24
+                    payloadByteCount: (groupSize * 3 + 7) / 8
                 ))
                 values.append(contentsOf: weights.map { scale * Float($0) + zero })
             }

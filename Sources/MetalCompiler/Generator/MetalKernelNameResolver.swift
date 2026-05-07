@@ -75,7 +75,6 @@ struct MetalKernelNameResolver {
     ) -> String {
         let weightFormatResolver = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
         let isBF16 = kernelContext.weightFormat.isBFloat16
-        let bf16Suffix = isBF16 ? "_bf16" : ""
         let isPrefill = kernelContext.bufferPrecision.isPrefillSequencePrecision
         let decodeSuffix = kernelContext.bufferPrecision.decodeKernelNameSuffix
         let accessPolicyResolver = ProjectionWeightAccessPolicyResolver(
@@ -89,15 +88,18 @@ struct MetalKernelNameResolver {
                 if isPrefill,
                    projection.isOutput,
                    projection.field == "weight",
-                   projection.outputDimension > projection.inputDimension,
-                   (
-                    tensorInfo.format.schemeIdentifier == .fp16RowMajor
-                    || tensorInfo.format.schemeIdentifier == .bf16RowMajor
-                    || tensorInfo.format.schemeIdentifier == .fp32RowMajor
-                   ) {
-                    return tensorInfo.format.schemeIdentifier == .bf16RowMajor
-                        ? "gemv_bf16_f32s"
-                        : "gemv_f32s"
+                   projection.outputDimension > projection.inputDimension {
+                    if tensorInfo.format.isQuantized,
+                       tensorInfo.format.directGEMMKernel() == nil {
+                        return "gemv_bf16_f32s"
+                    }
+                    if tensorInfo.format.schemeIdentifier == .fp16RowMajor
+                        || tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                        || tensorInfo.format.schemeIdentifier == .fp32RowMajor {
+                        return tensorInfo.format.schemeIdentifier == .bf16RowMajor
+                            ? "gemv_bf16_f32s"
+                            : "gemv_f32s"
+                    }
                 }
                 if !isPrefill,
                    let family = Self.denseDecodeProjectionFamily(

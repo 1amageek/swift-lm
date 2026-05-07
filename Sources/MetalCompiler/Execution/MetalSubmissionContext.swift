@@ -1,9 +1,11 @@
 import Metal
 
-/// Command submission infrastructure using Metal 4 reusable command buffer pattern.
+/// Command submission infrastructure using Metal 4 command queue APIs.
 ///
-/// Wraps `MTL4CommandQueue`, reusable `MTL4CommandBuffer`, and a pool of
-/// `MTL4CommandAllocator` for efficient per-token decode submission.
+/// Wraps `MTL4CommandQueue`, a reusable `MTL4ArgumentTable`, and a pool of
+/// `MTL4CommandAllocator` instances for efficient per-token decode submission.
+/// Command buffers remain fresh per submission until replay correctness is
+/// verified across prompt-state and real-model decode runs.
 struct MetalSubmissionContext: @unchecked Sendable {
     let queue: MTL4CommandQueue
     let argumentTable: MTL4ArgumentTable
@@ -58,11 +60,7 @@ struct MetalSubmissionContext: @unchecked Sendable {
         waitUntilCompleted: Bool = true,
         _ encode: (MTL4ComputeCommandEncoder, MTL4ArgumentTable) throws -> Void
     ) throws {
-        let environment = ProcessInfo.processInfo.environment
-        let useReuseSubmission = environment["SWIFTLM_METAL_REUSE_SUBMISSION"] == "1"
-        let useReuseArgumentTable = useReuseSubmission || environment["SWIFTLM_METAL_REUSE_ARGUMENT_TABLE"] == "1"
-        let useFreshSubmission = environment["SWIFTLM_METAL_FRESH_SUBMISSION"] == "1"
-        let useFreshArgumentTable = useFreshSubmission || !useReuseArgumentTable
+        let useFreshArgumentTable = shouldUseFreshArgumentTable(waitUntilCompleted: waitUntilCompleted)
         let allocator = allocators[frameIndex % Self.maxInFlight]
         frameIndex += 1
 
@@ -128,11 +126,7 @@ struct MetalSubmissionContext: @unchecked Sendable {
         ephemeralResidency: MetalResidencyLease = .empty,
         _ encode: (MTL4ComputeCommandEncoder, MTL4ArgumentTable) throws -> Void
     ) throws -> (gpuStartTime: CFTimeInterval, gpuEndTime: CFTimeInterval) {
-        let environment = ProcessInfo.processInfo.environment
-        let useReuseSubmission = environment["SWIFTLM_METAL_REUSE_SUBMISSION"] == "1"
-        let useReuseArgumentTable = useReuseSubmission || environment["SWIFTLM_METAL_REUSE_ARGUMENT_TABLE"] == "1"
-        let useFreshSubmission = environment["SWIFTLM_METAL_FRESH_SUBMISSION"] == "1"
-        let useFreshArgumentTable = useFreshSubmission || !useReuseArgumentTable
+        let useFreshArgumentTable = shouldUseFreshArgumentTable(waitUntilCompleted: true)
         let allocator = allocators[frameIndex % Self.maxInFlight]
         frameIndex += 1
 
@@ -244,6 +238,20 @@ struct MetalSubmissionContext: @unchecked Sendable {
     }
 
     var device: MTLDevice { queue.device }
+
+    private func shouldUseFreshArgumentTable(waitUntilCompleted: Bool) -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        if environment["SWIFTLM_METAL_FRESH_SUBMISSION"] == "1" {
+            return true
+        }
+        if environment["SWIFTLM_METAL_FRESH_ARGUMENT_TABLE"] == "1" {
+            return true
+        }
+        // The shared argument table is safe only when this call waits for GPU
+        // completion before returning. Asynchronous callers get an isolated table
+        // so later submissions cannot mutate descriptors still in flight.
+        return !waitUntilCompleted
+    }
 
     mutating func resetReuseState() {
         frameIndex = 0

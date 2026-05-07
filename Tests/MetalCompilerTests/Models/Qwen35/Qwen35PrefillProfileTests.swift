@@ -256,7 +256,8 @@ struct Qwen35PrefillProfileTests {
                 sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
             )
             let gridSize = step.resolvedGridSize(sequenceLength: sequenceLength)
-            step.descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: gridSize)
+            let descriptor = step.resolvedDescriptor(sequenceLength: sequenceLength)
+            descriptor.encode(on: encoder, argumentTable: argumentTable, gridSize: gridSize)
         case .lastToken:
             let lastPosition = sequenceLength - 1
             step.bindStaticArguments(argumentTable: argumentTable, position: lastPosition)

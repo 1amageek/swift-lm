@@ -377,7 +377,8 @@ struct MetalDispatchStepBuilder {
                     layout: descriptor.layout,
                     kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
                     usedFallback: descriptor.usedFallback,
-                    fallbackReason: descriptor.fallbackReason
+                    fallbackReason: descriptor.fallbackReason,
+                    prefillGEMM: nil
                 )
             )
         } else if let batched = fragment as? BatchedProjection {
@@ -400,7 +401,8 @@ struct MetalDispatchStepBuilder {
                         layout: descriptor.layout,
                         kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
                         usedFallback: descriptor.usedFallback,
-                        fallbackReason: descriptor.fallbackReason
+                        fallbackReason: descriptor.fallbackReason,
+                        prefillGEMM: nil
                     )
                 )
             }
@@ -423,7 +425,8 @@ struct MetalDispatchStepBuilder {
                     layout: descriptor.layout,
                     kernelFamily: .classify(kernelName: selectedKernelName, usesMPP: false),
                     usedFallback: descriptor.usedFallback,
-                    fallbackReason: descriptor.fallbackReason
+                    fallbackReason: descriptor.fallbackReason,
+                    prefillGEMM: nil
                 )
             )
         }

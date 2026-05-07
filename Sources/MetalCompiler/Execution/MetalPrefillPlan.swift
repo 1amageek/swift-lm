@@ -184,7 +184,7 @@ public struct MetalPrefillStep: @unchecked Sendable {
     /// Pick a dispatch descriptor for the given runtime sequence length.
     ///
     /// If tile variants are available, selects the smallest `tileHeight` that
-    /// still produces ≥ 1 tile (i.e. `tileHeight >= sequenceLength`) when the
+    /// still produces at least one tile (`tileHeight >= sequenceLength`) when the
     /// sequence is short enough to fit; otherwise falls back to the largest
     /// available variant so long sequences keep the high-utilization tile.
     public func resolvedDescriptor(sequenceLength: Int) -> MetalDispatchDescriptor {
@@ -269,31 +269,13 @@ public struct MetalPrefillPlan: @unchecked Sendable {
     }
 
     package enum SequencePrefillFallbackReason: Sendable, Equatable, CustomStringConvertible {
-        case unsupportedQ3Quantization
-
         package var description: String {
             switch self {
-            case .unsupportedQ3Quantization:
-                return "Q3 prefill projection or embedding lookup is not supported by sequence prefill"
             }
         }
     }
 
     package var sequencePrefillFallbackReason: SequencePrefillFallbackReason? {
-        if quantizationPlan.entries.contains(where: { entry in
-            guard entry.path == .prefillProjection || entry.path == .embeddingLookup else {
-                return false
-            }
-            switch entry.schemeIdentifier.baseScheme {
-            case .q3Group16ScaleF16, .q3Group32ScaleF16, .q3Group64ScaleF16:
-                return true
-            default:
-                return false
-            }
-        }) {
-            return .unsupportedQ3Quantization
-        }
-
         return nil
     }
 
@@ -324,9 +306,9 @@ public struct PrefillBufferSet: @unchecked Sendable {
     public let ropePositionAxes: MTLBuffer
     public let tokenOut: MTLBuffer
 
-    /// Scratch buffer for dequantized Q4→BF16 weights consumed by AMX matmul2d.
+    /// Scratch buffer for dequantized quantized→BF16 weights consumed by AMX matmul2d.
     /// Sized for the largest projection weight matrix: outputDim × inputDim × sizeof(bfloat16).
-    /// Nil when no Q4 weight dequantization is needed (e.g., BF16 or FP16 models).
+    /// Nil when no quantized weight dequantization is needed (e.g., BF16 or FP16 models).
     public let dequantScratch: MTLBuffer?
 
     /// Shared buffer for runtime constants (sequenceLength, positions, etc.)

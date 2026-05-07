@@ -20,6 +20,63 @@ not be used as a current Qwen sequence-prefill speed claim until the same
 benchmark is re-run on the current implementation after correctness gates pass.
 Current speed claim: pending re-benchmark.
 
+## Current swift-lm smoke rerun (2026-05-07)
+
+The following values are a focused swift-lm-only smoke rerun on the current
+implementation. They are useful for detecting whether the Qwen BF16 path still
+scales with sequence length, but they are **not** an updated MLX comparison and
+should not be presented as a speedup claim.
+
+| Prompt len | swift-lm median tok/s | swift-lm median ms |
+|---:|---:|---:|
+| 16 | 359.3 | 44.53 |
+| 32 | 345.5 | 92.63 |
+| 64 | 395.4 | 161.88 |
+| 128 | 408.5 | 313.31 |
+
+| Decode steps | swift-lm median tok/s | swift-lm median ms/token |
+|---:|---:|---:|
+| 100 | 96.1 | 10.41 |
+
+The paired profile still shows sequence-length-dependent cost in the dominant
+Qwen BF16 prefill kernels. The decode-equivalent sequence GEMV planner uses
+2 output rows per threadgroup because 4-row and 8-row experiments regressed
+longer prompt profiles. Sequence GEMV and synthesized fused kernels also skip redundant
+immediate `round_bf16_seq_f32` passes because they already write
+decode-rounded storage values. These are single-process smoke profiles and
+should be treated as diagnostic evidence only, not as an updated MLX comparison.
+
+| Plan shape | Before | Current |
+|---|---:|---:|
+| Total prefill steps | 576 | 293 |
+| `round_bf16_seq_f32` steps | 356 | 73 |
+
+| Kernel family | 16 tokens us | 64 tokens us | 128 tokens us | 128/16 |
+|---|---:|---:|---:|---:|
+| `batched_gemv2_seq_bf16_f32s` | 10917 | 43342 | 84257 | 7.72x |
+| `batched_gemv4_seq_bf16_f32s` | 9433 | 37407 | 72817 | 7.72x |
+| `ssm_recurrence_seq_bf16_f32` | 9154 | 34672 | 68739 | 7.51x |
+| `gemv_seq_bf16_f32s` | 9152 | 33773 | 64443 | 7.04x |
+| `round_bf16_seq_f32` | 1721 | 1783 | 1759 | 1.02x |
+
+The planner comparison rows were collected across focused smoke runs and should
+be used directionally, not as an apples-to-apples benchmark table.
+
+| Planner / round setting | 16 tokens ms | 64 tokens ms | 128 tokens ms | Status |
+|---|---:|---:|---:|---|
+| 2 output rows/threadgroup, no round elision | 96.23 | 183.85 | 310.59 | superseded baseline |
+| 4 output rows/threadgroup, no round elision | 145.09 | 199.91 | 356.05 | rejected profile |
+| 4 output rows/threadgroup, sequence projection round elision | 44.38 | 157.14 | 294.49 | superseded |
+| 4 output rows/threadgroup, projection + synthesized round elision | 43.15 | 172.14 | 401.59 | rejected 128-token profile |
+| 2 output rows/threadgroup, projection + synthesized round elision | 44.53 | 161.88 | 313.31 | current default |
+| 2 output rows/threadgroup, projection + synthesized round elision, sequence tile 1024 | 68.41 | 249.75 | 407.94 | rejected tile profile |
+| 8 output rows/threadgroup | 187.42 | 346.75 | 328.70 | rejected |
+
+Conclusion: the BF16 Qwen sequence path is correctness-gated, but the current
+smoke data does not prove a prefill speedup. The next prefill performance work
+is still sequence-kernel, SSM recurrence, and safe MPP/GEMM expansion work, not
+release marketing.
+
 ## 方法論
 
 両ランナーとも共通:

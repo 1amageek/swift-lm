@@ -37,6 +37,10 @@ extension BatchedProjection: PrimitiveMetalKernelFragment {
             // the fragment is decomposed into per-projection dispatches upstream.
         }
 
+        if format.isQuantized {
+            return "batched_gemv\(count)_q\(format.bits)_g\(format.groupSize)\(context.bufferPrecision.decodeKernelNameSuffix)"
+        }
+
         // Decode / dense weights: batched GEMV
         let suffix = format.isBFloat16 ? "_bf16" : ""
         return "batched_gemv\(count)\(suffix)\(context.bufferPrecision.decodeKernelNameSuffix)"
@@ -48,6 +52,14 @@ extension BatchedProjection: PrimitiveMetalKernelFragment {
         weightFormat: WeightFormat
     ) -> String {
         let count = projections.count
+        if weightFormat.isQuantized {
+            return MetalSourceGenerator.generateBatchedQuantizedGEMV(
+                name: name,
+                count: count,
+                format: weightFormat,
+                bufferPrecision: bufferPrecision
+            )
+        }
         switch count {
         case 2:
             return MetalSourceGenerator.generateBatchedGEMV2(

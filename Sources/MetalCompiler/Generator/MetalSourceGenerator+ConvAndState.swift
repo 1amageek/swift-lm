@@ -553,7 +553,6 @@ public static func generateSSMRecurrenceSequence(
         const uint dv = valueDimension;
         const uint keyGroupDim = groupCount * dk;
         const uint convDim = 2 * keyGroupDim + numHeads * dv;
-        const uint outputDim = numHeads * dv;
         const uint safeGroupCount = max(groupCount, 1u);
         const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
 
@@ -579,6 +578,9 @@ public static func generateSSMRecurrenceSequence(
         threadgroup float convSiluCache[\(localDim)];
         threadgroup float dotCache[\(headsPerGroup * valueHeadDimension)];
         threadgroup float normPartials[\(maxThreadgroupSize)];
+        threadgroup float qInvCache[\(headsPerGroup)];
+        threadgroup float kInvCache[\(headsPerGroup)];
+        threadgroup float kqSumCache[\(headsPerGroup)];
 
         for (uint pos = 0; pos < sequenceLength; ++pos) {
             device const \(bt)* projectedQKVPos = projectedQKV + pos * activationRowStride;
@@ -620,6 +622,29 @@ public static func generateSSMRecurrenceSequence(
                 const uint activeThreads = headsPerGroup * threadsPerHead;
                 if (tid < activeThreads) {
                     const uint localHead = tid / threadsPerHead;
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        const uint qBase = 0u;
+                        const uint kBase = dk;
+                        float qNormSq = 0.0f;
+                        float kNormSq = 0.0f;
+                        float kqSum = 0.0f;
+                        for (uint j = 0; j < dk; ++j) {
+                            float q = convSiluCache[qBase + j];
+                            float k = convSiluCache[kBase + j];
+                            qNormSq += q * q;
+                            kNormSq += k * k;
+                            kqSum += q * k;
+                        }
+                        qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                        kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
+                        kqSumCache[localHead] = kqSum;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < activeThreads) {
+                    const uint localHead = tid / threadsPerHead;
                     const uint headIndex = headStart + localHead;
                     const uint localTid = tid % threadsPerHead;
                     const uint dChunk = dv / threadsPerHead;
@@ -636,21 +661,9 @@ public static func generateSSMRecurrenceSequence(
                     const uint qBase = 0u;
                     const uint kBase = dk;
                     const uint vBase = 2u * dk + localHead * dv;
-
-                    // Precompute Q/K norms and kqSum = Σ Q[j]·K[j] once per head
-                    // (constant across d — eliminates redundant work inside the d loop).
-                    float qNormSq = 0.0f;
-                    float kNormSq = 0.0f;
-                    float kqSum = 0.0f;
-                    for (uint j = 0; j < dk; ++j) {
-                        float q = convSiluCache[qBase + j];
-                        float k = convSiluCache[kBase + j];
-                        qNormSq += q * q;
-                        kNormSq += k * k;
-                        kqSum += q * k;
-                    }
-                    float qInv = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
-                    float kInv = rsqrt(kNormSq + 1e-6f);
+                    float qInv = qInvCache[localHead];
+                    float kInv = kInvCache[localHead];
+                    float kqSum = kqSumCache[localHead];
 
                     // Algebraic identity used below:
                     //   state_after[j] = state_before[j]·decay + K[j]·kInvDelta

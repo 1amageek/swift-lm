@@ -35,7 +35,7 @@ struct STAFModelBundleMetadataBuilderTests {
         )
 
         #expect(metadata[STAFMetadataKey.sourceFormat] == .string("safetensors"))
-        #expect(metadata[STAFMetadataKey.converterVersion] == .uint32(1))
+        #expect(metadata[STAFMetadataKey.converterVersion] == .uint32(STAF.currentConverterVersion))
         #expect(metadata[STAFMetadataKey.metadataSchemaVersion] == .uint32(1))
         #expect(metadata[STAFMetadataKey.sourceShardCount] == .uint64(1))
 

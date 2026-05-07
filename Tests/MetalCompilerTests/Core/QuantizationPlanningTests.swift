@@ -45,6 +45,67 @@ struct QuantizationPlanningTests {
         #expect(quantizedEntry.schemeIdentifier == .q4Group64ScaleF16)
         #expect(quantizedEntry.kernelFamily == .mppGEMM)
         #expect(!quantizedEntry.usedFallback)
+        let prefillGEMM = try #require(quantizedEntry.prefillGEMM)
+        #expect(prefillGEMM.selectedKernelName.contains("gemm"))
+        #expect(prefillGEMM.inputDimension == target.inputDimension)
+        #expect(prefillGEMM.outputDimension == target.outputDimension)
+        #expect(prefillGEMM.inputRowStride == target.inputDimension)
+        #expect(prefillGEMM.maximumSequenceLength == 16)
+    }
+
+    @Test("dense prefill projection records runtime MPP tile variants")
+    func densePrefillProjectionRecordsRuntimeMPPTileVariants() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let config = makeConfig()
+        let graph = try resolvedGraph(config: config)
+        let target = try firstPrefillProjection(in: graph, device: device) {
+            $0.inputDimension == config.intermediateSize
+        }
+        let store = try makeWeightStore(
+            for: graph,
+            device: device,
+            overriding: target.tensorName,
+            withShape: [target.outputDimension, target.inputDimension],
+            schemeIdentifier: .fp16RowMajor
+        )
+
+        let plan = try MetalInferenceCompiler().compilePrefill(
+            graph: graph,
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.intermediateSize,
+            vocabSize: config.vocabSize,
+            inferencePolicy: InferencePolicy(maximumSequenceLength: 128),
+            stafWeightStore: store,
+            device: device
+        )
+
+        let denseEntry = try #require(
+            plan.quantizationPlan.entries.first(where: { $0.tensorName == target.tensorName })
+        )
+        #expect(denseEntry.kernelFamily == .mppGEMM)
+        #expect(!denseEntry.usedFallback)
+        let prefillGEMM = try #require(denseEntry.prefillGEMM)
+        #expect(prefillGEMM.sequenceTileHeight == 64)
+        #expect(prefillGEMM.tileVariantHeights == [16, 32, 64])
+
+        let gemmStep = try #require(plan.steps.first {
+            $0.metadata.kernelName?.contains("gemm") == true && !$0.tileVariants.isEmpty
+        })
+        #expect(gemmStep.resolvedDescriptor(sequenceLength: 16).pipeline.label?.hasSuffix("_mtile16") == true)
+        #expect(gemmStep.resolvedDescriptor(sequenceLength: 33).pipeline.label?.hasSuffix("_mtile64") == true)
+        #expect(gemmStep.resolvedDescriptor(sequenceLength: 96).pipeline.label?.hasSuffix("_mtile64") == true)
+        #expect(gemmStep.resolvedGridSize(sequenceLength: 96).height == 2)
+
+        let isolatedPlan = try plan.makeRuntimeIsolatedCopy(device: device)
+        let isolatedGEMMStep = try #require(isolatedPlan.steps.first {
+            $0.metadata.kernelName?.contains("gemm") == true && !$0.tileVariants.isEmpty
+        })
+        #expect(isolatedGEMMStep.tileVariants.map(\.tileHeight) == [16, 32, 64])
+        #expect(isolatedGEMMStep.resolvedDescriptor(sequenceLength: 96).pipeline.label?.hasSuffix("_mtile64") == true)
     }
 
     @Test("q4 prefill projection records direct kernel fallback when input stride is incompatible")
@@ -85,6 +146,12 @@ struct QuantizationPlanningTests {
         #expect(quantizedEntry.kernelFamily == .q4G64GEMM)
         #expect(quantizedEntry.usedFallback)
         #expect(quantizedEntry.fallbackReason == .inputStrideMismatch)
+        let prefillGEMM = try #require(quantizedEntry.prefillGEMM)
+        #expect(prefillGEMM.selectedKernelName == "gemm_q4_g64_f32s")
+        #expect(prefillGEMM.inputDimension == target.inputDimension)
+        #expect(prefillGEMM.outputDimension == target.outputDimension)
+        #expect(prefillGEMM.inputRowStride != target.inputDimension)
+        #expect(prefillGEMM.maximumSequenceLength == 16)
     }
 
     @Test("dense prefill projection records disabled environment fallback when MPP is off")
@@ -127,6 +194,12 @@ struct QuantizationPlanningTests {
         #expect(denseEntry.kernelFamily == .naiveGEMM)
         #expect(denseEntry.usedFallback)
         #expect(denseEntry.fallbackReason == .disabledByEnvironment)
+        let prefillGEMM = try #require(denseEntry.prefillGEMM)
+        #expect(prefillGEMM.selectedKernelName.hasPrefix("naive::gemm"))
+        #expect(prefillGEMM.inputDimension == target.inputDimension)
+        #expect(prefillGEMM.outputDimension == target.outputDimension)
+        #expect(prefillGEMM.inputRowStride == target.inputDimension)
+        #expect(prefillGEMM.maximumSequenceLength == 16)
     }
 
     @Test("prefill diagnostics include quantization summary")
@@ -151,6 +224,10 @@ struct QuantizationPlanningTests {
 
         #expect(diagnostics.contains("quantization: entries="))
         #expect(diagnostics.contains("prefillAccel="))
+        #expect(diagnostics.contains("kernelName="))
+        #expect(diagnostics.contains(" in="))
+        #expect(diagnostics.contains(" out="))
+        #expect(diagnostics.contains(" seq=16"))
     }
 
     @Test("q4 prefill embedding lookup records quantized embedding kernel family")
@@ -192,8 +269,8 @@ struct QuantizationPlanningTests {
         #expect(!embeddingEntry.usedFallback)
     }
 
-    @Test("q3 prefill projection records kernel family and requires sequential ingestion")
-    func q3PrefillProjectionRequiresSequentialPromptIngestion() throws {
+    @Test("q3 prefill projection records kernel family and enables sequence ingestion")
+    func q3PrefillProjectionEnablesSequencePromptIngestion() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -228,8 +305,105 @@ struct QuantizationPlanningTests {
         #expect(quantizedEntry.kernelFamily == .naiveGEMM)
         #expect(quantizedEntry.usedFallback)
         #expect(quantizedEntry.fallbackReason == .inputStrideMismatch)
-        #expect(plan.requiresSequentialPromptIngestion)
-        #expect(plan.sequencePrefillFallbackReason == .unsupportedQ3Quantization)
+        let prefillGEMM = try #require(quantizedEntry.prefillGEMM)
+        #expect(prefillGEMM.selectedKernelName.contains("gemm"))
+        #expect(prefillGEMM.inputDimension == target.inputDimension)
+        #expect(prefillGEMM.outputDimension == target.outputDimension)
+        #expect(prefillGEMM.maximumSequenceLength == 16)
+        #expect(!plan.requiresSequentialPromptIngestion)
+        #expect(plan.sequencePrefillFallbackReason == nil)
+    }
+
+    @Test("all q3 prefill projection schemes enable sequence ingestion")
+    func allQ3PrefillProjectionSchemesEnableSequencePromptIngestion() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let schemes: [QuantizationSchemeIdentifier] = [
+            .q3Group16ScaleF16,
+            .q3Group32ScaleF16,
+            .q3Group64ScaleF16,
+        ]
+        let config = makeConfig()
+        let graph = try resolvedGraph(config: config)
+        let target = try firstPrefillProjection(in: graph, device: device)
+
+        for scheme in schemes {
+            let store = try makeWeightStore(
+                for: graph,
+                device: device,
+                overriding: target.tensorName,
+                withShape: [target.outputDimension, target.inputDimension],
+                schemeIdentifier: scheme
+            )
+
+            let plan = try MetalInferenceCompiler().compilePrefill(
+                graph: graph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                inferencePolicy: InferencePolicy(maximumSequenceLength: 16),
+                stafWeightStore: store,
+                device: device
+            )
+
+            let quantizedEntry = try #require(
+                plan.quantizationPlan.entries.first(where: { $0.tensorName == target.tensorName })
+            )
+            #expect(quantizedEntry.path == .prefillProjection)
+            #expect(quantizedEntry.schemeIdentifier == scheme)
+            #expect(!plan.requiresSequentialPromptIngestion)
+            #expect(plan.sequencePrefillFallbackReason == nil)
+        }
+    }
+
+    @Test("all q3 prefill embedding schemes enable sequence ingestion")
+    func allQ3PrefillEmbeddingSchemesEnableSequencePromptIngestion() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let schemes: [QuantizationSchemeIdentifier] = [
+            .q3Group16ScaleF16,
+            .q3Group32ScaleF16,
+            .q3Group64ScaleF16,
+        ]
+        let config = makeConfig()
+        let graph = try resolvedGraph(config: config)
+        let embeddingBinding = try firstEmbeddingBinding(in: graph, device: device, phase: .prefill)
+        let resolvedEmbeddingBinding = try #require(embeddingBinding)
+
+        for scheme in schemes {
+            let store = try makeWeightStore(
+                for: graph,
+                device: device,
+                overriding: resolvedEmbeddingBinding.tensorName,
+                withShape: [config.vocabSize, config.hiddenSize],
+                schemeIdentifier: scheme
+            )
+
+            let plan = try MetalInferenceCompiler().compilePrefill(
+                graph: graph,
+                hiddenSize: config.hiddenSize,
+                intermediateSize: config.intermediateSize,
+                vocabSize: config.vocabSize,
+                inferencePolicy: InferencePolicy(maximumSequenceLength: 16),
+                stafWeightStore: store,
+                device: device
+            )
+
+            let embeddingEntry = try #require(
+                plan.quantizationPlan.entries.first {
+                    $0.tensorName == resolvedEmbeddingBinding.tensorName && $0.path == .embeddingLookup
+                }
+            )
+            #expect(embeddingEntry.schemeIdentifier == scheme)
+            #expect(!plan.requiresSequentialPromptIngestion)
+            #expect(plan.sequencePrefillFallbackReason == nil)
+        }
     }
 
     @Test("q8 decode embedding lookup records quantized embedding kernel family")
@@ -268,6 +442,52 @@ struct QuantizationPlanningTests {
         #expect(embeddingEntry.schemeIdentifier == .q8Group32ScaleF16)
         #expect(embeddingEntry.kernelFamily == .q8G32EmbeddingLookup)
         #expect(!embeddingEntry.usedFallback)
+    }
+
+    @Test("q4 decode keeps sibling projections batched")
+    func q4DecodeKeepsSiblingProjectionsBatched() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let config = makeConfig()
+        let graph = try resolvedGraph(config: config)
+        let target = try firstBatchedProjection(in: graph, device: device)
+        let overrides = Dictionary(uniqueKeysWithValues: target.projections.map {
+            (
+                $0.tensorName,
+                TensorOverride(
+                    shape: [$0.outputDimension, $0.inputDimension],
+                    schemeIdentifier: .q4Group64ScaleF16
+                )
+            )
+        })
+        let store = try makeWeightStore(for: graph, device: device, overrides: overrides)
+
+        let compiled = try MetalInferenceCompiler().compile(
+            graph: graph,
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.intermediateSize,
+            vocabSize: config.vocabSize,
+            stafWeightStore: store,
+            device: device
+        )
+
+        let step = try #require(
+            compiled.decodePlan.steps.first { $0.metadata.entryIndex == target.entry.index }
+        )
+        #expect(step.metadata.kernelName?.hasPrefix("batched_gemv") == true)
+        #expect(step.metadata.kernelName?.contains("_q4_g64") == true)
+
+        let tensorNames = Set(target.projections.map(\.tensorName))
+        let quantizedEntries = compiled.decodePlan.quantizationPlan.entries.filter {
+            guard let tensorName = $0.tensorName else { return false }
+            return tensorNames.contains(tensorName)
+        }
+        #expect(quantizedEntries.count == target.projections.count)
+        #expect(quantizedEntries.allSatisfy { $0.kernelFamily == .q4G64GEMV })
+        #expect(quantizedEntries.allSatisfy { !$0.usedFallback })
     }
 
     @Test("decode diagnostics include quantization summary")
@@ -318,6 +538,14 @@ struct QuantizationPlanningTests {
             kernelName: "gemm_q6_g16_f32s",
             usesMPP: false
         ) == .q6G16GEMM)
+        #expect(MetalQuantizationKernelFamily.classify(
+            kernelName: "batched_gemv3_q4_g64",
+            usesMPP: false
+        ) == .q4G64GEMV)
+        #expect(MetalQuantizationKernelFamily.classify(
+            kernelName: "batched_gemv2_q8_g32",
+            usesMPP: false
+        ) == .q8G32GEMV)
     }
 
     private func makeConfig() -> ModelConfig {
@@ -362,6 +590,11 @@ struct QuantizationPlanningTests {
         let outputDimension: Int
     }
 
+    private struct BatchedProjectionTarget {
+        let entry: DispatchEntry
+        let projections: [ProjectionTarget]
+    }
+
     private func firstPrefillProjection(
         in graph: ModelGraph,
         device: MTLDevice
@@ -404,6 +637,50 @@ struct QuantizationPlanningTests {
                 if predicate(target) {
                     return target
                 }
+            }
+        }
+
+        throw QuantizationPlanningError.missingProjection
+    }
+
+    private func firstBatchedProjection(
+        in graph: ModelGraph,
+        device: MTLDevice
+    ) throws -> BatchedProjectionTarget {
+        let context = CompileContext(
+            graph: graph,
+            hiddenSize: 128,
+            intermediateSize: 512,
+            vocabSize: 1024,
+            inferencePolicy: .default,
+            stafWeightStore: nil,
+            device: device,
+            weightFormat: .float16,
+            decodeBufferPrecision: .float16,
+            accessPolicyResolver: ProjectionWeightAccessPolicyResolver()
+        )
+        let entries = MetalEntryCollector().collect(
+            using: context,
+            kernelContext: context.decodeKernelContext
+        ).fusedEntries
+
+        for entry in entries {
+            guard let batched = entry.fragment as? BatchedProjection else {
+                continue
+            }
+            let projections = batched.projections.compactMap { projection -> ProjectionTarget? in
+                guard let binding = entry.parameterBindings.first(where: { $0.role == projection.field }) else {
+                    return nil
+                }
+                return ProjectionTarget(
+                    entry: entry,
+                    tensorName: binding.tensorName,
+                    inputDimension: projection.inputDimension,
+                    outputDimension: projection.outputDimension
+                )
+            }
+            if projections.count == batched.projections.count {
+                return BatchedProjectionTarget(entry: entry, projections: projections)
             }
         }
 
@@ -455,17 +732,42 @@ struct QuantizationPlanningTests {
         withShape shape: [Int] = [1],
         schemeIdentifier: QuantizationSchemeIdentifier = .passthrough
     ) throws -> STAFWeightStore {
-        let overridePayloadSize = max(1, shape.reduce(1, *) * MemoryLayout<UInt16>.size)
+        let overrides = tensorName.map {
+            [
+                $0: TensorOverride(
+                    shape: shape,
+                    schemeIdentifier: schemeIdentifier
+                )
+            ]
+        } ?? [:]
+        return try makeWeightStore(for: graph, device: device, overrides: overrides)
+    }
+
+    private struct TensorOverride {
+        let shape: [Int]
+        let schemeIdentifier: QuantizationSchemeIdentifier
+    }
+
+    private func makeWeightStore(
+        for graph: ModelGraph,
+        device: MTLDevice,
+        overrides: [String: TensorOverride]
+    ) throws -> STAFWeightStore {
+        let overridePayloadSize = max(
+            1,
+            overrides.values.map { $0.shape.reduce(1, *) }.max() ?? 1
+        ) * MemoryLayout<UInt16>.size
         let buffer = try #require(device.makeBuffer(length: overridePayloadSize, options: .storageModeShared))
         var entries: [String: STAFTensorEntry] = [:]
         for name in tensorNames(in: graph.rootRegion) {
-            let isOverride = name == tensorName
-            let entryShape = isOverride ? shape : [1]
+            let tensorOverride = overrides[name]
+            let isOverride = tensorOverride != nil
+            let entryShape = tensorOverride?.shape ?? [1]
             entries[name] = STAFTensorEntry(
                 name: name,
                 payloadOffset: 0,
                 payloadSize: isOverride ? overridePayloadSize : buffer.length,
-                schemeIdentifier: isOverride ? schemeIdentifier : .passthrough,
+                schemeIdentifier: tensorOverride?.schemeIdentifier ?? .passthrough,
                 semanticRole: .other,
                 shape: entryShape,
                 blockSize: 64,

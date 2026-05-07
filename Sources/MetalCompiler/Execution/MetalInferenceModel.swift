@@ -2157,7 +2157,8 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 sequenceLengthOffset: PrefillBufferSet.sequenceLengthOffset
             )
             let gridSize = step.resolvedGridSize(sequenceLength: sequenceLength)
-            step.descriptor.encode(
+            let descriptor = step.resolvedDescriptor(sequenceLength: sequenceLength)
+            descriptor.encode(
                 on: encoder,
                 argumentTable: argumentTable,
                 gridSize: gridSize

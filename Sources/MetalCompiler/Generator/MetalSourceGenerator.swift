@@ -8,7 +8,6 @@
 /// No dtype/precision variants are hardcoded. All combinations are generated
 /// from these three independent inputs.
 public struct MetalSourceGenerator: Sendable {
-
     // BufferPrecision and WeightFormat are top-level types in MetalDispatchTypes.swift.
     // These typealiases preserve source compatibility within MetalSourceGenerator.
     public typealias BufferPrecision = MetalCompiler.BufferPrecision

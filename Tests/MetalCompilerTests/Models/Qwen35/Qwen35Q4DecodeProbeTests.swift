@@ -28,6 +28,14 @@ struct Qwen35PromptIngestionTests {
             let prefillPlan = try #require(model.prefillPlan)
             #expect(!prefillPlan.requiresSequentialPromptIngestion)
             #expect(prefillPlan.sequencePrefillFallbackReason == nil)
+            #expect(
+                !Self.hasRedundantRoundAfterSequenceProjection(prefillPlan),
+                "Sequence GEMV kernels already store decode-rounded values; an immediate round step is redundant."
+            )
+            #expect(
+                Self.prefillKernelCount("round_bf16_seq_f32", in: prefillPlan) < 120,
+                "Qwen BF16 prefill should not re-round already decode-rounded projection or synthesized outputs."
+            )
 
             var prefillModel = try Self.makeRuntimeIsolatedModel(from: model)
             prefillModel.resetState()
@@ -86,8 +94,8 @@ struct Qwen35PromptIngestionTests {
             )
 
             let prefillPlan = try #require(model.prefillPlan)
-            #expect(prefillPlan.requiresSequentialPromptIngestion)
-            #expect(prefillPlan.sequencePrefillFallbackReason == .unsupportedQ3Quantization)
+            #expect(!prefillPlan.requiresSequentialPromptIngestion)
+            #expect(prefillPlan.sequencePrefillFallbackReason == nil)
 
             var prefillModel = try Self.makeRuntimeIsolatedModel(from: model)
             prefillModel.resetState()
@@ -107,8 +115,8 @@ struct Qwen35PromptIngestionTests {
             )
 
             #expect(
-                Array(prefillTrace.prefix(9)) == Array(sequentialTrace.prefix(9)),
-                "Q3 prompt ingestion must stay decode-equivalent. prefill=\(prefillTrace), sequential=\(sequentialTrace)"
+                prefillTrace == sequentialTrace,
+                "Q3 sequence prompt ingestion must stay decode-equivalent. prefill=\(prefillTrace), sequential=\(sequentialTrace)"
             )
         }
     }
@@ -159,6 +167,34 @@ struct Qwen35PromptIngestionTests {
             }
             .prefix(160)
             .joined(separator: ", ")
+    }
+
+    private static func prefillKernelCount(
+        _ kernelName: String,
+        in prefillPlan: MetalPrefillPlan
+    ) -> Int {
+        prefillPlan.steps.count { step in
+            (step.metadata.kernelName ?? step.pipeline.label) == kernelName
+        }
+    }
+
+    private static func hasRedundantRoundAfterSequenceProjection(
+        _ prefillPlan: MetalPrefillPlan
+    ) -> Bool {
+        for index in 0..<max(prefillPlan.steps.count - 1, 0) {
+            let current = prefillPlan.steps[index].metadata.kernelName
+                ?? prefillPlan.steps[index].pipeline.label
+                ?? ""
+            let next = prefillPlan.steps[index + 1].metadata.kernelName
+                ?? prefillPlan.steps[index + 1].pipeline.label
+                ?? ""
+            let isSequenceProjection = current.hasPrefix("gemv_seq_")
+                || (current.hasPrefix("batched_gemv") && current.contains("_seq_"))
+            if isSequenceProjection && next.hasPrefix("round_") {
+                return true
+            }
+        }
+        return false
     }
 
     private static func firstPostPrefillStateDifference(

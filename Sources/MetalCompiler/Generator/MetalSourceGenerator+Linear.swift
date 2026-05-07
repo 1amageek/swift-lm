@@ -380,6 +380,88 @@ extension MetalSourceGenerator {
         """
     }
 
+    /// Generate a sequence GEMV kernel that covers multiple tokens per threadgroup.
+    ///
+    /// Each SIMD group still owns one output row and one token, preserving the
+    /// decode GEMV reduction order for every row-token pair. The sequence tile
+    /// only amortizes input staging and dispatch overhead across adjacent tokens.
+    public static func generateTiledSequenceGEMV(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        sequenceTile: Int,
+        tileElements: Int = 256
+    ) -> String {
+        precondition(sequenceTile >= 1, "sequence tile must be positive")
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let storeValue: (String) -> String = { expr in
+            bufferPrecision.isPrefillSequencePrecision
+                ? MetalSourceGenerator.sequenceStorageValue(expr, weightFormat: weightFormat)
+                : expr
+        }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* weight             [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            constant uint& inputDimension          [[buffer(3)]],
+            constant uint& outputDimension         [[buffer(4)]],
+            constant uint& sequenceLength          [[buffer(5)]],
+            constant uint& inputRowStride          [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint tileElements = \(tileElements);
+            const uint sequenceTile = \(sequenceTile);
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint rowsPerThreadgroup = max(1u, simdgroupsPerThreadgroup / sequenceTile);
+            const uint localSeq = min(sequenceTile - 1u, sgitg / rowsPerThreadgroup);
+            const uint localRow = sgitg - localSeq * rowsPerThreadgroup;
+            const uint row = gid.x * rowsPerThreadgroup + localRow;
+            const uint seqPos = gid.y * sequenceTile + localSeq;
+            const bool validSeq = seqPos < sequenceLength;
+            const bool validRow = row < outputDimension;
+
+            threadgroup \(bt) inputTile[\(sequenceTile * tileElements)];
+            float sum = 0.0f;
+            for (uint base = 0; base < inputDimension; base += tileElements) {
+                if (localRow == 0u && validSeq) {
+                    device const \(bt)* inputRow = input + seqPos * inputRowStride;
+                    threadgroup \(bt)* tile = inputTile + localSeq * tileElements;
+                    for (uint j = tiisg; j < tileElements; j += SIMD_WIDTH) {
+                        const uint inputIndex = base + j;
+                        tile[j] = inputIndex < inputDimension ? inputRow[inputIndex] : \(bt)(0.0f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (validSeq && validRow) {
+                    device const \(wt)* weightRow = weight + row * inputDimension;
+                    threadgroup \(bt)* tile = inputTile + localSeq * tileElements;
+                    const uint tileCount = min(tileElements, inputDimension - base);
+                    for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                        sum += \(readWeight("weightRow[base + j]")) * float(tile[j]);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            if (validSeq && validRow) {
+                sum = simd_sum(sum);
+                if (tiisg == 0) {
+                    output[seqPos * outputRowStride + row] = \(bt)(\(storeValue("sum")));
+                }
+            }
+        }
+        """
+    }
+
     /// Generate a GEMV kernel specialized for vocab/output-head style projections.
     ///
     /// The input dimension is expected to be 2048. The entire input vector is staged

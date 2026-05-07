@@ -234,6 +234,61 @@ enum MetalQuantizationKernelFamily: Sendable, Equatable {
         {
             return .denseEmbeddingLookup
         }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q3_g16")
+        {
+            return .q3G16GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q3_g32")
+        {
+            return .q3G32GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q3_g64")
+        {
+            return .q3G64GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q4_g64")
+        {
+            return .q4G64GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q4_g128")
+        {
+            return .q4G128GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q5_g32")
+        {
+            return .q5G32GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q5_g64")
+        {
+            return .q5G64GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q6_g16")
+        {
+            return .q6G16GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q6_g32")
+        {
+            return .q6G32GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q8_g32")
+        {
+            return .q8G32GEMV
+        }
+        if normalizedName.hasPrefix("batched_gemv")
+            && normalizedName.contains("_q8_g64")
+        {
+            return .q8G64GEMV
+        }
         switch normalizedName {
         case "gemm_q3_g16_f32s":
             return .q3G16GEMM
@@ -301,6 +356,17 @@ enum MetalQuantizationFallbackReason: String, Sendable, Equatable {
     case unavailableAcceleration
 }
 
+struct MetalPrefillGEMMDiagnostics: Sendable, Equatable {
+    let selectedKernelName: String
+    let inputDimension: Int
+    let outputDimension: Int
+    let inputRowStride: Int
+    let maximumSequenceLength: Int
+    let sequenceTileHeight: Int?
+    let tileVariantHeights: [Int]
+    let projectionCount: Int
+}
+
 struct MetalQuantizationPlanEntry: Sendable, Equatable {
     let entryIndex: Int?
     let layerIndex: Int?
@@ -311,6 +377,7 @@ struct MetalQuantizationPlanEntry: Sendable, Equatable {
     let kernelFamily: MetalQuantizationKernelFamily
     let usedFallback: Bool
     let fallbackReason: MetalQuantizationFallbackReason?
+    let prefillGEMM: MetalPrefillGEMMDiagnostics?
 
     var isQuantizedWeight: Bool {
         schemeIdentifier.isWeightQuantized
@@ -341,6 +408,25 @@ struct MetalQuantizationPlan: Sendable, Equatable {
             }
             if entry.layout != .rowMajor {
                 line += " layout=\(entry.layout)"
+            }
+            if let prefillGEMM = entry.prefillGEMM {
+                line += " kernelName=\(prefillGEMM.selectedKernelName)"
+                line += " in=\(prefillGEMM.inputDimension)"
+                line += " out=\(prefillGEMM.outputDimension)"
+                line += " stride=\(prefillGEMM.inputRowStride)"
+                line += " seq=\(prefillGEMM.maximumSequenceLength)"
+                if let sequenceTileHeight = prefillGEMM.sequenceTileHeight {
+                    line += " tile=\(sequenceTileHeight)"
+                }
+                if !prefillGEMM.tileVariantHeights.isEmpty {
+                    let variants = prefillGEMM.tileVariantHeights
+                        .map(String.init)
+                        .joined(separator: ",")
+                    line += " tileVariants=\(variants)"
+                }
+                if prefillGEMM.projectionCount > 1 {
+                    line += " projections=\(prefillGEMM.projectionCount)"
+                }
             }
             if let fallbackReason = entry.fallbackReason {
                 line += " fallback=\(fallbackReason.rawValue)"

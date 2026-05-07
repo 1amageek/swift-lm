@@ -47,16 +47,21 @@ struct STAFValidator: Sendable {
             }
         }
 
-        if let expectedMetadata {
+        let requiredMetadata = STAFFileMetadata
+            .defaultCacheMetadata(sourceShardCount: safetensorsURLs.count)
+            .merged(with: expectedMetadata ?? .empty)
+        if header.supportsMetadataTable {
             let actualMetadata: STAFFileMetadata
             do {
                 actualMetadata = try STAFMetadataDecoder().decode(from: fileData, header: header)
             } catch {
                 return false
             }
-            guard actualMetadata.containsAllValues(of: expectedMetadata) else {
+            guard actualMetadata.containsAllValues(of: requiredMetadata) else {
                 return false
             }
+        } else if !requiredMetadata.isEmpty {
+            return false
         }
 
         let stafAttributes = try FileManager.default.attributesOfItem(atPath: stafURL.path)

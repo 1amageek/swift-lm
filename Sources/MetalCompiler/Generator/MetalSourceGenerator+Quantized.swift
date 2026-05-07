@@ -574,4 +574,368 @@ public static func generateUnifiedQuantizedGEMV(
     """
 }
 
+/// Generate a sequence GEMV kernel for packed quantized weights.
+///
+/// The reduction contract matches decode GEMV for each row-token pair: one SIMD
+/// group owns one output row for one sequence position, uses the same packed
+/// weight read expression, and rounds the stored activation to Float16 semantics.
+public static func generateUnifiedQuantizedSequenceGEMV(
+    name: String,
+    format: any QuantizationFormat,
+    bufferPrecision: BufferPrecision,
+    tileElements: Int = 256
+) -> String {
+    precondition(
+        format.isQuantized,
+        "generateUnifiedQuantizedSequenceGEMV requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    let bt = bufferPrecision.metalType
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
+    let storeValue = MetalSourceGenerator.sequenceStorageValue("sum", weightFormat: .float16)
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+    let scaffoldBody = """
+                for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                    float w = \(readExpression);
+                    sum += w * float(inputTile[tileOffset + k]);
+                }
+    """
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input              [[buffer(0)]],
+        device const uchar* weight            [[buffer(1)]],
+        device \(bt)* output                  [[buffer(2)]],
+        constant uint& inputDimension         [[buffer(3)]],
+        constant uint& outputDimension        [[buffer(4)]],
+        constant uint& sequenceLength         [[buffer(5)]],
+        constant uint& inputRowStride         [[buffer(6)]],
+        constant uint& outputRowStride        [[buffer(7)]],
+        uint2 gid                             [[threadgroup_position_in_grid]],
+        uint tid                              [[thread_index_in_threadgroup]],
+        uint tiisg                            [[thread_index_in_simdgroup]],
+        uint sgitg                            [[simdgroup_index_in_threadgroup]],
+        uint2 tptg                            [[threads_per_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint THREADS_PER_THREADGROUP = tptg.x;
+        const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
+        const uint TILE_ELEMENTS = \(tileElements);
+        const uint row = gid.x * rowsPerThreadgroup + sgitg;
+        const uint seqPos = gid.y;
+        const bool active = row < outputDimension && seqPos < sequenceLength;
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        const uint safeRow = min(row, max(outputDimension, 1u) - 1u);
+        const uint safeSeqPos = min(seqPos, max(sequenceLength, 1u) - 1u);
+        device const uchar* rowBase = weight + safeRow * blocksPerRow * BYTES_PER_BLOCK;
+        device const \(bt)* inputRow = input + safeSeqPos * inputRowStride;
+        threadgroup \(bt) inputTile[TILE_ELEMENTS];
+        float sum = 0.0f;
+
+        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
+            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
+            for (uint j = tid; j < tileCount; j += THREADS_PER_THREADGROUP) {
+                inputTile[j] = inputRow[base + j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint blockBase = base / WEIGHTS_PER_BLOCK;
+            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+    \(scaffoldBody)
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        sum = simd_sum(sum);
+        if (active && tiisg == 0) {
+            output[seqPos * outputRowStride + row] = \(bt)(\(storeValue));
+        }
+    }
+    """
+}
+
+/// Generate a batched sequence GEMV kernel for multiple packed quantized
+/// projections sharing the same sequence input.
+///
+/// The numeric contract mirrors `generateUnifiedQuantizedSequenceGEMV`: one SIMD
+/// group owns one output row for one sequence position, preserving decode-style
+/// reduction order and sequence-storage rounding while reducing dispatch count
+/// for Q/K/V and gate/up style projection groups.
+public static func generateBatchedQuantizedSequenceGEMV(
+    name: String,
+    count: Int,
+    format: any QuantizationFormat,
+    bufferPrecision: BufferPrecision,
+    tileElements: Int = 256
+) -> String {
+    precondition((2...4).contains(count), "batched quantized sequence GEMV supports 2...4 projections")
+    precondition(
+        format.isQuantized,
+        "generateBatchedQuantizedSequenceGEMV requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    let bt = bufferPrecision.metalType
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
+    let storeValue = MetalSourceGenerator.sequenceStorageValue("sum", weightFormat: .float16)
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+
+    let weightBindings = (0..<count).map { i in
+        "device const uchar* weight\(i)        [[buffer(\(1 + i))]],"
+    }.joined(separator: "\n        ")
+    let outputBindings = (0..<count).map { i in
+        "device \(bt)* output\(i)              [[buffer(\(1 + count + i))]],"
+    }.joined(separator: "\n        ")
+    let outputDimBindings = (0..<count).map { i in
+        "constant uint& outputDim\(i)          [[buffer(\(2 + 2 * count + i))]],"
+    }.joined(separator: "\n        ")
+    let totalRows = (0..<count).map { "outputDim\($0)" }.joined(separator: " + ")
+    let branchBlocks = (0..<count).map { i -> String in
+        let condition: String
+        if i == 0 {
+            condition = "if (globalRow < outputDim0)"
+        } else if i == count - 1 {
+            condition = "else"
+        } else {
+            let cumulative = (0...i).map { "outputDim\($0)" }.joined(separator: " + ")
+            condition = "else if (globalRow < \(cumulative))"
+        }
+        let prior = i == 0 ? "0u" : (0..<i).map { "outputDim\($0)" }.joined(separator: " + ")
+        return """
+                \(condition) {
+                    weight = weight\(i);
+                    output = output\(i);
+                    localRow = globalRow - (\(prior));
+                }
+        """
+    }.joined(separator: "\n        ")
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input              [[buffer(0)]],
+        \(weightBindings)
+        \(outputBindings)
+        constant uint& inputDimension          [[buffer(\(1 + 2 * count))]],
+        \(outputDimBindings)
+        constant uint& sequenceLength          [[buffer(\(2 + 3 * count))]],
+        constant uint& inputRowStride          [[buffer(\(3 + 3 * count))]],
+        constant uint& outputRowStride         [[buffer(\(4 + 3 * count))]],
+        uint2 gid                              [[threadgroup_position_in_grid]],
+        uint tid                               [[thread_index_in_threadgroup]],
+        uint tiisg                             [[thread_index_in_simdgroup]],
+        uint sgitg                             [[simdgroup_index_in_threadgroup]],
+        uint2 tptg                             [[threads_per_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint TILE_ELEMENTS = \(tileElements);
+        const uint THREADS_PER_THREADGROUP = tptg.x;
+        const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
+        const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
+        const uint seqPos = gid.y;
+        const uint totalRows = \(totalRows);
+        const bool active = globalRow < totalRows && seqPos < sequenceLength;
+
+        device const uchar* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
+        if (active) {
+        \(branchBlocks)
+        }
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        const uint safeSeqPos = min(seqPos, max(sequenceLength, 1u) - 1u);
+        device const \(bt)* inputRow = input + safeSeqPos * inputRowStride;
+        device const uchar* rowBase = weight + localRow * blocksPerRow * BYTES_PER_BLOCK;
+        threadgroup \(bt) inputTile[TILE_ELEMENTS];
+        float sum = 0.0f;
+
+        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
+            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
+            for (uint j = tid; j < tileCount; j += THREADS_PER_THREADGROUP) {
+                inputTile[j] = inputRow[base + j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint blockBase = base / WEIGHTS_PER_BLOCK;
+            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                        float w = \(readExpression);
+                        sum += w * float(inputTile[tileOffset + k]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        sum = simd_sum(sum);
+        if (active && tiisg == 0) {
+            output[seqPos * outputRowStride + localRow] = \(bt)(\(storeValue));
+        }
+    }
+    """
+}
+
+/// Generate a batched GEMV kernel for multiple quantized projections sharing
+/// the same decode input.
+///
+/// The binding convention intentionally matches the dense batched GEMV kernels:
+/// input at buffer 0, `count` packed weight buffers, `count` output buffers,
+/// followed by `inputDimension` and one output dimension per projection.
+/// Dequantization is delegated to `QuantizationFormat.perWeightReadExpression`
+/// so Q2/Q3/Q4/Q5/Q6/Q8 formats use one source template instead of being
+/// decomposed into per-projection dispatches.
+public static func generateBatchedQuantizedGEMV(
+    name: String,
+    count: Int,
+    format: any QuantizationFormat,
+    bufferPrecision: BufferPrecision,
+    tileElements: Int = 256
+) -> String {
+    precondition((2...4).contains(count), "batched quantized GEMV supports 2...4 projections")
+    precondition(
+        format.isQuantized,
+        "generateBatchedQuantizedGEMV requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    let bt = bufferPrecision.metalType
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+
+    let weightBindings = (0..<count).map { i in
+        "device const uchar* weight\(i)    [[buffer(\(1 + i))]],"
+    }.joined(separator: "\n        ")
+    let outputBindings = (0..<count).map { i in
+        "device \(bt)* output\(i)           [[buffer(\(1 + count + i))]],"
+    }.joined(separator: "\n        ")
+    let outputDimBindings = (0..<count).map { i in
+        "constant uint& outputDim\(i)      [[buffer(\(2 + 2 * count + i))]],"
+    }.joined(separator: "\n        ")
+    let totalRows = (0..<count).map { "outputDim\($0)" }.joined(separator: " + ")
+    let branchBlocks = (0..<count).map { i -> String in
+        let condition: String
+        if i == 0 {
+            condition = "if (globalRow < outputDim0)"
+        } else if i == count - 1 {
+            condition = "else"
+        } else {
+            let cumulative = (0...i).map { "outputDim\($0)" }.joined(separator: " + ")
+            condition = "else if (globalRow < \(cumulative))"
+        }
+        let prior = i == 0 ? "0u" : (0..<i).map { "outputDim\($0)" }.joined(separator: " + ")
+        return """
+                \(condition) {
+                    weight = weight\(i);
+                    output = output\(i);
+                    localRow = globalRow - (\(prior));
+                }
+        """
+    }.joined(separator: "\n        ")
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input       [[buffer(0)]],
+        \(weightBindings)
+        \(outputBindings)
+        constant uint& inputDimension  [[buffer(\(1 + 2 * count))]],
+        \(outputDimBindings)
+        uint gid                       [[threadgroup_position_in_grid]],
+        uint tid                       [[thread_index_in_threadgroup]],
+        uint tiisg                     [[thread_index_in_simdgroup]],
+        uint sgitg                     [[simdgroup_index_in_threadgroup]],
+        uint threadsPerThreadgroup     [[threads_per_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint TILE_ELEMENTS = \(tileElements);
+        const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+        const uint globalRow = gid * rowsPerThreadgroup + sgitg;
+        const uint totalRows = \(totalRows);
+        const bool active = globalRow < totalRows;
+
+        device const uchar* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
+        if (active) {
+        \(branchBlocks)
+        }
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        device const uchar* rowBase = weight + localRow * blocksPerRow * BYTES_PER_BLOCK;
+        threadgroup \(bt) inputTile[TILE_ELEMENTS];
+        float sum = 0.0f;
+
+        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
+            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
+            for (uint j = tid; j < tileCount; j += threadsPerThreadgroup) {
+                inputTile[j] = input[base + j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint blockBase = base / WEIGHTS_PER_BLOCK;
+            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                        float w = \(readExpression);
+                        sum += w * float(inputTile[tileOffset + k]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        sum = simd_sum(sum);
+        if (active && tiisg == 0) {
+            output[localRow] = \(bt)(sum);
+        }
+    }
+    """
+}
+
 }
