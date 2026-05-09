@@ -139,17 +139,20 @@ flowchart TD
 | 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; fused SwiGLU+down kernel keeps the materialized F32 intermediate contract and matches the unfused `swiglu_seq_f32 + gemv_seq_bf16_f32s` path |
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 ENABLE_METAL_PROBES=1` | Pass; 4/4 Qwen reference checks remain green with opt-in fused MLP down routing |
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 ENABLE_METAL_PROBES=1` | Pass; routing fires (`293 -> 269` steps, 24 fused dispatches), but end-to-end prefill regresses, so default routing remains disabled |
+| 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; adds an eight-rows-per-threadgroup fused scheduling contract |
+| 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; rows=8 fused route fires and improves the same-run Qwen profile at seqLen 64/128, but remains opt-in |
+| 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; 4/4 reference checks remain green with rows=8 fused scheduling |
 
 ## Failed Experiments
 
 | Experiment | Result | Decision |
 |---|---|---|
 | Sequence GEMV `tileElements = 1024` | Regressed Qwen profile | Rejected |
-| 4 / 8 output rows per threadgroup | Regressed or unstable Qwen profile | Rejected |
+| Generic sequence GEMV with 4 / 8 output rows per threadgroup | Regressed or unstable Qwen profile | Rejected |
 | MPP for 2-way gate/up while keeping stateful projections sequence GEMV | Broke BF16 Qwen token trace | Rejected |
 | Default tile4 sequence GEMV | Correctness passed but Qwen seqLen 16/64/128 regressed to 114.827/190.303/374.976 ms | Kept as non-default experiment; production planner reverted to base sequence GEMV |
 | Feature-flagged tile2 single sequence GEMV | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.572/158.280/314.697 ms to 44.768/160.643/317.498 ms | Kept behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`; default production planner stays on base sequence GEMV |
-| Feature-flagged fused SwiGLU + down projection | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Kept behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`; current F32-contract fused kernel is not performance-viable as a default |
+| Feature-flagged fused SwiGLU + down projection with 2 rows/threadgroup | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Rejected as the fused scheduling shape; it recomputes SwiGLU tiles too often |
 
 ## Open Decisions
 
@@ -160,7 +163,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | No; reference gate passes, but full-model profile regresses |
+| Whether fused SwiGLU + down should default | Not yet; rows=8 has a green reference gate and promising same-run profile, but needs repeated profile evidence before default promotion |
 
 ## Current Production Prefill Profile
 
@@ -418,11 +421,12 @@ Current routing effect from the opt-in Qwen profile:
 | `gemv_seq_bf16_f32s` | 48 | 24 |
 | `mlp_fused_swiglu_down_seq_bf16_f32s` | 0 | 24 |
 
-The local rerun confirms routing and correctness but rejects promotion. The
-feature flag reaches the test runner when run through `xcrun xctest`; passing
-the environment only to `xcodebuild` is not reliable for this gate.
+The first local rerun confirmed routing and correctness but rejected the
+original 2-row scheduling. The feature flag reaches the test runner when run
+through `xcrun xctest`; passing the environment only to `xcodebuild` is not
+reliable for this gate.
 
-| Sequence length | Default route | Fused flag enabled | Delta | Decision |
+| Sequence length | Default route | Fused rows=2 | Delta | Decision |
 |---:|---:|---:|---:|---|
 | 16 | 44.373 ms | 44.658 ms | +0.6% | noise / no promotion |
 | 64 | 158.926 ms | 211.582 ms | +33.1% | reject as default |
@@ -434,14 +438,34 @@ At seqLen 128, the fused plan reports 24
 more than outweighs the dispatch-count reduction. The result is a useful
 correctness-gated experiment, not a production speed path.
 
+The root cause is repeated SwiGLU tile computation. With 2 rows per
+threadgroup, each `(sequence, output-row-group)` threadgroup recomputes
+`silu(gate) * up`; this happens 256 times per token for a 512-row down
+projection. The rows=8 variant amortizes the same tile over 8 output rows and
+reduces the recomputation factor to 64 groups per token without changing the
+per-row SIMD reduction contract.
+
+Same-run profile after switching the opt-in fused route to rows=8:
+
+| Sequence length | Baseline flag off | Fused rows=8 | Delta | Decision |
+|---:|---:|---:|---:|---|
+| 16 | 68.705 ms | 42.615 ms | -38.0% | noisy but favorable |
+| 64 | 158.646 ms | 156.447 ms | -1.4% | favorable |
+| 128 | 312.070 ms | 306.569 ms | -1.8% | favorable |
+
+At seqLen 128, the rows=8 fused kernel reports 35.997 ms for 24 fused
+dispatches versus 39.870 ms for the 24 baseline `mlp.down_proj` GEMV dispatches
+plus 0.198 ms for 24 baseline `swiglu_seq_f32` dispatches. This is now a
+plausible opt-in speed path, but the margin is small and must be repeated
+before default promotion.
+
 Important numerical note: the fused kernel now keeps the same F32 intermediate
 contract as the current materialized two-kernel path. It removes the scratch
 round-trip for the SwiGLU output, but it does not change the precision of the
 down-projection input. `FusedSwigluDownEquivalenceTests` directly compares the
 fused kernel against the unfused path with zero tolerance.
 
-Next decision: redesign the fused kernel before trying promotion again. The
-current admission and reference harness are reusable, but the kernel body must
-avoid trading one scratch round-trip for substantially more arithmetic or poorer
-occupancy. Default promotion still requires model-level correctness and a
-stable end-to-end prefill improvement, not only dispatch-count reduction.
+Next decision: repeat the rows=8 Qwen profile and add a focused rows-per-
+threadgroup microbenchmark for 2/4/8. Default promotion still requires
+model-level correctness and a stable end-to-end prefill improvement, not only
+dispatch-count reduction.

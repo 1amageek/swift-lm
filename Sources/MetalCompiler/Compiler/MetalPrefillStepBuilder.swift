@@ -407,6 +407,21 @@ private struct PrefillStepPlanner {
         return raw == "1" || raw.lowercased() == "true"
     }()
 
+    /// Row-group width for the opt-in fused SwiGLU+down prefill experiment.
+    ///
+    /// The fused kernel computes the SwiGLU tile inside each output-row
+    /// threadgroup. More rows per threadgroup amortize that tile computation
+    /// across more down-projection rows while preserving the per-row SIMD
+    /// reduction contract. The value is intentionally capped to keep occupancy
+    /// predictable during experiments.
+    private static let fusedMlpDownRowsPerThreadgroup: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS"],
+              let value = Int(raw) else {
+            return 8
+        }
+        return min(max(value, 1), 8)
+    }()
+
     let buffers: PrefillBufferSet
     let stafWeightStore: STAFWeightStore?
     let hiddenSize: Int
@@ -745,7 +760,7 @@ private struct PrefillStepPlanner {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
         let rowsPerThreadgroup = max(
             1,
-            min(Self.decodeEquivalentSequenceRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
+            min(Self.fusedMlpDownRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
         )
         let threads = min(simdWidth * rowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
         let gridSize = MTLSize(

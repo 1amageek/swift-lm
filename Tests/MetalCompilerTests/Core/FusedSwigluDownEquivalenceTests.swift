@@ -185,6 +185,99 @@ struct FusedSwigluDownEquivalenceTests {
         )
     }
 
+    @Test("Fused SwiGLU+down BF16 matches unfused path with eight rows per threadgroup")
+    func fusedSwigluDownMatchesUnfusedPathWithEightRowsPerThreadgroup() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let intermediateDim = 1024
+        let outputDim = 256
+        let sequenceLength = 16
+        let inputRowStride = 1280
+        let outputRowStride = outputDim
+        let fusedKernel = "test_unfused_compare_fused_swiglu_down_rows8"
+        let swigluKernel = "test_unfused_swiglu_seq_f32_rows8"
+        let gemvKernel = "test_unfused_gemv_seq_bf16_f32s_rows8"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateSwiGLU(
+                name: swigluKernel,
+                bufferPrecision: .float32
+            ),
+            MetalSourceGenerator.generateSequenceGEMV(
+                name: gemvKernel,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16
+            ),
+            MetalSourceGenerator.generateFusedSwigluDownSequenceGEMV(
+                name: fusedKernel,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let swigluPipeline = try harness.pipeline(named: swigluKernel)
+        let gemvPipeline = try harness.pipeline(named: gemvKernel)
+        let fusedPipeline = try harness.pipeline(named: fusedKernel)
+
+        let gateValues = makeGateValues(
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            intermediateDim: intermediateDim
+        )
+        let upValues = makeUpValues(
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            intermediateDim: intermediateDim
+        )
+        let weightValues = makeWeightValues(
+            outputDim: outputDim,
+            intermediateDim: intermediateDim
+        )
+
+        let unfused = try runUnfusedPath(
+            harness: harness,
+            swigluPipeline: swigluPipeline,
+            gemvPipeline: gemvPipeline,
+            gate: gateValues,
+            up: upValues,
+            weight: weightValues,
+            intermediateDim: intermediateDim,
+            outputDim: outputDim,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            outputRowStride: outputRowStride
+        )
+        let fused = try runFusedKernel(
+            harness: harness,
+            pipeline: fusedPipeline,
+            gate: gateValues,
+            up: upValues,
+            weight: weightValues,
+            intermediateDim: intermediateDim,
+            outputDim: outputDim,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            outputRowStride: outputRowStride,
+            rowsPerThreadgroup: 8
+        )
+
+        let mismatch = harness.firstMismatch(
+            expected: unfused,
+            actual: fused,
+            tolerance: 0.0
+        )
+        let maxAbsError = harness.maxAbsoluteError(expected: unfused, actual: fused)
+        #expect(
+            mismatch == nil,
+            "rows8 fused vs unfused path drifted: \(String(describing: mismatch)), maxAbsError=\(maxAbsError)"
+        )
+    }
+
     // MARK: - Inputs
 
     private func makeGateValues(
@@ -277,7 +370,8 @@ struct FusedSwigluDownEquivalenceTests {
         outputDim: Int,
         sequenceLength: Int,
         inputRowStride: Int,
-        outputRowStride: Int
+        outputRowStride: Int,
+        rowsPerThreadgroup requestedRowsPerThreadgroup: Int = 2
     ) throws -> [Float] {
         let gateBuffer = try harness.makeSharedBuffer(values: gate)
         let upBuffer = try harness.makeSharedBuffer(values: up)
@@ -286,7 +380,7 @@ struct FusedSwigluDownEquivalenceTests {
             byteLength: sequenceLength * outputRowStride * MemoryLayout<Float>.stride
         )
         let simdWidth = 32
-        let threads = min(simdWidth * 2, pipeline.maxTotalThreadsPerThreadgroup)
+        let threads = min(simdWidth * requestedRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
         let rowsPerThreadgroup = max(1, threads / simdWidth)
         let grid = MTLSize(
             width: (outputDim + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
