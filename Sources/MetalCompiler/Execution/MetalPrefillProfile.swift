@@ -89,6 +89,7 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "mode",
                 "layerIndex",
                 "entryIndex",
+                "weightTensorName",
                 "gridWidth",
                 "gridHeight",
                 "threadgroupWidth",
@@ -104,7 +105,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         ]
         for entry in entries {
             var row: [String] = []
-            row.reserveCapacity(20)
+            row.reserveCapacity(21)
             row.append(entry.scope)
             row.append(String(entry.index))
             row.append(String(entry.rangeStart))
@@ -114,6 +115,7 @@ struct MetalPrefillProfile: Codable, Sendable {
             row.append(entry.mode)
             row.append(entry.layerIndex.map(String.init) ?? "")
             row.append(entry.entryIndex.map(String.init) ?? "")
+            row.append(csvEscape(entry.weightTensorName ?? ""))
             row.append(String(entry.gridWidth))
             row.append(String(entry.gridHeight))
             row.append(String(entry.threadgroupWidth))

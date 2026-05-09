@@ -132,6 +132,8 @@ flowchart TD
 | 2026-05-07 | `MetalCompilerTests/Qwen35BenchmarkTests` with `ENABLE_METAL_PROBES=1` | Pass; Q3 smoke benchmark confirms 96 total Q3 sequence GEMV entries, 48 batched Q3 sequence GEMV entries, and sequence prefill faster than sequential ingestion for lengths 16/64/128 |
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` (re-run) | Pass; projection share confirmed at 75.8-76.4%, single `gemv_seq_bf16_f32s` confirmed as 26.5% of projection time (48 dependent output projections), pass count remains 1 |
 | 2026-05-09 | `MetalCompilerTests/SequenceProjectionEquivalenceTests` | Pass; 5 tests including `BF16 tile2 single sequence GEMV matches repeated decode GEMV` and `BF16 tiled single sequence GEMV matches repeated decode GEMV` |
+| 2026-05-09 | `MetalCompilerTests/Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; 4/4 cases remain reference-equivalent with feature-flagged tile2 single sequence GEMV routing |
+| 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; tile2 routed 48 BF16 single sequence GEMV dispatches but did not improve prefill timing, so default routing remains disabled |
 
 ## Failed Experiments
 
@@ -141,6 +143,7 @@ flowchart TD
 | 4 / 8 output rows per threadgroup | Regressed or unstable Qwen profile | Rejected |
 | MPP for 2-way gate/up while keeping stateful projections sequence GEMV | Broke BF16 Qwen token trace | Rejected |
 | Default tile4 sequence GEMV | Correctness passed but Qwen seqLen 16/64/128 regressed to 114.827/190.303/374.976 ms | Kept as non-default experiment; production planner reverted to base sequence GEMV |
+| Feature-flagged tile2 single sequence GEMV | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.572/158.280/314.697 ms to 44.768/160.643/317.498 ms | Kept behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`; default production planner stays on base sequence GEMV |
 
 ## Open Decisions
 
@@ -148,7 +151,7 @@ flowchart TD
 |---|---|
 | Best sequence tile size for M1 | tile4 is not acceptable as default; smaller or different tiling remains future work |
 | Whether M1 should default to tile4 or stay opt-in | Stay non-default |
-| Whether M2 should route tile2 for dependent single projections | Pending — requires feature-flagged routing + Qwen3.5 BF16 correctness + profile comparison |
+| Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
 
@@ -305,31 +308,23 @@ Phase 1 + Phase 2 of the prefill speed plan are confirmed:
 | Phase 2 dependent-projection judgment | Yes | All 48 single GEMV entries are output projections (24 down + 18 ssm_out + 6 o) |
 | Phase 4 reference equivalence (BF16 single tile2) | Yes | `BF16 tile2 single sequence GEMV matches repeated decode GEMV` passes |
 | Phase 4 reference equivalence (BF16 single tile4) | Yes | `BF16 tiled single sequence GEMV matches repeated decode GEMV` passes |
-| Phase 5 routing decision (tile2 / tile4) | Pending real-shape benchmark | tile4 already rejected at 2026-05-07; tile2 routing requires a feature-flagged comparative profile run |
+| Phase 5 routing decision (tile2 / tile4) | Yes | tile4 already rejected at 2026-05-07; tile2 stays feature-flagged because real-shape Qwen3.5 profile was noise/slower |
 
 The base sequence GEMV kernel uses one threadgroup per `(rowGroup, token)` pair
 with `tileElements = 256` input staging. The tile2 kernel halves grid height by
 covering 2 tokens per threadgroup, sharing input staging across the two tokens.
-The kernel is already implemented in
-`MetalSourceGenerator.generateTiledSequenceGEMV` and is bit-equivalent to the
-repeated decode GEMV reduction at small synthetic shapes. What is **not** yet
-established is whether tile2 is faster on the real Qwen3.5 dependent-projection
-shapes (gridWidth 512, gridHeight 128, inputDim varies per role).
+It is implemented and reference-equivalent, but the real Qwen3.5 dependent
+projection shapes did not benefit.
 
-Routing tile2 in production requires:
+| Sequence length | Baseline | Tile2 flag enabled | Delta | Decision |
+|---:|---:|---:|---:|---|
+| 16 | 44.572 ms | 44.768 ms | +0.44% | noise |
+| 64 | 158.280 ms | 160.643 ms | +1.49% | slower |
+| 128 | 314.697 ms | 317.498 ms | +0.89% | noise |
 
-1. A feature-flagged `gemv_seq_bf16_f32s_tile2` routing path for dependent
-   single projections only (do not touch batched paths).
-2. A real-bundle Qwen3.5 BF16 prompt ingestion correctness gate run with
-   routing enabled.
-3. A `Qwen35PrefillProfileTests` re-run with routing enabled, comparing total
-   prefill time at seqLen 16/64/128 against the recorded base numbers.
-4. A reference-comparison run (`Qwen35ReferenceComparisonTests`) with routing
-   enabled.
-
-If any of those gates regress, the routing reverts and tile2 stays as a
-non-default experiment, mirroring the tile4 disposition.
-
-Until the routed-tile2 evidence exists, the production planner stays on the
-base sequence GEMV path and no speed claim is made for the single-projection
-kernel.
+The planner keeps tile2 behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`. The
+structural `SequenceGEMVKernelSelection` refactor remains because it makes
+future tiled experiments derive grid height, threadgroup shape, diagnostics,
+and sequence-length policy from one explicit tile descriptor instead of parsing
+kernel-name suffixes. Production default routing stays on the base sequence
+GEMV path and no speed claim is made for tile2.

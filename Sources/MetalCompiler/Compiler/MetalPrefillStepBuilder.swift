@@ -339,9 +339,37 @@ struct MetalPrefillStepBuilder {
     }
 }
 
+/// Selection of a sequence-equivalent GEMV kernel for one prefill projection.
+///
+/// `kernelName` is the catalog kernel that will be dispatched. `sequenceTile`
+/// is the number of token rows that one threadgroup processes along the
+/// sequence axis. `1` means the base, untiled kernel (`gemv_seq_*`). Values
+/// greater than 1 select a tiled variant (`gemv_seq_*_tile<N>`) and require
+/// the planner to scale grid height, threadgroup shape, diagnostics, and
+/// `bindAndAdjustGridHeightTiled` consistently. The planner must derive all
+/// tile-aware behaviour from this value rather than parsing the kernel name.
+private struct SequenceGEMVKernelSelection: Equatable {
+    let kernelName: String
+    let sequenceTile: Int
+
+    var isTiled: Bool { sequenceTile > 1 }
+}
+
 private struct PrefillStepPlanner {
     private static let decodeEquivalentSequenceRowsPerThreadgroup = 2
-    private static let decodeEquivalentSequenceTile = 4
+
+    /// Process-wide BF16 single sequence GEMV tile2 feature flag.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`, BF16 single (non-batched)
+    /// sequence GEMV projections route to `gemv_seq_bf16_f32s_tile2`. Other
+    /// schemes (FP16, Q3-*) and the batched path are unaffected. Read once
+    /// per process to avoid repeated `getenv` calls.
+    private static let bf16SingleTile2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_SINGLE_TILE2"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
 
     let buffers: PrefillBufferSet
     let stafWeightStore: STAFWeightStore?
@@ -439,19 +467,43 @@ private struct PrefillStepPlanner {
 
     private func decodeEquivalentSequenceGEMVKernelName(
         for descriptor: ProjectionWeightDescriptor
-    ) -> String? {
+    ) -> SequenceGEMVKernelSelection? {
         guard needsDecodeEquivalentSequenceProjectionMath else { return nil }
         switch descriptor.schemeIdentifier {
         case .bf16RowMajor:
-            return "gemv_seq_bf16_f32s"
+            // Feature-flagged tile2 routing: only BF16 single sequence GEMV.
+            // Quantized and FP16 paths intentionally stay on base kernels until
+            // their own profile evidence is collected.
+            if Self.bf16SingleTile2Enabled {
+                return SequenceGEMVKernelSelection(
+                    kernelName: "gemv_seq_bf16_f32s_tile2",
+                    sequenceTile: 2
+                )
+            }
+            return SequenceGEMVKernelSelection(
+                kernelName: "gemv_seq_bf16_f32s",
+                sequenceTile: 1
+            )
         case .fp16RowMajor:
-            return "gemv_seq_f32s"
+            return SequenceGEMVKernelSelection(
+                kernelName: "gemv_seq_f32s",
+                sequenceTile: 1
+            )
         case .q3Group16ScaleF16:
-            return "gemv_seq_q3_g16_f32s"
+            return SequenceGEMVKernelSelection(
+                kernelName: "gemv_seq_q3_g16_f32s",
+                sequenceTile: 1
+            )
         case .q3Group32ScaleF16:
-            return "gemv_seq_q3_g32_f32s"
+            return SequenceGEMVKernelSelection(
+                kernelName: "gemv_seq_q3_g32_f32s",
+                sequenceTile: 1
+            )
         case .q3Group64ScaleF16:
-            return "gemv_seq_q3_g64_f32s"
+            return SequenceGEMVKernelSelection(
+                kernelName: "gemv_seq_q3_g64_f32s",
+                sequenceTile: 1
+            )
         default:
             return nil
         }
@@ -460,33 +512,55 @@ private struct PrefillStepPlanner {
     private func decodeEquivalentBatchedSequenceGEMVKernelName(
         for descriptor: ProjectionWeightDescriptor,
         count: Int
-    ) -> String? {
+    ) -> SequenceGEMVKernelSelection? {
         guard needsDecodeEquivalentSequenceProjectionMath else { return nil }
         guard count >= 2 && count <= 4 else { return nil }
+        let baseName: String
         switch descriptor.schemeIdentifier {
         case .bf16RowMajor:
-            return "batched_gemv\(count)_seq_bf16_f32s"
+            baseName = "batched_gemv\(count)_seq_bf16_f32s"
         case .fp16RowMajor:
-            return "batched_gemv\(count)_seq_f32s"
+            baseName = "batched_gemv\(count)_seq_f32s"
         case .fp32RowMajor:
-            return "batched_gemv\(count)_seq_fp32_f32s"
+            baseName = "batched_gemv\(count)_seq_fp32_f32s"
         case .q3Group16ScaleF16:
-            return "batched_gemv\(count)_seq_q3_g16_f32s"
+            baseName = "batched_gemv\(count)_seq_q3_g16_f32s"
         case .q3Group32ScaleF16:
-            return "batched_gemv\(count)_seq_q3_g32_f32s"
+            baseName = "batched_gemv\(count)_seq_q3_g32_f32s"
         case .q3Group64ScaleF16:
-            return "batched_gemv\(count)_seq_q3_g64_f32s"
+            baseName = "batched_gemv\(count)_seq_q3_g64_f32s"
         default:
             return nil
         }
+        // Batched path stays on the base (untiled) kernel. The tile2
+        // feature flag is single-projection only by design.
+        return SequenceGEMVKernelSelection(kernelName: baseName, sequenceTile: 1)
     }
 
+    /// Resolve threadgroup shape and grid-height tile for a tiled sequence GEMV.
+    ///
+    /// `requestedSequenceTile` must come from `SequenceGEMVKernelSelection.sequenceTile`
+    /// — the planner never invents a tile size or parses it from the kernel
+    /// name. If the requested tile exceeds the pipeline's max simdgroups per
+    /// threadgroup, the kernel cannot be safely scheduled (each row needs one
+    /// simdgroup) and we throw rather than silently fall back.
     private func decodeEquivalentSequenceThreadShape(
-        pipeline: MTLComputePipelineState
-    ) -> (sequenceTile: Int, rowsPerThreadgroup: Int, threadgroupSize: MTLSize) {
+        pipeline: MTLComputePipelineState,
+        requestedSequenceTile: Int
+    ) throws -> (sequenceTile: Int, rowsPerThreadgroup: Int, threadgroupSize: MTLSize) {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
         let maxSimdgroups = max(1, pipeline.maxTotalThreadsPerThreadgroup / simdWidth)
-        let sequenceTile = min(Self.decodeEquivalentSequenceTile, maxSimdgroups)
+        guard requestedSequenceTile >= 1 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Sequence tile \(requestedSequenceTile) is invalid for kernel \(pipeline.label ?? "(unlabeled)")"
+            )
+        }
+        guard requestedSequenceTile <= maxSimdgroups else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Sequence tile \(requestedSequenceTile) exceeds max simdgroups \(maxSimdgroups) for kernel \(pipeline.label ?? "(unlabeled)")"
+            )
+        }
+        let sequenceTile = requestedSequenceTile
         let rowsPerThreadgroup = min(
             Self.decodeEquivalentSequenceRowsPerThreadgroup,
             max(1, maxSimdgroups / sequenceTile)
@@ -585,10 +659,10 @@ private struct PrefillStepPlanner {
             let useDirectQuantizedGEMM = directGEMM.flatMap {
                 planBuildContext.pipelineCache[$0.kernelName]
             } != nil
-            let sequenceGEMVKernelName = mode == .batch
+            let sequenceGEMVSelection = mode == .batch
                 ? decodeEquivalentSequenceGEMVKernelName(for: quantizationDescriptor)
                 : nil
-            let usesSequenceGEMVForStep = sequenceGEMVKernelName != nil
+            let usesSequenceGEMVForStep = sequenceGEMVSelection != nil
 
             let canDequantForAMX = quantizationDescriptor.schemeIdentifier.isWeightQuantized
                 && buffers.dequantScratch != nil
@@ -640,12 +714,12 @@ private struct PrefillStepPlanner {
             // Resolve GEMM pipeline
             let selectedPipeline: MTLComputePipelineState
             let selectedKernelName: String
-            if let sequenceGEMVKernelName {
-                guard let sequencePipeline = planBuildContext.pipelineCache[sequenceGEMVKernelName] else {
-                    throw MetalCompilerError.kernelNotFound(sequenceGEMVKernelName)
+            if let sequenceGEMVSelection {
+                guard let sequencePipeline = planBuildContext.pipelineCache[sequenceGEMVSelection.kernelName] else {
+                    throw MetalCompilerError.kernelNotFound(sequenceGEMVSelection.kernelName)
                 }
                 selectedPipeline = sequencePipeline
-                selectedKernelName = sequenceGEMVKernelName
+                selectedKernelName = sequenceGEMVSelection.kernelName
             } else if useDirectQuantizedGEMM,
                let resolvedGEMM = directGEMM,
                let directPipeline = planBuildContext.pipelineCache[resolvedGEMM.kernelName] {
@@ -681,8 +755,11 @@ private struct PrefillStepPlanner {
             let gridSize: MTLSize
             let threadgroupSize: MTLSize
             let sequenceGEMVTile: Int?
-            if usesSequenceGEMVForStep && selectedKernelName.hasSuffix("_tile4") {
-                let shape = decodeEquivalentSequenceThreadShape(pipeline: selectedPipeline)
+            if let sequenceGEMVSelection, sequenceGEMVSelection.isTiled {
+                let shape = try decodeEquivalentSequenceThreadShape(
+                    pipeline: selectedPipeline,
+                    requestedSequenceTile: sequenceGEMVSelection.sequenceTile
+                )
                 sequenceGEMVTile = shape.sequenceTile
                 gridSize = MTLSize(
                     width: (projection.outputDimension + shape.rowsPerThreadgroup - 1) / shape.rowsPerThreadgroup,
@@ -1127,10 +1204,10 @@ private struct PrefillStepPlanner {
             let useDirectQuantizedGEMM = directGEMM.flatMap {
                 planBuildContext.pipelineCache[$0.kernelName]
             } != nil
-            let sequenceGEMVKernelName = decodeEquivalentSequenceGEMVKernelName(
+            let sequenceGEMVSelection = decodeEquivalentSequenceGEMVKernelName(
                 for: quantizationDescriptor
             )
-            let usesSequenceGEMVForStep = sequenceGEMVKernelName != nil
+            let usesSequenceGEMVForStep = sequenceGEMVSelection != nil
 
             let canDequantForAMX = quantizationDescriptor.schemeIdentifier.isWeightQuantized
                 && buffers.dequantScratch != nil
@@ -1178,12 +1255,12 @@ private struct PrefillStepPlanner {
 
             let selectedPipeline: MTLComputePipelineState
             let selectedKernelName: String
-            if let sequenceGEMVKernelName {
-                guard let sequencePipeline = planBuildContext.pipelineCache[sequenceGEMVKernelName] else {
-                    throw MetalCompilerError.kernelNotFound(sequenceGEMVKernelName)
+            if let sequenceGEMVSelection {
+                guard let sequencePipeline = planBuildContext.pipelineCache[sequenceGEMVSelection.kernelName] else {
+                    throw MetalCompilerError.kernelNotFound(sequenceGEMVSelection.kernelName)
                 }
                 selectedPipeline = sequencePipeline
-                selectedKernelName = sequenceGEMVKernelName
+                selectedKernelName = sequenceGEMVSelection.kernelName
             } else if useDirectQuantizedGEMM,
                let resolved = directGEMM,
                let directPipeline = planBuildContext.pipelineCache[resolved.kernelName] {
@@ -1343,12 +1420,13 @@ private struct PrefillStepPlanner {
         scratchSlotSize: Int
     ) throws -> MetalPrefillStep? {
         let count = batched.projections.count
-        guard let kernelName = decodeEquivalentBatchedSequenceGEMVKernelName(
+        guard let selection = decodeEquivalentBatchedSequenceGEMVKernelName(
             for: firstDescriptor,
             count: count
         ) else {
             return nil
         }
+        let kernelName = selection.kernelName
         guard let pipeline = planBuildContext.pipelineCache[kernelName] else {
             throw MetalCompilerError.kernelNotFound(kernelName)
         }
@@ -1387,8 +1465,13 @@ private struct PrefillStepPlanner {
         bytesBindings.append(uint32Binding(seqLenIndex + 1, UInt32(inputRowStride)))
         bytesBindings.append(uint32Binding(seqLenIndex + 2, UInt32(slotDimension)))
 
-        let usesTiledKernel = kernelName.hasSuffix("_tile4")
-        let shape = usesTiledKernel ? decodeEquivalentSequenceThreadShape(pipeline: pipeline) : nil
+        let usesTiledKernel = selection.isTiled
+        let shape = usesTiledKernel
+            ? try decodeEquivalentSequenceThreadShape(
+                pipeline: pipeline,
+                requestedSequenceTile: selection.sequenceTile
+            )
+            : nil
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
         let threads = shape?.threadgroupSize.width
             ?? min(
