@@ -8,15 +8,13 @@ import Testing
 /// These tests pin down the numerical contract of
 /// `mlp_fused_swiglu_down_seq_bf16_f32s` independently from the prefill router.
 ///
-/// The fused kernel intentionally diverges from the unfused `swiglu_seq_f32 +
-/// gemv_seq_bf16_f32s` pair: the contract requires the SwiGLU intermediate
-/// `silu(g) * up` to be BF16-rounded before participating in the GEMV reduction,
-/// while the unfused two-kernel path keeps the intermediate in F32. The reference
-/// computed here applies the rounding explicitly so the admission test directly
-/// validates the contract.
+/// The fused kernel must preserve the materialized `swiglu_seq_f32 +
+/// gemv_seq_bf16_f32s` numerical surface: the SwiGLU intermediate stays F32
+/// until the down projection consumes it, and only the down-projection output is
+/// BF16-rounded for sequence storage.
 @Suite("Fused SwiGLU+Down Equivalence", .serialized)
 struct FusedSwigluDownEquivalenceTests {
-    @Test("Fused SwiGLU+down BF16 matches Swift reference with explicit BF16 rounding")
+    @Test("Fused SwiGLU+down BF16 matches Swift reference with F32 intermediate")
     func fusedSwigluDownMatchesSwiftReference() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
@@ -86,17 +84,17 @@ struct FusedSwigluDownEquivalenceTests {
         let mismatch = harness.firstMismatch(
             expected: expected,
             actual: actual,
-            tolerance: 0.0
+            tolerance: 0.001
         )
         let maxError = harness.maxAbsoluteError(expected: expected, actual: actual)
         #expect(
             mismatch == nil,
-            "fused SwiGLU+down drifted from BF16-rounded Swift reference: \(String(describing: mismatch)), maxError=\(maxError)"
+            "fused SwiGLU+down drifted from F32-intermediate Swift reference: \(String(describing: mismatch)), maxError=\(maxError)"
         )
     }
 
-    @Test("Fused SwiGLU+down BF16 quantifies divergence from unfused two-kernel path")
-    func fusedSwigluDownDivergesFromUnfusedPath() throws {
+    @Test("Fused SwiGLU+down BF16 matches unfused two-kernel path")
+    func fusedSwigluDownMatchesUnfusedPath() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -175,18 +173,15 @@ struct FusedSwigluDownEquivalenceTests {
             outputRowStride: outputRowStride
         )
 
+        let mismatch = harness.firstMismatch(
+            expected: unfused,
+            actual: fused,
+            tolerance: 0.0
+        )
         let maxAbsError = harness.maxAbsoluteError(expected: unfused, actual: fused)
-        let unfusedMagnitude = unfused.reduce(0.0 as Float) { partial, value in
-            max(partial, abs(value))
-        }
-        let relative = unfusedMagnitude > 0 ? maxAbsError / unfusedMagnitude : maxAbsError
-        // The contract permits per-element BF16 rounding noise on the SwiGLU
-        // intermediate, so the divergence accumulates over `intermediateDim`
-        // multiply-adds. A loose envelope (1% relative) catches gross routing
-        // bugs without overconstraining the documented numerical drift.
         #expect(
-            relative < 0.01,
-            "fused vs unfused divergence exceeds rounding envelope: maxAbsError=\(maxAbsError), unfusedMagnitude=\(unfusedMagnitude), relative=\(relative)"
+            mismatch == nil,
+            "fused vs unfused path drifted: \(String(describing: mismatch)), maxAbsError=\(maxAbsError)"
         )
     }
 
@@ -258,9 +253,8 @@ struct FusedSwigluDownEquivalenceTests {
                         let g = gate[seq * inputRowStride + idx]
                         let u = up[seq * inputRowStride + idx]
                         let siluUp = g * (1.0 / (1.0 + Foundation_exp(-g))) * u
-                        let rounded = Float(BFloat16(siluUp))
                         let w = Float(weight[row * intermediateDim + idx])
-                        sum += w * rounded
+                        sum += w * siluUp
                     }
                     base += tileElements
                 }

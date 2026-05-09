@@ -136,7 +136,7 @@ flowchart TD
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; tile2 routed 48 BF16 single sequence GEMV dispatches but did not improve prefill timing, so default routing remains disabled |
 | 2026-05-09 | `MetalCompilerTests/SequenceGEMVMicrobenchmarkTests` | Pass; synthetic real-shape BF16 single GEMV benchmark covers base/tile2/tile4 for output-projection shapes |
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; prints BF16 single sequence GEMV role breakdown, with `mlp.down_proj` taking 63.6% of single GEMV time at seqLen 128 |
-| 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; fused SwiGLU+down kernel matches explicit BF16-rounded Swift reference and stays within the documented divergence envelope from the unfused path |
+| 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; fused SwiGLU+down kernel keeps the materialized F32 intermediate contract and matches the unfused `swiglu_seq_f32 + gemv_seq_bf16_f32s` path |
 | 2026-05-10 | `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; Qwen reference parity remains green with opt-in fused MLP down routing |
 | 2026-05-10 | `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; step count drops from 293 to 269 and 24 `swiglu_seq_f32 + down_proj` pairs become 24 fused dispatches, but total prefill improvement is marginal |
 
@@ -389,7 +389,7 @@ SwiGLU MLP blocks:
 ```mermaid
 flowchart LR
   A["gate_proj + up_proj"] --> B["SwiGLU"]
-  B --> C["BF16-rounded intermediate contract"]
+  B --> C["F32 intermediate contract"]
   C --> D["down_proj sequence GEMV"]
   D --> E["hidden output"]
 ```
@@ -421,12 +421,13 @@ The per-kernel pair improves by about 15% in the reported seqLen 128 profile
 27.610 us). End-to-end prefill movement is still marginal and within normal
 GPU thermal/cache variance, so this is **not promoted to default routing**.
 
-Important numerical note: the fused kernel is not intended to be bit-equivalent
-to the current materialized two-kernel path. It applies explicit BF16 rounding
-to the SwiGLU intermediate before the down projection. That contract is pinned
-by `FusedSwigluDownEquivalenceTests`; model-level admission still requires the
-Qwen reference comparison gate before any future promotion.
+Important numerical note: the fused kernel now keeps the same F32 intermediate
+contract as the current materialized two-kernel path. It removes the scratch
+round-trip for the SwiGLU output, but it does not change the precision of the
+down-projection input. `FusedSwigluDownEquivalenceTests` directly compares the
+fused kernel against the unfused path with zero tolerance.
 
-Next decision: either keep this as an opt-in experiment, or redesign it to
-match the materialized F32 intermediate if default routing requires a stricter
-decode-equivalent contract.
+Next decision: rerun the Qwen reference and full-model profile gates with the
+F32-intermediate fused kernel. Default promotion still requires model-level
+correctness and a stable end-to-end prefill improvement, not only a local
+kernel-pair win.

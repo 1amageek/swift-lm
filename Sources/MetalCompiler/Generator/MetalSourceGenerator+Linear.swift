@@ -465,9 +465,8 @@ extension MetalSourceGenerator {
     /// Generate a fused SwiGLU + sequence GEMV kernel for the MLP down projection.
     ///
     /// Producer-consumer fusion: computes `silu(gate[j]) * up[j]` on-the-fly during
-    /// the GEMV tile-load step, BF16-rounds the intermediate value, then accumulates
-    /// `sum += weight[row, j] * tile[j]` in F32 with the same SIMD-group reduction
-    /// order as `generateSequenceGEMV`.
+    /// the GEMV tile-load step, then accumulates `sum += weight[row, j] * tile[j]`
+    /// in F32 with the same SIMD-group reduction order as `generateSequenceGEMV`.
     ///
     /// The intermediate SwiGLU output is never materialized to scratch — the kernel
     /// reads `gate` and `up` directly and writes only the projected hidden output.
@@ -475,13 +474,10 @@ extension MetalSourceGenerator {
     /// `intermediateDim * sequenceLength * 4 bytes` through scratch slot 0.
     ///
     /// Numerical contract:
-    ///   * Each `silu(g)*up` is computed in F32 and immediately passed through
-    ///     `float(bfloat(v))` so the GEMV reduction sees the same BF16-rounded
-    ///     operands the synthesized `ElementwiseFragment` path emits via
-    ///     `sequenceStorageValue`. This is intentionally stricter than the unfused
-    ///     `swiglu_seq_f32 + gemv_seq_bf16_f32s` pair, which keeps the intermediate
-    ///     in F32; the fused contract matches the kernelBody version of SwiGLU so
-    ///     future fragment-level fusion shares this kernel's numerical surface.
+    ///   * Each `silu(g)*up` intermediate remains F32, matching the materialized
+    ///     `swiglu_seq_f32 + gemv_seq_bf16_f32s` prefill path. The fused kernel
+    ///     avoids writing the intermediate to scratch, but it does not change the
+    ///     down-projection input precision.
     ///   * The reduction order, accumulator precision, and final-output cast are
     ///     identical to `generateSequenceGEMV` for BF16 weight: the running F32
     ///     `sum` is reduced via `simd_sum` and stored as `float(bfloat(sum))`.
@@ -506,16 +502,6 @@ extension MetalSourceGenerator {
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
-        // SwiGLU intermediate rounding: the contract requires `silu(g)*up` to be
-        // BF16-rounded before participating in the GEMV reduction. The unfused
-        // two-kernel path stores the intermediate as F32 in scratch (no rounding),
-        // so the fused kernel is intentionally NOT bit-equivalent to that path —
-        // it matches the synthesized-fragment path (`ElementwiseFragment.kernelBody`)
-        // which rounds via `sequenceStorageValue`.
-        let roundIntermediate = MetalSourceGenerator.sequenceStorageValue(
-            "silu_up",
-            weightFormat: weightFormat
-        )
         // Final output rounding mirrors `generateSequenceGEMV` so the fused kernel
         // stores the same BF16-rounded sum the unfused GEMV would produce.
         let storeOutput = MetalSourceGenerator.sequenceStorageValue(
@@ -558,7 +544,7 @@ extension MetalSourceGenerator {
                         float g = float(gateRow[inputIndex]);
                         float u = float(upRow[inputIndex]);
                         float silu_up = g * (1.0f / (1.0f + exp(-g))) * u;
-                        inputTile[j] = \(bt)(\(roundIntermediate));
+                        inputTile[j] = \(bt)(silu_up);
                     } else {
                         inputTile[j] = \(bt)(0.0f);
                     }
