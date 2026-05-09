@@ -143,6 +143,9 @@ flowchart TD
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; rows=8 fused route fires and improves the same-run Qwen profile at seqLen 64/128, but remains opt-in |
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; 4/4 reference checks remain green with rows=8 fused scheduling |
 | 2026-05-10 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16FusedSwigluDownRowsMicrobench` | Pass; writes fused rows-per-threadgroup microbenchmark artifact for rows 2/4/8 |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; same SwiftPM/probe baseline is 43.383/159.741/315.186 ms for seqLen 16/64/128 |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=2/4/8` | Pass; rows=8 is the best full-model fused variant and improves seqLen 64/128 in the same SwiftPM/probe run |
+| 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8` | Pass; 4/4 reference checks remain green with the best observed fused scheduling |
 
 ## Failed Experiments
 
@@ -164,7 +167,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | Not yet; rows=8 has a green reference gate and promising same-run profile, but needs repeated profile evidence before default promotion |
+| Whether fused SwiGLU + down should default | Not yet; rows=8 has repeated green reference/profile evidence and is the best current fused shape, but promotion still needs xcodebuild confirmation and at least one more stable release-gate run |
 
 ## Current Production Prefill Profile
 
@@ -485,8 +488,25 @@ round-trip for the SwiGLU output, but it does not change the precision of the
 down-projection input. `FusedSwigluDownEquivalenceTests` directly compares the
 fused kernel against the unfused path with zero tolerance.
 
-Next decision: repeat the full-model rows=8 Qwen profile and add a full-model
-rows=4 comparison once a probe-enabled Xcode test bundle can be built without
-hitting the 120-second outer timeout. Default promotion still requires
+The repeated SwiftPM/probe full-model run now closes the rows=4 comparison.
+SwiftPM was used because `ENABLE_METAL_PROBES=1` is wired into `Package.swift`
+and avoids rebuilding the Xcode test bundle under the 120-second timeout. The
+artifacts and logs are under `.test-artifacts/prefill-row-profiles/`.
+
+| Sequence length | Baseline | Fused rows=2 | Fused rows=4 | Fused rows=8 | Current decision |
+|---:|---:|---:|---:|---:|---|
+| 16 | 43.383 ms | 44.967 ms | 44.379 ms | 42.729 ms | rows=8 best |
+| 64 | 159.741 ms | 166.295 ms | 161.185 ms | 157.677 ms | rows=8 best |
+| 128 | 315.186 ms | 328.924 ms | 311.268 ms | 305.918 ms | rows=8 best |
+
+Rows=8 also passed the Qwen reference comparison in the same SwiftPM/probe
+environment: 4/4 checks green, including prefill final hidden/logits, prefill
+state, KV cache, and decode step zero. This makes rows=8 the only fused MLP
+candidate worth carrying forward. It should still remain opt-in until the
+same result is reproduced through the release validation path.
+
+Next decision: reproduce rows=8 through the release validation path, preferably
+`xcodebuild build-for-testing` once and `test-without-building` with the probe
+environment injected into the xctestrun. Default promotion still requires
 model-level correctness and a stable end-to-end prefill improvement, not only
 dispatch-count reduction or standalone microbenchmark wins.
