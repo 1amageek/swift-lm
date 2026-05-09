@@ -142,6 +142,7 @@ flowchart TD
 | 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; adds an eight-rows-per-threadgroup fused scheduling contract |
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; rows=8 fused route fires and improves the same-run Qwen profile at seqLen 64/128, but remains opt-in |
 | 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 ENABLE_METAL_PROBES=1` | Pass; 4/4 reference checks remain green with rows=8 fused scheduling |
+| 2026-05-10 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16FusedSwigluDownRowsMicrobench` | Pass; writes fused rows-per-threadgroup microbenchmark artifact for rows 2/4/8 |
 
 ## Failed Experiments
 
@@ -459,13 +460,33 @@ plus 0.198 ms for 24 baseline `swiglu_seq_f32` dispatches. This is now a
 plausible opt-in speed path, but the margin is small and must be repeated
 before default promotion.
 
+The standalone fused rows-per-threadgroup microbenchmark is now available in
+`SequenceGEMVMicrobenchmarkTests`. It is intentionally narrower than the
+full-model profile: it uses shared buffers and isolates only the fused
+`mlp.down_proj` shape, so it is a direction-finding harness rather than a
+promotion gate.
+
+| Sequence length | rows=2 | rows=4 | rows=8 | Standalone result |
+|---:|---:|---:|---:|---|
+| 16 | 1292.3 us | 1064.3 us | 888.5 us | rows=8 fastest |
+| 64 | 2008.5 us | 2217.8 us | 2563.2 us | rows=2 fastest |
+| 128 | 2596.0 us | 3066.0 us | 3293.9 us | rows=2 fastest |
+
+This contradicts the same-run full-model profile where rows=8 is favorable at
+seqLen 64/128. The likely reason is that the standalone harness does not
+reproduce full-model residency, cache pressure, surrounding barriers, and
+private-buffer behavior. Therefore the standalone microbenchmark is useful for
+kernel-shape exploration, but full-model Qwen profile remains the route
+promotion authority.
+
 Important numerical note: the fused kernel now keeps the same F32 intermediate
 contract as the current materialized two-kernel path. It removes the scratch
 round-trip for the SwiGLU output, but it does not change the precision of the
 down-projection input. `FusedSwigluDownEquivalenceTests` directly compares the
 fused kernel against the unfused path with zero tolerance.
 
-Next decision: repeat the rows=8 Qwen profile and add a focused rows-per-
-threadgroup microbenchmark for 2/4/8. Default promotion still requires
+Next decision: repeat the full-model rows=8 Qwen profile and add a full-model
+rows=4 comparison once a probe-enabled Xcode test bundle can be built without
+hitting the 120-second outer timeout. Default promotion still requires
 model-level correctness and a stable end-to-end prefill improvement, not only
-dispatch-count reduction.
+dispatch-count reduction or standalone microbenchmark wins.
