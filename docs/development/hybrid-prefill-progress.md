@@ -155,6 +155,14 @@ flowchart TD
 | 2026-05-10 | `xcodebuild build-for-testing` with `OTHER_SWIFT_FLAGS='$(inherited) -DENABLE_METAL_PROBES'` | Pass; probe-enabled Xcode test bundle builds inside the 120-second release gate for adaptive fused rows=8 validation |
 | 2026-05-10 | `xcodebuild test-without-building -xctestrun adaptive-min64-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35ReferenceComparisonTests` | Pass; adaptive rows=8 environment injected through the xctestrun, 4/4 reference checks pass |
 | 2026-05-10 | `xcodebuild test-without-building -xctestrun adaptive-min64-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; active routing is correct (`seqLen=16` unfused, `seqLen=64/128` fused rows=8), but timing remains noisy and does not justify default promotion |
+| 2026-05-10 | `swift build` | Pass after adding the experimental rows-per-SIMD fused MLP kernel generator and opt-in routing selector |
+| 2026-05-10 | `swift test --filter FusedSwigluDownEquivalenceTests` | Pass; 4/4, including the two-output-rows-per-SIMD-group fused kernel against the unfused path |
+| 2026-05-10 | `swift test --filter MetalSourceGeneratorTests` | Pass; 24/24, complete generated library still compiles with the additional rps2 fused kernel |
+| 2026-05-10 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16FusedSwigluDownRowsMicrobench` | Pass; rows16/rps2 improves the isolated fused MLP microbench at seqLen 16/64, but not seqLen 128 |
+| 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=16 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2` | Pass; 4/4 Qwen reference checks remain green with opt-in rps2 routing |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with the same rps2 environment | Pass; rps2 route fires (`269` steps) but full-model prefill regresses to 66.824/216.839/541.439 ms for seqLen 16/64/128 |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default production path remains unfused (`293` steps) with env flags absent |
+| 2026-05-10 | `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS' -only-testing:MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; 4/4, Xcode package scheme also validates the rows-per-SIMD equivalence contract |
 
 ## Failed Experiments
 
@@ -166,6 +174,7 @@ flowchart TD
 | Default tile4 sequence GEMV | Correctness passed but Qwen seqLen 16/64/128 regressed to 114.827/190.303/374.976 ms | Kept as non-default experiment; production planner reverted to base sequence GEMV |
 | Feature-flagged tile2 single sequence GEMV | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.572/158.280/314.697 ms to 44.768/160.643/317.498 ms | Kept behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`; default production planner stays on base sequence GEMV |
 | Feature-flagged fused SwiGLU + down projection with 2 rows/threadgroup | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Rejected as the fused scheduling shape; it recomputes SwiGLU tiles too often |
+| Feature-flagged fused SwiGLU + down projection with two output rows per SIMD group | Correctness passed and isolated microbench improved seqLen 16/64, but full-model Qwen profile regressed to 66.824/216.839/541.439 ms for seqLen 16/64/128 | Kept as an opt-in experiment behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2`; not eligible for default routing |
 
 ## Open Decisions
 
@@ -176,7 +185,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and best current fused shape, but default stays off. Runtime-gated rows=8 admission is implemented as an opt-in experiment for long sequences |
+| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and remains the best current full-model fused shape, but default stays off. The lower-recompute rows-per-SIMD rps2 shape is correctness-green but regresses the full model |
 
 ## Current Production Prefill Profile
 
@@ -588,3 +597,50 @@ than unconditional rows=8 because it avoids emitting fused work for short
 prompts, but the Xcode release-path timing is not stable enough to make it a
 production default. The next speed step should target a lower-recompute fused
 kernel or a broader benchmark set before changing default routing.
+
+### Rows-per-SIMD lower-recompute experiment (2026-05-10)
+
+The next fused-shape experiment keeps the same per-output-row reduction
+contract but lets one SIMD group compute two independent output rows. The
+staged SwiGLU tile is then shared by two row accumulators, reducing activation
+recompute without changing each row's accumulation order.
+
+```mermaid
+flowchart LR
+  A["rows8 fused: 8 SIMD groups"] --> B["8 output rows per threadgroup"]
+  C["rows16/rps2 fused: 8 SIMD groups"] --> D["16 output rows per threadgroup"]
+  C --> E["one staged SwiGLU tile shared by 2 row accumulators per SIMD group"]
+```
+
+The generator and router support this only as an opt-in experiment:
+
+```text
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=16
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2
+```
+
+Correctness is green: the standalone equivalence test matches the unfused
+`swiglu_seq_f32 + gemv_seq_bf16_f32s` path exactly, and Qwen reference
+comparison passes 4/4 with the route enabled. The isolated microbench looked
+promising for shorter sequences:
+
+| Sequence length | rows8 avg | rows16/rps2 avg | Microbench decision |
+|---:|---:|---:|---|
+| 16 | 930.3 us | 670.6 us | favorable |
+| 64 | 2235.5 us | 1906.1 us | favorable |
+| 128 | 1941.3 us | 2467.8 us | reject for long prompt |
+
+Full-model Qwen profile rejected the shape despite the microbench:
+
+| Sequence length | Default unfused same session | rows16/rps2 fused | Decision |
+|---:|---:|---:|---|
+| 16 | 62.410 ms | 66.824 ms | slower |
+| 64 | 168.373 ms | 216.839 ms | slower |
+| 128 | 392.324 ms | 541.439 ms | slower |
+
+Current decision: keep rps2 available only as an opt-in diagnostic. It proves
+the correctness contract can support multiple rows per SIMD group, but the
+full-model profile shows that register pressure or occupancy loss dominates
+the saved SwiGLU recompute. Do not promote it without a new full-model profile
+that beats rows8 and the unfused baseline in the same release-validation run.

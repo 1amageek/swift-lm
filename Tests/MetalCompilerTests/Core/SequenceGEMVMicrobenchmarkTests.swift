@@ -62,9 +62,30 @@ struct SequenceGEMVMicrobenchmarkTests {
         let harness = try MicrobenchmarkHarness(device: device)
         let shape = Shape(role: "mlp.down_proj", inputDimension: 3584, outputDimension: 1024)
         let variants = [
-            FusedRowsVariant(name: "rows2", rowsPerThreadgroup: 2),
-            FusedRowsVariant(name: "rows4", rowsPerThreadgroup: 4),
-            FusedRowsVariant(name: "rows8", rowsPerThreadgroup: 8),
+            FusedRowsVariant(
+                name: "rows2",
+                kernelName: "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
+                simdgroupsPerThreadgroup: 2,
+                rowsPerSimdgroup: 1
+            ),
+            FusedRowsVariant(
+                name: "rows4",
+                kernelName: "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
+                simdgroupsPerThreadgroup: 4,
+                rowsPerSimdgroup: 1
+            ),
+            FusedRowsVariant(
+                name: "rows8",
+                kernelName: "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
+                simdgroupsPerThreadgroup: 8,
+                rowsPerSimdgroup: 1
+            ),
+            FusedRowsVariant(
+                name: "rows16_rps2",
+                kernelName: "bench_mlp_fused_swiglu_down_seq_bf16_f32s_rps2",
+                simdgroupsPerThreadgroup: 8,
+                rowsPerSimdgroup: 2
+            ),
         ]
 
         var rows: [FusedRowsResultRow] = []
@@ -142,10 +163,10 @@ struct SequenceGEMVMicrobenchmarkTests {
         print()
         print("=== BF16 fused SwiGLU down rows-per-threadgroup microbench ===")
         print("artifact: \(artifact.path)")
-        print("role           seq  variant  avg_us  us/output  grid      tg")
+        print("role           seq  variant      avg_us  us/output  grid      tg")
         for row in rows.sorted(by: fusedRowsSort) {
             let role = row.role.padding(toLength: 14, withPad: " ", startingAt: 0)
-            let variant = row.variant.padding(toLength: 7, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 12, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 9, withPad: " ", startingAt: 0)
             print("  \(role) \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.4f", row.microsecondsPerOutput))  \(grid) \(row.threadgroupWidth)")
         }
@@ -164,6 +185,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 "sequenceLength",
                 "variant",
                 "rowsPerThreadgroup",
+                "simdgroupsPerThreadgroup",
+                "rowsPerSimdgroup",
                 "gridWidth",
                 "gridHeight",
                 "threadgroupWidth",
@@ -179,6 +202,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 String(row.sequenceLength),
                 row.variant,
                 String(row.rowsPerThreadgroup),
+                String(row.simdgroupsPerThreadgroup),
+                String(row.rowsPerSimdgroup),
                 String(row.gridWidth),
                 String(row.gridHeight),
                 String(row.threadgroupWidth),
@@ -207,7 +232,10 @@ struct SequenceGEMVMicrobenchmarkTests {
     private func fusedRowsSort(_ lhs: FusedRowsResultRow, _ rhs: FusedRowsResultRow) -> Bool {
         if lhs.role != rhs.role { return lhs.role < rhs.role }
         if lhs.sequenceLength != rhs.sequenceLength { return lhs.sequenceLength < rhs.sequenceLength }
-        return lhs.rowsPerThreadgroup < rhs.rowsPerThreadgroup
+        if lhs.rowsPerThreadgroup != rhs.rowsPerThreadgroup {
+            return lhs.rowsPerThreadgroup < rhs.rowsPerThreadgroup
+        }
+        return lhs.rowsPerSimdgroup < rhs.rowsPerSimdgroup
     }
 }
 
@@ -225,7 +253,13 @@ private struct Variant {
 
 private struct FusedRowsVariant {
     let name: String
-    let rowsPerThreadgroup: Int
+    let kernelName: String
+    let simdgroupsPerThreadgroup: Int
+    let rowsPerSimdgroup: Int
+
+    var rowsPerThreadgroup: Int {
+        simdgroupsPerThreadgroup * rowsPerSimdgroup
+    }
 }
 
 private struct ResultRow {
@@ -252,6 +286,8 @@ private struct FusedRowsResultRow {
     let sequenceLength: Int
     let variant: String
     let rowsPerThreadgroup: Int
+    let simdgroupsPerThreadgroup: Int
+    let rowsPerSimdgroup: Int
     let gridWidth: Int
     let gridHeight: Int
     let threadgroupWidth: Int
@@ -298,6 +334,12 @@ private struct MicrobenchmarkHarness {
                 bufferPrecision: .float32,
                 weightFormat: WeightFormats.bfloat16
             ),
+            MetalSourceGenerator.generateFusedSwigluDownSequenceGEMV(
+                name: "bench_mlp_fused_swiglu_down_seq_bf16_f32s_rps2",
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                rowsPerSimdgroup: 2
+            ),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
         options.languageVersion = .version4_0
@@ -307,6 +349,7 @@ private struct MicrobenchmarkHarness {
             "bench_gemv_seq_bf16_f32s_tile2",
             "bench_gemv_seq_bf16_f32s_tile4",
             "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
+            "bench_mlp_fused_swiglu_down_seq_bf16_f32s_rps2",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
         for name in names {
@@ -388,9 +431,8 @@ private struct MicrobenchmarkHarness {
         iterations: Int,
         warmupIterations: Int
     ) throws -> FusedRowsResultRow {
-        let kernelName = "bench_mlp_fused_swiglu_down_seq_bf16_f32s"
-        guard let pipeline = pipelines[kernelName] else {
-            throw MetalCompilerError.kernelNotFound(kernelName)
+        guard let pipeline = pipelines[variant.kernelName] else {
+            throw MetalCompilerError.kernelNotFound(variant.kernelName)
         }
         let gateValues = makeInputValues(count: sequenceLength * shape.inputDimension)
         let upValues = makeUpValues(count: sequenceLength * shape.inputDimension)
@@ -405,7 +447,8 @@ private struct MicrobenchmarkHarness {
             pipeline: pipeline,
             outputDimension: shape.outputDimension,
             sequenceLength: sequenceLength,
-            requestedRowsPerThreadgroup: variant.rowsPerThreadgroup
+            simdgroupsPerThreadgroup: variant.simdgroupsPerThreadgroup,
+            rowsPerSimdgroup: variant.rowsPerSimdgroup
         )
 
         for _ in 0..<warmupIterations {
@@ -442,6 +485,8 @@ private struct MicrobenchmarkHarness {
             sequenceLength: sequenceLength,
             variant: variant.name,
             rowsPerThreadgroup: variant.rowsPerThreadgroup,
+            simdgroupsPerThreadgroup: variant.simdgroupsPerThreadgroup,
+            rowsPerSimdgroup: variant.rowsPerSimdgroup,
             gridWidth: geometry.grid.width,
             gridHeight: geometry.grid.height,
             threadgroupWidth: geometry.threadgroup.width,
@@ -551,11 +596,13 @@ private struct MicrobenchmarkHarness {
         pipeline: MTLComputePipelineState,
         outputDimension: Int,
         sequenceLength: Int,
-        requestedRowsPerThreadgroup: Int
+        simdgroupsPerThreadgroup: Int,
+        rowsPerSimdgroup: Int
     ) -> (grid: MTLSize, threadgroup: MTLSize) {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let threads = min(simdWidth * requestedRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
-        let rowsPerThreadgroup = max(1, threads / simdWidth)
+        let threads = min(simdWidth * simdgroupsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
+        let actualSimdgroupsPerThreadgroup = max(1, threads / simdWidth)
+        let rowsPerThreadgroup = actualSimdgroupsPerThreadgroup * rowsPerSimdgroup
         let grid = MTLSize(
             width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
             height: sequenceLength,

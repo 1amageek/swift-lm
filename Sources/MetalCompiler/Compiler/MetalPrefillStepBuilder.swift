@@ -447,7 +447,22 @@ private struct PrefillStepPlanner {
               let value = Int(raw) else {
             return 8
         }
-        return min(max(value, 1), 8)
+        return min(max(value, 1), 16)
+    }()
+
+    /// Number of output rows computed by each SIMD group in the opt-in fused
+    /// SwiGLU+down prefill experiment.
+    ///
+    /// `1` preserves the original one-SIMD-one-row reduction shape. `2`
+    /// shares one staged SwiGLU tile across two independent row accumulators
+    /// inside the same SIMD group. This reduces activation recompute while
+    /// keeping each output row's reduction order unchanged.
+    private static let fusedMlpDownRowsPerSimdgroup: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP"],
+              let value = Int(raw) else {
+            return 1
+        }
+        return min(max(value, 1), 2)
     }()
 
     /// Minimum sequence length for the opt-in fused SwiGLU+down prefill route.
@@ -783,7 +798,10 @@ private struct PrefillStepPlanner {
         let mode: PrefillStepMode = .batch
 
         // Resolve the fused kernel pipeline.
-        let fusedKernelName = "mlp_fused_swiglu_down_seq_bf16_f32s"
+        let rowsPerSimdgroup = Self.fusedMlpDownRowsPerSimdgroup
+        let fusedKernelName = rowsPerSimdgroup == 1
+            ? "mlp_fused_swiglu_down_seq_bf16_f32s"
+            : "mlp_fused_swiglu_down_seq_bf16_f32s_rps\(rowsPerSimdgroup)"
         guard let pipeline = planBuildContext.pipelineCache[fusedKernelName] else {
             throw MetalCompilerError.kernelNotFound(fusedKernelName)
         }
@@ -809,11 +827,14 @@ private struct PrefillStepPlanner {
 
         // Grid: (output rows / rowsPerThreadgroup) × sequenceLength.
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let rowsPerThreadgroup = max(
+        let requestedRowsPerThreadgroup = Self.fusedMlpDownRowsPerThreadgroup
+        let requestedSimdgroupsPerThreadgroup = (requestedRowsPerThreadgroup + rowsPerSimdgroup - 1) / rowsPerSimdgroup
+        let simdgroupsPerThreadgroup = max(
             1,
-            min(Self.fusedMlpDownRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
+            min(requestedSimdgroupsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
         )
-        let threads = min(simdWidth * rowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = simdgroupsPerThreadgroup * rowsPerSimdgroup
+        let threads = simdWidth * simdgroupsPerThreadgroup
         let gridSize = MTLSize(
             width: (linear.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
             height: maximumSequenceLength,

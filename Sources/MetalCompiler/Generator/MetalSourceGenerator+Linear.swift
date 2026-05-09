@@ -489,7 +489,8 @@ extension MetalSourceGenerator {
         name: String,
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
-        tileElements: Int = 256
+        tileElements: Int = 256,
+        rowsPerSimdgroup: Int = 1
     ) -> String {
         precondition(
             weightFormat.isBFloat16,
@@ -499,15 +500,42 @@ extension MetalSourceGenerator {
             bufferPrecision.isPrefillSequencePrecision,
             "generateFusedSwigluDownSequenceGEMV requires the prefill sequence buffer precision"
         )
+        precondition(
+            rowsPerSimdgroup >= 1 && rowsPerSimdgroup <= 4,
+            "generateFusedSwigluDownSequenceGEMV supports 1...4 rows per simdgroup"
+        )
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
-        // Final output rounding mirrors `generateSequenceGEMV` so the fused kernel
-        // stores the same BF16-rounded sum the unfused GEMV would produce.
-        let storeOutput = MetalSourceGenerator.sequenceStorageValue(
-            "sum",
-            weightFormat: weightFormat
-        )
+        let sumDeclarations = (0..<rowsPerSimdgroup)
+            .map { "            float sum\($0) = 0.0f;" }
+            .joined(separator: "\n")
+        let accumulationLines = (0..<rowsPerSimdgroup)
+            .map { rowOffset in
+                """
+                    if (row\(rowOffset) < outputDimension) {
+                        sum\(rowOffset) += \(readWeight("weight[row\(rowOffset) * intermediateDim + base + j]")) * tileValue;
+                    }
+                """
+            }
+            .joined(separator: "\n")
+        let reductionLines = (0..<rowsPerSimdgroup)
+            .map { rowOffset in
+                let stored = MetalSourceGenerator.sequenceStorageValue(
+                    "sum\(rowOffset)",
+                    weightFormat: weightFormat
+                )
+                return """
+                    sum\(rowOffset) = simd_sum(sum\(rowOffset));
+                    if (tiisg == 0 && row\(rowOffset) < outputDimension) {
+                        output[seqPos * outputRowStride + row\(rowOffset)] = \(bt)(\(stored));
+                    }
+                """
+            }
+            .joined(separator: "\n")
+        let rowDeclarations = (0..<rowsPerSimdgroup)
+            .map { "            const uint row\($0) = rowBase + \($0)u;" }
+            .joined(separator: "\n")
 
         return """
         kernel void \(name)(
@@ -527,16 +555,18 @@ extension MetalSourceGenerator {
             uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
         ) {
             const uint tileElements = \(tileElements);
-            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
-            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint rowsPerSimdgroup = \(rowsPerSimdgroup)u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint rowsPerThreadgroup = simdgroupsPerThreadgroup * rowsPerSimdgroup;
+            const uint rowBase = gid.x * rowsPerThreadgroup + sgitg * rowsPerSimdgroup;
             const uint seqPos = gid.y;
-            if (row >= outputDimension || seqPos >= sequenceLength) return;
+            if (rowBase >= outputDimension || seqPos >= sequenceLength) return;
+            \(rowDeclarations)
 
             threadgroup \(bt) inputTile[tileElements];
-            float sum = 0.0f;
+            \(sumDeclarations)
             device const \(bt)* gateRow = gate + seqPos * inputRowStride;
             device const \(bt)* upRow   = up   + seqPos * inputRowStride;
-            device const \(wt)* weightRow = weight + row * intermediateDim;
             for (uint base = 0; base < intermediateDim; base += tileElements) {
                 for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
                     const uint inputIndex = base + j;
@@ -553,14 +583,12 @@ extension MetalSourceGenerator {
 
                 const uint tileCount = min(tileElements, intermediateDim - base);
                 for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                    const float tileValue = float(inputTile[j]);
+                    \(accumulationLines)
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            sum = simd_sum(sum);
-            if (tiisg == 0) {
-                output[seqPos * outputRowStride + row] = \(bt)(\(storeOutput));
-            }
+            \(reductionLines)
         }
         """
     }

@@ -626,6 +626,19 @@ struct MetalKernelSourceCatalog {
                     tileElements: 256
                 ))
             }
+            // Experimental lower-recompute fused MLP kernel. Each SIMD group
+            // computes two output rows while sharing the same staged SwiGLU
+            // input tile, reducing repeated activation work without changing
+            // the per-row reduction contract.
+            if generatedNames.insert("mlp_fused_swiglu_down_seq_bf16_f32s_rps2").inserted {
+                sources.append(MetalSourceGenerator.generateFusedSwigluDownSequenceGEMV(
+                    name: "mlp_fused_swiglu_down_seq_bf16_f32s_rps2",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    tileElements: 256,
+                    rowsPerSimdgroup: 2
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g16_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g16_f32s",
