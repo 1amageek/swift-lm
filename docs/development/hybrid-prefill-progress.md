@@ -134,6 +134,8 @@ flowchart TD
 | 2026-05-09 | `MetalCompilerTests/SequenceProjectionEquivalenceTests` | Pass; 5 tests including `BF16 tile2 single sequence GEMV matches repeated decode GEMV` and `BF16 tiled single sequence GEMV matches repeated decode GEMV` |
 | 2026-05-09 | `MetalCompilerTests/Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; 4/4 cases remain reference-equivalent with feature-flagged tile2 single sequence GEMV routing |
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; tile2 routed 48 BF16 single sequence GEMV dispatches but did not improve prefill timing, so default routing remains disabled |
+| 2026-05-09 | `MetalCompilerTests/SequenceGEMVMicrobenchmarkTests` | Pass; synthetic real-shape BF16 single GEMV benchmark covers base/tile2/tile4 for output-projection shapes |
+| 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; prints BF16 single sequence GEMV role breakdown, with `mlp.down_proj` taking 63.6% of single GEMV time at seqLen 128 |
 
 ## Failed Experiments
 
@@ -157,24 +159,24 @@ flowchart TD
 
 ## Current Production Prefill Profile
 
-Latest focused Qwen profile (2026-05-09 re-run, two runs consistent within run-to-run noise),
-with production planner using base decode-equivalent sequence GEMV:
+Latest focused Qwen profile (2026-05-09 re-run), with production planner using
+base decode-equivalent sequence GEMV:
 
 | Sequence length | Total prefill time | Steps | Pass count |
 |---:|---:|---:|---:|
-| 16 | 43.333 ms | 293 | 1 |
-| 64 | 159.418 ms | 293 | 1 |
-| 128 | 311.291 ms | 293 | 1 |
+| 16 | 44.373 ms | 293 | 1 |
+| 64 | 158.926 ms | 293 | 1 |
+| 128 | 308.411 ms | 293 | 1 |
 
 Category share at seqLen=128:
 
 | Category | Steps | Time | Share |
 |---|---:|---:|---:|
-| `projection` | 97 | 236.054 ms | 75.8% |
-| `ssm_recurrence` | 18 | 68.859 ms | 22.1% |
-| `attention` | 6 | 3.841 ms | 1.2% |
-| `other` | 129 | 2.260 ms | 0.7% |
-| remaining | 43 | 0.354 ms | 0.1% |
+| `projection` | 97 | 233.408 ms | 75.7% |
+| `ssm_recurrence` | 18 | 68.643 ms | 22.3% |
+| `attention` | 6 | 3.840 ms | 1.2% |
+| `other` | 129 | 2.179 ms | 0.7% |
+| remaining | 43 | 0.342 ms | 0.1% |
 
 Kernel families confirmed in the plan:
 
@@ -224,6 +226,39 @@ Single output projections remain because their input is intermediate-only.
 
 The next prefill speed lever is therefore **per-token amortization inside the
 single-projection kernel** (M2 territory), not additional batching.
+
+The live profile test now also prints the BF16 single sequence GEMV role
+breakdown directly, so the dominant dependent projection can be identified
+without post-processing the CSV artifact:
+
+| Projection role | Count | Total time | Average dispatch | Share of single GEMV |
+|---|---:|---:|---:|---:|
+| `mlp.down_proj` | 24 | 39.458 ms | 1644.1 us | 63.6% |
+| `linear_attn.out_proj` | 18 | 16.921 ms | 940.0 us | 27.3% |
+| `self_attn.o_proj` | 6 | 5.643 ms | 940.5 us | 9.1% |
+
+## BF16 Single GEMV Microbenchmark (2026-05-09)
+
+`SequenceGEMVMicrobenchmarkTests` isolates the real Qwen3.5 dependent
+output-projection shapes outside the full model and measures base/tile2/tile4
+sequence GEMV variants. It is an exploratory harness, not a release benchmark,
+because full-model correctness and end-to-end profile remain the routing gates.
+
+| Shape | SeqLen | Base | Tile2 | Tile4 | Local decision |
+|---|---:|---:|---:|---:|---|
+| `attn_or_ssm.out_proj` | 16 | 574.4 us | 652.1 us | 632.4 us | base |
+| `attn_or_ssm.out_proj` | 64 | 1551.6 us | 2209.6 us | 2278.0 us | base |
+| `attn_or_ssm.out_proj` | 128 | 2578.5 us | 2408.7 us | 3201.1 us | tile2 is interesting but not decisive |
+| `mlp.down_proj` | 16 | 1030.6 us | 1124.8 us | 1125.4 us | base |
+| `mlp.down_proj` | 64 | 2479.4 us | 2590.9 us | 2594.6 us | base |
+| `mlp.down_proj` | 128 | 3210.4 us | 2695.5 us | 2404.1 us | tile4 is interesting in isolation |
+
+The isolated harness confirms that token tiling can help some long-sequence
+single-projection shapes, especially `mlp.down_proj` at seqLen 128, but it does
+not produce a uniform win and contradicts the full-model default-routing gate.
+Therefore tile2/tile4 remain experiments. The next design should target either
+an `mlp.down_proj`-specific long-sequence variant or producer-consumer fusion
+around `swiglu -> down_proj`, with full-model profile as the promotion gate.
 
 ## Current Q3 Prefill Smoke
 
@@ -328,3 +363,17 @@ future tiled experiments derive grid height, threadgroup shape, diagnostics,
 and sequence-length policy from one explicit tile descriptor instead of parsing
 kernel-name suffixes. Production default routing stays on the base sequence
 GEMV path and no speed claim is made for tile2.
+
+M2 is complete as a measurement and correctness harness, but not as a faster
+production route. The next milestone should not try more global sequence tiles.
+It should split the single-projection problem by role:
+
+```mermaid
+flowchart TD
+  A["Single GEMV bottleneck"] --> B["mlp.down_proj dominates 63.6%"]
+  A --> C["linear_attn/self_attn out_proj share shape"]
+  B --> D["Investigate swiglu -> down_proj fusion or MLP-specific long-seq tile"]
+  C --> E["Keep base until isolated and full-model gates agree"]
+  D --> F["Correctness gate"]
+  F --> G["Full-model profile gate"]
+```

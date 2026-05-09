@@ -98,6 +98,9 @@ struct Qwen35PrefillProfileTests {
             let profiles = profile.entries
             profilesByLength[seqLen] = profiles
             printCategoryBreakdown(profiles: profiles, iterations: Self.iterations, seqLen: seqLen)
+            if seqLen == 128 {
+                printSingleProjectionRoleBreakdown(profiles: profiles)
+            }
             print("  artifacts: \(stepArtifacts.map(\.path).joined(separator: ", "))")
             print("  pass artifacts: \(passArtifacts.map(\.path).joined(separator: ", "))")
         }
@@ -181,6 +184,45 @@ struct Qwen35PrefillProfileTests {
             let pctStr = String(format: "%.1f", pct)
             print("  \(catPadded) steps=\(entry.steps)  \(msStr) ms (\(pctStr)%)")
         }
+    }
+
+    private func printSingleProjectionRoleBreakdown(profiles: [MetalPrefillProfile.Entry]) {
+        struct RoleAggregate {
+            var count: Int = 0
+            var totalMicroseconds: Double = 0
+        }
+
+        var byRole: [String: RoleAggregate] = [:]
+        for profile in profiles where profile.kernelName.hasPrefix("gemv_seq_bf16_f32s") {
+            let role = profile.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
+            var aggregate = byRole[role] ?? RoleAggregate()
+            aggregate.count += 1
+            aggregate.totalMicroseconds += profile.averageGpuMicroseconds
+            byRole[role] = aggregate
+        }
+
+        guard !byRole.isEmpty else { return }
+        let total = byRole.values.reduce(0.0) { $0 + $1.totalMicroseconds }
+        print()
+        print("=== BF16 single sequence GEMV role breakdown (seqLen 128) ===")
+        for (role, aggregate) in byRole.sorted(by: { $0.value.totalMicroseconds > $1.value.totalMicroseconds }) {
+            let totalMs = aggregate.totalMicroseconds / 1000.0
+            let averageUs = aggregate.totalMicroseconds / Double(max(aggregate.count, 1))
+            let share = total > 0 ? aggregate.totalMicroseconds / total * 100.0 : 0
+            print("  \(role.padding(toLength: 24, withPad: " ", startingAt: 0)) count=\(aggregate.count) total=\(String(format: "%.3f", totalMs)) ms avg=\(String(format: "%.1f", averageUs)) us share=\(String(format: "%.1f", share))%")
+        }
+    }
+
+    private func weightRoleSummary(_ tensorName: String) -> String {
+        var components = tensorName.split(separator: ".").map(String.init)
+        if components.last == "weight" {
+            components.removeLast()
+        }
+        if let layerIndex = components.firstIndex(of: "layers"),
+           layerIndex + 2 < components.count {
+            return components[(layerIndex + 2)...].joined(separator: ".")
+        }
+        return components.suffix(3).joined(separator: ".")
     }
 
     private func printScalingReport(profilesByLength: [Int: [MetalPrefillProfile.Entry]], iterations: Int) {
