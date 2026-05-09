@@ -136,6 +136,9 @@ flowchart TD
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1` | Pass; tile2 routed 48 BF16 single sequence GEMV dispatches but did not improve prefill timing, so default routing remains disabled |
 | 2026-05-09 | `MetalCompilerTests/SequenceGEMVMicrobenchmarkTests` | Pass; synthetic real-shape BF16 single GEMV benchmark covers base/tile2/tile4 for output-projection shapes |
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; prints BF16 single sequence GEMV role breakdown, with `mlp.down_proj` taking 63.6% of single GEMV time at seqLen 128 |
+| 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; fused SwiGLU+down kernel matches explicit BF16-rounded Swift reference and stays within the documented divergence envelope from the unfused path |
+| 2026-05-10 | `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; Qwen reference parity remains green with opt-in fused MLP down routing |
+| 2026-05-10 | `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; step count drops from 293 to 269 and 24 `swiglu_seq_f32 + down_proj` pairs become 24 fused dispatches, but total prefill improvement is marginal |
 
 ## Failed Experiments
 
@@ -377,3 +380,53 @@ flowchart TD
   D --> F["Correctness gate"]
   F --> G["Full-model profile gate"]
 ```
+
+## Fused SwiGLU Down Projection Experiment (2026-05-10)
+
+The first role-specific producer-consumer fusion targets only Qwen/LFM-style
+SwiGLU MLP blocks:
+
+```mermaid
+flowchart LR
+  A["gate_proj + up_proj"] --> B["SwiGLU"]
+  B --> C["BF16-rounded intermediate contract"]
+  C --> D["down_proj sequence GEMV"]
+  D --> E["hidden output"]
+```
+
+Routing is controlled by `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`. Production
+default remains off.
+
+| Gate | Requirement |
+|---|---|
+| Fragment pair | `ElementwiseFragment(.swiglu)` followed by `LinearFragment(field: "down_proj")` |
+| Scope | Same `compositeID` and same `layerIndex` |
+| Shape | `swiglu.count == down_proj.inputDimension`, `down_proj.outputDimension <= hiddenSize` |
+| Precision | BF16 dense row-major weight only |
+| Quantization | Q3/Q4/Q8 excluded |
+| Mode | Sequence prefill `.batch` only |
+| Failure mode | Missing fused kernel is an explicit `kernelNotFound`, not a silent fallback |
+
+Current routing effect from the opt-in Qwen profile:
+
+| Metric | Default | Fused flag enabled |
+|---|---:|---:|
+| Total prefill steps | 293 | 269 |
+| `swiglu_seq_f32` | 24 | 0 |
+| `gemv_seq_bf16_f32s` | 48 | 24 |
+| `mlp_fused_swiglu_down_seq_bf16_f32s` | 0 | 24 |
+
+The per-kernel pair improves by about 15% in the reported seqLen 128 profile
+(`swiglu_seq_f32 + gemv_seq_bf16_f32s` p50 32.613 us versus fused p50
+27.610 us). End-to-end prefill movement is still marginal and within normal
+GPU thermal/cache variance, so this is **not promoted to default routing**.
+
+Important numerical note: the fused kernel is not intended to be bit-equivalent
+to the current materialized two-kernel path. It applies explicit BF16 rounding
+to the SwiGLU intermediate before the down projection. That contract is pinned
+by `FusedSwigluDownEquivalenceTests`; model-level admission still requires the
+Qwen reference comparison gate before any future promotion.
+
+Next decision: either keep this as an opt-in experiment, or redesign it to
+match the materialized F32 intermediate if default routing requires a stricter
+decode-equivalent contract.

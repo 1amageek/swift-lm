@@ -6,7 +6,7 @@ import Testing
 /// Admission tests for the fused SwiGLU + down-projection kernel.
 ///
 /// These tests pin down the numerical contract of
-/// `mlp_fused_swiglu_down_seq_bf16_f32s` before any prefill routing is wired up.
+/// `mlp_fused_swiglu_down_seq_bf16_f32s` independently from the prefill router.
 ///
 /// The fused kernel intentionally diverges from the unfused `swiglu_seq_f32 +
 /// gemv_seq_bf16_f32s` pair: the contract requires the SwiGLU intermediate

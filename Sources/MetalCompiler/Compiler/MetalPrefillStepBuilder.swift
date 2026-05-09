@@ -629,9 +629,10 @@ private struct PrefillStepPlanner {
     ///      projection must write at most `hiddenSize` rows. Output-head
     ///      projections (vocab GEMV) take a different routing path.
     ///   5. **Routing state** — the SwiGLU output must be the consumer's input
-    ///      (`lastOutputIsHidden == false`, `currentInputOffset == 0`,
-    ///      matching `ElementwiseFragment.prefillSteps`'s declared output of
-    ///      scratch slot 0).
+    ///      (`lastOutputIsHidden == false`). At admission time the routing
+    ///      state still points at the post-up-projection scratch slot because
+    ///      the producing SwiGLU step is intentionally skipped; the fused
+    ///      kernel reads gate/up slots directly.
     ///   6. **Buffer precision** — must be the prefill sequence precision
     ///      (F32 hidden/scratch, BF16 storage rounding).
     ///   7. **Weight format** — `mlp.down_proj` must use a non-quantized
@@ -718,13 +719,7 @@ private struct PrefillStepPlanner {
         // Resolve the fused kernel pipeline.
         let fusedKernelName = "mlp_fused_swiglu_down_seq_bf16_f32s"
         guard let pipeline = planBuildContext.pipelineCache[fusedKernelName] else {
-            // Pipeline not in cache — fall back rather than fail. The kernel
-            // is generated unconditionally in MetalKernelSourceCatalog, so a
-            // missing pipeline means the metallib build dropped it; the
-            // unfused path remains correct, so silent fallback is allowed
-            // here only in the sense that we hand the work to the existing
-            // verified path, not that we corrupt output.
-            return nil
+            throw MetalCompilerError.kernelNotFound(fusedKernelName)
         }
 
         // Resolve down_proj weight buffer.
