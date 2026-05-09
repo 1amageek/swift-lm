@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-09
+Last updated: 2026-05-10
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -137,8 +137,8 @@ flowchart TD
 | 2026-05-09 | `MetalCompilerTests/SequenceGEMVMicrobenchmarkTests` | Pass; synthetic real-shape BF16 single GEMV benchmark covers base/tile2/tile4 for output-projection shapes |
 | 2026-05-09 | `MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; prints BF16 single sequence GEMV role breakdown, with `mlp.down_proj` taking 63.6% of single GEMV time at seqLen 128 |
 | 2026-05-10 | `MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; fused SwiGLU+down kernel keeps the materialized F32 intermediate contract and matches the unfused `swiglu_seq_f32 + gemv_seq_bf16_f32s` path |
-| 2026-05-10 | `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; Qwen reference parity remains green with opt-in fused MLP down routing |
-| 2026-05-10 | `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Reported pass; step count drops from 293 to 269 and 24 `swiglu_seq_f32 + down_proj` pairs become 24 fused dispatches, but total prefill improvement is marginal |
+| 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 ENABLE_METAL_PROBES=1` | Pass; 4/4 Qwen reference checks remain green with opt-in fused MLP down routing |
+| 2026-05-10 | `xcrun xctest -XCTest MetalCompilerTests.Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 ENABLE_METAL_PROBES=1` | Pass; routing fires (`293 -> 269` steps, 24 fused dispatches), but end-to-end prefill regresses, so default routing remains disabled |
 
 ## Failed Experiments
 
@@ -149,6 +149,7 @@ flowchart TD
 | MPP for 2-way gate/up while keeping stateful projections sequence GEMV | Broke BF16 Qwen token trace | Rejected |
 | Default tile4 sequence GEMV | Correctness passed but Qwen seqLen 16/64/128 regressed to 114.827/190.303/374.976 ms | Kept as non-default experiment; production planner reverted to base sequence GEMV |
 | Feature-flagged tile2 single sequence GEMV | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.572/158.280/314.697 ms to 44.768/160.643/317.498 ms | Kept behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`; default production planner stays on base sequence GEMV |
+| Feature-flagged fused SwiGLU + down projection | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Kept behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`; current F32-contract fused kernel is not performance-viable as a default |
 
 ## Open Decisions
 
@@ -159,6 +160,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
+| Whether fused SwiGLU + down should default | No; reference gate passes, but full-model profile regresses |
 
 ## Current Production Prefill Profile
 
@@ -416,10 +418,21 @@ Current routing effect from the opt-in Qwen profile:
 | `gemv_seq_bf16_f32s` | 48 | 24 |
 | `mlp_fused_swiglu_down_seq_bf16_f32s` | 0 | 24 |
 
-The per-kernel pair improves by about 15% in the reported seqLen 128 profile
-(`swiglu_seq_f32 + gemv_seq_bf16_f32s` p50 32.613 us versus fused p50
-27.610 us). End-to-end prefill movement is still marginal and within normal
-GPU thermal/cache variance, so this is **not promoted to default routing**.
+The local rerun confirms routing and correctness but rejects promotion. The
+feature flag reaches the test runner when run through `xcrun xctest`; passing
+the environment only to `xcodebuild` is not reliable for this gate.
+
+| Sequence length | Default route | Fused flag enabled | Delta | Decision |
+|---:|---:|---:|---:|---|
+| 16 | 44.373 ms | 44.658 ms | +0.6% | noise / no promotion |
+| 64 | 158.926 ms | 211.582 ms | +33.1% | reject as default |
+| 128 | 308.411 ms | 479.223 ms | +55.4% | reject as default |
+
+At seqLen 128, the fused plan reports 24
+`mlp_fused_swiglu_down_seq_bf16_f32s` dispatches and removes all 24
+`swiglu_seq_f32` dispatches, but the fused kernel consumes 80.747 ms. This
+more than outweighs the dispatch-count reduction. The result is a useful
+correctness-gated experiment, not a production speed path.
 
 Important numerical note: the fused kernel now keeps the same F32 intermediate
 contract as the current materialized two-kernel path. It removes the scratch
@@ -427,7 +440,8 @@ round-trip for the SwiGLU output, but it does not change the precision of the
 down-projection input. `FusedSwigluDownEquivalenceTests` directly compares the
 fused kernel against the unfused path with zero tolerance.
 
-Next decision: rerun the Qwen reference and full-model profile gates with the
-F32-intermediate fused kernel. Default promotion still requires model-level
-correctness and a stable end-to-end prefill improvement, not only a local
-kernel-pair win.
+Next decision: redesign the fused kernel before trying promotion again. The
+current admission and reference harness are reusable, but the kernel body must
+avoid trading one scratch round-trip for substantially more arithmetic or poorer
+occupancy. Default promotion still requires model-level correctness and a
+stable end-to-end prefill improvement, not only dispatch-count reduction.
