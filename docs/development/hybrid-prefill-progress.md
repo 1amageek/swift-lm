@@ -146,6 +146,9 @@ flowchart TD
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; same SwiftPM/probe baseline is 43.383/159.741/315.186 ms for seqLen 16/64/128 |
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=2/4/8` | Pass; rows=8 is the best full-model fused variant and improves seqLen 64/128 in the same SwiftPM/probe run |
 | 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8` | Pass; 4/4 reference checks remain green with the best observed fused scheduling |
+| 2026-05-10 | `xcodebuild build-for-testing` with `OTHER_SWIFT_FLAGS='$(inherited) -DENABLE_METAL_PROBES'` | Pass; probe-enabled Xcode test bundle builds inside the 120-second release gate |
+| 2026-05-10 | `xcodebuild test-without-building -xctestrun rows8-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35ReferenceComparisonTests` | Pass; rows=8 environment injected through the xctestrun, 4/4 reference checks pass |
+| 2026-05-10 | `xcodebuild test-without-building ... Qwen35PrefillProfileTests` baseline and rows=8 xctestruns | Pass; rows=8 improves seqLen 64/128 but regresses seqLen 16, so it stays opt-in |
 
 ## Failed Experiments
 
@@ -167,7 +170,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | Not yet; rows=8 has repeated green reference/profile evidence and is the best current fused shape, but promotion still needs xcodebuild confirmation and at least one more stable release-gate run |
+| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and best current fused shape, but Xcode release-profile validation still regresses seqLen 16 |
 
 ## Current Production Prefill Profile
 
@@ -505,8 +508,22 @@ state, KV cache, and decode step zero. This makes rows=8 the only fused MLP
 candidate worth carrying forward. It should still remain opt-in until the
 same result is reproduced through the release validation path.
 
-Next decision: reproduce rows=8 through the release validation path, preferably
-`xcodebuild build-for-testing` once and `test-without-building` with the probe
-environment injected into the xctestrun. Default promotion still requires
-model-level correctness and a stable end-to-end prefill improvement, not only
-dispatch-count reduction or standalone microbenchmark wins.
+Rows=8 was then reproduced through the Xcode release-validation path by
+building with `OTHER_SWIFT_FLAGS='$(inherited) -DENABLE_METAL_PROBES'` and
+injecting the fused-route environment into the `MetalCompilerTests` entry of
+the xctestrun. This confirms the env-injected path works and the correctness
+gate is green, but it does not justify default promotion.
+
+| Sequence length | Xcode baseline | Xcode fused rows=8 | Delta | Promotion decision |
+|---:|---:|---:|---:|---|
+| 16 | 43.639 ms | 47.833 ms | +9.6% | reject default |
+| 64 | 158.869 ms | 157.344 ms | -1.0% | favorable |
+| 128 | 313.777 ms | 308.725 ms | -1.6% | favorable |
+
+Next decision: keep rows=8 behind
+`SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8`
+and do not promote it as a default Qwen route. The next speed design should
+target a sequence-length-aware admission rule, a different short-sequence
+schedule, or a lower-recompute fused kernel. Default promotion still requires
+model-level correctness and a stable end-to-end prefill improvement across the
+release-relevant sequence lengths.
