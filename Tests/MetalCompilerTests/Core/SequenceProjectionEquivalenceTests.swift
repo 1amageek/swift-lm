@@ -310,6 +310,82 @@ struct SequenceProjectionEquivalenceTests {
         )
     }
 
+    @Test("BF16 tile2 single sequence GEMV matches repeated decode GEMV")
+    func bf16Tile2SingleSequenceGEMVMatchesRepeatedDecodeGEMV() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        // Use an odd sequence length to exercise the tail sequence path
+        // (sequenceLength % sequenceTile != 0). Output dimension is kept
+        // aligned to rowsPerThreadgroup so the existing single-projection
+        // helper geometry stays valid for the row dimension.
+        let inputDimension = 73
+        let outputDimension = 20
+        let sequenceLength = 9
+        let sequenceTile = 2
+        let decodeKernelName = "gemv_bf16_single_decode_equivalence_tile2"
+        let sequenceKernelName = "gemv_bf16_single_tile2_sequence_equivalence"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateGEMV(
+                name: decodeKernelName,
+                bufferPrecision: BufferPrecision.bfloat16,
+                weightFormat: WeightFormats.bfloat16,
+                tileElements: 256
+            ),
+            MetalSourceGenerator.generateTiledSequenceGEMV(
+                name: sequenceKernelName,
+                bufferPrecision: BufferPrecision.float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: sequenceTile
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let decodePipeline = try harness.pipeline(named: decodeKernelName)
+        let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
+
+        let inputValues = (0..<(sequenceLength * inputDimension)).map { index in
+            Float(BFloat16(Float((index * 19) % 37 - 18) * 0.03125))
+        }
+        let weights = (0..<(outputDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 7) % 43 - 21) * 0.015625)
+        }
+
+        let expected = try runDecodeSingleProjectionTrace(
+            harness: harness,
+            pipeline: decodePipeline,
+            inputValues: inputValues,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength
+        )
+        let actual = try runSequenceSingleProjectionTrace(
+            harness: harness,
+            pipeline: sequencePipeline,
+            inputValues: inputValues,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength,
+            sequenceTile: sequenceTile
+        )
+
+        let mismatch = harness.firstMismatch(
+            expected: expected,
+            actual: actual,
+            tolerance: 0.000_001
+        )
+        #expect(
+            mismatch == nil,
+            "single tile2 projection drifted: \(String(describing: mismatch)), maxError=\(harness.maxAbsoluteError(expected: expected, actual: actual))"
+        )
+    }
+
     private func runDecodeProjectionTraceInScratch(
         harness: SequenceKernelEquivalenceHarness,
         pipeline: MTLComputePipelineState,

@@ -600,6 +600,20 @@ struct MetalKernelSourceCatalog {
                     tileElements: 256
                 ))
             }
+            // tile2 is a non-default reference-backed experiment: the tile4 variant
+            // regressed Qwen3.5 prefill profile, so we explore a smaller sequence
+            // tile that keeps decode-equivalent reduction order while halving the
+            // sequence-axis grid height. Production planner stays on the base
+            // sequence GEMV until profile evidence shows tile2 is faster.
+            if generatedNames.insert("gemv_seq_bf16_f32s_tile2").inserted {
+                sources.append(MetalSourceGenerator.generateTiledSequenceGEMV(
+                    name: "gemv_seq_bf16_f32s_tile2",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    sequenceTile: 2,
+                    tileElements: 256
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g16_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g16_f32s",
