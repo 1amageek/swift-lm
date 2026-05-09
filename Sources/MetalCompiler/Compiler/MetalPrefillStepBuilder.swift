@@ -30,9 +30,29 @@ struct MetalPrefillStepBuilder {
             resolveDispatch: resolveDispatch
         )
 
-        for entry in fusedEntries {
+        var index = 0
+        while index < fusedEntries.count {
+            let entry = fusedEntries[index]
+            // Lookahead admission: when the next entry is a compatible
+            // `mlp.down_proj` and the current entry is the producing SwiGLU,
+            // we may emit a single fused kernel instead of the two-step path.
+            // The admission check is gated by `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN`
+            // and only succeeds when every contract gate is satisfied. On
+            // success we consume two entries and continue; on failure we fall
+            // through to the per-entry path.
+            if index + 1 < fusedEntries.count,
+               let fusedSteps = try planner.tryBuildFusedSwigluDownSteps(
+                   producer: entry,
+                   consumer: fusedEntries[index + 1]
+               )
+            {
+                steps.append(contentsOf: fusedSteps)
+                index += 2
+                continue
+            }
             let prefillSteps = try planner.buildSteps(for: entry)
             steps.append(contentsOf: prefillSteps)
+            index += 1
         }
 
         let correctedSteps = try Self.insertDecodeEquivalentSequenceStorageRoundingIfNeeded(
@@ -371,6 +391,22 @@ private struct PrefillStepPlanner {
         return raw == "1" || raw.lowercased() == "true"
     }()
 
+    /// Process-wide BF16 fused SwiGLU+down_proj feature flag.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`, the planner replaces the
+    /// `swiglu_seq_f32 + gemv_seq_bf16_f32s` pair on `mlp.down_proj` with the
+    /// fused `mlp_fused_swiglu_down_seq_bf16_f32s` kernel. Admission requires
+    /// matching compositeID/layerIndex, BF16 sequence prefill precision, BF16
+    /// dense weight, output writing back to hidden, and `.batch` mode. Other
+    /// projections, schemes, and decode are unaffected. Read once per process
+    /// to avoid repeated `getenv` calls.
+    private static let bf16FusedMlpDownEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
     let buffers: PrefillBufferSet
     let stafWeightStore: STAFWeightStore?
     let hiddenSize: Int
@@ -571,6 +607,231 @@ private struct PrefillStepPlanner {
             rowsPerThreadgroup,
             MTLSize(width: threads, height: 1, depth: 1)
         )
+    }
+
+    /// Attempt to fuse a `(SwiGLU, mlp.down_proj)` entry pair into a single
+    /// `mlp_fused_swiglu_down_seq_bf16_f32s` dispatch.
+    ///
+    /// Returns the fused steps when every admission gate is satisfied, or `nil`
+    /// when any gate fails — in which case the caller must fall back to the
+    /// per-entry build path. The gates protect every assumption baked into the
+    /// fused kernel:
+    ///
+    ///   1. **Fragment pair** — producer is an `ElementwiseFragment(.swiglu)`
+    ///      and consumer is a `LinearFragment` for `mlp.down_proj` with
+    ///      `isOutput == true`. GeluGated and other elementwise variants do
+    ///      not share the SwiGLU rounding contract.
+    ///   2. **CompositeID** — both entries must belong to the same MLP
+    ///      composite. Different composites mean different scratch slot owners
+    ///      and the fused kernel would read stale data.
+    ///   3. **LayerIndex** — both entries must reference the same layer.
+    ///   4. **Shape** — `linear.inputDimension == swiglu.count` and the down
+    ///      projection must write at most `hiddenSize` rows. Output-head
+    ///      projections (vocab GEMV) take a different routing path.
+    ///   5. **Routing state** — the SwiGLU output must be the consumer's input
+    ///      (`lastOutputIsHidden == false`, `currentInputOffset == 0`,
+    ///      matching `ElementwiseFragment.prefillSteps`'s declared output of
+    ///      scratch slot 0).
+    ///   6. **Buffer precision** — must be the prefill sequence precision
+    ///      (F32 hidden/scratch, BF16 storage rounding).
+    ///   7. **Weight format** — `mlp.down_proj` must use a non-quantized
+    ///      `.bf16RowMajor` scheme. Quantized variants need their own dequant
+    ///      contracts.
+    ///   8. **Mode** — must run in `.batch` mode. Last-token projections take
+    ///      the lastToken path.
+    ///
+    /// All gates must succeed; partial admission is not allowed.
+    mutating func tryBuildFusedSwigluDownSteps(
+        producer: DispatchEntry,
+        consumer: DispatchEntry
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16FusedMlpDownEnabled else { return nil }
+
+        // Gate 1: Fragment pair (SwiGLU producer + LinearFragment consumer).
+        guard let swiglu = producer.fragment as? ElementwiseFragment,
+              swiglu.kind == .swiglu else {
+            return nil
+        }
+        guard let linear = consumer.fragment as? LinearFragment else {
+            return nil
+        }
+        // Gate 1 (cont.): consumer must be the down projection writing back to
+        // the hidden buffer. We restrict to the canonical `down_proj` role to
+        // avoid accidentally fusing past parallel projections that happen to
+        // sit next to a SwiGLU in the dispatch list.
+        guard linear.field == "down_proj", linear.isOutput else {
+            return nil
+        }
+
+        // Gate 2: CompositeID — both entries must share the same composite so
+        // that scratch slot ownership is unambiguous.
+        guard let composite = producer.compositeID,
+              consumer.compositeID == composite else {
+            return nil
+        }
+
+        // Gate 3: LayerIndex — both must reference the same layer.
+        guard producer.layerIndex == consumer.layerIndex else {
+            return nil
+        }
+
+        // Gate 4: Shape — SwiGLU output count must match the down projection's
+        // input dimension; the projection output must fit into hidden.
+        let intermediateDim = swiglu.count
+        guard linear.inputDimension == intermediateDim,
+              linear.outputDimension <= hiddenSize else {
+            return nil
+        }
+
+        // Gate 5: Routing state — at this point the routing reflects the
+        // post-up_proj state (gate_proj wrote slot 1, up_proj wrote slot 2,
+        // `lastOutputIsHidden=false`). The fused kernel reads slots 1 and 2
+        // directly, so we only require that the previous output stayed in
+        // scratch (`lastOutputIsHidden == false`); `currentInputOffset` would
+        // otherwise point at up_proj's slot 2, which the fused kernel does not
+        // consume. The unfused path's reset to 0 happens inside SwiGLU's
+        // prefillSteps, which the fused path skips entirely.
+        guard !routingState.lastOutputIsHidden else {
+            return nil
+        }
+
+        // Gate 6: Buffer precision — must be prefill sequence precision (F32
+        // working buffers with BF16 storage rounding).
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            return nil
+        }
+
+        // Gate 7: Weight format — fused kernel only supports BF16 row-major.
+        let descriptor = resolveProjectionWeightDescriptor(role: linear.field, entry: consumer)
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            return nil
+        }
+
+        // Gate 8: Mode — fused kernel runs as `.batch` over the full sequence.
+        // (`lastToken` projections take a different code path; we only fuse
+        // when the consumer would also pick `.batch` in the unfused path,
+        // which is true whenever `outputDimension <= hiddenSize` for an
+        // `isOutput` projection.)
+        let mode: PrefillStepMode = .batch
+
+        // Resolve the fused kernel pipeline.
+        let fusedKernelName = "mlp_fused_swiglu_down_seq_bf16_f32s"
+        guard let pipeline = planBuildContext.pipelineCache[fusedKernelName] else {
+            // Pipeline not in cache — fall back rather than fail. The kernel
+            // is generated unconditionally in MetalKernelSourceCatalog, so a
+            // missing pipeline means the metallib build dropped it; the
+            // unfused path remains correct, so silent fallback is allowed
+            // here only in the sense that we hand the work to the existing
+            // verified path, not that we corrupt output.
+            return nil
+        }
+
+        // Resolve down_proj weight buffer.
+        let weightResolver = WeightResolver(
+            entry: consumer,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .prefill,
+            accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
+        )
+        let (weightBuffer, weightOffset) = weightResolver.resolve(role: linear.field)
+        let weightTensorName = consumer.parameterBindings.first(where: { $0.role == linear.field })?.tensorName
+
+        // Buffer layout matches `generateFusedSwigluDownSequenceGEMV`:
+        //   buffer(0) = gate   = scratch slot 1
+        //   buffer(1) = up     = scratch slot 2
+        //   buffer(2) = weight = down_proj BF16
+        //   buffer(3) = output = hidden offset 0
+        let scratchSlotSize = slotDimension * scratchElementSize * maximumSequenceLength
+        let inputRowStride = slotDimension
+        let outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+
+        // Grid: (output rows / rowsPerThreadgroup) × sequenceLength.
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let rowsPerThreadgroup = max(
+            1,
+            min(Self.decodeEquivalentSequenceRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
+        )
+        let threads = min(simdWidth * rowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup)
+        let gridSize = MTLSize(
+            width: (linear.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+            height: maximumSequenceLength,
+            depth: 1
+        )
+        let threadgroupSize = MTLSize(width: threads, height: 1, depth: 1)
+
+        // Buffer access pattern: reads gate(0), up(1), weight(2); writes output(3).
+        let accessPattern = MetalDispatchStepMetadata.BufferAccessPattern(
+            reads: [0, 1, 2],
+            writes: [3]
+        )
+
+        let fusedStep = MetalPrefillStep(
+            pipeline: pipeline,
+            gridSize: gridSize,
+            threadgroupSize: threadgroupSize,
+            bufferBindings: [
+                (0, buffers.scratch, 1 * scratchSlotSize),
+                (1, buffers.scratch, 2 * scratchSlotSize),
+                (2, weightBuffer, weightOffset),
+                (3, buffers.hidden, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(4, UInt32(intermediateDim)),
+                uint32Binding(5, UInt32(linear.outputDimension)),
+                uint32Binding(6, UInt32(maximumSequenceLength)),
+                uint32Binding(7, UInt32(inputRowStride)),
+                uint32Binding(8, UInt32(outputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: mode,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: fusedKernelName,
+                entryIndex: consumer.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: accessPattern
+            )
+        )
+
+        // Record quantization plan entry for `down_proj` to keep the plan
+        // consistent with the unfused path. SwiGLU is not a projection so
+        // no entry is recorded for the producer.
+        recordProjectionQuantization(
+            entry: consumer,
+            descriptor: descriptor,
+            mode: mode,
+            inputRowStride: inputRowStride,
+            inputDimension: linear.inputDimension,
+            outputDimension: linear.outputDimension,
+            selectedKernelName: fusedKernelName,
+            usesMPPForStep: false,
+            sequenceTileHeight: nil,
+            tileVariantHeights: []
+        )
+
+        // Update routing state so subsequent entries see the same state the
+        // unfused (SwiGLU → LinearFragment isOutput) path would leave behind:
+        //   * `lastOutputIsHidden = true` (down_proj wrote to hidden)
+        //   * `currentInputOffset = 0`
+        //   * `projectionIndex = 1` to match the unfused increment after
+        //     SwiGLU's reset to 0 followed by LinearFragment's `+= 1`. The
+        //     next reduction-bearing layer norm resets it again, so the
+        //     specific value matters only for symmetry with the unfused path.
+        routingState.lastOutputIsHidden = true
+        routingState.currentInputOffset = 0
+        routingState.projectionIndex = 1
+
+        // Refresh composite-input tracking. Both entries share `composite`, so
+        // `activeCompositeID` advances exactly once for the fused pair.
+        activeCompositeID = composite
+        refreshCompositeInputSource()
+
+        let annotated = annotate([fusedStep], entryIndex: consumer.index, layerIndex: consumer.layerIndex)
+        return annotated
     }
 
     mutating func buildSteps(for entry: DispatchEntry) throws -> [MetalPrefillStep] {

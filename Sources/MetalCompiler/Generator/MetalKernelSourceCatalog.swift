@@ -614,6 +614,18 @@ struct MetalKernelSourceCatalog {
                     tileElements: 256
                 ))
             }
+            // Producer-consumer fusion of `swiglu_seq_f32` and the BF16 sequence
+            // GEMV used by `mlp.down_proj`. Generated unconditionally so the
+            // routing pass can pick it up when the feature flag is enabled, but
+            // production planner only routes when admission gates are satisfied.
+            if generatedNames.insert("mlp_fused_swiglu_down_seq_bf16_f32s").inserted {
+                sources.append(MetalSourceGenerator.generateFusedSwigluDownSequenceGEMV(
+                    name: "mlp_fused_swiglu_down_seq_bf16_f32s",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    tileElements: 256
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g16_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g16_f32s",

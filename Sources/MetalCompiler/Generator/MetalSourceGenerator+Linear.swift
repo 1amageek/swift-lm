@@ -462,6 +462,123 @@ extension MetalSourceGenerator {
         """
     }
 
+    /// Generate a fused SwiGLU + sequence GEMV kernel for the MLP down projection.
+    ///
+    /// Producer-consumer fusion: computes `silu(gate[j]) * up[j]` on-the-fly during
+    /// the GEMV tile-load step, BF16-rounds the intermediate value, then accumulates
+    /// `sum += weight[row, j] * tile[j]` in F32 with the same SIMD-group reduction
+    /// order as `generateSequenceGEMV`.
+    ///
+    /// The intermediate SwiGLU output is never materialized to scratch — the kernel
+    /// reads `gate` and `up` directly and writes only the projected hidden output.
+    /// This eliminates the SwiGLU dispatch, its barrier, and the round-trip of
+    /// `intermediateDim * sequenceLength * 4 bytes` through scratch slot 0.
+    ///
+    /// Numerical contract:
+    ///   * Each `silu(g)*up` is computed in F32 and immediately passed through
+    ///     `float(bfloat(v))` so the GEMV reduction sees the same BF16-rounded
+    ///     operands the synthesized `ElementwiseFragment` path emits via
+    ///     `sequenceStorageValue`. This is intentionally stricter than the unfused
+    ///     `swiglu_seq_f32 + gemv_seq_bf16_f32s` pair, which keeps the intermediate
+    ///     in F32; the fused contract matches the kernelBody version of SwiGLU so
+    ///     future fragment-level fusion shares this kernel's numerical surface.
+    ///   * The reduction order, accumulator precision, and final-output cast are
+    ///     identical to `generateSequenceGEMV` for BF16 weight: the running F32
+    ///     `sum` is reduced via `simd_sum` and stored as `float(bfloat(sum))`.
+    ///
+    /// Currently only BF16 weight is supported because the rounding contract is
+    /// weight-format-specific. Q3/Q4/Q8 fused variants would require separate
+    /// rounding/dequant contracts and are out of scope for this generator.
+    public static func generateFusedSwigluDownSequenceGEMV(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        tileElements: Int = 256
+    ) -> String {
+        precondition(
+            weightFormat.isBFloat16,
+            "generateFusedSwigluDownSequenceGEMV currently supports only BF16 weight format"
+        )
+        precondition(
+            bufferPrecision.isPrefillSequencePrecision,
+            "generateFusedSwigluDownSequenceGEMV requires the prefill sequence buffer precision"
+        )
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        // SwiGLU intermediate rounding: the contract requires `silu(g)*up` to be
+        // BF16-rounded before participating in the GEMV reduction. The unfused
+        // two-kernel path stores the intermediate as F32 in scratch (no rounding),
+        // so the fused kernel is intentionally NOT bit-equivalent to that path —
+        // it matches the synthesized-fragment path (`ElementwiseFragment.kernelBody`)
+        // which rounds via `sequenceStorageValue`.
+        let roundIntermediate = MetalSourceGenerator.sequenceStorageValue(
+            "silu_up",
+            weightFormat: weightFormat
+        )
+        // Final output rounding mirrors `generateSequenceGEMV` so the fused kernel
+        // stores the same BF16-rounded sum the unfused GEMV would produce.
+        let storeOutput = MetalSourceGenerator.sequenceStorageValue(
+            "sum",
+            weightFormat: weightFormat
+        )
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* gate               [[buffer(0)]],
+            device const \(bt)* up                 [[buffer(1)]],
+            device const \(wt)* weight             [[buffer(2)]],
+            device \(bt)* output                   [[buffer(3)]],
+            constant uint& intermediateDim         [[buffer(4)]],
+            constant uint& outputDimension         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& inputRowStride          [[buffer(7)]],
+            constant uint& outputRowStride         [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint tileElements = \(tileElements);
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (row >= outputDimension || seqPos >= sequenceLength) return;
+
+            threadgroup \(bt) inputTile[tileElements];
+            float sum = 0.0f;
+            device const \(bt)* gateRow = gate + seqPos * inputRowStride;
+            device const \(bt)* upRow   = up   + seqPos * inputRowStride;
+            device const \(wt)* weightRow = weight + row * intermediateDim;
+            for (uint base = 0; base < intermediateDim; base += tileElements) {
+                for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
+                    const uint inputIndex = base + j;
+                    if (inputIndex < intermediateDim) {
+                        float g = float(gateRow[inputIndex]);
+                        float u = float(upRow[inputIndex]);
+                        float silu_up = g * (1.0f / (1.0f + exp(-g))) * u;
+                        inputTile[j] = \(bt)(\(roundIntermediate));
+                    } else {
+                        inputTile[j] = \(bt)(0.0f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint tileCount = min(tileElements, intermediateDim - base);
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storeOutput));
+            }
+        }
+        """
+    }
+
     /// Generate a GEMV kernel specialized for vocab/output-head style projections.
     ///
     /// The input dimension is expected to be 2048. The entire input vector is staged
