@@ -1118,6 +1118,9 @@ struct MetalPrefillExecutor: @unchecked Sendable {
             steps = prefillPlan.steps[...]
         }
         for step in steps {
+            guard step.shouldExecute(sequenceLength: sequenceLength) else {
+                continue
+            }
             switch step.mode {
             case .batch:
                 step.bindings.bind(to: argumentTable)

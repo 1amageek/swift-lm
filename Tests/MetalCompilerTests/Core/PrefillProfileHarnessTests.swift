@@ -4,6 +4,17 @@ import Testing
 
 @Suite("Prefill Profile Harness")
 struct PrefillProfileHarnessTests {
+    @Test("Prefill execution conditions gate sequence lengths")
+    func prefillExecutionConditionsGateSequenceLengths() {
+        #expect(PrefillStepExecutionCondition.always.shouldExecute(sequenceLength: 1))
+        #expect(PrefillStepExecutionCondition.sequenceLengthAtLeast(64).shouldExecute(sequenceLength: 64))
+        #expect(PrefillStepExecutionCondition.sequenceLengthAtLeast(64).shouldExecute(sequenceLength: 128))
+        #expect(!PrefillStepExecutionCondition.sequenceLengthAtLeast(64).shouldExecute(sequenceLength: 63))
+        #expect(PrefillStepExecutionCondition.sequenceLengthAtMost(63).shouldExecute(sequenceLength: 1))
+        #expect(PrefillStepExecutionCondition.sequenceLengthAtMost(63).shouldExecute(sequenceLength: 63))
+        #expect(!PrefillStepExecutionCondition.sequenceLengthAtMost(63).shouldExecute(sequenceLength: 64))
+    }
+
     @Test("Profile artifacts encode JSON and CSV summaries")
     func profileArtifactsEncodeJSONAndCSV() throws {
         let entry = MetalPrefillProfile.Entry(

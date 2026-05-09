@@ -46,6 +46,25 @@ public enum PrefillSequenceLengthPolicy: Sendable {
     }
 }
 
+/// Runtime condition that decides whether a prefill step is encoded for the
+/// current sequence length.
+public enum PrefillStepExecutionCondition: Sendable, Equatable {
+    case always
+    case sequenceLengthAtLeast(Int)
+    case sequenceLengthAtMost(Int)
+
+    public func shouldExecute(sequenceLength: Int) -> Bool {
+        switch self {
+        case .always:
+            return true
+        case .sequenceLengthAtLeast(let minimum):
+            return sequenceLength >= minimum
+        case .sequenceLengthAtMost(let maximum):
+            return sequenceLength <= maximum
+        }
+    }
+}
+
 /// Tile-size variant for MPP GEMM prefill steps.
 ///
 /// A single prefill step can compile multiple pipelines differing only in
@@ -72,6 +91,7 @@ public struct MetalPrefillStep: @unchecked Sendable {
     public let positionBufferIndex: Int?
     public let perPositionStrides: [Int: Int]
     public let metadata: MetalDispatchStepMetadata
+    public let executionCondition: PrefillStepExecutionCondition
     /// MPP GEMM tile-size variants sorted ascending by `tileHeight`. Empty for
     /// non-MPP steps; in that case the base `descriptor` is used unconditionally.
     public let tileVariants: [PrefillTileVariant]
@@ -102,6 +122,7 @@ public struct MetalPrefillStep: @unchecked Sendable {
         positionBufferIndex: Int?,
         perPositionStrides: [Int : Int],
         metadata: MetalDispatchStepMetadata = .init(),
+        executionCondition: PrefillStepExecutionCondition = .always,
         tileVariants: [PrefillTileVariant] = []
     ) {
         self.descriptor = MetalDispatchDescriptor(
@@ -118,6 +139,7 @@ public struct MetalPrefillStep: @unchecked Sendable {
         self.positionBufferIndex = positionBufferIndex
         self.perPositionStrides = perPositionStrides
         self.metadata = metadata
+        self.executionCondition = executionCondition
         self.tileVariants = tileVariants.sorted { $0.tileHeight < $1.tileHeight }
     }
 
@@ -129,6 +151,7 @@ public struct MetalPrefillStep: @unchecked Sendable {
         positionBufferIndex: Int?,
         perPositionStrides: [Int: Int],
         metadata: MetalDispatchStepMetadata = .init(),
+        executionCondition: PrefillStepExecutionCondition = .always,
         tileVariants: [PrefillTileVariant] = []
     ) {
         self.descriptor = descriptor
@@ -138,7 +161,28 @@ public struct MetalPrefillStep: @unchecked Sendable {
         self.positionBufferIndex = positionBufferIndex
         self.perPositionStrides = perPositionStrides
         self.metadata = metadata
+        self.executionCondition = executionCondition
         self.tileVariants = tileVariants.sorted { $0.tileHeight < $1.tileHeight }
+    }
+
+    public func shouldExecute(sequenceLength: Int) -> Bool {
+        executionCondition.shouldExecute(sequenceLength: sequenceLength)
+    }
+
+    public func withExecutionCondition(
+        _ condition: PrefillStepExecutionCondition
+    ) -> MetalPrefillStep {
+        MetalPrefillStep(
+            descriptor: descriptor,
+            bindings: bindings,
+            mode: mode,
+            sequenceLengthPolicy: sequenceLengthPolicy,
+            positionBufferIndex: positionBufferIndex,
+            perPositionStrides: perPositionStrides,
+            metadata: metadata,
+            executionCondition: condition,
+            tileVariants: tileVariants
+        )
     }
 
     public func bindRuntimeArguments(

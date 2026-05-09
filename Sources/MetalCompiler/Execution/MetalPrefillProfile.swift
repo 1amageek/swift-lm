@@ -211,8 +211,12 @@ struct MetalPrefillProfileHarness: Sendable {
         )
         writeRuntimeConstants(plan: plan, basePosition: basePosition, sequenceLength: sequenceLength)
 
+        let activeSteps = plan.steps.enumerated().filter {
+            $0.element.shouldExecute(sequenceLength: sequenceLength)
+        }
+
         for _ in 0..<warmupIterations {
-            for step in plan.steps {
+            for (_, step) in activeSteps {
                 try encodeTimedStep(
                     step,
                     plan: plan,
@@ -224,8 +228,8 @@ struct MetalPrefillProfileHarness: Sendable {
         }
 
         var entries: [MetalPrefillProfile.Entry] = []
-        entries.reserveCapacity(plan.steps.count)
-        for (index, step) in plan.steps.enumerated() {
+        entries.reserveCapacity(activeSteps.count)
+        for (index, step) in activeSteps {
             let timing = try measure(iterations: iterations) {
                 try encodeTimedStep(
                     step,
@@ -251,7 +255,7 @@ struct MetalPrefillProfileHarness: Sendable {
             maximumSequenceLength: plan.maximumSequenceLength,
             iterations: iterations,
             warmupIterations: warmupIterations,
-            stepCount: plan.steps.count,
+            stepCount: activeSteps.count,
             entries: entries
         )
     }
@@ -278,6 +282,11 @@ struct MetalPrefillProfileHarness: Sendable {
         writeRuntimeConstants(plan: plan, basePosition: basePosition, sequenceLength: sequenceLength)
 
         let ranges = prefillPassRanges(for: plan.steps, within: 0..<plan.steps.count)
+            .filter { range in
+                plan.steps[range].contains {
+                    $0.shouldExecute(sequenceLength: sequenceLength)
+                }
+            }
         for _ in 0..<warmupIterations {
             for range in ranges {
                 try encodeTimedRange(
@@ -319,7 +328,11 @@ struct MetalPrefillProfileHarness: Sendable {
             maximumSequenceLength: plan.maximumSequenceLength,
             iterations: iterations,
             warmupIterations: warmupIterations,
-            stepCount: plan.steps.count,
+            stepCount: ranges.reduce(0) { partial, range in
+                partial + plan.steps[range].filter {
+                    $0.shouldExecute(sequenceLength: sequenceLength)
+                }.count
+            },
             entries: entries
         )
     }
@@ -421,6 +434,7 @@ struct MetalPrefillProfileHarness: Sendable {
     ) throws -> (gpuStartTime: CFTimeInterval, gpuEndTime: CFTimeInterval, wallMicroseconds: Double) {
         let wallStart = CFAbsoluteTimeGetCurrent()
         let timing = try submission.withComputeTimed(ephemeralResidency: ephemeralResidency) { encoder, argumentTable in
+            guard step.shouldExecute(sequenceLength: sequenceLength) else { return }
             encodeStep(
                 step,
                 encoder: encoder,
@@ -444,6 +458,9 @@ struct MetalPrefillProfileHarness: Sendable {
         let wallStart = CFAbsoluteTimeGetCurrent()
         let timing = try submission.withComputeTimed(ephemeralResidency: ephemeralResidency) { encoder, argumentTable in
             for step in plan.steps[range] {
+                guard step.shouldExecute(sequenceLength: sequenceLength) else {
+                    continue
+                }
                 encodeStep(
                     step,
                     encoder: encoder,
@@ -464,6 +481,9 @@ struct MetalPrefillProfileHarness: Sendable {
         runtimeConstantBuffer: MTLBuffer,
         sequenceLength: Int
     ) {
+        guard step.shouldExecute(sequenceLength: sequenceLength) else {
+            return
+        }
         switch step.mode {
         case .batch:
             step.bindings.bind(to: argumentTable)
@@ -539,7 +559,9 @@ struct MetalPrefillProfileHarness: Sendable {
         timing: (gpuMicroseconds: Double, wallMicroseconds: Double),
         iterations: Int
     ) -> MetalPrefillProfile.Entry {
-        let steps = plan.steps[range]
+        let steps = plan.steps[range].filter {
+            $0.shouldExecute(sequenceLength: sequenceLength)
+        }
         let bindingCount = steps.reduce(0) { $0 + $1.bindings.buffers.count }
         let inlineBytes = steps.reduce(0) { $0 + inlineConstantBytes(for: $1) }
         let uniqueBytes = uniqueBoundBufferBytes(for: Array(steps))
@@ -639,7 +661,7 @@ private func estimatedDispatchCount(for step: MetalPrefillStep, sequenceLength: 
     }
 }
 
-private func commonLayerIndex(for steps: ArraySlice<MetalPrefillStep>) -> Int? {
+private func commonLayerIndex<S: Sequence>(for steps: S) -> Int? where S.Element == MetalPrefillStep {
     let layerIndices = Set(steps.compactMap(\.metadata.layerIndex))
     return layerIndices.count == 1 ? layerIndices.first : nil
 }

@@ -3913,6 +3913,7 @@ struct OptimizerEntryContractTests {
                 positionBufferIndex: step.positionBufferIndex,
                 perPositionStrides: step.perPositionStrides,
                 metadata: step.metadata,
+                executionCondition: step.executionCondition,
                 tileVariants: step.tileVariants
             )
         }

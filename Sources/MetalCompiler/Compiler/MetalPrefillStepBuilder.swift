@@ -40,15 +40,40 @@ struct MetalPrefillStepBuilder {
             // and only succeeds when every contract gate is satisfied. On
             // success we consume two entries and continue; on failure we fall
             // through to the per-entry path.
-            if index + 1 < fusedEntries.count,
-               let fusedSteps = try planner.tryBuildFusedSwigluDownSteps(
-                   producer: entry,
-                   consumer: fusedEntries[index + 1]
-               )
-            {
-                steps.append(contentsOf: fusedSteps)
-                index += 2
-                continue
+            if index + 1 < fusedEntries.count {
+                let consumer = fusedEntries[index + 1]
+                if planner.usesRuntimeGatedFusedMlpDown {
+                    var fusedPlanner = planner
+                    if let fusedSteps = try fusedPlanner.tryBuildFusedSwigluDownSteps(
+                        producer: entry,
+                        consumer: consumer
+                    ) {
+                        var unfusedPlanner = planner
+                        let producerSteps = try unfusedPlanner.buildSteps(for: entry)
+                        let consumerSteps = try unfusedPlanner.buildSteps(for: consumer)
+                        // The fused and unfused paths must leave identical
+                        // routing state for downstream entries. Keep the
+                        // fused planner as the canonical state because the
+                        // fused path owns the long-sequence execution branch.
+                        let threshold = planner.fusedMlpDownMinimumSequenceLength
+                        steps.append(contentsOf: (producerSteps + consumerSteps).map {
+                            $0.withExecutionCondition(.sequenceLengthAtMost(threshold - 1))
+                        })
+                        steps.append(contentsOf: fusedSteps.map {
+                            $0.withExecutionCondition(.sequenceLengthAtLeast(threshold))
+                        })
+                        planner = fusedPlanner
+                        index += 2
+                        continue
+                    }
+                } else if let fusedSteps = try planner.tryBuildFusedSwigluDownSteps(
+                    producer: entry,
+                    consumer: consumer
+                ) {
+                    steps.append(contentsOf: fusedSteps)
+                    index += 2
+                    continue
+                }
             }
             let prefillSteps = try planner.buildSteps(for: entry)
             steps.append(contentsOf: prefillSteps)
@@ -189,7 +214,8 @@ struct MetalPrefillStepBuilder {
                     entryIndex: step.metadata.entryIndex,
                     layerIndex: step.metadata.layerIndex,
                     bufferAccessPattern: .init(reads: [0], writes: [0])
-                )
+                ),
+                executionCondition: step.executionCondition
             ))
         }
         return roundSteps
@@ -296,6 +322,7 @@ struct MetalPrefillStepBuilder {
                 positionBufferIndex: step.positionBufferIndex,
                 perPositionStrides: step.perPositionStrides,
                 metadata: step.metadata,
+                executionCondition: step.executionCondition,
                 tileVariants: step.tileVariants
             )
         }
@@ -353,6 +380,7 @@ struct MetalPrefillStepBuilder {
                 positionBufferIndex: step.positionBufferIndex,
                 perPositionStrides: step.perPositionStrides,
                 metadata: step.metadata,
+                executionCondition: step.executionCondition,
                 tileVariants: step.tileVariants
             )
         }
@@ -422,6 +450,20 @@ private struct PrefillStepPlanner {
         return min(max(value, 1), 8)
     }()
 
+    /// Minimum sequence length for the opt-in fused SwiGLU+down prefill route.
+    ///
+    /// Values greater than 1 make the planner emit both the unfused and fused
+    /// paths with explicit runtime execution conditions. This is deterministic
+    /// runtime admission, not a fallback: short sequences run the existing
+    /// unfused contract, and longer sequences run the admitted fused contract.
+    private static let fusedMlpDownMinimumSequenceLength: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH"],
+              let value = Int(raw) else {
+            return 1
+        }
+        return max(value, 1)
+    }()
+
     let buffers: PrefillBufferSet
     let stafWeightStore: STAFWeightStore?
     let hiddenSize: Int
@@ -443,6 +485,14 @@ private struct PrefillStepPlanner {
     var activeCompositeID: Int?
     var compositeInputSource: (buffer: MTLBuffer, offset: Int)?
     var quantizationEntries: [MetalQuantizationPlanEntry] = []
+
+    var fusedMlpDownMinimumSequenceLength: Int {
+        Self.fusedMlpDownMinimumSequenceLength
+    }
+
+    var usesRuntimeGatedFusedMlpDown: Bool {
+        Self.bf16FusedMlpDownEnabled && Self.fusedMlpDownMinimumSequenceLength > 1
+    }
 
     init(
         buffers: PrefillBufferSet,
@@ -495,6 +545,7 @@ private struct PrefillStepPlanner {
                     weightTensorName: step.metadata.weightTensorName,
                     bufferAccessPattern: step.metadata.bufferAccessPattern
                 ),
+                executionCondition: step.executionCondition,
                 tileVariants: step.tileVariants
             )
         }

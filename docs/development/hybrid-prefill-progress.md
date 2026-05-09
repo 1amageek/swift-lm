@@ -149,6 +149,9 @@ flowchart TD
 | 2026-05-10 | `xcodebuild build-for-testing` with `OTHER_SWIFT_FLAGS='$(inherited) -DENABLE_METAL_PROBES'` | Pass; probe-enabled Xcode test bundle builds inside the 120-second release gate |
 | 2026-05-10 | `xcodebuild test-without-building -xctestrun rows8-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35ReferenceComparisonTests` | Pass; rows=8 environment injected through the xctestrun, 4/4 reference checks pass |
 | 2026-05-10 | `xcodebuild test-without-building ... Qwen35PrefillProfileTests` baseline and rows=8 xctestruns | Pass; rows=8 improves seqLen 64/128 but regresses seqLen 16, so it stays opt-in |
+| 2026-05-10 | `swift test --filter PrefillProfileHarnessTests` | Pass; validates `PrefillStepExecutionCondition` contract and profile artifact encoding |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH=64` | Pass; runtime-gated adaptive route executes unfused steps at seqLen 16 and fused rows=8 steps at seqLen 64/128 |
+| 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with the same adaptive fused rows=8 environment | Pass; 4/4 Qwen reference checks remain green |
 
 ## Failed Experiments
 
@@ -170,7 +173,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and best current fused shape, but Xcode release-profile validation still regresses seqLen 16 |
+| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and best current fused shape, but default stays off. Runtime-gated rows=8 admission is implemented as an opt-in experiment for long sequences |
 
 ## Current Production Prefill Profile
 
@@ -527,3 +530,46 @@ target a sequence-length-aware admission rule, a different short-sequence
 schedule, or a lower-recompute fused kernel. Default promotion still requires
 model-level correctness and a stable end-to-end prefill improvement across the
 release-relevant sequence lengths.
+
+### Runtime-gated rows=8 admission (2026-05-10)
+
+The planner can now emit both the existing unfused MLP route and the rows=8
+fused MLP route into the same prefill plan when all of these flags are present:
+
+```text
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8
+SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH=64
+```
+
+This is explicit runtime admission, not fallback. Each step carries a
+`PrefillStepExecutionCondition`; the executor and profiler encode only the
+steps admitted for the current sequence length. The synthesized storage
+rounding steps inherit the same condition as their producer so inactive
+branches do not leave extra rounding work in the active profile.
+
+```mermaid
+flowchart LR
+  A["SwiGLU entry"] --> B{"seqLen >= 64?"}
+  B -->|"No"| C["unfused: swiglu_seq_f32 + gemv_seq_bf16_f32s"]
+  B -->|"Yes"| D["fused: mlp_fused_swiglu_down_seq_bf16_f32s rows=8"]
+  C --> E["same downstream routing state"]
+  D --> E
+```
+
+The same SwiftPM/probe validation run produced the expected active step counts:
+
+| Sequence length | Active route | Active steps | Total prefill time | Notes |
+|---:|---|---:|---:|---|
+| 16 | unfused | 293 | 43.511 ms | protects the short-prompt case that regressed under unconditional rows=8 |
+| 64 | fused rows=8 | 269 | 158.106 ms | removes 24 `swiglu_seq_f32` and 24 `mlp.down_proj` GEMV dispatches |
+| 128 | fused rows=8 | 269 | 305.809 ms | long prompt uses the best observed fused route |
+
+The raw plan has 341 steps because it contains both branches. Diagnostics and
+profile summaries must therefore distinguish raw plan size from active steps.
+The profile harness now reports active steps for the measured sequence length.
+
+Current decision: keep the adaptive route opt-in. It is structurally better
+than unconditional rows=8 because it avoids the known short-sequence regression,
+but default promotion still requires the same behavior to be validated through
+the Xcode release path and preferably repeated on another thermal run.
