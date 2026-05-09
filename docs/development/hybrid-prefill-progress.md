@@ -152,6 +152,9 @@ flowchart TD
 | 2026-05-10 | `swift test --filter PrefillProfileHarnessTests` | Pass; validates `PrefillStepExecutionCondition` contract and profile artifact encoding |
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH=64` | Pass; runtime-gated adaptive route executes unfused steps at seqLen 16 and fused rows=8 steps at seqLen 64/128 |
 | 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with the same adaptive fused rows=8 environment | Pass; 4/4 Qwen reference checks remain green |
+| 2026-05-10 | `xcodebuild build-for-testing` with `OTHER_SWIFT_FLAGS='$(inherited) -DENABLE_METAL_PROBES'` | Pass; probe-enabled Xcode test bundle builds inside the 120-second release gate for adaptive fused rows=8 validation |
+| 2026-05-10 | `xcodebuild test-without-building -xctestrun adaptive-min64-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35ReferenceComparisonTests` | Pass; adaptive rows=8 environment injected through the xctestrun, 4/4 reference checks pass |
+| 2026-05-10 | `xcodebuild test-without-building -xctestrun adaptive-min64-release-validation.xctestrun -only-testing:MetalCompilerTests/Qwen35PrefillProfileTests` | Pass; active routing is correct (`seqLen=16` unfused, `seqLen=64/128` fused rows=8), but timing remains noisy and does not justify default promotion |
 
 ## Failed Experiments
 
@@ -569,7 +572,19 @@ The raw plan has 341 steps because it contains both branches. Diagnostics and
 profile summaries must therefore distinguish raw plan size from active steps.
 The profile harness now reports active steps for the measured sequence length.
 
+The same adaptive route was then validated through the Xcode release path by
+injecting the environment into the xctestrun. Correctness remained green and
+the active branch selection matched the contract, but the timing was not stable
+enough for default promotion.
+
+| Sequence length | Xcode adaptive min64 | Active steps | Active route | Baseline comparator | Decision |
+|---:|---:|---:|---|---:|---|
+| 16 | 68.220 ms | 293 | unfused | 43.639 ms | reject default; unfused active route still measured noisy/regressed in this run |
+| 64 | 157.996 ms | 269 | fused rows=8 | 158.869 ms | favorable but marginal |
+| 128 | 310.846 ms | 269 | fused rows=8 | 313.777 ms | favorable but marginal |
+
 Current decision: keep the adaptive route opt-in. It is structurally better
-than unconditional rows=8 because it avoids the known short-sequence regression,
-but default promotion still requires the same behavior to be validated through
-the Xcode release path and preferably repeated on another thermal run.
+than unconditional rows=8 because it avoids emitting fused work for short
+prompts, but the Xcode release-path timing is not stable enough to make it a
+production default. The next speed step should target a lower-recompute fused
+kernel or a broader benchmark set before changing default routing.
