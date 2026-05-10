@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-10
+Last updated: 2026-05-11
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -169,6 +169,11 @@ flowchart TD
 | 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; 4/4 Qwen reference checks remain green with the opt-in shared-RMS SSM route |
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; route fires for all 18 SSM recurrence dispatches, but total improvement is within profile noise, so default routing remains disabled |
 | 2026-05-10 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated Qwen-shape SSM recurrence benchmark shows shared-RMS is faster than base for seqLen 16/64/128 and writes `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` |
+| 2026-05-11 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; default, shared-RMS, and narrow threadgroup-width SSM sequence routes match repeated decode recurrence |
+| 2026-05-11 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated benchmark now sweeps base/shared-RMS kernels across requested threadgroup widths 128/256/384 |
+| 2026-05-11 | `swift build` | Pass after adding the opt-in SSM sequence threadgroup-width override |
+| 2026-05-11 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=256` | Pass; 4/4 Qwen reference checks remain green with the opt-in narrower SSM dispatch geometry |
+| 2026-05-11 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=256` | Pass; all 18 SSM recurrence dispatches use `tg=256`, but full-model timing is slightly slower/noisy, so default routing remains unchanged |
 
 ## Failed Experiments
 
@@ -182,6 +187,7 @@ flowchart TD
 | Feature-flagged fused SwiGLU + down projection with 2 rows/threadgroup | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Rejected as the fused scheduling shape; it recomputes SwiGLU tiles too often |
 | Feature-flagged fused SwiGLU + down projection with two output rows per SIMD group | Correctness passed and isolated microbench improved seqLen 16/64, but full-model Qwen profile regressed to 66.824/216.839/541.439 ms for seqLen 16/64/128 | Kept as an opt-in experiment behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2`; not eligible for default routing |
 | Feature-flagged shared-RMS SSM recurrence | Correctness passed and removed redundant per-thread RMS scale recomputation, but same-session profile evidence was not stable enough to separate the effect from projection/thermal noise | Kept behind `SWIFTLM_PREFILL_SSM_SHARED_RMS=1`; default SSM sequence kernel remains unchanged |
+| Feature-flagged SSM recurrence threadgroup-width override | Correctness passed at `tg=128` and `tg=256`, but Qwen full-model profile with `tg=256` was 43.813/160.583/315.422 ms for seqLen 16/64/128 and did not beat the default profile | Kept behind `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH`; default SSM sequence kernel keeps the device-derived width |
 
 ## Open Decisions
 
@@ -194,6 +200,7 @@ flowchart TD
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
 | Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and remains the best current full-model fused shape, but default stays off. The lower-recompute rows-per-SIMD rps2 shape is correctness-green but regresses the full model |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
+| Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
 
 ## Current Production Prefill Profile
 
@@ -718,3 +725,75 @@ Current decision: keep the variant as an opt-in diagnostic. The next SSM speed
 work should target larger structural savings, such as reducing repeated state
 reads/writes or fusing adjacent linear-attention output work, rather than
 promoting this micro-optimization.
+
+## SSM Threadgroup Width Experiment (2026-05-11)
+
+The default SSM sequence dispatch uses the device-derived threadgroup width
+(`tg=384` for the current Qwen3.5 BF16 profile). A second opt-in experiment
+tests whether lower inactive-lane pressure at `tg=128` or `tg=256` can improve
+occupancy without changing the recurrence math.
+
+```mermaid
+flowchart LR
+  A["SSM sequence fragment"] --> B["device default width"]
+  B --> C{"SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH"}
+  C -->|"unset"| D["use default width"]
+  C -->|"128 / 256"| E["validate width"]
+  E --> F["same kernel, narrower threadgroup"]
+  D --> G["sequence recurrence dispatch"]
+  F --> G
+```
+
+| Property | Default | Threadgroup-width opt-in |
+|---|---|---|
+| Kernel | `ssm_recurrence_seq_bf16_f32` | same kernel |
+| Routing flag | none | `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=<width>` |
+| Validated widths | device-derived default | `128`, `256` in sequence equivalence tests |
+| Validation rules | compiler-derived | integer, at least active phase-2 threads, not above default, SIMD-width aligned |
+| Production default | enabled | disabled |
+
+Correctness evidence is green:
+
+| Gate | Result |
+|---|---|
+| `SSMRecurrenceSequenceEquivalenceTests` | default, shared-RMS, `tg=128`, and `tg=256` sequence routes match repeated decode recurrence |
+| `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=256` | 4/4 pass; prefill output/state/KV and decode0 gates remain green |
+
+The isolated recurrence sweep shows that no single width dominates across all
+sequence lengths or kernel variants:
+
+| Sequence length | Variant | Average | Per token | Threadgroup |
+|---:|---|---:|---:|---:|
+| 16 | base | 1959.0 us | 122.439 us | 128 |
+| 16 | shared-RMS | 525.7 us | 32.858 us | 128 |
+| 16 | base | 663.9 us | 41.496 us | 256 |
+| 16 | shared-RMS | 515.4 us | 32.216 us | 256 |
+| 16 | base | 809.8 us | 50.612 us | 384 |
+| 16 | shared-RMS | 878.3 us | 54.896 us | 384 |
+| 64 | base | 3065.3 us | 47.896 us | 128 |
+| 64 | shared-RMS | 1957.3 us | 30.584 us | 128 |
+| 64 | base | 2545.7 us | 39.777 us | 256 |
+| 64 | shared-RMS | 1971.5 us | 30.804 us | 256 |
+| 64 | base | 2129.7 us | 33.277 us | 384 |
+| 64 | shared-RMS | 1931.3 us | 30.177 us | 384 |
+| 128 | base | 4241.8 us | 33.139 us | 128 |
+| 128 | shared-RMS | 3891.2 us | 30.400 us | 128 |
+| 128 | base | 3804.8 us | 29.725 us | 256 |
+| 128 | shared-RMS | 3825.2 us | 29.884 us | 256 |
+| 128 | base | 3724.1 us | 29.095 us | 384 |
+| 128 | shared-RMS | 3772.3 us | 29.471 us | 384 |
+
+The full Qwen prefill profile with `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=256`
+confirms the route fires for all 18 SSM recurrence dispatches, but the result
+does not justify default promotion:
+
+| Sequence length | Total prefill time | SSM time | Decision |
+|---:|---:|---:|---|
+| 16 | 43.813 ms | 9.203 ms | noise |
+| 64 | 160.583 ms | 35.392 ms | slower |
+| 128 | 315.422 ms | 70.439 ms | slower/noisy |
+
+Current decision: keep the width override as an opt-in diagnostic only. It is
+valuable for future sweeps because it proves narrower dispatch geometry is
+decode-equivalent, but the production route stays on the device-derived default
+width until a full-model profile shows a stable win.

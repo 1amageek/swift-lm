@@ -211,6 +211,52 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             decode.convStateBits == sharedRMSSequence.convStateBits,
             "Shared-RMS SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(sharedRMSSequence.convStateBits)"
         )
+
+        for threadgroupWidth in [128, 256] {
+            let narrowSequence = try runSequenceSSMTrace(
+                harness: harness,
+                pipeline: sequencePipeline,
+                projectedQKV: projectedQKV,
+                projectedZ: projectedZ,
+                projectedBeta: projectedBeta,
+                projectedAlpha: projectedAlpha,
+                convWeight: convWeight,
+                normWeight: normWeight,
+                dtBias: dtBias,
+                aLog: aLog,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyDimension: keyDimension,
+                valueDimension: valueDimension,
+                convKernelSize: convKernelSize,
+                sequenceLength: sequenceLength,
+                convDimension: convDimension,
+                outputDimension: outputDimension,
+                threadgroupWidthOverride: threadgroupWidth
+            )
+            let narrowOutputMismatch = harness.firstMismatch(
+                expected: decode.output,
+                actual: narrowSequence.output,
+                tolerance: 0.000_01
+            )
+            #expect(
+                narrowOutputMismatch == nil,
+                "SSM output drifted at tg=\(threadgroupWidth): \(String(describing: narrowOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: narrowSequence.output))"
+            )
+            let narrowRecurrentMismatch = harness.firstMismatch(
+                expected: decode.recurrentState,
+                actual: narrowSequence.recurrentState,
+                tolerance: 0.000_01
+            )
+            #expect(
+                narrowRecurrentMismatch == nil,
+                "SSM recurrent state drifted at tg=\(threadgroupWidth): \(String(describing: narrowRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: narrowSequence.recurrentState))"
+            )
+            #expect(
+                decode.convStateBits == narrowSequence.convStateBits,
+                "SSM conv state drifted at tg=\(threadgroupWidth): decode=\(String(describing: decode.convStateBits)), sequence=\(String(describing: narrowSequence.convStateBits))"
+            )
+        }
     }
 
     private func roundedBFloat16Values(
@@ -341,7 +387,8 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         convKernelSize: Int,
         sequenceLength: Int,
         convDimension: Int,
-        outputDimension: Int
+        outputDimension: Int,
+        threadgroupWidthOverride: Int? = nil
     ) throws -> (output: [Float], recurrentState: [Float], convStateBits: [UInt16]) {
         let activationRowStride = max(convDimension, outputDimension, headCount)
         let qkvBuffer = try harness.makeSharedBuffer(values: paddedRows(
@@ -381,13 +428,14 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let outputBuffer = try harness.makeZeroedSharedBuffer(
             byteLength: sequenceLength * activationRowStride * MemoryLayout<Float>.stride
         )
-        let threads = ssmThreadCount(
+        let defaultThreads = ssmThreadCount(
             pipeline: pipeline,
             headCount: headCount,
             groupCount: groupCount,
             keyDimension: keyDimension,
             valueDimension: valueDimension
         )
+        let threads = min(threadgroupWidthOverride ?? defaultThreads, defaultThreads)
         let grid = MTLSize(width: max(groupCount, 1), height: 1, depth: 1)
         let threadgroup = MTLSize(width: threads, height: 1, depth: 1)
 

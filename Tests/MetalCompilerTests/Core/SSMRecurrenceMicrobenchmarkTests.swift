@@ -20,8 +20,12 @@ struct SSMRecurrenceMicrobenchmarkTests {
 
         let harness = try SSMRecurrenceMicrobenchmarkHarness(device: device)
         let variants = [
-            SSMVariant(name: "base", kernelName: "bench_ssm_recurrence_seq_bf16_f32"),
-            SSMVariant(name: "shared_rms", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms"),
+            SSMVariant(name: "base_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32", threadgroupWidth: 128),
+            SSMVariant(name: "base_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32", threadgroupWidth: 256),
+            SSMVariant(name: "base_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32", threadgroupWidth: 384),
+            SSMVariant(name: "shared_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 128),
+            SSMVariant(name: "shared_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 256),
+            SSMVariant(name: "shared_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 384),
         ]
 
         var rows: [SSMResultRow] = []
@@ -46,9 +50,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print()
         print("=== BF16 SSM recurrence real-shape microbench ===")
         print("artifact: \(artifact.path)")
-        print("seq  variant     avg_us  us/token  grid   tg")
+        print("seq  variant       avg_us  us/token  grid   tg")
         for row in rows.sorted(by: rowSort) {
-            let variant = row.variant.padding(toLength: 11, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 13, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 6, withPad: " ", startingAt: 0)
             print("  \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(grid) \(row.threadgroupWidth)")
         }
@@ -71,6 +75,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "gridWidth",
                 "gridHeight",
                 "threadgroupWidth",
+                "requestedThreadgroupWidth",
                 "averageGpuMicroseconds",
                 "microsecondsPerToken",
             ].joined(separator: ","),
@@ -87,6 +92,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.gridWidth),
                 String(row.gridHeight),
                 String(row.threadgroupWidth),
+                String(row.requestedThreadgroupWidth),
                 String(format: "%.3f", row.averageGpuMicroseconds),
                 String(format: "%.6f", row.microsecondsPerToken),
             ].joined(separator: ","))
@@ -107,6 +113,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
         if lhs.sequenceLength != rhs.sequenceLength {
             return lhs.sequenceLength < rhs.sequenceLength
         }
+        if lhs.requestedThreadgroupWidth != rhs.requestedThreadgroupWidth {
+            return lhs.requestedThreadgroupWidth < rhs.requestedThreadgroupWidth
+        }
         return lhs.variant < rhs.variant
     }
 }
@@ -114,6 +123,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
 private struct SSMVariant {
     let name: String
     let kernelName: String
+    let threadgroupWidth: Int
 }
 
 private struct SSMResultRow {
@@ -127,6 +137,7 @@ private struct SSMResultRow {
     let gridWidth: Int
     let gridHeight: Int
     let threadgroupWidth: Int
+    let requestedThreadgroupWidth: Int
     let averageGpuMicroseconds: Double
 
     var microsecondsPerToken: Double {
@@ -221,7 +232,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         let output = try makeZeroedSharedBuffer(
             byteLength: sequenceLength * activationRowStride * MemoryLayout<Float>.stride
         )
-        let geometry = dispatchGeometry(pipeline: pipeline)
+        let geometry = dispatchGeometry(pipeline: pipeline, requestedThreadgroupWidth: variant.threadgroupWidth)
 
         for _ in 0..<warmupIterations {
             reset(recurrentState: recurrentState, convState: convState, output: output, sequenceLength: sequenceLength)
@@ -261,6 +272,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             gridWidth: geometry.grid.width,
             gridHeight: geometry.grid.height,
             threadgroupWidth: geometry.threadgroup.width,
+            requestedThreadgroupWidth: variant.threadgroupWidth,
             averageGpuMicroseconds: totalMicroseconds / Double(iterations)
         )
     }
@@ -369,16 +381,20 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         memset(output.contents(), 0, sequenceLength * activationRowStride * MemoryLayout<Float>.stride)
     }
 
-    private func dispatchGeometry(pipeline: MTLComputePipelineState) -> (grid: MTLSize, threadgroup: MTLSize) {
+    private func dispatchGeometry(
+        pipeline: MTLComputePipelineState,
+        requestedThreadgroupWidth: Int
+    ) -> (grid: MTLSize, threadgroup: MTLSize) {
         let safeGroupCount = max(groupCount, 1)
         let headsPerGroup = max(1, headCount / safeGroupCount)
         let localDimension = 2 * keyDimension + headsPerGroup * valueDimension
         let phase2Threads = headsPerGroup * min(valueDimension, 256)
         let desiredThreads = max(localDimension, phase2Threads)
-        let threads = min(
+        let defaultThreads = min(
             min(SSMRecurrenceFragment.maxThreadgroupSize, desiredThreads),
             pipeline.maxTotalThreadsPerThreadgroup
         )
+        let threads = min(max(requestedThreadgroupWidth, 1), defaultThreads)
         return (
             MTLSize(width: safeGroupCount, height: 1, depth: 1),
             MTLSize(width: threads, height: 1, depth: 1)

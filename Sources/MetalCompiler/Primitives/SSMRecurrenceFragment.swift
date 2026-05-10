@@ -100,6 +100,37 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_SHARED_RMS"] == "1"
     }
 
+    static func prefillThreadgroupWidthOverride(
+        defaultThreads: Int,
+        minimumActiveThreads: Int,
+        simdWidth: Int
+    ) throws -> Int {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH"] else {
+            return defaultThreads
+        }
+        guard let requested = Int(raw) else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH must be an integer, got '\(raw)'"
+            )
+        }
+        guard requested >= minimumActiveThreads else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) is below required active threads \(minimumActiveThreads)"
+            )
+        }
+        guard requested <= defaultThreads else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) exceeds default threadgroup width \(defaultThreads)"
+            )
+        }
+        guard simdWidth <= 1 || requested % simdWidth == 0 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) must be a multiple of SIMD width \(simdWidth)"
+            )
+        }
+        return requested
+    }
+
     public func requiredFallbackBufferSize(for role: String, bytesPerScalar: Int) -> Int {
         switch role {
         case "conv_weight":
@@ -211,9 +242,15 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
         let phase2Threads = headsPerGroup * min(valueHeadDimension, 256)
         let desiredThreads = max(localDim, phase2Threads)
-        let threads = min(
+        let defaultThreads = min(
             min(Self.maxThreadgroupSize, desiredThreads),
             pipeline.maxTotalThreadsPerThreadgroup
+        )
+        let minimumActiveThreads = headsPerGroup * min(valueHeadDimension, 256)
+        let threads = try Self.prefillThreadgroupWidthOverride(
+            defaultThreads: defaultThreads,
+            minimumActiveThreads: minimumActiveThreads,
+            simdWidth: max(pipeline.threadExecutionWidth, 1)
         )
         let step = MetalPrefillStep(
             pipeline: pipeline,
