@@ -163,6 +163,11 @@ flowchart TD
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with the same rps2 environment | Pass; rps2 route fires (`269` steps) but full-model prefill regresses to 66.824/216.839/541.439 ms for seqLen 16/64/128 |
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default production path remains unfused (`293` steps) with env flags absent |
 | 2026-05-10 | `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS' -only-testing:MetalCompilerTests/FusedSwigluDownEquivalenceTests` | Pass; 4/4, Xcode package scheme also validates the rows-per-SIMD equivalence contract |
+| 2026-05-10 | `swift build` | Pass after adding the opt-in shared-RMS SSM recurrence sequence variant |
+| 2026-05-10 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; default sequence SSM and shared-RMS sequence SSM both match repeated decode recurrence |
+| 2026-05-10 | `swift test --filter MetalSourceGeneratorTests` | Pass; 24/24 after adding the shared-RMS sequence generator path |
+| 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; 4/4 Qwen reference checks remain green with the opt-in shared-RMS SSM route |
+| 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; route fires for all 18 SSM recurrence dispatches, but total improvement is within profile noise, so default routing remains disabled |
 
 ## Failed Experiments
 
@@ -175,6 +180,7 @@ flowchart TD
 | Feature-flagged tile2 single sequence GEMV | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.572/158.280/314.697 ms to 44.768/160.643/317.498 ms | Kept behind `SWIFTLM_PREFILL_BF16_SINGLE_TILE2=1`; default production planner stays on base sequence GEMV |
 | Feature-flagged fused SwiGLU + down projection with 2 rows/threadgroup | Correctness passed, but Qwen seqLen 16/64/128 changed from 44.373/158.926/308.411 ms to 44.658/211.582/479.223 ms | Rejected as the fused scheduling shape; it recomputes SwiGLU tiles too often |
 | Feature-flagged fused SwiGLU + down projection with two output rows per SIMD group | Correctness passed and isolated microbench improved seqLen 16/64, but full-model Qwen profile regressed to 66.824/216.839/541.439 ms for seqLen 16/64/128 | Kept as an opt-in experiment behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2`; not eligible for default routing |
+| Feature-flagged shared-RMS SSM recurrence | Correctness passed and removed redundant per-thread RMS scale recomputation, but same-session profile evidence was not stable enough to separate the effect from projection/thermal noise | Kept behind `SWIFTLM_PREFILL_SSM_SHARED_RMS=1`; default SSM sequence kernel remains unchanged |
 
 ## Open Decisions
 
@@ -186,6 +192,7 @@ flowchart TD
 | Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
 | Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and remains the best current full-model fused shape, but default stays off. The lower-recompute rows-per-SIMD rps2 shape is correctness-green but regresses the full model |
+| Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 
 ## Current Production Prefill Profile
 
@@ -644,3 +651,56 @@ the correctness contract can support multiple rows per SIMD group, but the
 full-model profile shows that register pressure or occupancy loss dominates
 the saved SwiGLU recompute. Do not promote it without a new full-model profile
 that beats rows8 and the unfused baseline in the same release-validation run.
+
+## SSM Shared RMS Experiment (2026-05-10)
+
+After the MLP fused routes failed to produce a stable default-speed win, the
+next bottleneck examined was SSM recurrence. The Qwen profile consistently
+shows 18 `ssm_recurrence_seq_bf16_f32` dispatches taking roughly 20-22% of
+prefill time at seqLen 128.
+
+The first safe SSM experiment targets only the RMS scale computation in phase
+3. The default sequence kernel has every active thread in a head recompute the
+same `totalNormSq` over `threadsPerHead` partials. The opt-in variant lets one
+thread per head compute that scale in the same summation order, stores it in
+threadgroup memory, and lets all threads reuse the cached scale.
+
+```mermaid
+flowchart LR
+  A["Phase 2 dot output"] --> B["norm partials per thread"]
+  B --> C{"shared RMS flag?"}
+  C -->|"off"| D["each active thread recomputes RMS scale"]
+  C -->|"on"| E["one thread/head computes RMS scale"]
+  E --> F["threadgroup scale cache"]
+  D --> G["gated normalized output"]
+  F --> G
+```
+
+| Property | Default | Shared-RMS opt-in |
+|---|---|---|
+| Kernel | `ssm_recurrence_seq_bf16_f32` | `ssm_recurrence_seq_bf16_f32_shared_rms` |
+| Routing flag | none | `SWIFTLM_PREFILL_SSM_SHARED_RMS=1` |
+| Decode-equivalence | Required | Required |
+| Reduction order for RMS scale | thread-local loop over partials | same loop, executed by `localTid == 0` |
+| Production default | enabled | disabled |
+
+Correctness evidence is green:
+
+| Gate | Result |
+|---|---|
+| `SSMRecurrenceSequenceEquivalenceTests` | default sequence and shared-RMS sequence both match repeated decode recurrence |
+| `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | 4/4 pass; prefill output/state/KV and decode0 gates remain green |
+
+The opt-in Qwen profile confirms routing and shows no regression in the
+correctness path, but the timing is not strong enough for default promotion:
+
+| Sequence length | Shared-RMS total | Shared-RMS SSM time | Decision |
+|---:|---:|---:|---|
+| 16 | 43.149 ms | 9.063 ms | favorable but noisy |
+| 64 | 157.261 ms | 34.788 ms | favorable but marginal |
+| 128 | 309.603 ms | 69.306 ms | marginal |
+
+Current decision: keep the variant as an opt-in diagnostic. The next SSM speed
+work should target larger structural savings, such as reducing repeated state
+reads/writes or fusing adjacent linear-attention output work, rather than
+promoting this micro-optimization.

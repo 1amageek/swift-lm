@@ -24,6 +24,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let outputDimension = headCount * valueDimension
         let decodeKernelName = "ssm_recurrence_bf16_decode_equivalence"
         let sequenceKernelName = "ssm_recurrence_bf16_sequence_equivalence"
+        let sharedRMSSequenceKernelName = "ssm_recurrence_bf16_sequence_shared_rms_equivalence"
         let source = [
             MetalSourceGenerator.commonHeader,
             MetalSourceGenerator.generateSSMWeightIndependentHelpers(),
@@ -50,10 +51,23 @@ struct SSMRecurrenceSequenceEquivalenceTests {
                 keyHeadDimension: keyDimension,
                 valueHeadDimension: valueDimension
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: sharedRMSSequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                shareRMSScale: true
+            ),
         ].joined(separator: "\n")
         let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
         let decodePipeline = try harness.pipeline(named: decodeKernelName)
         let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
+        let sharedRMSSequencePipeline = try harness.pipeline(named: sharedRMSSequenceKernelName)
 
         let projectedQKV = roundedBFloat16Values(
             count: sequenceLength * convDimension,
@@ -132,6 +146,26 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             convDimension: convDimension,
             outputDimension: outputDimension
         )
+        let sharedRMSSequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: sharedRMSSequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: outputDimension
+        )
 
         let outputMismatch = harness.firstMismatch(
             expected: decode.output,
@@ -154,6 +188,28 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         #expect(
             decode.convStateBits == sequence.convStateBits,
             "SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(sequence.convStateBits)"
+        )
+        let sharedRMSOutputMismatch = harness.firstMismatch(
+            expected: decode.output,
+            actual: sharedRMSSequence.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            sharedRMSOutputMismatch == nil,
+            "Shared-RMS SSM output drifted: \(String(describing: sharedRMSOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: sharedRMSSequence.output))"
+        )
+        let sharedRMSRecurrentMismatch = harness.firstMismatch(
+            expected: decode.recurrentState,
+            actual: sharedRMSSequence.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            sharedRMSRecurrentMismatch == nil,
+            "Shared-RMS SSM recurrent state drifted: \(String(describing: sharedRMSRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: sharedRMSSequence.recurrentState))"
+        )
+        #expect(
+            decode.convStateBits == sharedRMSSequence.convStateBits,
+            "Shared-RMS SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(sharedRMSSequence.convStateBits)"
         )
     }
 

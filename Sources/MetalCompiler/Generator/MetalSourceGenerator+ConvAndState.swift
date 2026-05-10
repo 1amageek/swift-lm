@@ -288,7 +288,8 @@ public static func generateSSMRecurrence(
     headCount: Int,
     groupCount: Int,
     keyHeadDimension: Int,
-    valueHeadDimension: Int
+    valueHeadDimension: Int,
+    shareRMSScale: Bool = false
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
@@ -312,6 +313,66 @@ public static func generateSSMRecurrence(
     let safeGroupCount = max(groupCount, 1)
     let headsPerGroup = max(1, headCount / safeGroupCount)
     let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
+    let rmsScaleCacheDeclaration = shareRMSScale
+        ? "\n        threadgroup float rmsScaleCache[\(headsPerGroup)];"
+        : ""
+    let rmsPhase = shareRMSScale
+        ? """
+            {
+                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                const uint activeThreads = headsPerGroup * threadsPerHead;
+                if (tid < activeThreads) {
+                    const uint localHead = tid / threadsPerHead;
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        float totalNormSq = 0.0f;
+                        for (uint t = 0; t < threadsPerHead; ++t) {
+                            totalNormSq += normPartials[localHead * threadsPerHead + t];
+                        }
+                        rmsScaleCache[localHead] = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < activeThreads) {
+                    const uint localHead = tid / threadsPerHead;
+                    const uint headIndex = headStart + localHead;
+                    const uint localTid = tid % threadsPerHead;
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    float rmsScale = rmsScaleCache[localHead];
+                    for (uint d = dStart; d < dEnd; ++d) {
+                        float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
+                        float z = float(projectedZ[headIndex * dv + d]);
+                        output[headIndex * dv + d] = \(bt)(normed * z * stable_sigmoid(z));
+                    }
+                }
+            }
+        """
+        : """
+            {
+                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                const uint activeThreads = headsPerGroup * threadsPerHead;
+                if (tid < activeThreads) {
+                    const uint localHead = tid / threadsPerHead;
+                    const uint headIndex = headStart + localHead;
+                    const uint localTid = tid % threadsPerHead;
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    float totalNormSq = 0.0f;
+                    for (uint t = 0; t < threadsPerHead; ++t) {
+                        totalNormSq += normPartials[localHead * threadsPerHead + t];
+                    }
+                    float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                    for (uint d = dStart; d < dEnd; ++d) {
+                        float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
+                        float z = float(projectedZ[headIndex * dv + d]);
+                        output[headIndex * dv + d] = \(bt)(normed * z * stable_sigmoid(z));
+                    }
+                }
+            }
+        """
 
     return """
     kernel void \(name)(
@@ -365,7 +426,7 @@ public static func generateSSMRecurrence(
 
         threadgroup float convSiluCache[\(localDim)];
         threadgroup float dotCache[\(headsPerGroup * valueHeadDimension)];
-        threadgroup float normPartials[\(maxThreadgroupSize)];
+        threadgroup float normPartials[\(maxThreadgroupSize)];\(rmsScaleCacheDeclaration)
 
         // Phase 1: fused conv-shift + SiLU for this threadgroup's owned channels.
         // Each threadgroup touches only its own Q/K/V channels in convState and
@@ -472,29 +533,7 @@ public static func generateSSMRecurrence(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // Phase 3: RMS norm + gated activation for owned heads.
-        {
-            const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
-            const uint activeThreads = headsPerGroup * threadsPerHead;
-            if (tid < activeThreads) {
-                const uint localHead = tid / threadsPerHead;
-                const uint headIndex = headStart + localHead;
-                const uint localTid = tid % threadsPerHead;
-                const uint dChunk = dv / threadsPerHead;
-                const uint dStart = localTid * dChunk;
-                const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
-
-                float totalNormSq = 0.0f;
-                for (uint t = 0; t < threadsPerHead; ++t) {
-                    totalNormSq += normPartials[localHead * threadsPerHead + t];
-                }
-                float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
-                for (uint d = dStart; d < dEnd; ++d) {
-                    float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
-                    float z = float(projectedZ[headIndex * dv + d]);
-                    output[headIndex * dv + d] = \(bt)(normed * z * stable_sigmoid(z));
-                }
-            }
-        }
+        \(rmsPhase)
     }
     """
 }
@@ -508,7 +547,8 @@ public static func generateSSMRecurrenceSequence(
     headCount: Int,
     groupCount: Int,
     keyHeadDimension: Int,
-    valueHeadDimension: Int
+    valueHeadDimension: Int,
+    shareRMSScale: Bool = false
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
@@ -524,6 +564,68 @@ public static func generateSSMRecurrenceSequence(
     let safeGroupCount = max(groupCount, 1)
     let headsPerGroup = max(1, headCount / safeGroupCount)
     let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
+    let rmsScaleCacheDeclaration = shareRMSScale
+        ? "\n        threadgroup float rmsScaleCache[\(headsPerGroup)];"
+        : ""
+    let rmsPhase = shareRMSScale
+        ? """
+                {
+                    const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                    const uint activeThreads = headsPerGroup * threadsPerHead;
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint localTid = tid % threadsPerHead;
+                        if (localTid == 0) {
+                            float totalNormSq = 0.0f;
+                            for (uint t = 0; t < threadsPerHead; ++t) {
+                                totalNormSq += normPartials[localHead * threadsPerHead + t];
+                            }
+                            rmsScaleCache[localHead] = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint headIndex = headStart + localHead;
+                        const uint localTid = tid % threadsPerHead;
+                        const uint dChunk = dv / threadsPerHead;
+                        const uint dStart = localTid * dChunk;
+                        const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                        float rmsScale = rmsScaleCache[localHead];
+                        for (uint d = dStart; d < dEnd; ++d) {
+                            float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
+                            float z = \(activationStorageValue("float(projectedZPos[headIndex * dv + d])"));
+                            float gated = normed * z * stable_sigmoid(z);
+                            outputPos[headIndex * dv + d] = \(bt)(\(activationStorageValue("gated")));
+                        }
+                    }
+                }
+        """
+        : """
+                {
+                    const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                    const uint activeThreads = headsPerGroup * threadsPerHead;
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint headIndex = headStart + localHead;
+                        const uint localTid = tid % threadsPerHead;
+                        const uint dChunk = dv / threadsPerHead;
+                        const uint dStart = localTid * dChunk;
+                        const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                        float totalNormSq = 0.0f;
+                        for (uint t = 0; t < threadsPerHead; ++t) {
+                            totalNormSq += normPartials[localHead * threadsPerHead + t];
+                        }
+                        float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                        for (uint d = dStart; d < dEnd; ++d) {
+                            float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
+                            float z = \(activationStorageValue("float(projectedZPos[headIndex * dv + d])"));
+                            float gated = normed * z * stable_sigmoid(z);
+                            outputPos[headIndex * dv + d] = \(bt)(\(activationStorageValue("gated")));
+                        }
+                    }
+                }
+        """
 
     return """
     kernel void \(name)(
@@ -580,7 +682,7 @@ public static func generateSSMRecurrenceSequence(
         threadgroup float normPartials[\(maxThreadgroupSize)];
         threadgroup float qInvCache[\(headsPerGroup)];
         threadgroup float kInvCache[\(headsPerGroup)];
-        threadgroup float kqSumCache[\(headsPerGroup)];
+        threadgroup float kqSumCache[\(headsPerGroup)];\(rmsScaleCacheDeclaration)
 
         for (uint pos = 0; pos < sequenceLength; ++pos) {
             device const \(bt)* projectedQKVPos = projectedQKV + pos * activationRowStride;
@@ -707,30 +809,7 @@ public static func generateSSMRecurrenceSequence(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             // Phase 3: RMS norm + gated activation for owned heads.
-            {
-                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
-                const uint activeThreads = headsPerGroup * threadsPerHead;
-                if (tid < activeThreads) {
-                    const uint localHead = tid / threadsPerHead;
-                    const uint headIndex = headStart + localHead;
-                    const uint localTid = tid % threadsPerHead;
-                    const uint dChunk = dv / threadsPerHead;
-                    const uint dStart = localTid * dChunk;
-                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
-
-                    float totalNormSq = 0.0f;
-                    for (uint t = 0; t < threadsPerHead; ++t) {
-                        totalNormSq += normPartials[localHead * threadsPerHead + t];
-                    }
-                    float rmsScale = rsqrt(totalNormSq / float(dv) + 1e-6f);
-                    for (uint d = dStart; d < dEnd; ++d) {
-                        float normed = dotCache[localHead * dv + d] * rmsScale * normWeight[d];
-                        float z = \(activationStorageValue("float(projectedZPos[headIndex * dv + d])"));
-                        float gated = normed * z * stable_sigmoid(z);
-                        outputPos[headIndex * dv + d] = \(bt)(\(activationStorageValue("gated")));
-                    }
-                }
-            }
+            \(rmsPhase)
             // Skip barrier after final position — no subsequent iteration reads this state,
             // and the command encoder's implicit barrier handles cross-dispatch visibility.
             if (pos + 1 < sequenceLength) {

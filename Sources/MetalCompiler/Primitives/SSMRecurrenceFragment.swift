@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 
 /// DeltaNet/Mamba state-space model recurrence step.
@@ -86,6 +87,17 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             return bf16 ? "ssm_recurrence_seq_bf16_f32" : "ssm_recurrence_seq_f32"
         }
         return bf16 ? "ssm_recurrence_seq_bf16" : "ssm_recurrence_seq"
+    }
+
+    static func sharedRMSSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_shared_rms"
+    }
+
+    static var isSharedRMSPrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_SHARED_RMS"] == "1"
     }
 
     public func requiredFallbackBufferSize(for role: String, bytesPerScalar: Int) -> Int {
@@ -182,10 +194,15 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             * context.buffers.convStateKernelSize
             * context.buffers.convStateDimension
             * MemoryLayout<Float16>.size
-        let kernelName = Self.sequenceKernelName(
-            bufferPrecision: context.kernelContext.bufferPrecision,
-            weightFormat: context.kernelContext.weightFormat
-        )
+        let kernelName = Self.isSharedRMSPrefillEnabled
+            ? Self.sharedRMSSequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+            : Self.sequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
         let pipeline = try context.getPipeline(kernelName)
         // Size threadgroup to cover Phase 1 (localDim channels) and Phase 2 (headsPerGroup × dv threads).
         // Each threadgroup owns one key-group and runs independently on its own GPU core.
