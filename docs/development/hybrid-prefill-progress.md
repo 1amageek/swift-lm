@@ -168,6 +168,7 @@ flowchart TD
 | 2026-05-10 | `swift test --filter MetalSourceGeneratorTests` | Pass; 24/24 after adding the shared-RMS sequence generator path |
 | 2026-05-10 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; 4/4 Qwen reference checks remain green with the opt-in shared-RMS SSM route |
 | 2026-05-10 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | Pass; route fires for all 18 SSM recurrence dispatches, but total improvement is within profile noise, so default routing remains disabled |
+| 2026-05-10 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated Qwen-shape SSM recurrence benchmark shows shared-RMS is faster than base for seqLen 16/64/128 and writes `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` |
 
 ## Failed Experiments
 
@@ -690,6 +691,19 @@ Correctness evidence is green:
 |---|---|
 | `SSMRecurrenceSequenceEquivalenceTests` | default sequence and shared-RMS sequence both match repeated decode recurrence |
 | `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_SSM_SHARED_RMS=1` | 4/4 pass; prefill output/state/KV and decode0 gates remain green |
+| `SSMRecurrenceMicrobenchmarkTests` | pass; records isolated real-shape SSM timing for base and shared-RMS variants |
+
+The isolated SSM microbenchmark uses the Qwen3.5 recurrence shape
+(`headCount=16`, `groupCount=16`, `keyDimension=128`,
+`valueDimension=128`, `convKernelSize=4`) and resets recurrent/conv/output
+state between iterations. It measures only the recurrence kernel, so it is
+useful for kernel-shape direction but not sufficient for route promotion.
+
+| Sequence length | Base SSM | Shared-RMS SSM | Local result |
+|---:|---:|---:|---|
+| 16 | 1607.6 us | 814.4 us | favorable |
+| 64 | 3526.4 us | 2700.1 us | favorable |
+| 128 | 4345.9 us | 3721.4 us | favorable |
 
 The opt-in Qwen profile confirms routing and shows no regression in the
 correctness path, but the timing is not strong enough for default promotion:
