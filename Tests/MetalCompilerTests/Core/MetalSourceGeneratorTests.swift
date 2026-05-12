@@ -927,6 +927,130 @@ struct MetalSourceGeneratorTests {
         )
     }
 
+    @Test("Decode GEMV matches CPU reference with odd output tail")
+    func decodeGEMVMatchesCPUReferenceWithOddOutputTail() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 65
+        let outputDimension = 5
+        let outputCapacity = 8
+        let input = makeDecodeFloatInput(inputDimension: inputDimension)
+        let weights = makeDecodeFloat16Weights(
+            outputDimension: outputDimension,
+            inputDimension: inputDimension,
+            projectionSeed: 3
+        )
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weights,
+            length: weights.count * MemoryLayout<Float16>.size,
+            options: .storageModeShared
+        ))
+        var output = [Float](repeating: .nan, count: outputCapacity)
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateGEMV(
+                name: "test_decode_gemv_odd_tail",
+                bufferPrecision: .float32,
+                weightFormat: .float16,
+                tileElements: 128
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "test_decode_gemv_odd_tail"))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        var inputDim = UInt32(inputDimension)
+        var outputDim = UInt32(outputDimension)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&outputDim, length: MemoryLayout<UInt32>.size, index: 4)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / pipeline.threadExecutionWidth)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let actualPointer = outputBuffer.contents().bindMemory(
+            to: Float.self,
+            capacity: output.count
+        )
+        let expected = decodeCPUReference(
+            input: input,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension
+        )
+        var actual: [Float] = []
+        actual.reserveCapacity(outputDimension)
+        for row in 0..<outputDimension {
+            actual.append(actualPointer[row])
+        }
+        for row in outputDimension..<outputCapacity {
+            #expect(actualPointer[row].isNaN)
+        }
+
+        let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+            max(partial, abs(pair.0 - pair.1))
+        }
+        #expect(
+            maxError < 0.001,
+            "Decode GEMV odd-tail drifted: maxError=\(maxError)"
+        )
+    }
+
+    @Test("Batched decode GEMV matches CPU reference with odd total row tail")
+    func batchedDecodeGEMVMatchesCPUReferenceWithOddTotalRowTail() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try assertBatchedDecodeGEMVOddTail(
+            device: device,
+            count: 2,
+            outputDimensions: [3, 4]
+        )
+        try assertBatchedDecodeGEMVOddTail(
+            device: device,
+            count: 3,
+            outputDimensions: [2, 2, 3]
+        )
+        try assertBatchedDecodeGEMVOddTail(
+            device: device,
+            count: 4,
+            outputDimensions: [1, 2, 1, 3]
+        )
+    }
+
     @Test("Quantized Q8 GEMM matches CPU reference with padded scratch input and output stride")
     func quantizedQ8GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -1796,6 +1920,174 @@ struct MetalSourceGeneratorTests {
             }
         }
         return input
+    }
+
+    private func makeDecodeFloatInput(inputDimension: Int) -> [Float] {
+        (0..<inputDimension).map { index in
+            Float((index * 13) % 41 - 20) * 0.03125
+        }
+    }
+
+    private func makeDecodeFloat16Weights(
+        outputDimension: Int,
+        inputDimension: Int,
+        projectionSeed: Int
+    ) -> [Float16] {
+        (0..<(outputDimension * inputDimension)).map { index in
+            Float16(Float((index * projectionSeed) % 37 - 18) * 0.015625)
+        }
+    }
+
+    private func decodeCPUReference(
+        input: [Float],
+        weights: [Float16],
+        inputDimension: Int,
+        outputDimension: Int
+    ) -> [Float] {
+        var expected = [Float](repeating: .zero, count: outputDimension)
+        for row in 0..<outputDimension {
+            var sum: Float = 0
+            for column in 0..<inputDimension {
+                sum += Float(weights[row * inputDimension + column]) * input[column]
+            }
+            expected[row] = sum
+        }
+        return expected
+    }
+
+    private func assertBatchedDecodeGEMVOddTail(
+        device: MTLDevice,
+        count: Int,
+        outputDimensions: [Int]
+    ) throws {
+        let inputDimension = 65
+        let outputCapacity = 8
+        let kernelName = "test_batched_decode_gemv\(count)_odd_tail"
+        let input = makeDecodeFloatInput(inputDimension: inputDimension)
+        let weights = outputDimensions.enumerated().map { projection, outputDimension in
+            makeDecodeFloat16Weights(
+                outputDimension: outputDimension,
+                inputDimension: inputDimension,
+                projectionSeed: projection + 3
+            )
+        }
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + batchedDecodeGEMVSource(
+                name: kernelName,
+                count: count
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffers = try weights.map { weight in
+            try #require(device.makeBuffer(
+                bytes: weight,
+                length: weight.count * MemoryLayout<Float16>.size,
+                options: .storageModeShared
+            ))
+        }
+        var outputValues = outputDimensions.map { _ in
+            [Float](repeating: .nan, count: outputCapacity)
+        }
+        let outputBuffers = try outputValues.indices.map { index in
+            try #require(device.makeBuffer(
+                bytes: &outputValues[index],
+                length: outputValues[index].count * MemoryLayout<Float>.size,
+                options: .storageModeShared
+            ))
+        }
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        for index in 0..<count {
+            encoder.setBuffer(weightBuffers[index], offset: 0, index: 1 + index)
+            encoder.setBuffer(outputBuffers[index], offset: 0, index: 1 + count + index)
+        }
+        let dimBase = 1 + 2 * count
+        var inputDim = UInt32(inputDimension)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.size, index: dimBase)
+        var outputDims = outputDimensions.map(UInt32.init)
+        for index in outputDims.indices {
+            encoder.setBytes(&outputDims[index], length: MemoryLayout<UInt32>.size, index: dimBase + 1 + index)
+        }
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / pipeline.threadExecutionWidth)
+        let totalRows = outputDimensions.reduce(0, +)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (totalRows + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        for projection in 0..<count {
+            let actualPointer = outputBuffers[projection].contents().bindMemory(
+                to: Float.self,
+                capacity: outputCapacity
+            )
+            let expected = decodeCPUReference(
+                input: input,
+                weights: weights[projection],
+                inputDimension: inputDimension,
+                outputDimension: outputDimensions[projection]
+            )
+            var actual: [Float] = []
+            actual.reserveCapacity(outputDimensions[projection])
+            for row in 0..<outputDimensions[projection] {
+                actual.append(actualPointer[row])
+            }
+            for row in outputDimensions[projection]..<outputCapacity {
+                #expect(actualPointer[row].isNaN)
+            }
+            let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+                max(partial, abs(pair.0 - pair.1))
+            }
+            #expect(
+                maxError < 0.001,
+                "Batched decode GEMV\(count) odd-tail projection \(projection) drifted: maxError=\(maxError)"
+            )
+        }
+    }
+
+    private func batchedDecodeGEMVSource(
+        name: String,
+        count: Int
+    ) -> String {
+        switch count {
+        case 2:
+            MetalSourceGenerator.generateBatchedGEMV2(
+                name: name,
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            )
+        case 3:
+            MetalSourceGenerator.generateBatchedGEMV3(
+                name: name,
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            )
+        case 4:
+            MetalSourceGenerator.generateBatchedGEMV4(
+                name: name,
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            )
+        default:
+            fatalError("Unsupported batched decode GEMV count \(count)")
+        }
     }
 
     private func makeConstantQ4Weights(

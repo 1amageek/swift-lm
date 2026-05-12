@@ -957,7 +957,9 @@ Evidence:
 | `MetalSourceGeneratorTests/quantizedQ8GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride` | Pass; direct Q8 GEMM writes padded odd-row scratch outputs correctly without early barrier exit |
 | `MetalSourceGeneratorTests/batchedQuantizedQ4GEMM2MatchesCPUReferenceWithPaddedScratchOutputStride` | Pass; two-way direct Q4 batched GEMM writes each padded scratch output independently |
 | `MetalSourceGeneratorTests/batchedQuantizedQ4GEMM3MatchesCPUReferenceWithPaddedScratchOutputStride` | Pass; three-way direct Q4 batched GEMM writes each padded scratch output independently |
-| `MetalSourceGeneratorTests` | 27/27 pass after adding the Q8 and batched Q4 stride/barrier coverage |
+| `MetalSourceGeneratorTests/decodeGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; dense single decode GEMV keeps inactive row groups through barriers and preserves output tail sentinels |
+| `MetalSourceGeneratorTests/batchedDecodeGEMVMatchesCPUReferenceWithOddTotalRowTail` | Pass; dense batched decode GEMV count 2/3/4 keeps inactive row groups through barriers and preserves output tail sentinels |
+| `MetalSourceGeneratorTests` | 29/29 pass after adding Q8, batched Q4, and dense decode GEMV row-tail coverage |
 | `SequenceProjectionEquivalenceTests/bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride` | Pass; dense single sequence GEMV keeps inactive row groups through barriers and preserves padded output rows |
 | `SequenceProjectionEquivalenceTests/bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride` | Pass; dense batched sequence GEMV keeps inactive row groups through barriers and preserves each padded output |
 | `SequenceProjectionEquivalenceTests` | 8/8 pass after adding dense odd-row tail coverage |

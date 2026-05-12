@@ -29,12 +29,16 @@ public static func generateBatchedGEMV2(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        const bool isSecond = (globalRow >= outputDim0);
-        const uint localRow = isSecond ? (globalRow - outputDim0) : globalRow;
-        device const \(wt)* weight = isSecond ? weight1 : weight0;
-        device \(bt)* output = isSecond ? output1 : output0;
+        device const \(wt)* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
+        if (globalRow < outputDim0) {
+            weight = weight0; output = output0; localRow = globalRow;
+        } else if (globalRow < totalRows) {
+            weight = weight1; output = output1; localRow = globalRow - outputDim0;
+        }
 
         threadgroup \(bt) inputTile[tileElements];
         float sum = 0.0f;
@@ -47,13 +51,15 @@ public static func generateBatchedGEMV2(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }
@@ -159,16 +165,16 @@ public static func generateBatchedGEMV3(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1 + outputDim2;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        device const \(wt)* weight;
-        device \(bt)* output;
-        uint localRow;
+        device const \(wt)* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
             weight = weight0; output = output0; localRow = globalRow;
         } else if (globalRow < outputDim0 + outputDim1) {
             weight = weight1; output = output1; localRow = globalRow - outputDim0;
-        } else {
+        } else if (globalRow < totalRows) {
             weight = weight2; output = output2; localRow = globalRow - outputDim0 - outputDim1;
         }
 
@@ -183,13 +189,15 @@ public static func generateBatchedGEMV3(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }
@@ -307,18 +315,18 @@ public static func generateBatchedGEMV4(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1 + outputDim2 + outputDim3;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        device const \(wt)* weight;
-        device \(bt)* output;
-        uint localRow;
+        device const \(wt)* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
             weight = weight0; output = output0; localRow = globalRow;
         } else if (globalRow < outputDim0 + outputDim1) {
             weight = weight1; output = output1; localRow = globalRow - outputDim0;
         } else if (globalRow < outputDim0 + outputDim1 + outputDim2) {
             weight = weight2; output = output2; localRow = globalRow - outputDim0 - outputDim1;
-        } else {
+        } else if (globalRow < totalRows) {
             weight = weight3; output = output3; localRow = globalRow - outputDim0 - outputDim1 - outputDim2;
         }
 
@@ -333,13 +341,15 @@ public static func generateBatchedGEMV4(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }
