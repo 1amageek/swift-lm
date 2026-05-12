@@ -949,6 +949,7 @@ Evidence:
 | Gate | Result |
 |---|---|
 | `NaiveGEMMArgumentTableTests` | 13/13 pass, including padded output-row-stride execution |
+| `MetalSourceGeneratorTests/quantizedQ4GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride` | Pass; direct Q4 GEMM writes padded scratch output rows correctly |
 | `QuantizationPlanningTests` | 14/14 pass, diagnostics now include `outputRowStride` |
 | `Qwen35ReferenceComparisonTests` with probes | 4/4 pass; prefill/decode token gates unchanged |
 

@@ -794,8 +794,8 @@ struct MetalSourceGeneratorTests {
         #expect(maxError < 0.01, "MPP FP16 GEMM drifted: maxError=\(maxError)")
     }
 
-    @Test("Quantized Q4 GEMM matches CPU reference with padded scratch input stride")
-    func quantizedQ4GEMMMatchesCPUReferenceWithPaddedScratchInputStride() throws {
+    @Test("Quantized Q4 GEMM matches CPU reference with padded scratch input and output stride")
+    func quantizedQ4GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
             Issue.record("No Metal device")
             return
@@ -807,6 +807,7 @@ struct MetalSourceGeneratorTests {
         let outputDimension = 4
         let sequenceLength = 4
         let inputRowStride = 256
+        let outputRowStride = 8
 
         var input = [Float](repeating: 9_999, count: sequenceLength * inputRowStride)
         for seq in 0..<sequenceLength {
@@ -840,8 +841,10 @@ struct MetalSourceGeneratorTests {
             length: weightBytes.count,
             options: .storageModeShared
         ))
+        var output = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
         let outputBuffer = try #require(device.makeBuffer(
-            length: outputDimension * sequenceLength * MemoryLayout<Float>.size,
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
             options: .storageModeShared
         ))
 
@@ -868,11 +871,13 @@ struct MetalSourceGeneratorTests {
         var inDim = UInt32(inputDimension)
         var outDim = UInt32(outputDimension)
         var seqLen = UInt32(sequenceLength)
-        var rowStride = UInt32(inputRowStride)
+        var inputStride = UInt32(inputRowStride)
+        var outputStride = UInt32(outputRowStride)
         encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 3)
         encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.size, index: 4)
         encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 5)
-        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.size, index: 7)
         let simdWidth = pipeline.threadExecutionWidth
         let threads = min(2 * simdWidth, pipeline.maxTotalThreadsPerThreadgroup)
         encoder.dispatchThreadgroups(
@@ -885,9 +890,18 @@ struct MetalSourceGeneratorTests {
 
         let actualPointer = outputBuffer.contents().bindMemory(
             to: Float.self,
-            capacity: outputDimension * sequenceLength
+            capacity: output.count
         )
-        let actual = (0..<(outputDimension * sequenceLength)).map { actualPointer[$0] }
+        var actual: [Float] = []
+        actual.reserveCapacity(outputDimension * sequenceLength)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                actual.append(actualPointer[seq * outputRowStride + row])
+            }
+            for row in outputDimension..<outputRowStride {
+                #expect(actualPointer[seq * outputRowStride + row].isNaN)
+            }
+        }
 
         var expected = [Float](repeating: .zero, count: outputDimension * sequenceLength)
         for seq in 0..<sequenceLength {
@@ -905,7 +919,7 @@ struct MetalSourceGeneratorTests {
         #expect(
             maxError < 0.001,
             """
-            Quantized Q4 GEMM drifted with padded scratch stride
+            Quantized Q4 GEMM drifted with padded scratch input/output stride
             maxError=\(maxError)
             actualPrefix=\(actual.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
             expectedPrefix=\(expected.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
