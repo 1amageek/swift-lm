@@ -50,6 +50,7 @@ struct QuantizationPlanningTests {
         #expect(prefillGEMM.inputDimension == target.inputDimension)
         #expect(prefillGEMM.outputDimension == target.outputDimension)
         #expect(prefillGEMM.inputRowStride == target.inputDimension)
+        #expect(prefillGEMM.outputRowStride == target.outputDimension)
         #expect(prefillGEMM.maximumSequenceLength == 16)
     }
 
@@ -193,6 +194,7 @@ struct QuantizationPlanningTests {
         #expect(prefillGEMM.inputDimension == target.inputDimension)
         #expect(prefillGEMM.outputDimension == target.outputDimension)
         #expect(prefillGEMM.inputRowStride != target.inputDimension)
+        #expect(prefillGEMM.outputRowStride >= target.outputDimension)
         #expect(prefillGEMM.maximumSequenceLength == 16)
     }
 
@@ -241,6 +243,7 @@ struct QuantizationPlanningTests {
         #expect(prefillGEMM.inputDimension == target.inputDimension)
         #expect(prefillGEMM.outputDimension == target.outputDimension)
         #expect(prefillGEMM.inputRowStride == target.inputDimension)
+        #expect(prefillGEMM.outputRowStride == target.outputDimension)
         #expect(prefillGEMM.maximumSequenceLength == 16)
     }
 

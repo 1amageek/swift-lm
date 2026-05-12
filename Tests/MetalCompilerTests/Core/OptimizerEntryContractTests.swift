@@ -3581,6 +3581,7 @@ struct OptimizerEntryContractTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputDimension))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -3702,6 +3703,7 @@ struct OptimizerEntryContractTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputDimension))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -3821,6 +3823,7 @@ struct OptimizerEntryContractTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputDimension))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )

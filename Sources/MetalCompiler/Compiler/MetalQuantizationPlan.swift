@@ -351,6 +351,7 @@ enum MetalQuantizationFallbackReason: String, Sendable, Equatable {
     case missingWeightStore
     case missingTensorMetadata
     case inputStrideMismatch
+    case outputStrideMismatch
     case lastTokenProjectionUsesDecodeKernel
     case disabledByEnvironment
     case unavailableAcceleration
@@ -361,6 +362,7 @@ struct MetalPrefillGEMMDiagnostics: Sendable, Equatable {
     let inputDimension: Int
     let outputDimension: Int
     let inputRowStride: Int
+    let outputRowStride: Int
     let maximumSequenceLength: Int
     let sequenceTileHeight: Int?
     let tileVariantHeights: [Int]
@@ -414,6 +416,7 @@ struct MetalQuantizationPlan: Sendable, Equatable {
                 line += " in=\(prefillGEMM.inputDimension)"
                 line += " out=\(prefillGEMM.outputDimension)"
                 line += " stride=\(prefillGEMM.inputRowStride)"
+                line += " outStride=\(prefillGEMM.outputRowStride)"
                 line += " seq=\(prefillGEMM.maximumSequenceLength)"
                 if let sequenceTileHeight = prefillGEMM.sequenceTileHeight {
                     line += " tile=\(sequenceTileHeight)"

@@ -927,3 +927,31 @@ Follow-up hardening extended the same guard to single projection MPP and added a
 planning regression for dense batched prefill projections whose scratch outputs
 are padded. The positive MPP paths remain available when the compact output
 dimension and runtime output row stride are identical.
+
+## GEMM Output Row Stride Hardening (2026-05-12)
+
+The next correctness pass closed the non-MPP side of the same layout contract:
+standard sequence GEMM and direct Q4/Q8 prefill GEMM now bind
+`outputRowStride` explicitly and write rows using the runtime stride. Batched
+Q4 direct GEMM gets the same stride binding for each scratch output slot.
+
+```mermaid
+flowchart LR
+  A["Prefill projection"] --> B{"Kernel family"}
+  B -->|"MPP"| C["requires compact output stride"]
+  B -->|"naive / direct quantized / sequence GEMV"| D["binds outputRowStride"]
+  C --> E["reject padded scratch"]
+  D --> F["write padded scratch correctly"]
+```
+
+Evidence:
+
+| Gate | Result |
+|---|---|
+| `NaiveGEMMArgumentTableTests` | 13/13 pass, including padded output-row-stride execution |
+| `QuantizationPlanningTests` | 14/14 pass, diagnostics now include `outputRowStride` |
+| `Qwen35ReferenceComparisonTests` with probes | 4/4 pass; prefill/decode token gates unchanged |
+
+Current decision: keep MPP admission conservative, but allow non-MPP GEMM
+families to handle padded scratch layouts directly through their row-stride
+binding.

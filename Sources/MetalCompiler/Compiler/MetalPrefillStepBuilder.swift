@@ -889,8 +889,10 @@ private struct PrefillStepPlanner {
             inputRowStride: inputRowStride,
             inputDimension: linear.inputDimension,
             outputDimension: linear.outputDimension,
+            outputRowStride: outputRowStride,
             selectedKernelName: fusedKernelName,
             usesMPPForStep: false,
+            usesSequenceGEMVForStep: true,
             sequenceTileHeight: nil,
             tileVariantHeights: []
         )
@@ -1191,8 +1193,10 @@ private struct PrefillStepPlanner {
                 inputRowStride: inputRowStride,
                 inputDimension: projection.inputDimension,
                 outputDimension: projection.outputDimension,
+                outputRowStride: outputRowStride,
                 selectedKernelName: selectedKernelName,
                 usesMPPForStep: usesMPPForStep,
+                usesSequenceGEMVForStep: usesSequenceGEMVForStep,
                 sequenceTileHeight: sequenceGEMVTile
                     ?? (mode == .batch && usesMPPForStep && !useDirectQuantizedGEMM ? 64 : nil),
                 tileVariantHeights: mppTileVariants.map(\.tileHeight)
@@ -1213,7 +1217,7 @@ private struct PrefillStepPlanner {
                         uint32Binding(5, seqLenValue),
                         uint32Binding(6, UInt32(inputRowStride)),
                     ]
-                    if usesSequenceGEMVForStep {
+                    if !usesMPPForStep {
                         bindings.append(uint32Binding(7, UInt32(outputRowStride)))
                     }
                     return bindings
@@ -1451,8 +1455,10 @@ private struct PrefillStepPlanner {
                 bytesBindings.append(uint32Binding(dimBase + 1 + i, UInt32(projection.outputDimension)))
             }
             let seqLenIndex = dimBase + 1 + count
+            let outputRowStride = slotDimension
             bytesBindings.append(uint32Binding(seqLenIndex, UInt32(maximumSequenceLength)))
             bytesBindings.append(uint32Binding(seqLenIndex + 1, UInt32(inputRowStride)))
+            bytesBindings.append(uint32Binding(seqLenIndex + 2, UInt32(outputRowStride)))
 
             // Grid covers all output rows across all projections
             let simdWidth = max(batchedPipeline.threadExecutionWidth, 1)
@@ -1504,8 +1510,10 @@ private struct PrefillStepPlanner {
                     inputRowStride: inputRowStride,
                     inputDimension: projection.inputDimension,
                     outputDimension: projection.outputDimension,
+                    outputRowStride: outputRowStride,
                     selectedKernelName: batchedGEMM.kernelName,
                     usesMPPForStep: false,
+                    usesSequenceGEMVForStep: false,
                     projectionCount: count
                 )
             }
@@ -1690,8 +1698,10 @@ private struct PrefillStepPlanner {
                 inputRowStride: projInputRowStride,
                 inputDimension: projection.inputDimension,
                 outputDimension: projection.outputDimension,
+                outputRowStride: outputRowStride,
                 selectedKernelName: selectedKernelName,
                 usesMPPForStep: usesMPPForStep,
+                usesSequenceGEMVForStep: usesSequenceGEMVForStep,
                 sequenceTileHeight: usesMPPForStep && !useDirectQuantizedGEMM ? 64 : nil,
                 tileVariantHeights: batchedMPPTileVariants.map(\.tileHeight)
             )
@@ -1712,7 +1722,7 @@ private struct PrefillStepPlanner {
                             uint32Binding(5, UInt32(maximumSequenceLength)),
                             uint32Binding(6, UInt32(projInputRowStride)),
                         ]
-                        if usesSequenceGEMVForStep {
+                        if !usesMPPForStep {
                             bindings.append(uint32Binding(7, UInt32(outputRowStride)))
                         }
                         return bindings
@@ -1845,8 +1855,10 @@ private struct PrefillStepPlanner {
                 inputRowStride: inputRowStride,
                 inputDimension: projection.inputDimension,
                 outputDimension: projection.outputDimension,
+                outputRowStride: slotDimension,
                 selectedKernelName: kernelName,
                 usesMPPForStep: false,
+                usesSequenceGEMVForStep: true,
                 sequenceTileHeight: shape?.sequenceTile,
                 projectionCount: count
             )
@@ -2128,8 +2140,10 @@ private struct PrefillStepPlanner {
         inputRowStride: Int,
         inputDimension: Int,
         outputDimension: Int,
+        outputRowStride: Int,
         selectedKernelName: String,
         usesMPPForStep: Bool,
+        usesSequenceGEMVForStep: Bool,
         sequenceTileHeight: Int? = nil,
         tileVariantHeights: [Int] = [],
         projectionCount: Int = 1
@@ -2139,7 +2153,10 @@ private struct PrefillStepPlanner {
             mode: mode,
             inputRowStride: inputRowStride,
             inputDimension: inputDimension,
-            usesMPPForStep: usesMPPForStep
+            outputRowStride: outputRowStride,
+            outputDimension: outputDimension,
+            usesMPPForStep: usesMPPForStep,
+            usesSequenceGEMVForStep: usesSequenceGEMVForStep
         )
         quantizationEntries.append(
             MetalQuantizationPlanEntry(
@@ -2160,6 +2177,7 @@ private struct PrefillStepPlanner {
                     inputDimension: inputDimension,
                     outputDimension: outputDimension,
                     inputRowStride: inputRowStride,
+                    outputRowStride: outputRowStride,
                     maximumSequenceLength: maximumSequenceLength,
                     sequenceTileHeight: sequenceTileHeight,
                     tileVariantHeights: tileVariantHeights,
@@ -2367,8 +2385,10 @@ private struct PrefillStepPlanner {
                 inputRowStride: inputRowStride,
                 inputDimension: projection.inputDimension,
                 outputDimension: projection.outputDimension,
+                outputRowStride: outputRowStride,
                 selectedKernelName: kernelName,
                 usesMPPForStep: true,
+                usesSequenceGEMVForStep: false,
                 sequenceTileHeight: mTile,
                 tileVariantHeights: batchedTileVariants.map(\.tileHeight),
                 projectionCount: count
@@ -2432,7 +2452,10 @@ private struct PrefillStepPlanner {
         mode: PrefillStepMode,
         inputRowStride: Int,
         inputDimension: Int,
-        usesMPPForStep: Bool
+        outputRowStride: Int,
+        outputDimension: Int,
+        usesMPPForStep: Bool,
+        usesSequenceGEMVForStep: Bool
     ) -> MetalQuantizationFallbackReason? {
         if let fallbackReason = descriptor.fallbackReason {
             return fallbackReason
@@ -2445,6 +2468,9 @@ private struct PrefillStepPlanner {
         }
         guard !descriptor.schemeIdentifier.isWeightQuantized else {
             return nil
+        }
+        if !usesSequenceGEMVForStep && !usesMPPForStep && outputRowStride != outputDimension {
+            return .outputStrideMismatch
         }
         guard !usesMPPForStep else {
             return nil

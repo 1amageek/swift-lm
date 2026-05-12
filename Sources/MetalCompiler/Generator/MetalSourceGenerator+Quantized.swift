@@ -11,6 +11,7 @@ extension MetalSourceGenerator {
 /// - Buffer 4: outputDimension  (uint32)
 /// - Buffer 5: sequenceLength   (uint32)
 /// - Buffer 6: inputRowStride   (uint32)
+/// - Buffer 7: outputRowStride  (uint32)
 ///
 /// Block layout (per MLX Q8 affine):
 /// ```
@@ -36,6 +37,7 @@ public static func generateQuantizedGEMM_Q8(
         constant uint& outputDimension [[buffer(4)]],
         constant uint& sequenceLength  [[buffer(5)]],
         constant uint& inputRowStride  [[buffer(6)]],
+        constant uint& outputRowStride [[buffer(7)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -79,7 +81,7 @@ public static func generateQuantizedGEMM_Q8(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputDimension + row] = \(bt)(sum);
+        if (tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
     }
     """
 }
@@ -103,6 +105,7 @@ public static func generateQuantizedGEMM_Q4(
         constant uint& outputDimension [[buffer(4)]],
         constant uint& sequenceLength  [[buffer(5)]],
         constant uint& inputRowStride  [[buffer(6)]],
+        constant uint& outputRowStride [[buffer(7)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -150,7 +153,7 @@ public static func generateQuantizedGEMM_Q4(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputDimension + row] = \(bt)(sum);
+        if (tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
     }
     """
 }
@@ -184,6 +187,7 @@ public static func generateBatchedQuantizedGEMM_Q4_2(
         constant uint& outputDim1      [[buffer(7)]],
         constant uint& sequenceLength  [[buffer(8)]],
         constant uint& inputRowStride  [[buffer(9)]],
+        constant uint& outputRowStride [[buffer(10)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -242,7 +246,7 @@ public static func generateBatchedQuantizedGEMM_Q4_2(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputDim + localRow] = \(bt)(sum);
+        if (tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
     }
     """
 }
@@ -272,6 +276,7 @@ public static func generateBatchedQuantizedGEMM_Q4_3(
         constant uint& outputDim2      [[buffer(10)]],
         constant uint& sequenceLength  [[buffer(11)]],
         constant uint& inputRowStride  [[buffer(12)]],
+        constant uint& outputRowStride [[buffer(13)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -332,7 +337,7 @@ public static func generateBatchedQuantizedGEMM_Q4_3(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputDim + localRow] = \(bt)(sum);
+        if (tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
     }
     """
 }

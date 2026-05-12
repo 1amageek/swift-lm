@@ -15,6 +15,95 @@ struct NaiveGEMMArgumentTableTests {
         )
     }
 
+    @Test("Naive BF16 GEMM writes padded output row stride with classic bindings")
+    func naiveBF16GEMMWritesPaddedOutputRowStrideWithClassicBindings() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let inputDimension = 7
+        let outputDimension = 5
+        let outputRowStride = 8
+        let sequenceLength = 4
+        let input = makeInput(
+            inputDimension: inputDimension,
+            sequenceLength: sequenceLength,
+            rowStride: inputDimension
+        )
+        let weight = makeWeight(
+            kind: .bfloat16,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension
+        )
+        let expected = cpuReference(
+            input: input,
+            weight: weight,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputDimension
+        )
+        var output = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try makeWeightBuffer(device: device, weight: weight)
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+
+        let pipeline = try makePipeline(device: device, weightKind: .bfloat16)
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        var inDim = UInt32(inputDimension)
+        var outDim = UInt32(outputDimension)
+        var seqLen = UInt32(sequenceLength)
+        var inputStride = UInt32(inputDimension)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 7)
+        let geometry = naiveGeometry(
+            pipeline: pipeline,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength
+        )
+        encoder.dispatchThreadgroups(
+            geometry.gridSize,
+            threadsPerThreadgroup: geometry.threadgroupSize
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let actual = outputBuffer.contents().bindMemory(to: Float.self, capacity: output.count)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                let actualValue = actual[seq * outputRowStride + row]
+                let expectedValue = expected[seq * outputDimension + row]
+                #expect(abs(actualValue - expectedValue) < 0.01)
+            }
+            for row in outputDimension..<outputRowStride {
+                #expect(actual[seq * outputRowStride + row].isNaN)
+            }
+        }
+    }
+
     @Test("Naive BF16 GEMM matches CPU reference with Metal 4 argument table")
     func naiveBF16GEMMMatchesCPUReferenceWithArgumentTable() throws {
         try runScenario(
@@ -426,11 +515,13 @@ struct NaiveGEMMArgumentTableTests {
         var inDim = UInt32(inputDimension)
         var outDim = UInt32(outputDimension)
         var seqLen = UInt32(sequenceLength)
-        var rowStride = UInt32(inputRowStride)
+        var inputStride = UInt32(inputRowStride)
+        var outputStride = UInt32(outputDimension)
         encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.stride, index: 3)
         encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.stride, index: 4)
         encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
-        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 7)
         let geometry = naiveGeometry(pipeline: pipeline, outputDimension: outputDimension, sequenceLength: sequenceLength)
         encoder.dispatchThreadgroups(
             geometry.gridSize,
@@ -466,6 +557,7 @@ struct NaiveGEMMArgumentTableTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputRowStride))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -527,6 +619,7 @@ struct NaiveGEMMArgumentTableTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(sequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputRowStride))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -606,6 +699,7 @@ struct NaiveGEMMArgumentTableTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(maximumSequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputRowStride))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -693,6 +787,7 @@ struct NaiveGEMMArgumentTableTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(maximumSequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputRowStride))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )
@@ -848,6 +943,7 @@ struct NaiveGEMMArgumentTableTests {
                 (index: 4, value: uint32Bytes(UInt32(outputDimension))),
                 (index: 5, value: uint32Bytes(UInt32(maximumSequenceLength))),
                 (index: 6, value: uint32Bytes(UInt32(inputDimension))),
+                (index: 7, value: uint32Bytes(UInt32(outputDimension))),
             ],
             argumentPolicy: .argumentTable
         )

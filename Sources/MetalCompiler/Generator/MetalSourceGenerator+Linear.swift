@@ -232,6 +232,7 @@ extension MetalSourceGenerator {
             constant uint& outputDimension         [[buffer(4)]],
             constant uint& sequenceLength          [[buffer(5)]],
             constant uint& inputRowStride         [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
             uint2 gid                              [[threadgroup_position_in_grid]],
             uint tiisg                             [[thread_index_in_simdgroup]],
             uint sgitg                             [[simdgroup_index_in_threadgroup]]
@@ -249,7 +250,7 @@ extension MetalSourceGenerator {
             }
             sum = simd_sum(sum);
             if (tiisg == 0) {
-                output[seqPos * outputDimension + row] = \(bt)(\(storeValue("sum")));
+                output[seqPos * outputRowStride + row] = \(bt)(\(storeValue("sum")));
             }
         }
         """
