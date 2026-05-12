@@ -2256,6 +2256,11 @@ private struct PrefillStepPlanner {
         // Input row stride must match input dimension for MPP tensor_inline.
         guard inputRowStride == sharedInputDim else { return nil }
 
+        let outputRowStride = scratchSlotSize / max(maximumSequenceLength, 1) / scratchElementSize
+        for projection in batched.projections where projection.outputDimension != outputRowStride {
+            return nil
+        }
+
         guard let pipeline = planBuildContext.pipelineCache[kernelName] else {
             return nil
         }

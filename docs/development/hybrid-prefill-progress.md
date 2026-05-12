@@ -891,3 +891,34 @@ Current decision: keep the width override as an opt-in diagnostic only. It is
 valuable for future sweeps because it proves narrower dispatch geometry is
 decode-equivalent, but the production route stays on the device-derived default
 width until a full-model profile shows a stable win.
+
+## Batched MPP Equivalence Harness (2026-05-12)
+
+The forced BF16 batched-MPP routing experiment was rejected after Qwen3.5
+reference comparison showed token and hidden-state drift. The follow-up
+isolated harness now separates three contracts:
+
+```mermaid
+flowchart LR
+  A["Batched sequence GEMV"] --> B["decode-equivalent reduction"]
+  C["Batched MPP GEMM"] --> D["MPP matmul reduction"]
+  C --> E["compact tensor layout"]
+  B --> F["scratch row stride aware"]
+  E --> G{"runtime routing allowed?"}
+  F --> G
+  G -->|"same row stride and tolerated precision"| H["eligible"]
+  G -->|"stride mismatch or strict trace gate"| I["reject"]
+```
+
+| Contract | Evidence | Decision |
+|---|---|---|
+| Batched MPP math | `SequenceProjectionEquivalenceTests/bf16BatchedMPPGEMMMatchesBatchedSequenceGEMVWithinMPPPrecision` passes for count 2 and 3 with uniform output dimensions | MPP is usable only under an MPP precision tolerance, not as a strict decode-equivalent replacement |
+| Input layout | `buildBatchedMPPGEMMStep` requires `inputRowStride == inputDimension` | keep |
+| Output layout | `buildBatchedMPPGEMMStep` now requires every `outputDimension` to match the scratch output row stride | keep |
+| Qwen runtime promotion | forced experiment produced reference drift | rejected |
+
+The important result is that MPP is not a drop-in replacement for the
+decode-equivalent sequence GEMV path. It may still be useful for projection
+groups whose input and output tensors are compact and whose correctness gate
+allows MPP-level numerical tolerance, but it must not be routed through padded
+scratch slots unless the kernel gains explicit output-row-stride support.
