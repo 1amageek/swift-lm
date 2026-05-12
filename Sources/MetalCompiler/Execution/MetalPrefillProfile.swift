@@ -132,19 +132,103 @@ struct MetalPrefillProfile: Codable, Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    var categoryCSVString: String {
+        var lines: [String] = [
+            [
+                "category",
+                "entryCount",
+                "totalGpuMicroseconds",
+                "totalWallMicroseconds",
+                "percentageOfGpu",
+            ].joined(separator: ","),
+        ]
+        for category in summary.entriesByCategory {
+            lines.append([
+                csvEscape(category.name),
+                String(category.entryCount),
+                String(format: "%.3f", category.totalGpuMicroseconds),
+                String(format: "%.3f", category.totalWallMicroseconds),
+                String(format: "%.3f", category.percentageOfGpu),
+            ].joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
+    var kernelCSVString: String {
+        aggregateCSVString(
+            headers: [
+                "kernelName",
+                "category",
+                "entryCount",
+                "estimatedDispatchCount",
+                "totalGpuMicroseconds",
+                "averageGpuMicroseconds",
+                "totalWallMicroseconds",
+                "averageWallMicroseconds",
+            ],
+            groups: aggregateEntries(entries: entries) { entry in
+                [entry.kernelName, entry.category]
+            }
+        )
+    }
+
+    var layerCSVString: String {
+        aggregateCSVString(
+            headers: [
+                "layerIndex",
+                "category",
+                "entryCount",
+                "estimatedDispatchCount",
+                "totalGpuMicroseconds",
+                "averageGpuMicroseconds",
+                "totalWallMicroseconds",
+                "averageWallMicroseconds",
+            ],
+            groups: aggregateEntries(entries: entries) { entry in
+                [entry.layerIndex.map(String.init) ?? "", entry.category]
+            }
+        )
+    }
+
+    var weightRoleCSVString: String {
+        aggregateCSVString(
+            headers: [
+                "weightRole",
+                "category",
+                "entryCount",
+                "estimatedDispatchCount",
+                "totalGpuMicroseconds",
+                "averageGpuMicroseconds",
+                "totalWallMicroseconds",
+                "averageWallMicroseconds",
+            ],
+            groups: aggregateEntries(entries: entries) { entry in
+                [weightRoleSummary(entry.weightTensorName), entry.category]
+            }
+        )
+    }
+
     func writeArtifacts(directory: URL, basename: String) throws -> [URL] {
         let manager = FileManager.default
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
 
         let jsonURL = directory.appendingPathComponent("\(basename).json")
         let csvURL = directory.appendingPathComponent("\(basename).csv")
+        let categoryCSVURL = directory.appendingPathComponent("\(basename)-categories.csv")
+        let kernelCSVURL = directory.appendingPathComponent("\(basename)-kernels.csv")
+        let layerCSVURL = directory.appendingPathComponent("\(basename)-layers.csv")
+        let weightCSVURL = directory.appendingPathComponent("\(basename)-weights.csv")
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         let jsonData = try encoder.encode(self)
         try jsonData.write(to: jsonURL, options: .atomic)
         try Data(csvString.utf8).write(to: csvURL, options: .atomic)
-        return [jsonURL, csvURL]
+        try Data(categoryCSVString.utf8).write(to: categoryCSVURL, options: .atomic)
+        try Data(kernelCSVString.utf8).write(to: kernelCSVURL, options: .atomic)
+        try Data(layerCSVString.utf8).write(to: layerCSVURL, options: .atomic)
+        try Data(weightRoleCSVString.utf8).write(to: weightCSVURL, options: .atomic)
+        return [jsonURL, csvURL, categoryCSVURL, kernelCSVURL, layerCSVURL, weightCSVURL]
     }
 
     private static func makeSummary(entries: [Entry]) -> Summary {
@@ -187,6 +271,84 @@ struct MetalPrefillProfile: Codable, Sendable {
             entriesByCategory: categories
         )
     }
+}
+
+private struct PrefillProfileAggregate: Sendable {
+    let keys: [String]
+    var entryCount: Int
+    var estimatedDispatchCount: Int
+    var totalGpuMicroseconds: Double
+    var totalWallMicroseconds: Double
+
+    var averageGpuMicroseconds: Double {
+        totalGpuMicroseconds / Double(max(entryCount, 1))
+    }
+
+    var averageWallMicroseconds: Double {
+        totalWallMicroseconds / Double(max(entryCount, 1))
+    }
+}
+
+private func aggregateEntries(
+    entries: [MetalPrefillProfile.Entry],
+    key: (MetalPrefillProfile.Entry) -> [String]
+) -> [PrefillProfileAggregate] {
+    var aggregatesByKey: [String: PrefillProfileAggregate] = [:]
+    for entry in entries {
+        let keys = key(entry)
+        let joinedKey = keys.map { "\($0.count):\($0)" }.joined(separator: "|")
+        var aggregate = aggregatesByKey[joinedKey] ?? PrefillProfileAggregate(
+            keys: keys,
+            entryCount: 0,
+            estimatedDispatchCount: 0,
+            totalGpuMicroseconds: 0,
+            totalWallMicroseconds: 0
+        )
+        aggregate.entryCount += 1
+        aggregate.estimatedDispatchCount += entry.estimatedDispatchCount
+        aggregate.totalGpuMicroseconds += entry.averageGpuMicroseconds
+        aggregate.totalWallMicroseconds += entry.averageWallMicroseconds
+        aggregatesByKey[joinedKey] = aggregate
+    }
+    return aggregatesByKey.values.sorted {
+        if $0.totalGpuMicroseconds == $1.totalGpuMicroseconds {
+            return $0.keys.lexicographicallyPrecedes($1.keys)
+        }
+        return $0.totalGpuMicroseconds > $1.totalGpuMicroseconds
+    }
+}
+
+private func aggregateCSVString(
+    headers: [String],
+    groups: [PrefillProfileAggregate]
+) -> String {
+    var lines = [headers.joined(separator: ",")]
+    for group in groups {
+        var row = group.keys.map(csvEscape)
+        row.append(String(group.entryCount))
+        row.append(String(group.estimatedDispatchCount))
+        row.append(String(format: "%.3f", group.totalGpuMicroseconds))
+        row.append(String(format: "%.3f", group.averageGpuMicroseconds))
+        row.append(String(format: "%.3f", group.totalWallMicroseconds))
+        row.append(String(format: "%.3f", group.averageWallMicroseconds))
+        lines.append(row.joined(separator: ","))
+    }
+    return lines.joined(separator: "\n") + "\n"
+}
+
+private func weightRoleSummary(_ tensorName: String?) -> String {
+    guard var components = tensorName?.split(separator: ".").map(String.init),
+          !components.isEmpty else {
+        return ""
+    }
+    if components.last == "weight" {
+        components.removeLast()
+    }
+    if let layerIndex = components.firstIndex(of: "layers"),
+       layerIndex + 2 < components.count {
+        return components[(layerIndex + 2)...].joined(separator: ".")
+    }
+    return components.suffix(3).joined(separator: ".")
 }
 
 struct MetalPrefillProfileHarness: Sendable {

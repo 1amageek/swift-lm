@@ -60,9 +60,13 @@ struct PrefillProfileHarnessTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let urls = try profile.writeArtifacts(directory: root, basename: "synthetic")
 
-        #expect(urls.count == 2)
+        #expect(urls.count == 6)
         let jsonURL = root.appendingPathComponent("synthetic.json")
         let csvURL = root.appendingPathComponent("synthetic.csv")
+        let categoryCSVURL = root.appendingPathComponent("synthetic-categories.csv")
+        let kernelCSVURL = root.appendingPathComponent("synthetic-kernels.csv")
+        let layerCSVURL = root.appendingPathComponent("synthetic-layers.csv")
+        let weightCSVURL = root.appendingPathComponent("synthetic-weights.csv")
         let jsonData = try Data(contentsOf: jsonURL)
         let decoded = try JSONDecoder().decode(MetalPrefillProfile.self, from: jsonData)
         #expect(decoded.summary.entriesByCategory.first?.name == "projection")
@@ -71,6 +75,14 @@ struct PrefillProfileHarnessTests {
         let csv = try String(contentsOf: csvURL, encoding: .utf8)
         #expect(csv.contains("gemv_seq_bf16_f32s"))
         #expect(csv.contains("averageGpuMicroseconds"))
+        let categories = try String(contentsOf: categoryCSVURL, encoding: .utf8)
+        #expect(categories.contains("percentageOfGpu"))
+        let kernels = try String(contentsOf: kernelCSVURL, encoding: .utf8)
+        #expect(kernels.contains("gemv_seq_bf16_f32s,projection,1,1,25.000"))
+        let layers = try String(contentsOf: layerCSVURL, encoding: .utf8)
+        #expect(layers.contains("0,projection,1,1,25.000"))
+        let weights = try String(contentsOf: weightCSVURL, encoding: .utf8)
+        #expect(weights.contains("mlp.down_proj,projection,1,1,25.000"))
     }
 
     private func repositoryRoot() -> URL {
