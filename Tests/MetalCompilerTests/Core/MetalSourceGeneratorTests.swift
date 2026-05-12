@@ -927,6 +927,429 @@ struct MetalSourceGeneratorTests {
         )
     }
 
+    @Test("Quantized Q8 GEMM matches CPU reference with padded scratch input and output stride")
+    func quantizedQ8GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 64
+        let outputDimension = 5
+        let sequenceLength = 3
+        let inputRowStride = 96
+        let outputRowStride = 8
+
+        var input = [Float](repeating: 9_999, count: sequenceLength * inputRowStride)
+        for seq in 0..<sequenceLength {
+            for column in 0..<inputDimension {
+                input[seq * inputRowStride + column] = Float(((seq + 2) * ((column % 11) - 5))) * 0.0625
+            }
+        }
+
+        var weightBytes: [UInt8] = []
+        weightBytes.reserveCapacity(outputDimension * 68)
+        func appendBytes<T>(_ value: T) {
+            withUnsafeBytes(of: value) { weightBytes.append(contentsOf: $0) }
+        }
+        for row in 0..<outputDimension {
+            let scale = Float16(0.125)
+            let zero = Float16(0)
+            appendBytes(scale)
+            appendBytes(zero)
+            weightBytes.append(contentsOf: repeatElement(UInt8(row + 2), count: inputDimension))
+        }
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weightBytes,
+            length: weightBytes.count,
+            options: .storageModeShared
+        ))
+        var output = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateQuantizedGEMM_Q8(
+                name: "test_quantized_gemm_q8_g64_f32s",
+                bufferPrecision: .float32,
+                groupSize: 64
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "test_quantized_gemm_q8_g64_f32s"))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        var inDim = UInt32(inputDimension)
+        var outDim = UInt32(outputDimension)
+        var seqLen = UInt32(sequenceLength)
+        var inputStride = UInt32(inputRowStride)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.size, index: 7)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + 1) / 2, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let actualPointer = outputBuffer.contents().bindMemory(
+            to: Float.self,
+            capacity: output.count
+        )
+        var actual: [Float] = []
+        actual.reserveCapacity(outputDimension * sequenceLength)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                actual.append(actualPointer[seq * outputRowStride + row])
+            }
+            for row in outputDimension..<outputRowStride {
+                #expect(actualPointer[seq * outputRowStride + row].isNaN)
+            }
+        }
+
+        var expected = [Float](repeating: .zero, count: outputDimension * sequenceLength)
+        for seq in 0..<sequenceLength {
+            let inputSum = (0..<inputDimension).reduce(Float.zero) { partial, column in
+                partial + input[seq * inputRowStride + column]
+            }
+            for row in 0..<outputDimension {
+                expected[seq * outputDimension + row] = inputSum * (0.125 * Float(row + 2))
+            }
+        }
+
+        let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+            max(partial, abs(pair.0 - pair.1))
+        }
+        #expect(
+            maxError < 0.001,
+            """
+            Quantized Q8 GEMM drifted with padded scratch input/output stride
+            maxError=\(maxError)
+            actualPrefix=\(actual.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
+            expectedPrefix=\(expected.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
+            """
+        )
+    }
+
+    @Test("Batched quantized Q4 GEMM count 2 matches CPU reference with padded output stride")
+    func batchedQuantizedQ4GEMM2MatchesCPUReferenceWithPaddedScratchOutputStride() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 64
+        let outputDim0 = 3
+        let outputDim1 = 5
+        let sequenceLength = 3
+        let inputRowStride = 96
+        let outputRowStride = 8
+
+        let input = makePaddedFloatInput(
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride
+        )
+        let weight0 = makeConstantQ4Weights(
+            outputDimension: outputDim0,
+            inputDimension: inputDimension,
+            scale: 0.25,
+            quantizedValueBase: 1
+        )
+        let weight1 = makeConstantQ4Weights(
+            outputDimension: outputDim1,
+            inputDimension: inputDimension,
+            scale: 0.25,
+            quantizedValueBase: 5
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer0 = try #require(device.makeBuffer(
+            bytes: weight0,
+            length: weight0.count,
+            options: .storageModeShared
+        ))
+        let weightBuffer1 = try #require(device.makeBuffer(
+            bytes: weight1,
+            length: weight1.count,
+            options: .storageModeShared
+        ))
+        var output0 = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        var output1 = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        let outputBuffer0 = try #require(device.makeBuffer(
+            bytes: &output0,
+            length: output0.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let outputBuffer1 = try #require(device.makeBuffer(
+            bytes: &output1,
+            length: output1.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_2(
+                name: "test_batched_quantized_gemm_q4_2_g64_f32s",
+                bufferPrecision: .float32,
+                groupSize: 64
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "test_batched_quantized_gemm_q4_2_g64_f32s"))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer0, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer1, offset: 0, index: 2)
+        encoder.setBuffer(outputBuffer0, offset: 0, index: 3)
+        encoder.setBuffer(outputBuffer1, offset: 0, index: 4)
+        var inDim = UInt32(inputDimension)
+        var outDim0 = UInt32(outputDim0)
+        var outDim1 = UInt32(outputDim1)
+        var seqLen = UInt32(sequenceLength)
+        var inputStride = UInt32(inputRowStride)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&outDim0, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&outDim1, length: MemoryLayout<UInt32>.size, index: 7)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 8)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.size, index: 9)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.size, index: 10)
+        let totalRows = outputDim0 + outputDim1
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (totalRows + 1) / 2, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertConstantQ4Output(
+            outputBuffer0,
+            input: input,
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride,
+            outputDimension: outputDim0,
+            outputRowStride: outputRowStride,
+            scale: 0.25,
+            quantizedValueBase: 1
+        )
+        assertConstantQ4Output(
+            outputBuffer1,
+            input: input,
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride,
+            outputDimension: outputDim1,
+            outputRowStride: outputRowStride,
+            scale: 0.25,
+            quantizedValueBase: 5
+        )
+    }
+
+    @Test("Batched quantized Q4 GEMM count 3 matches CPU reference with padded output stride")
+    func batchedQuantizedQ4GEMM3MatchesCPUReferenceWithPaddedScratchOutputStride() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 64
+        let outputDim0 = 2
+        let outputDim1 = 4
+        let outputDim2 = 5
+        let sequenceLength = 3
+        let inputRowStride = 96
+        let outputRowStride = 8
+
+        let input = makePaddedFloatInput(
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride
+        )
+        let weight0 = makeConstantQ4Weights(
+            outputDimension: outputDim0,
+            inputDimension: inputDimension,
+            scale: 0.25,
+            quantizedValueBase: 1
+        )
+        let weight1 = makeConstantQ4Weights(
+            outputDimension: outputDim1,
+            inputDimension: inputDimension,
+            scale: 0.25,
+            quantizedValueBase: 4
+        )
+        let weight2 = makeConstantQ4Weights(
+            outputDimension: outputDim2,
+            inputDimension: inputDimension,
+            scale: 0.25,
+            quantizedValueBase: 8
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer0 = try #require(device.makeBuffer(
+            bytes: weight0,
+            length: weight0.count,
+            options: .storageModeShared
+        ))
+        let weightBuffer1 = try #require(device.makeBuffer(
+            bytes: weight1,
+            length: weight1.count,
+            options: .storageModeShared
+        ))
+        let weightBuffer2 = try #require(device.makeBuffer(
+            bytes: weight2,
+            length: weight2.count,
+            options: .storageModeShared
+        ))
+        var output0 = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        var output1 = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        var output2 = [Float](repeating: .nan, count: outputRowStride * sequenceLength)
+        let outputBuffer0 = try #require(device.makeBuffer(
+            bytes: &output0,
+            length: output0.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let outputBuffer1 = try #require(device.makeBuffer(
+            bytes: &output1,
+            length: output1.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let outputBuffer2 = try #require(device.makeBuffer(
+            bytes: &output2,
+            length: output2.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateBatchedQuantizedGEMM_Q4_3(
+                name: "test_batched_quantized_gemm_q4_3_g64_f32s",
+                bufferPrecision: .float32,
+                groupSize: 64
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "test_batched_quantized_gemm_q4_3_g64_f32s"))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer0, offset: 0, index: 1)
+        encoder.setBuffer(weightBuffer1, offset: 0, index: 2)
+        encoder.setBuffer(weightBuffer2, offset: 0, index: 3)
+        encoder.setBuffer(outputBuffer0, offset: 0, index: 4)
+        encoder.setBuffer(outputBuffer1, offset: 0, index: 5)
+        encoder.setBuffer(outputBuffer2, offset: 0, index: 6)
+        var inDim = UInt32(inputDimension)
+        var outDim0 = UInt32(outputDim0)
+        var outDim1 = UInt32(outputDim1)
+        var outDim2 = UInt32(outputDim2)
+        var seqLen = UInt32(sequenceLength)
+        var inputStride = UInt32(inputRowStride)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 7)
+        encoder.setBytes(&outDim0, length: MemoryLayout<UInt32>.size, index: 8)
+        encoder.setBytes(&outDim1, length: MemoryLayout<UInt32>.size, index: 9)
+        encoder.setBytes(&outDim2, length: MemoryLayout<UInt32>.size, index: 10)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 11)
+        encoder.setBytes(&inputStride, length: MemoryLayout<UInt32>.size, index: 12)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.size, index: 13)
+        let totalRows = outputDim0 + outputDim1 + outputDim2
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (totalRows + 1) / 2, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertConstantQ4Output(
+            outputBuffer0,
+            input: input,
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride,
+            outputDimension: outputDim0,
+            outputRowStride: outputRowStride,
+            scale: 0.25,
+            quantizedValueBase: 1
+        )
+        assertConstantQ4Output(
+            outputBuffer1,
+            input: input,
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride,
+            outputDimension: outputDim1,
+            outputRowStride: outputRowStride,
+            scale: 0.25,
+            quantizedValueBase: 4
+        )
+        assertConstantQ4Output(
+            outputBuffer2,
+            input: input,
+            sequenceLength: sequenceLength,
+            inputDimension: inputDimension,
+            inputRowStride: inputRowStride,
+            outputDimension: outputDim2,
+            outputRowStride: outputRowStride,
+            scale: 0.25,
+            quantizedValueBase: 8
+        )
+    }
+
     @Test("Generated structural kernels compile")
     func structuralCompiles() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
@@ -1359,6 +1782,87 @@ struct MetalSourceGeneratorTests {
         bytes.append(contentsOf: packLSBFirstBitStream(weights: weights, bits: bits))
         #expect(bytes.count == 4 + payloadByteCount)
         return bytes
+    }
+
+    private func makePaddedFloatInput(
+        sequenceLength: Int,
+        inputDimension: Int,
+        inputRowStride: Int
+    ) -> [Float] {
+        var input = [Float](repeating: 9_999, count: sequenceLength * inputRowStride)
+        for seq in 0..<sequenceLength {
+            for column in 0..<inputDimension {
+                input[seq * inputRowStride + column] = Float(((seq + 3) * ((column % 9) - 4))) * 0.125
+            }
+        }
+        return input
+    }
+
+    private func makeConstantQ4Weights(
+        outputDimension: Int,
+        inputDimension: Int,
+        scale: Float,
+        quantizedValueBase: UInt8
+    ) -> [UInt8] {
+        var bytes: [UInt8] = []
+        bytes.reserveCapacity(outputDimension * (4 + inputDimension / 2))
+        func appendBytes<T>(_ value: T) {
+            withUnsafeBytes(of: value) { bytes.append(contentsOf: $0) }
+        }
+        for row in 0..<outputDimension {
+            appendBytes(Float16(scale))
+            appendBytes(Float16(0))
+            let quantized = quantizedValueBase + UInt8(row)
+            let packed = quantized | (quantized << 4)
+            bytes.append(contentsOf: repeatElement(packed, count: inputDimension / 2))
+        }
+        return bytes
+    }
+
+    private func assertConstantQ4Output(
+        _ outputBuffer: MTLBuffer,
+        input: [Float],
+        sequenceLength: Int,
+        inputDimension: Int,
+        inputRowStride: Int,
+        outputDimension: Int,
+        outputRowStride: Int,
+        scale: Float,
+        quantizedValueBase: UInt8
+    ) {
+        let actualPointer = outputBuffer.contents().bindMemory(
+            to: Float.self,
+            capacity: outputRowStride * sequenceLength
+        )
+        var actual: [Float] = []
+        actual.reserveCapacity(outputDimension * sequenceLength)
+        var expected = [Float](repeating: .zero, count: outputDimension * sequenceLength)
+        for seq in 0..<sequenceLength {
+            let inputSum = (0..<inputDimension).reduce(Float.zero) { partial, column in
+                partial + input[seq * inputRowStride + column]
+            }
+            for row in 0..<outputDimension {
+                actual.append(actualPointer[seq * outputRowStride + row])
+                expected[seq * outputDimension + row] =
+                    inputSum * scale * Float(quantizedValueBase + UInt8(row))
+            }
+            for row in outputDimension..<outputRowStride {
+                #expect(actualPointer[seq * outputRowStride + row].isNaN)
+            }
+        }
+
+        let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+            max(partial, abs(pair.0 - pair.1))
+        }
+        #expect(
+            maxError < 0.001,
+            """
+            Batched quantized Q4 GEMM drifted with padded output stride
+            maxError=\(maxError)
+            actualPrefix=\(actual.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
+            expectedPrefix=\(expected.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
+            """
+        )
     }
 
     private func packLSBFirstBitStream(weights: [UInt32], bits: Int) -> [UInt8] {

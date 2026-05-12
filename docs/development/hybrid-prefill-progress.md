@@ -933,7 +933,11 @@ dimension and runtime output row stride are identical.
 The next correctness pass closed the non-MPP side of the same layout contract:
 standard sequence GEMM and direct Q4/Q8 prefill GEMM now bind
 `outputRowStride` explicitly and write rows using the runtime stride. Batched
-Q4 direct GEMM gets the same stride binding for each scratch output slot.
+Q4 direct GEMM gets the same stride binding for each scratch output slot. The
+direct quantized kernels also keep inactive SIMD groups alive through
+threadgroup barriers, so odd output dimensions no longer let the final
+partially active row group exit before its paired active group reaches a
+barrier.
 
 ```mermaid
 flowchart LR
@@ -950,6 +954,10 @@ Evidence:
 |---|---|
 | `NaiveGEMMArgumentTableTests` | 13/13 pass, including padded output-row-stride execution |
 | `MetalSourceGeneratorTests/quantizedQ4GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride` | Pass; direct Q4 GEMM writes padded scratch output rows correctly |
+| `MetalSourceGeneratorTests/quantizedQ8GEMMMatchesCPUReferenceWithPaddedScratchInputAndOutputStride` | Pass; direct Q8 GEMM writes padded odd-row scratch outputs correctly without early barrier exit |
+| `MetalSourceGeneratorTests/batchedQuantizedQ4GEMM2MatchesCPUReferenceWithPaddedScratchOutputStride` | Pass; two-way direct Q4 batched GEMM writes each padded scratch output independently |
+| `MetalSourceGeneratorTests/batchedQuantizedQ4GEMM3MatchesCPUReferenceWithPaddedScratchOutputStride` | Pass; three-way direct Q4 batched GEMM writes each padded scratch output independently |
+| `MetalSourceGeneratorTests` | 27/27 pass after adding the Q8 and batched Q4 stride/barrier coverage |
 | `QuantizationPlanningTests` | 14/14 pass, diagnostics now include `outputRowStride` |
 | `Qwen35ReferenceComparisonTests` with probes | 4/4 pass; prefill/decode token gates unchanged |
 

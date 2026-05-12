@@ -50,10 +50,12 @@ public static func generateQuantizedGEMM_Q8(
         const uint TILE_ELEMENTS = \(tileElements);
         const uint row = gid.x * rowsPerThreadgroup + sgitg;
         const uint seqPos = gid.y;
-        if (row >= outputDimension || seqPos >= sequenceLength) return;
+        if (seqPos >= sequenceLength) return;
+        const bool active = row < outputDimension;
 
         const uint blocksPerRow = inputDimension / GROUP_SIZE;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
+        const uint safeRow = active ? row : 0;
+        device const uchar* rowBase = weight + safeRow * blocksPerRow * BYTES_PER_BLOCK;
         device const \(bt)* inputRow = input + seqPos * inputRowStride;
         threadgroup \(bt) inputTile[TILE_ELEMENTS];
         float sum = 0.0f;
@@ -67,21 +69,23 @@ public static func generateQuantizedGEMM_Q8(
 
             const uint blockBase = base / GROUP_SIZE;
             const uint blockCount = tileCount / GROUP_SIZE;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* quantized = block + 4;
-                const uint tileOffset = localBlock * GROUP_SIZE;
-                for (uint i = tiisg; i < GROUP_SIZE; i += SIMD_WIDTH) {
-                    float w = blockScale * float(quantized[i]) + blockZero;
-                    sum += w * float(inputTile[tileOffset + i]);
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float blockScale = float(*(device const half*)(block));
+                    float blockZero = float(*(device const half*)(block + 2));
+                    device const uchar* quantized = block + 4;
+                    const uint tileOffset = localBlock * GROUP_SIZE;
+                    for (uint i = tiisg; i < GROUP_SIZE; i += SIMD_WIDTH) {
+                        float w = blockScale * float(quantized[i]) + blockZero;
+                        sum += w * float(inputTile[tileOffset + i]);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
+        if (active && tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
     }
     """
 }
@@ -118,10 +122,12 @@ public static func generateQuantizedGEMM_Q4(
         const uint TILE_ELEMENTS = \(tileElements);
         const uint row = gid.x * rowsPerThreadgroup + sgitg;
         const uint seqPos = gid.y;
-        if (row >= outputDimension || seqPos >= sequenceLength) return;
+        if (seqPos >= sequenceLength) return;
+        const bool active = row < outputDimension;
 
         const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
+        const uint safeRow = active ? row : 0;
+        device const uchar* rowBase = weight + safeRow * blocksPerRow * BYTES_PER_BLOCK;
         device const \(bt)* inputRow = input + seqPos * inputRowStride;
         threadgroup \(bt) inputTile[TILE_ELEMENTS];
         float sum = 0.0f;
@@ -135,25 +141,27 @@ public static func generateQuantizedGEMM_Q4(
 
             const uint blockBase = base / WEIGHTS_PER_BLOCK;
             const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* nibbles = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
-                for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
-                    uchar packed = nibbles[i];
-                    const uint inputOffset = tileOffset + i * 2;
-                float w0 = float(packed & 0x0F) * blockScale + blockZero;
-                float w1 = float(packed >> 4) * blockScale + blockZero;
-                    sum += w0 * float(inputTile[inputOffset]);
-                    sum += w1 * float(inputTile[inputOffset + 1]);
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float blockScale = float(*(device const half*)(block));
+                    float blockZero = float(*(device const half*)(block + 2));
+                    device const uchar* nibbles = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
+                        uchar packed = nibbles[i];
+                        const uint inputOffset = tileOffset + i * 2;
+                        float w0 = float(packed & 0x0F) * blockScale + blockZero;
+                        float w1 = float(packed >> 4) * blockScale + blockZero;
+                        sum += w0 * float(inputTile[inputOffset]);
+                        sum += w1 * float(inputTile[inputOffset + 1]);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
+        if (active && tiisg == 0) output[seqPos * outputRowStride + row] = \(bt)(sum);
     }
     """
 }
@@ -201,16 +209,16 @@ public static func generateBatchedQuantizedGEMM_Q4_2(
         const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1;
         const uint seqPos = gid.y;
-        if (globalRow >= totalRows || seqPos >= sequenceLength) return;
+        if (seqPos >= sequenceLength) return;
+        const bool active = globalRow < totalRows;
 
-        device const uchar* weight;
-        device \(bt)* output;
-        uint localRow;
-        uint outputDim;
+        device const uchar* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
-            weight = weight0; output = output0; localRow = globalRow; outputDim = outputDim0;
-        } else {
-            weight = weight1; output = output1; localRow = globalRow - outputDim0; outputDim = outputDim1;
+            weight = weight0; output = output0; localRow = globalRow;
+        } else if (globalRow < totalRows) {
+            weight = weight1; output = output1; localRow = globalRow - outputDim0;
         }
 
         const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
@@ -228,25 +236,27 @@ public static func generateBatchedQuantizedGEMM_Q4_2(
 
             const uint blockBase = base / WEIGHTS_PER_BLOCK;
             const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* nibbles = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
-                for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
-                    uchar packed = nibbles[i];
-                    const uint inputOffset = tileOffset + i * 2;
-                    float w0 = float(packed & 0x0F) * blockScale + blockZero;
-                    float w1 = float(packed >> 4) * blockScale + blockZero;
-                    sum += w0 * float(inputTile[inputOffset]);
-                    sum += w1 * float(inputTile[inputOffset + 1]);
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float blockScale = float(*(device const half*)(block));
+                    float blockZero = float(*(device const half*)(block + 2));
+                    device const uchar* nibbles = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
+                        uchar packed = nibbles[i];
+                        const uint inputOffset = tileOffset + i * 2;
+                        float w0 = float(packed & 0x0F) * blockScale + blockZero;
+                        float w1 = float(packed >> 4) * blockScale + blockZero;
+                        sum += w0 * float(inputTile[inputOffset]);
+                        sum += w1 * float(inputTile[inputOffset + 1]);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
+        if (active && tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
     }
     """
 }
@@ -290,18 +300,18 @@ public static func generateBatchedQuantizedGEMM_Q4_3(
         const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1 + outputDim2;
         const uint seqPos = gid.y;
-        if (globalRow >= totalRows || seqPos >= sequenceLength) return;
+        if (seqPos >= sequenceLength) return;
+        const bool active = globalRow < totalRows;
 
-        device const uchar* weight;
-        device \(bt)* output;
-        uint localRow;
-        uint outputDim;
+        device const uchar* weight = weight0;
+        device \(bt)* output = output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
-            weight = weight0; output = output0; localRow = globalRow; outputDim = outputDim0;
+            weight = weight0; output = output0; localRow = globalRow;
         } else if (globalRow < outputDim0 + outputDim1) {
-            weight = weight1; output = output1; localRow = globalRow - outputDim0; outputDim = outputDim1;
-        } else {
-            weight = weight2; output = output2; localRow = globalRow - outputDim0 - outputDim1; outputDim = outputDim2;
+            weight = weight1; output = output1; localRow = globalRow - outputDim0;
+        } else if (globalRow < totalRows) {
+            weight = weight2; output = output2; localRow = globalRow - outputDim0 - outputDim1;
         }
 
         const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
@@ -319,25 +329,27 @@ public static func generateBatchedQuantizedGEMM_Q4_3(
 
             const uint blockBase = base / WEIGHTS_PER_BLOCK;
             const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float blockScale = float(*(device const half*)(block));
-                float blockZero = float(*(device const half*)(block + 2));
-                device const uchar* nibbles = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
-                for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
-                    uchar packed = nibbles[i];
-                    const uint inputOffset = tileOffset + i * 2;
-                    float w0 = float(packed & 0x0F) * blockScale + blockZero;
-                    float w1 = float(packed >> 4) * blockScale + blockZero;
-                    sum += w0 * float(inputTile[inputOffset]);
-                    sum += w1 * float(inputTile[inputOffset + 1]);
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float blockScale = float(*(device const half*)(block));
+                    float blockZero = float(*(device const half*)(block + 2));
+                    device const uchar* nibbles = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint i = tiisg; i < WEIGHTS_PER_BLOCK / 2; i += SIMD_WIDTH) {
+                        uchar packed = nibbles[i];
+                        const uint inputOffset = tileOffset + i * 2;
+                        float w0 = float(packed & 0x0F) * blockScale + blockZero;
+                        float w1 = float(packed >> 4) * blockScale + blockZero;
+                        sum += w0 * float(inputTile[inputOffset]);
+                        sum += w1 * float(inputTile[inputOffset + 1]);
+                    }
                 }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
+        if (active && tiisg == 0) output[seqPos * outputRowStride + localRow] = \(bt)(sum);
     }
     """
 }
