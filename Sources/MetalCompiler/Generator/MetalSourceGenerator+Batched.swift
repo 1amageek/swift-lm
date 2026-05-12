@@ -465,7 +465,7 @@ public static func generateBatchedSequenceGEMV(
         if i == 0 {
             condition = "if (globalRow < outputDim0)"
         } else if i == count - 1 {
-            condition = "else"
+            condition = "else if (globalRow < totalRows)"
         } else {
             let cumulative = (0...i).map { "outputDim\($0)" }.joined(separator: " + ")
             condition = "else if (globalRow < \(cumulative))"
@@ -500,12 +500,13 @@ public static func generateBatchedSequenceGEMV(
         const uint globalRow = gid.x * rowsPerThreadgroup + sgitg;
         const uint seqPos = gid.y;
         const uint totalRows = \(totalRows);
-        if (globalRow >= totalRows || seqPos >= sequenceLength) return;
+        if (seqPos >= sequenceLength) return;
+        const bool active = globalRow < totalRows;
 
-        device const \(wt)* weight;
-        device \(bt)* output;
-        uint outputDimension;
-        uint localRow;
+        device const \(wt)* weight = weight0;
+        device \(bt)* output = output0;
+        uint outputDimension = outputDim0;
+        uint localRow = 0;
         \(branchBlocks)
 
         threadgroup \(bt) inputTile[tileElements];
@@ -520,13 +521,15 @@ public static func generateBatchedSequenceGEMV(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[seqPos * outputRowStride + localRow] = \(bt)(\(storeValue("sum")));
         }
     }

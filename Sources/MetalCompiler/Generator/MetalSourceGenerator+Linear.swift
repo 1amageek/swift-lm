@@ -354,12 +354,14 @@ extension MetalSourceGenerator {
             const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
             const uint row = gid.x * rowsPerThreadgroup + sgitg;
             const uint seqPos = gid.y;
-            if (row >= outputDimension || seqPos >= sequenceLength) return;
+            if (seqPos >= sequenceLength) return;
+            const bool active = row < outputDimension;
 
             threadgroup \(bt) inputTile[tileElements];
             float sum = 0.0f;
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
-            device const \(wt)* weightRow = weight + row * inputDimension;
+            const uint safeRow = active ? row : 0;
+            device const \(wt)* weightRow = weight + safeRow * inputDimension;
             for (uint base = 0; base < inputDimension; base += tileElements) {
                 for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
                     const uint inputIndex = base + j;
@@ -368,13 +370,15 @@ extension MetalSourceGenerator {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 const uint tileCount = min(tileElements, inputDimension - base);
-                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                if (active) {
+                    for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                        sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                    }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
             sum = simd_sum(sum);
-            if (tiisg == 0) {
+            if (active && tiisg == 0) {
                 output[seqPos * outputRowStride + row] = \(bt)(\(storeValue("sum")));
             }
         }
@@ -561,7 +565,7 @@ extension MetalSourceGenerator {
             const uint rowsPerThreadgroup = simdgroupsPerThreadgroup * rowsPerSimdgroup;
             const uint rowBase = gid.x * rowsPerThreadgroup + sgitg * rowsPerSimdgroup;
             const uint seqPos = gid.y;
-            if (rowBase >= outputDimension || seqPos >= sequenceLength) return;
+            if (seqPos >= sequenceLength) return;
             \(rowDeclarations)
 
             threadgroup \(bt) inputTile[tileElements];

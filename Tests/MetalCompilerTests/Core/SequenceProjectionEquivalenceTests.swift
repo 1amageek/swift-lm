@@ -411,6 +411,212 @@ struct SequenceProjectionEquivalenceTests {
         )
     }
 
+    @Test("BF16 single sequence GEMV handles odd output tail with padded stride")
+    func bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 65
+        let outputDimension = 5
+        let outputRowStride = 8
+        let sequenceLength = 4
+        let kernelName = "gemv_bf16_single_sequence_odd_tail"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateSequenceGEMV(
+                name: kernelName,
+                bufferPrecision: BufferPrecision.float32,
+                weightFormat: WeightFormats.bfloat16,
+                tileElements: 128
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let pipeline = try harness.pipeline(named: kernelName)
+
+        let inputValues = (0..<(sequenceLength * inputDimension)).map { index in
+            Float((index * 13) % 41 - 20) * 0.03125
+        }
+        let weights = (0..<(outputDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 7) % 31 - 15) * 0.015625)
+        }
+        let inputBuffer = try harness.makeSharedBuffer(values: inputValues)
+        let weightBuffer = try harness.makeSharedBuffer(values: weights)
+        let outputBuffer = try harness.makeSharedBuffer(
+            values: [Float](repeating: .nan, count: sequenceLength * outputRowStride)
+        )
+
+        let simdWidth = 32
+        let threads = min(simdWidth * 2, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / simdWidth)
+        let grid = MTLSize(
+            width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+            height: sequenceLength,
+            depth: 1
+        )
+        let threadgroup = MTLSize(width: threads, height: 1, depth: 1)
+
+        let (commandBuffer, encoder) = try harness.makeCommandEncoder()
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        var inputDim = UInt32(inputDimension)
+        var outputDim = UInt32(outputDimension)
+        var seqLen = UInt32(sequenceLength)
+        var inputRowStride = UInt32(inputDimension)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes(&outputDim, length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: threadgroup)
+        encoder.endEncoding()
+        try harness.complete(commandBuffer)
+
+        let padded = harness.readFloat32(
+            outputBuffer,
+            count: sequenceLength * outputRowStride
+        )
+        var actual: [Float] = []
+        var expected: [Float] = []
+        actual.reserveCapacity(sequenceLength * outputDimension)
+        expected.reserveCapacity(sequenceLength * outputDimension)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                actual.append(padded[seq * outputRowStride + row])
+                var sum: Float = 0
+                for column in 0..<inputDimension {
+                    sum += Float(weights[row * inputDimension + column]) *
+                        inputValues[seq * inputDimension + column]
+                }
+                expected.append(Float(BFloat16(sum)))
+            }
+            for row in outputDimension..<outputRowStride {
+                #expect(padded[seq * outputRowStride + row].isNaN)
+            }
+        }
+
+        let mismatch = harness.firstMismatch(expected: expected, actual: actual, tolerance: 0.000_001)
+        #expect(
+            mismatch == nil,
+            "single sequence odd-tail projection drifted: \(String(describing: mismatch)), maxError=\(harness.maxAbsoluteError(expected: expected, actual: actual))"
+        )
+    }
+
+    @Test("BF16 batched sequence GEMV handles odd total row tail with padded stride")
+    func bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 65
+        let outputDimensions = [3, 4]
+        let outputRowStride = 8
+        let sequenceLength = 4
+        let kernelName = "batched_gemv2_bf16_sequence_odd_tail"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateBatchedSequenceGEMV(
+                name: kernelName,
+                count: outputDimensions.count,
+                bufferPrecision: BufferPrecision.float32,
+                weightFormat: WeightFormats.bfloat16,
+                tileElements: 128
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let pipeline = try harness.pipeline(named: kernelName)
+
+        let inputValues = (0..<(sequenceLength * inputDimension)).map { index in
+            Float((index * 17) % 43 - 21) * 0.03125
+        }
+        let weights = outputDimensions.enumerated().map { projection, outputDimension in
+            (0..<(outputDimension * inputDimension)).map { index in
+                BFloat16(Float((index * (projection + 5)) % 37 - 18) * 0.015625)
+            }
+        }
+        let inputBuffer = try harness.makeSharedBuffer(values: inputValues)
+        let weightBuffers = try weights.map { try harness.makeSharedBuffer(values: $0) }
+        let outputBuffers = try outputDimensions.map { _ in
+            try harness.makeSharedBuffer(
+                values: [Float](repeating: .nan, count: sequenceLength * outputRowStride)
+            )
+        }
+
+        let simdWidth = 32
+        let threads = min(simdWidth * 2, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / simdWidth)
+        let totalRows = outputDimensions.reduce(0, +)
+        let grid = MTLSize(
+            width: (totalRows + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+            height: sequenceLength,
+            depth: 1
+        )
+        let threadgroup = MTLSize(width: threads, height: 1, depth: 1)
+
+        let (commandBuffer, encoder) = try harness.makeCommandEncoder()
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffers[0], offset: 0, index: 1)
+        encoder.setBuffer(weightBuffers[1], offset: 0, index: 2)
+        encoder.setBuffer(outputBuffers[0], offset: 0, index: 3)
+        encoder.setBuffer(outputBuffers[1], offset: 0, index: 4)
+        var inputDim = UInt32(inputDimension)
+        var outputDim0 = UInt32(outputDimensions[0])
+        var outputDim1 = UInt32(outputDimensions[1])
+        var seqLen = UInt32(sequenceLength)
+        var inputRowStride = UInt32(inputDimension)
+        var outputStride = UInt32(outputRowStride)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes(&outputDim0, length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes(&outputDim1, length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes(&outputStride, length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: threadgroup)
+        encoder.endEncoding()
+        try harness.complete(commandBuffer)
+
+        for projection in outputDimensions.indices {
+            let padded = harness.readFloat32(
+                outputBuffers[projection],
+                count: sequenceLength * outputRowStride
+            )
+            var actual: [Float] = []
+            var expected: [Float] = []
+            actual.reserveCapacity(sequenceLength * outputDimensions[projection])
+            expected.reserveCapacity(sequenceLength * outputDimensions[projection])
+            for seq in 0..<sequenceLength {
+                for row in 0..<outputDimensions[projection] {
+                    actual.append(padded[seq * outputRowStride + row])
+                    var sum: Float = 0
+                    for column in 0..<inputDimension {
+                        sum += Float(weights[projection][row * inputDimension + column]) *
+                            inputValues[seq * inputDimension + column]
+                    }
+                    expected.append(Float(BFloat16(sum)))
+                }
+                for row in outputDimensions[projection]..<outputRowStride {
+                    #expect(padded[seq * outputRowStride + row].isNaN)
+                }
+            }
+
+            let mismatch = harness.firstMismatch(expected: expected, actual: actual, tolerance: 0.000_001)
+            #expect(
+                mismatch == nil,
+                "batched sequence odd-tail projection \(projection) drifted: \(String(describing: mismatch)), maxError=\(harness.maxAbsoluteError(expected: expected, actual: actual))"
+            )
+        }
+    }
+
     private func runDecodeProjectionTraceInScratch(
         harness: SequenceKernelEquivalenceHarness,
         pipeline: MTLComputePipelineState,
