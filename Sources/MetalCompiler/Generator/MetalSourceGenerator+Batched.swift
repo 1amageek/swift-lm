@@ -101,12 +101,16 @@ public static func generateBatchedGEMV2ArgumentTableVariant(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        const bool isSecond = (globalRow >= outputDim0);
-        const uint localRow = isSecond ? (globalRow - outputDim0) : globalRow;
-        device const \(wt)* weight = isSecond ? args.weight1 : args.weight0;
-        device \(bt)* output = isSecond ? args.output1 : args.output0;
+        device const \(wt)* weight = args.weight0;
+        device \(bt)* output = args.output0;
+        uint localRow = 0;
+        if (globalRow < outputDim0) {
+            weight = args.weight0; output = args.output0; localRow = globalRow;
+        } else if (globalRow < totalRows) {
+            weight = args.weight1; output = args.output1; localRow = globalRow - outputDim0;
+        }
 
         threadgroup \(bt) inputTile[tileElements];
         float sum = 0.0f;
@@ -119,13 +123,15 @@ public static func generateBatchedGEMV2ArgumentTableVariant(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }
@@ -242,16 +248,16 @@ public static func generateBatchedGEMV3ArgumentTableVariant(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1 + outputDim2;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        device const \(wt)* weight;
-        device \(bt)* output;
-        uint localRow;
+        device const \(wt)* weight = args.weight0;
+        device \(bt)* output = args.output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
             weight = args.weight0; output = args.output0; localRow = globalRow;
         } else if (globalRow < outputDim0 + outputDim1) {
             weight = args.weight1; output = args.output1; localRow = globalRow - outputDim0;
-        } else {
+        } else if (globalRow < totalRows) {
             weight = args.weight2; output = args.output2; localRow = globalRow - outputDim0 - outputDim1;
         }
 
@@ -266,13 +272,15 @@ public static func generateBatchedGEMV3ArgumentTableVariant(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }
@@ -397,18 +405,18 @@ public static func generateBatchedGEMV4ArgumentTableVariant(
         const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
         const uint globalRow = gid * rowsPerThreadgroup + sgitg;
         const uint totalRows = outputDim0 + outputDim1 + outputDim2 + outputDim3;
-        if (globalRow >= totalRows) return;
+        const bool active = globalRow < totalRows;
 
-        device const \(wt)* weight;
-        device \(bt)* output;
-        uint localRow;
+        device const \(wt)* weight = args.weight0;
+        device \(bt)* output = args.output0;
+        uint localRow = 0;
         if (globalRow < outputDim0) {
             weight = args.weight0; output = args.output0; localRow = globalRow;
         } else if (globalRow < outputDim0 + outputDim1) {
             weight = args.weight1; output = args.output1; localRow = globalRow - outputDim0;
         } else if (globalRow < outputDim0 + outputDim1 + outputDim2) {
             weight = args.weight2; output = args.output2; localRow = globalRow - outputDim0 - outputDim1;
-        } else {
+        } else if (globalRow < totalRows) {
             weight = args.weight3; output = args.output3; localRow = globalRow - outputDim0 - outputDim1 - outputDim2;
         }
 
@@ -423,13 +431,15 @@ public static func generateBatchedGEMV4ArgumentTableVariant(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint tileCount = min(tileElements, inputDimension - base);
-            for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+            if (active) {
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) {
+        if (active && tiisg == 0) {
             output[localRow] = \(bt)(sum);
         }
     }

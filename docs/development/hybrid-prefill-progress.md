@@ -959,7 +959,9 @@ Evidence:
 | `MetalSourceGeneratorTests/batchedQuantizedQ4GEMM3MatchesCPUReferenceWithPaddedScratchOutputStride` | Pass; three-way direct Q4 batched GEMM writes each padded scratch output independently |
 | `MetalSourceGeneratorTests/decodeGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; dense single decode GEMV keeps inactive row groups through barriers and preserves output tail sentinels |
 | `MetalSourceGeneratorTests/batchedDecodeGEMVMatchesCPUReferenceWithOddTotalRowTail` | Pass; dense batched decode GEMV count 2/3/4 keeps inactive row groups through barriers and preserves output tail sentinels |
-| `MetalSourceGeneratorTests` | 29/29 pass after adding Q8, batched Q4, and dense decode GEMV row-tail coverage |
+| `MetalSourceGeneratorTests/decodeGEMVArgumentTableMatchesCPUReferenceWithOddOutputTail` | Pass; dense single decode GEMV argument-table variant keeps inactive row groups through barriers and preserves output tail sentinels |
+| `MetalSourceGeneratorTests/batchedDecodeGEMVArgumentTableMatchesCPUReferenceWithOddTotalRowTail` | Pass; dense batched decode GEMV argument-table variants count 2/3/4 keep inactive row groups through barriers and preserve output tail sentinels |
+| `MetalSourceGeneratorTests` | 31/31 pass after adding Q8, batched Q4, dense decode GEMV, and argument-table decode GEMV row-tail coverage |
 | `SequenceProjectionEquivalenceTests/bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride` | Pass; dense single sequence GEMV keeps inactive row groups through barriers and preserves padded output rows |
 | `SequenceProjectionEquivalenceTests/bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride` | Pass; dense batched sequence GEMV keeps inactive row groups through barriers and preserves each padded output |
 | `SequenceProjectionEquivalenceTests` | 8/8 pass after adding dense odd-row tail coverage |
