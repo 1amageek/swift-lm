@@ -695,11 +695,12 @@ extension MetalSourceGenerator {
             const uint stagedInputElements = \(tileElements);
             const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
             const uint row = gid * rowsPerThreadgroup + sgitg;
-            if (row >= \(fixedOutputDimension.map { "\($0)u" } ?? "outputDimension")) return;
+            const bool active = row < \(fixedOutputDimension.map { "\($0)u" } ?? "outputDimension");
 
             threadgroup \(stagedInputType) inputTile[stagedInputElements];
             float sum = 0.0f;
-            device const \(wt)* weightRow = weight + row * fixedInputDimension;
+            const uint safeRow = active ? row : 0;
+            device const \(wt)* weightRow = weight + safeRow * fixedInputDimension;
             for (uint base = 0; base < fixedInputDimension; base += stagedInputElements) {
                 device const \(bt)* inputTileSource = input + base + tid;
                 for (uint j = tid; j < stagedInputElements; j += threadsPerThreadgroup) {
@@ -708,19 +709,21 @@ extension MetalSourceGenerator {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                device const \(wt)* tileWeight = weightRow + base + tiisg * \(effectiveUnroll);
-                threadgroup const \(stagedInputType)* tileInput = inputTile + tiisg * \(effectiveUnroll);
-                for (uint j = tiisg * \(effectiveUnroll); j < stagedInputElements; j += SIMD_WIDTH * \(effectiveUnroll)) {
-                    \(unrolledAccumulate)
-                    tileWeight += SIMD_WIDTH * \(effectiveUnroll);
-                    tileInput += SIMD_WIDTH * \(effectiveUnroll);
+                if (active) {
+                    device const \(wt)* tileWeight = weightRow + base + tiisg * \(effectiveUnroll);
+                    threadgroup const \(stagedInputType)* tileInput = inputTile + tiisg * \(effectiveUnroll);
+                    for (uint j = tiisg * \(effectiveUnroll); j < stagedInputElements; j += SIMD_WIDTH * \(effectiveUnroll)) {
+                        \(unrolledAccumulate)
+                        tileWeight += SIMD_WIDTH * \(effectiveUnroll);
+                        tileInput += SIMD_WIDTH * \(effectiveUnroll);
+                    }
                 }
                 if (base + stagedInputElements < fixedInputDimension) {
                     threadgroup_barrier(mem_flags::mem_threadgroup);
                 }
             }
             sum = simd_sum(sum);
-            if (tiisg == 0) {
+            if (active && tiisg == 0) {
                 output[row] = \(bt)(sum);
             }
         }
@@ -809,7 +812,7 @@ extension MetalSourceGenerator {
             const uint stagedInputElements = \(stagedInputElements);
             const uint rowsPerThreadgroup = \(rowsPerThreadgroupExpr);
             const uint row = gid * rowsPerThreadgroup + sgitg;
-            if (row >= \(outputDimensionExpr)) return;
+            const bool active = row < \(outputDimensionExpr);
 
             threadgroup \(stagedInputType) inputTile[stagedInputElements];
             for (uint j = tid; j < stagedInputElements; j += \(effectiveThreadsPerThreadgroupExpr)) {
@@ -818,22 +821,24 @@ extension MetalSourceGenerator {
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             float sum = 0.0f;
-            device const \(wt)* weightRow = weight + row * \(inputDimensionExpr);
-            \(usePointerIncrementLoop ? """
-            device const \(wt)* weightLane = weightRow + tiisg * \(effectiveUnroll);
-            threadgroup const \(stagedInputType)* inputLane = inputTile + tiisg * \(effectiveUnroll);
-            for (uint j = tiisg * \(effectiveUnroll); j < \(inputDimensionExpr); j += SIMD_WIDTH * \(effectiveUnroll)) {
-                \(pointerAccumulate)
-                weightLane += SIMD_WIDTH * \(effectiveUnroll);
-                inputLane += SIMD_WIDTH * \(effectiveUnroll);
+            if (active) {
+                device const \(wt)* weightRow = weight + row * \(inputDimensionExpr);
+                \(usePointerIncrementLoop ? """
+                device const \(wt)* weightLane = weightRow + tiisg * \(effectiveUnroll);
+                threadgroup const \(stagedInputType)* inputLane = inputTile + tiisg * \(effectiveUnroll);
+                for (uint j = tiisg * \(effectiveUnroll); j < \(inputDimensionExpr); j += SIMD_WIDTH * \(effectiveUnroll)) {
+                    \(pointerAccumulate)
+                    weightLane += SIMD_WIDTH * \(effectiveUnroll);
+                    inputLane += SIMD_WIDTH * \(effectiveUnroll);
+                }
+                """ : """
+                for (uint j = tiisg * \(effectiveUnroll); j < \(inputDimensionExpr); j += SIMD_WIDTH * \(effectiveUnroll)) {
+                    \(unrolledAccumulate)
+                }
+                """)
             }
-            """ : """
-            for (uint j = tiisg * \(effectiveUnroll); j < \(inputDimensionExpr); j += SIMD_WIDTH * \(effectiveUnroll)) {
-                \(unrolledAccumulate)
-            }
-            """)
             sum = simd_sum(sum);
-            if (tiisg == 0) {
+            if (active && tiisg == 0) {
                 output[row] = \(bt)(sum);
             }
         }

@@ -961,7 +961,9 @@ Evidence:
 | `MetalSourceGeneratorTests/batchedDecodeGEMVMatchesCPUReferenceWithOddTotalRowTail` | Pass; dense batched decode GEMV count 2/3/4 keeps inactive row groups through barriers and preserves output tail sentinels |
 | `MetalSourceGeneratorTests/decodeGEMVArgumentTableMatchesCPUReferenceWithOddOutputTail` | Pass; dense single decode GEMV argument-table variant keeps inactive row groups through barriers and preserves output tail sentinels |
 | `MetalSourceGeneratorTests/batchedDecodeGEMVArgumentTableMatchesCPUReferenceWithOddTotalRowTail` | Pass; dense batched decode GEMV argument-table variants count 2/3/4 keep inactive row groups through barriers and preserve output tail sentinels |
-| `MetalSourceGeneratorTests` | 31/31 pass after adding Q8, batched Q4, dense decode GEMV, and argument-table decode GEMV row-tail coverage |
+| `MetalSourceGeneratorTests/specializedDecodeGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; specialized 2048-input and 8192-input decode GEMV variants keep inactive row groups through barriers and preserve output tail sentinels |
+| `MetalSourceGeneratorTests/specializedDecodeGEMVArgumentTableMatchesCPUReferenceWithOddOutputTail` | Pass; vocab, specialized 2048-input, and specialized 8192-input argument-table variants require explicit resource usage and match CPU reference with odd output tails |
+| `MetalSourceGeneratorTests` | 33/33 pass after adding Q8, batched Q4, dense decode GEMV, argument-table decode GEMV, and specialized decode GEMV row-tail coverage |
 | `SequenceProjectionEquivalenceTests/bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride` | Pass; dense single sequence GEMV keeps inactive row groups through barriers and preserves padded output rows |
 | `SequenceProjectionEquivalenceTests/bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride` | Pass; dense batched sequence GEMV keeps inactive row groups through barriers and preserves each padded output |
 | `SequenceProjectionEquivalenceTests` | 8/8 pass after adding dense odd-row tail coverage |

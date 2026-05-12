@@ -1115,6 +1115,10 @@ struct MetalSourceGeneratorTests {
         let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
         encoder.setComputePipelineState(pipeline)
         encoder.setBuffer(argumentBuffer, offset: 0, index: argumentBufferIndex)
+        encoder.useResource(argumentBuffer, usage: .read)
+        encoder.useResource(inputBuffer, usage: .read)
+        encoder.useResource(weightBuffer, usage: .read)
+        encoder.useResource(outputBuffer, usage: .write)
         var inputDim = UInt32(inputDimension)
         var outputDim = UInt32(outputDimension)
         encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.size, index: 3)
@@ -1166,6 +1170,91 @@ struct MetalSourceGeneratorTests {
             count: 4,
             outputDimensions: [1, 2, 1, 3],
             usesArgumentTable: true
+        )
+    }
+
+    @Test("Specialized decode GEMV matches CPU reference with odd output tail")
+    func specializedDecodeGEMVMatchesCPUReferenceWithOddOutputTail() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try assertSingleDecodeGEMVOddTail(
+            device: device,
+            name: "test_input2048_decode_gemv_odd_tail",
+            inputDimension: 2_048,
+            source: MetalSourceGenerator.generateInput2048GEMV(
+                name: "test_input2048_decode_gemv_odd_tail",
+                bufferPrecision: .float32,
+                weightFormat: .float16,
+                fixedOutputDimension: 5
+            )
+        )
+        try assertSingleDecodeGEMVOddTail(
+            device: device,
+            name: "test_input8192_decode_gemv_odd_tail",
+            inputDimension: 8_192,
+            source: MetalSourceGenerator.generateInput8192TiledGEMV(
+                name: "test_input8192_decode_gemv_odd_tail",
+                bufferPrecision: .float32,
+                weightFormat: .float16,
+                fixedOutputDimension: 5,
+                tileElements: 1_024
+            )
+        )
+    }
+
+    @Test("Specialized decode GEMV argument table matches CPU reference with odd output tail")
+    func specializedDecodeGEMVArgumentTableMatchesCPUReferenceWithOddOutputTail() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let argumentBufferIndex = 30
+        try assertSingleDecodeGEMVOddTail(
+            device: device,
+            name: "test_vocab_decode_gemv_argbuf_odd_tail",
+            inputDimension: 2_048,
+            source: MetalSourceGenerator.generateVocabGEMVArgumentTableVariant(
+                name: "test_vocab_decode_gemv_argbuf_odd_tail",
+                argumentBufferIndex: argumentBufferIndex,
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            ),
+            argumentBufferIndex: argumentBufferIndex
+        )
+        try assertSingleDecodeGEMVOddTail(
+            device: device,
+            name: "test_input2048_decode_gemv_argbuf_odd_tail",
+            inputDimension: 2_048,
+            source: MetalSourceGenerator.generateInput2048GEMVArgumentTableVariant(
+                name: "test_input2048_decode_gemv_argbuf_odd_tail",
+                argumentBufferIndex: argumentBufferIndex,
+                bufferPrecision: .float32,
+                weightFormat: .float16,
+                fixedOutputDimension: 5
+            ),
+            argumentBufferIndex: argumentBufferIndex
+        )
+        try assertSingleDecodeGEMVOddTail(
+            device: device,
+            name: "test_input8192_decode_gemv_argbuf_odd_tail",
+            inputDimension: 8_192,
+            source: MetalSourceGenerator.generateInput8192TiledGEMVArgumentTableVariant(
+                name: "test_input8192_decode_gemv_argbuf_odd_tail",
+                argumentBufferIndex: argumentBufferIndex,
+                bufferPrecision: .float32,
+                weightFormat: .float16,
+                fixedOutputDimension: 5,
+                tileElements: 1_024
+            ),
+            argumentBufferIndex: argumentBufferIndex
         )
     }
 
@@ -2073,6 +2162,96 @@ struct MetalSourceGeneratorTests {
         return expected
     }
 
+    private func assertSingleDecodeGEMVOddTail(
+        device: MTLDevice,
+        name: String,
+        inputDimension: Int,
+        outputDimension: Int = 5,
+        outputCapacity: Int = 8,
+        source: String,
+        argumentBufferIndex: Int? = nil
+    ) throws {
+        let input = makeDecodeFloatInput(inputDimension: inputDimension)
+        let weights = makeDecodeFloat16Weights(
+            outputDimension: outputDimension,
+            inputDimension: inputDimension,
+            projectionSeed: 3
+        )
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weights,
+            length: weights.count * MemoryLayout<Float16>.size,
+            options: .storageModeShared
+        ))
+        var output = [Float](repeating: .nan, count: outputCapacity)
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(
+            source: MetalSourceGenerator.commonHeader + "\n\n" + source,
+            options: options
+        )
+        let function = try #require(library.makeFunction(name: name))
+        let pipeline = try device.makeComputePipelineState(function: function)
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        if let argumentBufferIndex {
+            let argumentEncoder = function.makeArgumentEncoder(bufferIndex: argumentBufferIndex)
+            let argumentBuffer = try #require(device.makeBuffer(
+                length: argumentEncoder.encodedLength,
+                options: .storageModeShared
+            ))
+            argumentEncoder.setArgumentBuffer(argumentBuffer, offset: 0)
+            argumentEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
+            argumentEncoder.setBuffer(weightBuffer, offset: 0, index: 1)
+            argumentEncoder.setBuffer(outputBuffer, offset: 0, index: 2)
+            encoder.setBuffer(argumentBuffer, offset: 0, index: argumentBufferIndex)
+            encoder.useResource(argumentBuffer, usage: .read)
+        } else {
+            encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+            encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+            encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        }
+        encoder.useResource(inputBuffer, usage: .read)
+        encoder.useResource(weightBuffer, usage: .read)
+        encoder.useResource(outputBuffer, usage: .write)
+        var inputDim = UInt32(inputDimension)
+        var outputDim = UInt32(outputDimension)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&outputDim, length: MemoryLayout<UInt32>.size, index: 4)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / pipeline.threadExecutionWidth)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertDecodeOutput(
+            outputBuffer: outputBuffer,
+            outputCapacity: outputCapacity,
+            input: input,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            label: "\(name) odd-tail"
+        )
+    }
+
     private func assertBatchedDecodeGEMVOddTail(
         device: MTLDevice,
         count: Int,
@@ -2146,12 +2325,18 @@ struct MetalSourceGeneratorTests {
                 argumentEncoder.setBuffer(outputBuffers[index], offset: 0, index: 1 + count + index)
             }
             encoder.setBuffer(argumentBuffer, offset: 0, index: argumentBufferIndex)
+            encoder.useResource(argumentBuffer, usage: .read)
         } else {
             encoder.setBuffer(inputBuffer, offset: 0, index: 0)
             for index in 0..<count {
                 encoder.setBuffer(weightBuffers[index], offset: 0, index: 1 + index)
                 encoder.setBuffer(outputBuffers[index], offset: 0, index: 1 + count + index)
             }
+        }
+        encoder.useResource(inputBuffer, usage: .read)
+        for index in 0..<count {
+            encoder.useResource(weightBuffers[index], usage: .read)
+            encoder.useResource(outputBuffers[index], usage: .write)
         }
         let dimBase = 1 + 2 * count
         var inputDim = UInt32(inputDimension)
