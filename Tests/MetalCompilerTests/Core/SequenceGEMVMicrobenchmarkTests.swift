@@ -50,6 +50,60 @@ struct SequenceGEMVMicrobenchmarkTests {
         #expect(rows.count == shapes.count * Self.sequenceLengths.count * variants.count)
     }
 
+    @Test("BF16 batched sequence GEMV real-shape microbench")
+    func bf16BatchedSequenceGEMVRealShapeMicrobench() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let harness = try MicrobenchmarkHarness(device: device)
+        let shapes = [
+            BatchedShape(
+                role: "mlp.gate_up",
+                inputDimension: 2048,
+                outputDimensions: [3584, 3584]
+            ),
+            BatchedShape(
+                role: "self_attn.qkv",
+                inputDimension: 2048,
+                outputDimensions: [4096, 512, 512]
+            ),
+            BatchedShape(
+                role: "linear_attn.in_proj",
+                inputDimension: 2048,
+                outputDimensions: [6144, 2048, 16, 16]
+            ),
+        ]
+        let variants = [
+            BatchedVariant(name: "base", sequenceTile: 1),
+            BatchedVariant(name: "tile2", sequenceTile: 2),
+            BatchedVariant(name: "tile4", sequenceTile: 4),
+        ]
+
+        var rows: [BatchedResultRow] = []
+        for shape in shapes {
+            for sequenceLength in Self.sequenceLengths {
+                for variant in variants {
+                    let measurement = try harness.measureBatched(
+                        shape: shape,
+                        variant: variant,
+                        sequenceLength: sequenceLength,
+                        iterations: Self.iterations,
+                        warmupIterations: Self.warmupIterations
+                    )
+                    rows.append(measurement)
+                }
+            }
+        }
+
+        let artifact = try writeBatchedCSV(rows: rows)
+        printBatchedReport(rows: rows, artifact: artifact)
+        #expect(rows.count == shapes.count * Self.sequenceLengths.count * variants.count)
+    }
+
     @Test("BF16 fused SwiGLU down rows-per-threadgroup microbench")
     func bf16FusedSwigluDownRowsMicrobench() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -159,6 +213,62 @@ struct SequenceGEMVMicrobenchmarkTests {
         return url
     }
 
+    private func printBatchedReport(rows: [BatchedResultRow], artifact: URL) {
+        print()
+        print("=== BF16 batched sequence GEMV real-shape microbench ===")
+        print("artifact: \(artifact.path)")
+        print("role                 seq  variant  count  avg_us  us/output  grid      tg")
+        for row in rows.sorted(by: batchedRowSort) {
+            let role = row.role.padding(toLength: 20, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 7, withPad: " ", startingAt: 0)
+            let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 9, withPad: " ", startingAt: 0)
+            print("  \(role) \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%5d", row.projectionCount))  \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.4f", row.microsecondsPerOutput))  \(grid) \(row.threadgroupWidth)")
+        }
+    }
+
+    private func writeBatchedCSV(rows: [BatchedResultRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/sequence-gemv-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-batched-sequence-gemv.csv")
+        var lines = [
+            [
+                "role",
+                "inputDimension",
+                "outputDimensions",
+                "totalOutputDimension",
+                "sequenceLength",
+                "variant",
+                "sequenceTile",
+                "projectionCount",
+                "gridWidth",
+                "gridHeight",
+                "threadgroupWidth",
+                "averageGpuMicroseconds",
+                "microsecondsPerOutput",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: batchedRowSort) {
+            lines.append([
+                row.role,
+                String(row.inputDimension),
+                row.outputDimensions.map(String.init).joined(separator: "+"),
+                String(row.totalOutputDimension),
+                String(row.sequenceLength),
+                row.variant,
+                String(row.sequenceTile),
+                String(row.projectionCount),
+                String(row.gridWidth),
+                String(row.gridHeight),
+                String(row.threadgroupWidth),
+                String(format: "%.3f", row.averageGpuMicroseconds),
+                String(format: "%.6f", row.microsecondsPerOutput),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func printFusedRowsReport(rows: [FusedRowsResultRow], artifact: URL) {
         print()
         print("=== BF16 fused SwiGLU down rows-per-threadgroup microbench ===")
@@ -229,6 +339,12 @@ struct SequenceGEMVMicrobenchmarkTests {
         return lhs.sequenceTile < rhs.sequenceTile
     }
 
+    private func batchedRowSort(_ lhs: BatchedResultRow, _ rhs: BatchedResultRow) -> Bool {
+        if lhs.role != rhs.role { return lhs.role < rhs.role }
+        if lhs.sequenceLength != rhs.sequenceLength { return lhs.sequenceLength < rhs.sequenceLength }
+        return lhs.sequenceTile < rhs.sequenceTile
+    }
+
     private func fusedRowsSort(_ lhs: FusedRowsResultRow, _ rhs: FusedRowsResultRow) -> Bool {
         if lhs.role != rhs.role { return lhs.role < rhs.role }
         if lhs.sequenceLength != rhs.sequenceLength { return lhs.sequenceLength < rhs.sequenceLength }
@@ -245,9 +361,32 @@ private struct Shape {
     let outputDimension: Int
 }
 
+private struct BatchedShape {
+    let role: String
+    let inputDimension: Int
+    let outputDimensions: [Int]
+
+    var projectionCount: Int {
+        outputDimensions.count
+    }
+
+    var totalOutputDimension: Int {
+        outputDimensions.reduce(0, +)
+    }
+
+    var maximumOutputDimension: Int {
+        outputDimensions.max() ?? 0
+    }
+}
+
 private struct Variant {
     let name: String
     let kernelName: String
+    let sequenceTile: Int
+}
+
+private struct BatchedVariant {
+    let name: String
     let sequenceTile: Int
 }
 
@@ -276,6 +415,28 @@ private struct ResultRow {
 
     var microsecondsPerOutput: Double {
         averageGpuMicroseconds / Double(sequenceLength * outputDimension)
+    }
+}
+
+private struct BatchedResultRow {
+    let role: String
+    let inputDimension: Int
+    let outputDimensions: [Int]
+    let sequenceLength: Int
+    let variant: String
+    let sequenceTile: Int
+    let projectionCount: Int
+    let gridWidth: Int
+    let gridHeight: Int
+    let threadgroupWidth: Int
+    let averageGpuMicroseconds: Double
+
+    var totalOutputDimension: Int {
+        outputDimensions.reduce(0, +)
+    }
+
+    var microsecondsPerOutput: Double {
+        averageGpuMicroseconds / Double(sequenceLength * totalOutputDimension)
     }
 }
 
@@ -329,6 +490,66 @@ private struct MicrobenchmarkHarness {
                 weightFormat: WeightFormats.bfloat16,
                 sequenceTile: 4
             ),
+            MetalSourceGenerator.generateBatchedSequenceGEMV(
+                name: "bench_batched_gemv2_seq_bf16_f32s",
+                count: 2,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv2_seq_bf16_f32s_tile2",
+                count: 2,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 2
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv2_seq_bf16_f32s_tile4",
+                count: 2,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 4
+            ),
+            MetalSourceGenerator.generateBatchedSequenceGEMV(
+                name: "bench_batched_gemv3_seq_bf16_f32s",
+                count: 3,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv3_seq_bf16_f32s_tile2",
+                count: 3,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 2
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv3_seq_bf16_f32s_tile4",
+                count: 3,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 4
+            ),
+            MetalSourceGenerator.generateBatchedSequenceGEMV(
+                name: "bench_batched_gemv4_seq_bf16_f32s",
+                count: 4,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv4_seq_bf16_f32s_tile2",
+                count: 4,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 2
+            ),
+            MetalSourceGenerator.generateTiledBatchedSequenceGEMV(
+                name: "bench_batched_gemv4_seq_bf16_f32s_tile4",
+                count: 4,
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                sequenceTile: 4
+            ),
             MetalSourceGenerator.generateFusedSwigluDownSequenceGEMV(
                 name: "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
                 bufferPrecision: .float32,
@@ -348,6 +569,15 @@ private struct MicrobenchmarkHarness {
             "bench_gemv_seq_bf16_f32s",
             "bench_gemv_seq_bf16_f32s_tile2",
             "bench_gemv_seq_bf16_f32s_tile4",
+            "bench_batched_gemv2_seq_bf16_f32s",
+            "bench_batched_gemv2_seq_bf16_f32s_tile2",
+            "bench_batched_gemv2_seq_bf16_f32s_tile4",
+            "bench_batched_gemv3_seq_bf16_f32s",
+            "bench_batched_gemv3_seq_bf16_f32s_tile2",
+            "bench_batched_gemv3_seq_bf16_f32s_tile4",
+            "bench_batched_gemv4_seq_bf16_f32s",
+            "bench_batched_gemv4_seq_bf16_f32s_tile2",
+            "bench_batched_gemv4_seq_bf16_f32s_tile4",
             "bench_mlp_fused_swiglu_down_seq_bf16_f32s",
             "bench_mlp_fused_swiglu_down_seq_bf16_f32s_rps2",
         ]
@@ -417,6 +647,74 @@ private struct MicrobenchmarkHarness {
             sequenceLength: sequenceLength,
             variant: variant.name,
             sequenceTile: variant.sequenceTile,
+            gridWidth: geometry.grid.width,
+            gridHeight: geometry.grid.height,
+            threadgroupWidth: geometry.threadgroup.width,
+            averageGpuMicroseconds: totalMicroseconds / Double(iterations)
+        )
+    }
+
+    func measureBatched(
+        shape: BatchedShape,
+        variant: BatchedVariant,
+        sequenceLength: Int,
+        iterations: Int,
+        warmupIterations: Int
+    ) throws -> BatchedResultRow {
+        let kernelName = batchedKernelName(count: shape.projectionCount, sequenceTile: variant.sequenceTile)
+        guard let pipeline = pipelines[kernelName] else {
+            throw MetalCompilerError.kernelNotFound(kernelName)
+        }
+        let inputValues = makeInputValues(count: sequenceLength * shape.inputDimension)
+        let weights = shape.outputDimensions.map { outputDimension in
+            makeWeights(count: outputDimension * shape.inputDimension)
+        }
+        let inputBuffer = try makeSharedBuffer(values: inputValues)
+        let weightBuffers = try weights.map(makeSharedBuffer)
+        let outputByteLength = sequenceLength * shape.maximumOutputDimension * MemoryLayout<Float>.stride
+        let outputBuffers = try shape.outputDimensions.map { _ in
+            try makeZeroedSharedBuffer(byteLength: outputByteLength)
+        }
+        let geometry = dispatchGeometry(
+            pipeline: pipeline,
+            outputDimension: shape.totalOutputDimension,
+            sequenceLength: sequenceLength,
+            sequenceTile: variant.sequenceTile
+        )
+
+        for _ in 0..<warmupIterations {
+            _ = try executeBatched(
+                pipeline: pipeline,
+                inputBuffer: inputBuffer,
+                weightBuffers: weightBuffers,
+                outputBuffers: outputBuffers,
+                shape: shape,
+                sequenceLength: sequenceLength,
+                geometry: geometry
+            )
+        }
+
+        var totalMicroseconds = 0.0
+        for _ in 0..<iterations {
+            totalMicroseconds += try executeBatched(
+                pipeline: pipeline,
+                inputBuffer: inputBuffer,
+                weightBuffers: weightBuffers,
+                outputBuffers: outputBuffers,
+                shape: shape,
+                sequenceLength: sequenceLength,
+                geometry: geometry
+            )
+        }
+
+        return BatchedResultRow(
+            role: shape.role,
+            inputDimension: shape.inputDimension,
+            outputDimensions: shape.outputDimensions,
+            sequenceLength: sequenceLength,
+            variant: variant.name,
+            sequenceTile: variant.sequenceTile,
+            projectionCount: shape.projectionCount,
             gridWidth: geometry.grid.width,
             gridHeight: geometry.grid.height,
             threadgroupWidth: geometry.threadgroup.width,
@@ -531,6 +829,51 @@ private struct MicrobenchmarkHarness {
         return (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1_000_000
     }
 
+    private func executeBatched(
+        pipeline: MTLComputePipelineState,
+        inputBuffer: MTLBuffer,
+        weightBuffers: [MTLBuffer],
+        outputBuffers: [MTLBuffer],
+        shape: BatchedShape,
+        sequenceLength: Int,
+        geometry: (grid: MTLSize, threadgroup: MTLSize)
+    ) throws -> Double {
+        guard let commandBuffer = queue.makeCommandBuffer(),
+              let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw MetalCompilerError.deviceSetupFailed("Cannot create batched microbenchmark command buffer")
+        }
+        let count = shape.projectionCount
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        for (index, buffer) in weightBuffers.enumerated() {
+            encoder.setBuffer(buffer, offset: 0, index: 1 + index)
+        }
+        for (index, buffer) in outputBuffers.enumerated() {
+            encoder.setBuffer(buffer, offset: 0, index: 1 + count + index)
+        }
+        let dimBase = 1 + 2 * count
+        var inputDimension = UInt32(shape.inputDimension)
+        encoder.setBytes(&inputDimension, length: MemoryLayout<UInt32>.stride, index: dimBase)
+        var outputDimensions = shape.outputDimensions.map(UInt32.init)
+        for index in outputDimensions.indices {
+            encoder.setBytes(&outputDimensions[index], length: MemoryLayout<UInt32>.stride, index: dimBase + 1 + index)
+        }
+        var sequenceLengthValue = UInt32(sequenceLength)
+        var inputRowStride = UInt32(shape.inputDimension)
+        var outputRowStride = UInt32(shape.maximumOutputDimension)
+        encoder.setBytes(&sequenceLengthValue, length: MemoryLayout<UInt32>.stride, index: dimBase + 1 + count)
+        encoder.setBytes(&inputRowStride, length: MemoryLayout<UInt32>.stride, index: dimBase + 2 + count)
+        encoder.setBytes(&outputRowStride, length: MemoryLayout<UInt32>.stride, index: dimBase + 3 + count)
+        encoder.dispatchThreadgroups(geometry.grid, threadsPerThreadgroup: geometry.threadgroup)
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw MetalCompilerError.deviceSetupFailed("Batched microbenchmark command failed: \(error.localizedDescription)")
+        }
+        return (commandBuffer.gpuEndTime - commandBuffer.gpuStartTime) * 1_000_000
+    }
+
     private func executeFusedSwigluDown(
         pipeline: MTLComputePipelineState,
         gateBuffer: MTLBuffer,
@@ -628,6 +971,13 @@ private struct MicrobenchmarkHarness {
         (0..<count).map { index in
             BFloat16(Float((index * 13) % 67 - 33) * 0.00390625)
         }
+    }
+
+    private func batchedKernelName(count: Int, sequenceTile: Int) -> String {
+        if sequenceTile == 1 {
+            return "bench_batched_gemv\(count)_seq_bf16_f32s"
+        }
+        return "bench_batched_gemv\(count)_seq_bf16_f32s_tile\(sequenceTile)"
     }
 
     private func makeSharedBuffer<T>(values: [T]) throws -> MTLBuffer {

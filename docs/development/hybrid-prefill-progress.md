@@ -179,6 +179,7 @@ flowchart TD
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes aggregate CSVs for both step and pass profiles at seqLen 16/64/128 |
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; layer CSV now infers `layers.N` from weight tensor names and weight-role CSV supports batched semicolon-separated tensor groups |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
+| 2026-05-12 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; base batched sequence GEMV beats tile2/tile4 for the dominant Qwen3.5 BF16 batched projection shapes except small noisy cases |
 
 ## Failed Experiments
 
@@ -193,6 +194,7 @@ flowchart TD
 | Feature-flagged fused SwiGLU + down projection with two output rows per SIMD group | Correctness passed and isolated microbench improved seqLen 16/64, but full-model Qwen profile regressed to 66.824/216.839/541.439 ms for seqLen 16/64/128 | Kept as an opt-in experiment behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP=2`; not eligible for default routing |
 | Feature-flagged shared-RMS SSM recurrence | Correctness passed and removed redundant per-thread RMS scale recomputation, but same-session profile evidence was not stable enough to separate the effect from projection/thermal noise | Kept behind `SWIFTLM_PREFILL_SSM_SHARED_RMS=1`; default SSM sequence kernel remains unchanged |
 | Feature-flagged SSM recurrence threadgroup-width override | Correctness passed at `tg=128` and `tg=256`, but Qwen full-model profile with `tg=256` was 43.813/160.583/315.422 ms for seqLen 16/64/128 and did not beat the default profile | Kept behind `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH`; default SSM sequence kernel keeps the device-derived width |
+| Batched BF16 sequence GEMV tile2/tile4 | Isolated real-shape benchmark passed, but base is faster for the dominant seqLen 64/128 MLP gate+up, SSM in-proj, and attention QKV shapes | Do not route tiled batched BF16 kernels by default; future batched work should change data movement or use a different math path, not just sequence tiling |
 
 ## Open Decisions
 
@@ -309,6 +311,51 @@ not produce a uniform win and contradicts the full-model default-routing gate.
 Therefore tile2/tile4 remain experiments. The next design should target either
 an `mlp.down_proj`-specific long-sequence variant or producer-consumer fusion
 around `swiglu -> down_proj`, with full-model profile as the promotion gate.
+
+## BF16 Batched GEMV Microbenchmark (2026-05-12)
+
+`SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench`
+isolates the three dominant batched projection families from the Qwen3.5 BF16
+profile and compares the existing base sequence GEMV against tile2/tile4
+variants. This benchmark uses the same total output dimensions seen in the
+profile artifacts:
+
+| Role | Projection count | Output dimensions | Profile bucket |
+|---|---:|---|---|
+| `mlp.gate_up` | 2 | `3584+3584` | `mlp.gate_proj+mlp.up_proj` |
+| `self_attn.qkv` | 3 | `4096+512+512` | `self_attn.q_proj+self_attn.k_proj+self_attn.v_proj` |
+| `linear_attn.in_proj` | 4 | `6144+2048+16+16` | `linear_attn.in_proj_qkv+linear_attn.in_proj_z+linear_attn.in_proj_b+linear_attn.in_proj_a` |
+
+The result does not support promoting tiled batched kernels:
+
+| Role | SeqLen | Base | Tile2 | Tile4 | Local decision |
+|---|---:|---:|---:|---:|---|
+| `mlp.gate_up` | 16 | 2653.9 us | 2434.5 us | 2425.9 us | noisy small-seq win |
+| `mlp.gate_up` | 64 | 3894.1 us | 4261.9 us | 4595.8 us | base |
+| `mlp.gate_up` | 128 | 7169.6 us | 7875.9 us | 8459.3 us | base |
+| `linear_attn.in_proj` | 16 | 1700.5 us | 2433.9 us | 2705.1 us | base |
+| `linear_attn.in_proj` | 64 | 4468.6 us | 5314.1 us | 5571.0 us | base |
+| `linear_attn.in_proj` | 128 | 8123.7 us | 9722.0 us | 10654.1 us | base |
+| `self_attn.qkv` | 16 | 1936.4 us | 2629.6 us | 2381.5 us | base |
+| `self_attn.qkv` | 64 | 3062.7 us | 2995.9 us | 3708.4 us | noisy tile2 |
+| `self_attn.qkv` | 128 | 5164.0 us | 6059.6 us | 6617.2 us | base |
+
+The conclusion is now stronger than the single-GEMV result alone: simple
+sequence tiling is not the right default-speed lever for the current BF16
+prefill projection kernels. The next batched-projection work should target one
+of these larger structural changes:
+
+```mermaid
+flowchart TD
+  A["Batched projection bottleneck"] --> B["Keep base sequence GEMV as default"]
+  A --> C["Investigate MPP / GEMM path for stateless batched groups"]
+  A --> D["Investigate producer-consumer fusion around SSM input path"]
+  A --> E["Reduce dispatch or barrier cost around repeated projection blocks"]
+  C --> F["Reference gate"]
+  D --> F
+  E --> F
+  F --> G["Full-model Qwen profile gate"]
+```
 
 ## Current Q3 Prefill Smoke
 
