@@ -1901,6 +1901,37 @@ struct MetalSourceGeneratorTests {
         )
     }
 
+    @Test("Batched QK norm decode overdispatch updates only valid heads")
+    func batchedQKNormDecodeOverdispatchUpdatesOnlyValidHeads() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try assertBatchedQKNormDecodeOverdispatch(
+            device: device,
+            name: "test_batched_qk_norm_overdispatch",
+            source: MetalSourceGenerator.generateBatchedPerHead2(
+                name: "test_batched_qk_norm_overdispatch",
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            )
+        )
+        try assertBatchedQKNormDecodeOverdispatch(
+            device: device,
+            name: "test_batched_qk_norm_argbuf_overdispatch",
+            source: MetalSourceGenerator.generateBatchedPerHead2ArgumentTableVariant(
+                name: "test_batched_qk_norm_argbuf_overdispatch",
+                argumentBufferIndex: 30,
+                bufferPrecision: .float32,
+                weightFormat: .float16
+            ),
+            argumentBufferIndex: 30
+        )
+    }
+
     @Test("Unified quantized GEMV emits MLX-compatible Q6 bit extraction")
     func unifiedQuantizedGEMVQ6EmitsMLXBitPattern() throws {
         let formats: [any QuantizationFormat] = [
@@ -2764,6 +2795,160 @@ struct MetalSourceGeneratorTests {
         }
         for index in tailStart..<data.count {
             #expect(actualPointer[index] == originalData[index])
+        }
+    }
+
+    private func assertBatchedQKNormDecodeOverdispatch(
+        device: MTLDevice,
+        name: String,
+        source: String,
+        argumentBufferIndex: Int? = nil
+    ) throws {
+        let count0 = 2
+        let count1 = 1
+        let headDimension = 8
+        let epsilon: Float = 1e-5
+        let weightBias: Float = 0
+        var data0 = (0..<(count0 * headDimension)).map { index in
+            Float((index % 11) - 5) * 0.125
+        }
+        var data1 = (0..<(count1 * headDimension)).map { index in
+            Float((index % 7) - 3) * 0.25
+        }
+        let originalData0 = data0
+        let originalData1 = data1
+        let weight0 = (0..<headDimension).map { index in
+            Float16(0.5 + Float(index) * 0.0625)
+        }
+        let weight1 = (0..<headDimension).map { index in
+            Float16(0.75 + Float(index) * 0.03125)
+        }
+        let data0Buffer = try #require(device.makeBuffer(
+            bytes: &data0,
+            length: data0.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let data1Buffer = try #require(device.makeBuffer(
+            bytes: &data1,
+            length: data1.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weight0Buffer = try #require(device.makeBuffer(
+            bytes: weight0,
+            length: weight0.count * MemoryLayout<Float16>.size,
+            options: .storageModeShared
+        ))
+        let weight1Buffer = try #require(device.makeBuffer(
+            bytes: weight1,
+            length: weight1.count * MemoryLayout<Float16>.size,
+            options: .storageModeShared
+        ))
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(
+            source: MetalSourceGenerator.commonHeader + "\n\n" + source,
+            options: options
+        )
+        let function = try #require(library.makeFunction(name: name))
+        let pipeline = try device.makeComputePipelineState(function: function)
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        if let argumentBufferIndex {
+            let argumentEncoder = function.makeArgumentEncoder(bufferIndex: argumentBufferIndex)
+            let argumentBuffer = try #require(device.makeBuffer(
+                length: argumentEncoder.encodedLength,
+                options: .storageModeShared
+            ))
+            argumentEncoder.setArgumentBuffer(argumentBuffer, offset: 0)
+            argumentEncoder.setBuffer(data0Buffer, offset: 0, index: 0)
+            argumentEncoder.setBuffer(data1Buffer, offset: 0, index: 1)
+            argumentEncoder.setBuffer(weight0Buffer, offset: 0, index: 2)
+            argumentEncoder.setBuffer(weight1Buffer, offset: 0, index: 3)
+            encoder.setBuffer(argumentBuffer, offset: 0, index: argumentBufferIndex)
+            encoder.useResource(argumentBuffer, usage: .read)
+        } else {
+            encoder.setBuffer(data0Buffer, offset: 0, index: 0)
+            encoder.setBuffer(data1Buffer, offset: 0, index: 1)
+            encoder.setBuffer(weight0Buffer, offset: 0, index: 2)
+            encoder.setBuffer(weight1Buffer, offset: 0, index: 3)
+        }
+        encoder.useResource(data0Buffer, usage: [.read, .write])
+        encoder.useResource(data1Buffer, usage: [.read, .write])
+        encoder.useResource(weight0Buffer, usage: .read)
+        encoder.useResource(weight1Buffer, usage: .read)
+        var count0Value = UInt32(count0)
+        var count1Value = UInt32(count1)
+        var headDimValue = UInt32(headDimension)
+        var epsilonValue = epsilon
+        var weightBiasValue = weightBias
+        encoder.setBytes(&count0Value, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&count1Value, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&headDimValue, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&epsilonValue, length: MemoryLayout<Float>.size, index: 7)
+        encoder.setBytes(&weightBiasValue, length: MemoryLayout<Float>.size, index: 8)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: count0 + count1 + 1, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertQKNormValues(
+            buffer: data0Buffer,
+            original: originalData0,
+            weight: weight0,
+            headCount: count0,
+            headDimension: headDimension,
+            epsilon: epsilon,
+            weightBias: weightBias,
+            label: "\(name).data0"
+        )
+        assertQKNormValues(
+            buffer: data1Buffer,
+            original: originalData1,
+            weight: weight1,
+            headCount: count1,
+            headDimension: headDimension,
+            epsilon: epsilon,
+            weightBias: weightBias,
+            label: "\(name).data1"
+        )
+    }
+
+    private func assertQKNormValues(
+        buffer: MTLBuffer,
+        original: [Float],
+        weight: [Float16],
+        headCount: Int,
+        headDimension: Int,
+        epsilon: Float,
+        weightBias: Float,
+        label: String
+    ) {
+        let actualPointer = buffer.contents().bindMemory(
+            to: Float.self,
+            capacity: original.count
+        )
+        for head in 0..<headCount {
+            let base = head * headDimension
+            let sumSquares = (0..<headDimension).reduce(Float.zero) { partial, index in
+                let value = original[base + index]
+                return partial + value * value
+            }
+            let scale = 1 / sqrt(sumSquares / Float(headDimension) + epsilon)
+            for index in 0..<headDimension {
+                let expected = original[base + index] * scale * (Float(weight[index]) + weightBias)
+                #expect(
+                    abs(actualPointer[base + index] - expected) < 0.001,
+                    "\(label) drifted at head=\(head) index=\(index)"
+                )
+            }
         }
     }
 
