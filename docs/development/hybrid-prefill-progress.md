@@ -38,7 +38,7 @@ flowchart TD
 | M3 reference-equivalent MPP prefill | Pending | Requires M2 before adopting non decode-equivalent math |
 | M4 fused hybrid block prefill | Pending | Requires M2 and block-level reference probes |
 | M5 benchmark-backed release claim | Pending | Requires real-bundle correctness gates first |
-| External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 to guide M3/M4 scope |
+| External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 as a baseline to beat, not a target to copy |
 
 ## M1 Design
 
@@ -520,10 +520,11 @@ flowchart TD
 
 ## External Implementation Review: llama.cpp / ggml Metal (2026-05-12)
 
-This work is no longer guided only by local kernel experiments. The current
-external reference is llama.cpp / ggml Metal because Ollama delegates model
-execution to llama.cpp-family backends rather than providing the relevant
-Metal prefill kernels itself.
+This work is no longer guided only by local kernel experiments. llama.cpp /
+ggml Metal is treated as an external baseline to beat, not as the target
+architecture. Ollama delegates model execution to llama.cpp-family backends
+rather than providing the relevant Metal prefill kernels itself, so the useful
+comparison point is ggml Metal's prompt-processing and hybrid-kernel design.
 
 Reviewed source snapshot:
 
@@ -537,43 +538,45 @@ Reviewed source snapshot:
 
 Key comparison:
 
-| Area | llama.cpp / ggml Metal observation | swift-lm implication |
+| Area | llama.cpp / ggml Metal observation | swift-lm implication for a faster design |
 |---|---|---|
 | Prompt execution unit | `llama_decode` accepts many tokens, splits them into `ubatch`, and computes a graph with `batched = ubatch.n_tokens > 1` | Prefill should stay a sequence graph, not token-by-token decode, but correctness gates must own state updates |
-| Graph reuse | `process_ubatch` reuses graph topology when the ubatch shape and memory context match | M3 should separate stable shape planning from runtime inputs so larger kernels do not rebuild routing decisions |
-| Matmul selection | `GGML_OP_MUL_MAT` routes small `ne11` batches to extended mat-vec, larger prompt batches to simdgroup matrix-matrix | The next projection route should be shape-gated GEMM/MPP, not another universal tiled GEMV |
-| Hybrid Qwen3Next | Q/K/V/Z and beta/alpha are projected as sequence tensors, convolution state is concatenated with prompt tokens, then state cache is updated from the tail | swift-lm's conv-state sequence kernels match the right shape of the problem; future fusion must preserve exact tail-state semantics |
-| SSM convolution | ggml uses a batched SSM conv kernel when token count is greater than one | swift-lm should investigate SSM conv token batching before more single-GEMV micro-tiling |
-| Gated delta recurrence | ggml has a dedicated `kernel_gated_delta_net_*` that loops over sequence tokens inside the kernel and emits both output and final state | M4 should target a fused recurrent block kernel with reference probes, not just `ssm_out` projection tuning |
-| Quantized matmul | ggml has both matrix-matrix and matrix-vector families for many quantized block types | Q3 sequence support in swift-lm should remain reference-backed; Q4/Q8 GEMM adoption needs the same output/state gates |
+| Graph reuse | `process_ubatch` reuses graph topology when the ubatch shape and memory context match | swift-lm should go further by compiling a static dispatch plan with stable argument layout for known model shapes |
+| Matmul selection | `GGML_OP_MUL_MAT` routes small `ne11` batches to extended mat-vec, larger prompt batches to simdgroup matrix-matrix | The next projection route should be shape-gated GEMM/MPP, but only as an input to compiler-level fusion |
+| Hybrid Qwen3Next | Q/K/V/Z and beta/alpha are projected as sequence tensors, convolution state is concatenated with prompt tokens, then state cache is updated from the tail | swift-lm can specialize this exact family and fuse across graph boundaries that ggml keeps as generic ops |
+| SSM convolution | ggml uses a batched SSM conv kernel when token count is greater than one | swift-lm should make conv batching a sub-kernel inside a larger recurrent-block fusion, not stop at a standalone conv dispatch |
+| Gated delta recurrence | ggml has a dedicated `kernel_gated_delta_net_*` that loops over sequence tokens inside the kernel and emits both output and final state | M4 should target a fused recurrent block kernel with reference probes, reducing intermediate traffic and dispatch count beyond ggml |
+| Quantized matmul | ggml has both matrix-matrix and matrix-vector families for many quantized block types | Q3 sequence support in swift-lm should remain reference-backed; Q4/Q8 should aim at packed fused projection families, not generic parity |
 
 Design consequence:
 
 ```mermaid
 flowchart TD
   A["Local profile: projection 75% / SSM 22%"] --> B["External review: prompt batches become graph matmul + state kernels"]
-  B --> C["M3A: shape-gated reference-equivalent GEMM/MPP for stateless projections"]
-  B --> D["M3B: batched SSM conv/scan probes"]
-  C --> E["M4: fused hybrid block with state-tail proof"]
+  B --> C["M3A: shape-gated GEMM/MPP as a compiler primitive"]
+  B --> D["M3B: batched SSM conv/scan as fusion inputs"]
+  C --> E["M4: fused hybrid block beyond ggml op boundaries"]
   D --> E
-  E --> F["Release claim only after full-model trace + profile gates"]
+  E --> F["Beat-baseline claim only after correctness + profile comparison"]
 ```
 
 The rejected tile2/tile4 and fused-down experiments are still useful because
 they proved that the bottleneck is not a missing sibling batch. The external
-review changes the next bet: optimize around larger graph-level tensor work
-and stateful hybrid kernels, while using the reference harness to prevent the
-state drift that broke earlier MPP attempts.
+review changes the next bet: do not clone ggml's generic graph executor.
+Instead, use its successful shape decisions as lower-bound evidence, then use
+swift-lm's model-family compiler to specialize and fuse across op boundaries
+that a generic runtime cannot safely assume. The reference harness remains the
+admission gate that prevents the state drift that broke earlier MPP attempts.
 
 Next implementation order:
 
 | Step | Scope | Admission gate |
 |---|---|---|
-| M3A.1 | Add a reference-equivalent BF16 GEMM/MPP candidate for stateless attention/MLP input projections only | Fragment CPU reference, Qwen reference trace, full-model profile |
-| M3A.2 | Extend the candidate to dependent output projections only if M3A.1 is green | Same gates plus role-specific profile win |
-| M3B.1 | Prototype batched SSM conv with exact final conv-state extraction | Conv-state reference comparison across multiple prompt lengths |
-| M3B.2 | Prototype recurrent block scan/gated-delta fusion only behind an explicit experiment flag | Recurrent-state and decode0 reference comparison |
-| M4 | Fuse a complete Qwen hybrid recurrent block where projections, conv, recurrence, norm/gate, and output projection can share layout | Block-level reference dump plus end-to-end token trace |
+| M3A.1 | Add a reference-equivalent BF16 GEMM/MPP compiler primitive for stateless attention/MLP input projections | Fragment CPU reference, Qwen reference trace, full-model profile |
+| M3A.2 | Route GEMM/MPP only where it is a building block for future fusion, not as a generic replacement for all GEMV | Same gates plus role-specific profile win |
+| M3B.1 | Prototype batched SSM conv with exact final conv-state extraction as a reusable fused-block subroutine | Conv-state reference comparison across multiple prompt lengths |
+| M3B.2 | Prototype recurrent block scan/gated-delta fusion behind an explicit experiment flag | Recurrent-state and decode0 reference comparison |
+| M4 | Fuse a complete Qwen hybrid recurrent block where projections, conv, recurrence, norm/gate, and output projection can share layout and reduce intermediate memory traffic | Block-level reference dump plus end-to-end token trace plus baseline comparison |
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
