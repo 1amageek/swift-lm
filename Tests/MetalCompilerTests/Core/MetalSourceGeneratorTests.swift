@@ -1932,6 +1932,35 @@ struct MetalSourceGeneratorTests {
         )
     }
 
+    @Test("RoPE decode overdispatch updates only valid heads and lanes")
+    func ropeDecodeOverdispatchUpdatesOnlyValidHeadsAndLanes() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try assertRoPEDecodeOverdispatch(
+            device: device,
+            name: "test_rope_overdispatch",
+            source: MetalSourceGenerator.generateRoPE(
+                name: "test_rope_overdispatch",
+                bufferPrecision: .float32
+            )
+        )
+        try assertRoPEDecodeOverdispatch(
+            device: device,
+            name: "test_rope_argbuf_overdispatch",
+            source: MetalSourceGenerator.generateRoPEArgumentTableVariant(
+                name: "test_rope_argbuf_overdispatch",
+                argumentBufferIndex: 30,
+                bufferPrecision: .float32
+            ),
+            argumentBufferIndex: 30
+        )
+    }
+
     @Test("Unified quantized GEMV emits MLX-compatible Q6 bit extraction")
     func unifiedQuantizedGEMVQ6EmitsMLXBitPattern() throws {
         let formats: [any QuantizationFormat] = [
@@ -2949,6 +2978,172 @@ struct MetalSourceGeneratorTests {
                     "\(label) drifted at head=\(head) index=\(index)"
                 )
             }
+        }
+    }
+
+    private func assertRoPEDecodeOverdispatch(
+        device: MTLDevice,
+        name: String,
+        source: String,
+        argumentBufferIndex: Int? = nil
+    ) throws {
+        let headCount = 2
+        let kvHeadCount = 1
+        let headCapacity = 3
+        let headDimension = 8
+        let ropeDimension = 8
+        let pairCount = ropeDimension / 2
+        let ropeBase: Float = 10_000
+        let position: UInt32 = 3
+        var query = (0..<(headCapacity * headDimension)).map { index in
+            Float((index % 17) - 8) * 0.125
+        }
+        var key = (0..<(headCapacity * headDimension)).map { index in
+            Float((index % 19) - 9) * 0.0625
+        }
+        let queryTailStart = headCount * headDimension
+        let keyTailStart = kvHeadCount * headDimension
+        for index in queryTailStart..<query.count {
+            query[index] = 2000 + Float(index)
+        }
+        for index in keyTailStart..<key.count {
+            key[index] = 3000 + Float(index)
+        }
+        let originalQuery = query
+        let originalKey = key
+        var positionAxes = [position, position, position]
+        let queryBuffer = try #require(device.makeBuffer(
+            bytes: &query,
+            length: query.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let keyBuffer = try #require(device.makeBuffer(
+            bytes: &key,
+            length: key.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let positionBuffer = try #require(device.makeBuffer(
+            bytes: &positionAxes,
+            length: positionAxes.count * MemoryLayout<UInt32>.size,
+            options: .storageModeShared
+        ))
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(
+            source: MetalSourceGenerator.commonHeader + "\n\n" + source,
+            options: options
+        )
+        let function = try #require(library.makeFunction(name: name))
+        let pipeline = try device.makeComputePipelineState(function: function)
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        if let argumentBufferIndex {
+            let argumentEncoder = function.makeArgumentEncoder(bufferIndex: argumentBufferIndex)
+            let argumentBuffer = try #require(device.makeBuffer(
+                length: argumentEncoder.encodedLength,
+                options: .storageModeShared
+            ))
+            argumentEncoder.setArgumentBuffer(argumentBuffer, offset: 0)
+            argumentEncoder.setBuffer(queryBuffer, offset: 0, index: 0)
+            argumentEncoder.setBuffer(keyBuffer, offset: 0, index: 1)
+            argumentEncoder.setBuffer(positionBuffer, offset: 0, index: 2)
+            encoder.setBuffer(argumentBuffer, offset: 0, index: argumentBufferIndex)
+            encoder.useResource(argumentBuffer, usage: .read)
+        } else {
+            encoder.setBuffer(queryBuffer, offset: 0, index: 0)
+            encoder.setBuffer(keyBuffer, offset: 0, index: 1)
+            encoder.setBuffer(positionBuffer, offset: 0, index: 2)
+        }
+        encoder.useResource(queryBuffer, usage: [.read, .write])
+        encoder.useResource(keyBuffer, usage: [.read, .write])
+        encoder.useResource(positionBuffer, usage: .read)
+        var headCountValue = UInt32(headCount)
+        var kvHeadCountValue = UInt32(kvHeadCount)
+        var headDimValue = UInt32(headDimension)
+        var ropeDimValue = UInt32(ropeDimension)
+        var ropeBaseValue = ropeBase
+        var zero: UInt32 = 0
+        encoder.setBytes(&headCountValue, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&kvHeadCountValue, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&headDimValue, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&ropeDimValue, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.setBytes(&ropeBaseValue, length: MemoryLayout<Float>.size, index: 7)
+        encoder.setBytes(&zero, length: MemoryLayout<UInt32>.size, index: 8)
+        encoder.setBytes(&zero, length: MemoryLayout<UInt32>.size, index: 9)
+        encoder.setBytes(&zero, length: MemoryLayout<UInt32>.size, index: 10)
+        encoder.setBytes(&zero, length: MemoryLayout<UInt32>.size, index: 11)
+        encoder.setBytes(&zero, length: MemoryLayout<UInt32>.size, index: 12)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: headCapacity, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertRoPEValues(
+            buffer: queryBuffer,
+            original: originalQuery,
+            activeHeadCount: headCount,
+            headCapacity: headCapacity,
+            headDimension: headDimension,
+            pairCount: pairCount,
+            ropeDimension: ropeDimension,
+            position: Float(position),
+            ropeBase: ropeBase,
+            label: "\(name).query"
+        )
+        assertRoPEValues(
+            buffer: keyBuffer,
+            original: originalKey,
+            activeHeadCount: kvHeadCount,
+            headCapacity: headCapacity,
+            headDimension: headDimension,
+            pairCount: pairCount,
+            ropeDimension: ropeDimension,
+            position: Float(position),
+            ropeBase: ropeBase,
+            label: "\(name).key"
+        )
+    }
+
+    private func assertRoPEValues(
+        buffer: MTLBuffer,
+        original: [Float],
+        activeHeadCount: Int,
+        headCapacity: Int,
+        headDimension: Int,
+        pairCount: Int,
+        ropeDimension: Int,
+        position: Float,
+        ropeBase: Float,
+        label: String
+    ) {
+        let actualPointer = buffer.contents().bindMemory(
+            to: Float.self,
+            capacity: headCapacity * headDimension
+        )
+        for head in 0..<activeHeadCount {
+            let base = head * headDimension
+            for pair in 0..<pairCount {
+                let theta = position * pow(ropeBase, -2 * Float(pair) / Float(ropeDimension))
+                let cosTheta = cos(theta)
+                let sinTheta = sin(theta)
+                let x0 = original[base + pair]
+                let x1 = original[base + pairCount + pair]
+                let expected0 = x0 * cosTheta - x1 * sinTheta
+                let expected1 = x0 * sinTheta + x1 * cosTheta
+                #expect(abs(actualPointer[base + pair] - expected0) < 0.0001, "\(label) low pair \(pair) drifted")
+                #expect(abs(actualPointer[base + pairCount + pair] - expected1) < 0.0001, "\(label) high pair \(pair) drifted")
+            }
+        }
+        for index in (activeHeadCount * headDimension)..<original.count {
+            #expect(actualPointer[index] == original[index])
         }
     }
 

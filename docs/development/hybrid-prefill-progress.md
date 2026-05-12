@@ -966,7 +966,8 @@ Evidence:
 | `MetalSourceGeneratorTests/unifiedQuantizedGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; unified Q4 decode GEMV keeps inactive row groups through barriers and preserves output tail sentinels |
 | `MetalSourceGeneratorTests/qkNormDecodeOverdispatchUpdatesOnlyValidHeads` | Pass; QK norm decode and argument-table variants update valid heads only under over-dispatch |
 | `MetalSourceGeneratorTests/batchedQKNormDecodeOverdispatchUpdatesOnlyValidHeads` | Pass; batched QK norm decode and argument-table variants update valid heads only under over-dispatch |
-| `MetalSourceGeneratorTests` | 36/36 pass after adding Q8, batched Q4, dense decode GEMV, argument-table decode GEMV, specialized decode GEMV, unified quantized decode GEMV, QK norm, and batched QK norm over-dispatch coverage |
+| `MetalSourceGeneratorTests/ropeDecodeOverdispatchUpdatesOnlyValidHeadsAndLanes` | Pass; RoPE decode and argument-table variants update valid Q/K heads and lanes only under over-dispatch |
+| `MetalSourceGeneratorTests` | 37/37 pass after adding Q8, batched Q4, dense decode GEMV, argument-table decode GEMV, specialized decode GEMV, unified quantized decode GEMV, QK norm, batched QK norm, and RoPE over-dispatch coverage |
 | `SequenceProjectionEquivalenceTests/bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride` | Pass; dense single sequence GEMV keeps inactive row groups through barriers and preserves padded output rows |
 | `SequenceProjectionEquivalenceTests/bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride` | Pass; dense batched sequence GEMV keeps inactive row groups through barriers and preserves each padded output |
 | `SequenceProjectionEquivalenceTests` | 8/8 pass after adding dense odd-row tail coverage |
