@@ -1388,6 +1388,91 @@ struct MetalSourceGeneratorTests {
         )
     }
 
+    @Test("Unified quantized GEMV matches CPU reference with odd output tail")
+    func unifiedQuantizedGEMVMatchesCPUReferenceWithOddOutputTail() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 64
+        let outputDimension = 5
+        let outputCapacity = 8
+        let scale: Float = 0.25
+        let quantizedValueBase: UInt8 = 2
+        let input = makeDecodeFloatInput(inputDimension: inputDimension)
+        let weights = makeConstantQ4Weights(
+            outputDimension: outputDimension,
+            inputDimension: inputDimension,
+            scale: scale,
+            quantizedValueBase: quantizedValueBase
+        )
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weights,
+            length: weights.count,
+            options: .storageModeShared
+        ))
+        var output = [Float](repeating: .nan, count: outputCapacity)
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let kernelName = "test_unified_q4_gemv_odd_tail"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateUnifiedQuantizedGEMV(
+                name: kernelName,
+                format: AffineQ4Group64Format(),
+                bufferPrecision: .float32,
+                tileElements: inputDimension
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        var inputDim = UInt32(inputDimension)
+        var outputDim = UInt32(outputDimension)
+        encoder.setBytes(&inputDim, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&outputDim, length: MemoryLayout<UInt32>.size, index: 4)
+        let threads = min(2 * pipeline.threadExecutionWidth, pipeline.maxTotalThreadsPerThreadgroup)
+        let rowsPerThreadgroup = max(1, threads / pipeline.threadExecutionWidth)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: threads, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        assertConstantQ4DecodeOutput(
+            outputBuffer,
+            input: input,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            outputCapacity: outputCapacity,
+            scale: scale,
+            quantizedValueBase: quantizedValueBase
+        )
+    }
+
     @Test("Batched quantized Q4 GEMM count 2 matches CPU reference with padded output stride")
     func batchedQuantizedQ4GEMM2MatchesCPUReferenceWithPaddedScratchOutputStride() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -2514,6 +2599,36 @@ struct MetalSourceGeneratorTests {
             actualPrefix=\(actual.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
             expectedPrefix=\(expected.prefix(8).map { String(format: "%.4f", $0) }.joined(separator: ", "))
             """
+        )
+    }
+
+    private func assertConstantQ4DecodeOutput(
+        _ outputBuffer: MTLBuffer,
+        input: [Float],
+        inputDimension: Int,
+        outputDimension: Int,
+        outputCapacity: Int,
+        scale: Float,
+        quantizedValueBase: UInt8
+    ) {
+        let actualPointer = outputBuffer.contents().bindMemory(
+            to: Float.self,
+            capacity: outputCapacity
+        )
+        let inputSum = (0..<inputDimension).reduce(Float.zero) { partial, column in
+            partial + input[column]
+        }
+        var maxError: Float = 0
+        for row in 0..<outputDimension {
+            let expected = inputSum * scale * Float(quantizedValueBase + UInt8(row))
+            maxError = max(maxError, abs(actualPointer[row] - expected))
+        }
+        for row in outputDimension..<outputCapacity {
+            #expect(actualPointer[row].isNaN)
+        }
+        #expect(
+            maxError < 0.001,
+            "Unified Q4 decode GEMV odd-tail drifted: maxError=\(maxError)"
         )
     }
 

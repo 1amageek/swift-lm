@@ -559,10 +559,11 @@ public static func generateUnifiedQuantizedGEMV(
         const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
         const uint TILE_ELEMENTS = \(tileElements);
         const uint row = gid.x * rowsPerThreadgroup + sgitg;
-        if (row >= outputDimension) return;
+        const bool active = row < outputDimension;
 
         const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
-        device const uchar* rowBase = weight + row * blocksPerRow * BYTES_PER_BLOCK;
+        const uint safeRow = active ? row : 0;
+        device const uchar* rowBase = weight + safeRow * blocksPerRow * BYTES_PER_BLOCK;
         threadgroup \(bt) inputTile[TILE_ELEMENTS];
         float sum = 0.0f;
 
@@ -575,18 +576,20 @@ public static func generateUnifiedQuantizedGEMV(
 
             const uint blockBase = base / WEIGHTS_PER_BLOCK;
             const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
-            for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
-                device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
-                float scale = float(*(device const half*)(block));
-                float zero = float(*(device const half*)(block + 2));
-                device const uchar* qs = block + 4;
-                const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
     \(scaffoldBody)
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         sum = simd_sum(sum);
-        if (tiisg == 0) output[row] = \(bt)(sum);
+        if (active && tiisg == 0) output[row] = \(bt)(sum);
     }
     """
 }
