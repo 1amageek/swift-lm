@@ -1489,7 +1489,7 @@ private struct PrefillStepPlanner {
                 metadata: .init(
                     kernelName: batchedGEMM.kernelName,
                     entryIndex: entry.index,
-                    weightTensorName: nil,
+                    weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
                     bufferAccessPattern: .init(reads: readIndices, writes: writeIndices)
                 )
             )
@@ -1868,7 +1868,7 @@ private struct PrefillStepPlanner {
             metadata: .init(
                 kernelName: kernelName,
                 entryIndex: entry.index,
-                weightTensorName: nil,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
                 bufferAccessPattern: .init(reads: readIndices, writes: writeIndices)
             )
         )
@@ -2339,7 +2339,7 @@ private struct PrefillStepPlanner {
             metadata: .init(
                 kernelName: kernelName,
                 entryIndex: entry.index,
-                weightTensorName: nil,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
                 bufferAccessPattern: .init(reads: readIndices, writes: writeIndices)
             ),
             tileVariants: batchedTileVariants
@@ -2449,6 +2449,17 @@ private struct PrefillStepPlanner {
         case .enabled:
             return nil
         }
+    }
+
+    private static func batchedWeightTensorName(
+        for batched: BatchedProjection,
+        entry: DispatchEntry
+    ) -> String? {
+        let tensorNames = batched.projections.compactMap { projection in
+            entry.parameterBindings.first(where: { $0.role == projection.field })?.tensorName
+        }
+        guard !tensorNames.isEmpty else { return nil }
+        return tensorNames.joined(separator: ";")
     }
 
     private var fallbackSchemeIdentifier: QuantizationSchemeIdentifier {

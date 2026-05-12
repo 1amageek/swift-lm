@@ -185,7 +185,7 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "averageWallMicroseconds",
             ],
             groups: aggregateEntries(entries: entries) { entry in
-                [entry.layerIndex.map(String.init) ?? "", entry.category]
+                [effectiveLayerIndex(entry).map(String.init) ?? "", entry.category]
             }
         )
     }
@@ -337,10 +337,20 @@ private func aggregateCSVString(
 }
 
 private func weightRoleSummary(_ tensorName: String?) -> String {
-    guard var components = tensorName?.split(separator: ".").map(String.init),
-          !components.isEmpty else {
+    guard let tensorName, !tensorName.isEmpty else {
         return ""
     }
+    let roles = tensorName
+        .split(separator: ";")
+        .map(String.init)
+        .map(singleWeightRoleSummary)
+        .filter { !$0.isEmpty }
+    return roles.joined(separator: "+")
+}
+
+private func singleWeightRoleSummary(_ tensorName: String) -> String {
+    var components = tensorName.split(separator: ".").map(String.init)
+    guard !components.isEmpty else { return "" }
     if components.last == "weight" {
         components.removeLast()
     }
@@ -349,6 +359,23 @@ private func weightRoleSummary(_ tensorName: String?) -> String {
         return components[(layerIndex + 2)...].joined(separator: ".")
     }
     return components.suffix(3).joined(separator: ".")
+}
+
+private func effectiveLayerIndex(_ entry: MetalPrefillProfile.Entry) -> Int? {
+    if let layerIndex = entry.layerIndex {
+        return layerIndex
+    }
+    return layerIndex(from: entry.weightTensorName)
+}
+
+private func layerIndex(from tensorName: String?) -> Int? {
+    let firstTensorName = tensorName?.split(separator: ";").first.map(String.init)
+    guard let components = firstTensorName?.split(separator: ".").map(String.init),
+          let layerTokenIndex = components.firstIndex(of: "layers"),
+          layerTokenIndex + 1 < components.count else {
+        return nil
+    }
+    return Int(components[layerTokenIndex + 1])
 }
 
 struct MetalPrefillProfileHarness: Sendable {

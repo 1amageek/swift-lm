@@ -17,7 +17,7 @@ struct PrefillProfileHarnessTests {
 
     @Test("Profile artifacts encode JSON and CSV summaries")
     func profileArtifactsEncodeJSONAndCSV() throws {
-        let entry = MetalPrefillProfile.Entry(
+        let firstEntry = MetalPrefillProfile.Entry(
             scope: "step",
             index: 0,
             rangeStart: 0,
@@ -44,6 +44,36 @@ struct PrefillProfileHarnessTests {
             totalWallMicroseconds: 140,
             averageWallMicroseconds: 35
         )
+        let inferredLayerEntry = MetalPrefillProfile.Entry(
+            scope: "step",
+            index: 1,
+            rangeStart: 1,
+            rangeEnd: 2,
+            kernelName: "gemv_seq_bf16_f32s",
+            category: "projection",
+            mode: "batch",
+            layerIndex: nil,
+            entryIndex: 5,
+            weightTensorName: [
+                "model.language_model.layers.3.self_attn.q_proj.weight",
+                "model.language_model.layers.3.self_attn.k_proj.weight",
+            ].joined(separator: ";"),
+            gridWidth: 1024,
+            gridHeight: 128,
+            gridDepth: 1,
+            threadgroupWidth: 64,
+            threadgroupHeight: 1,
+            threadgroupDepth: 1,
+            threadgroupMemoryBytes: 1024,
+            bufferBindingCount: 4,
+            inlineConstantBytes: 16,
+            uniqueBoundBufferBytes: 4096,
+            estimatedDispatchCount: 1,
+            totalGpuMicroseconds: 80,
+            averageGpuMicroseconds: 20,
+            totalWallMicroseconds: 120,
+            averageWallMicroseconds: 30
+        )
         let profile = MetalPrefillProfile(
             profileKind: "step",
             sequenceLength: 128,
@@ -51,7 +81,7 @@ struct PrefillProfileHarnessTests {
             iterations: 4,
             warmupIterations: 1,
             stepCount: 1,
-            entries: [entry],
+            entries: [firstEntry, inferredLayerEntry],
             generatedAt: "2026-05-07T00:00:00Z"
         )
 
@@ -70,7 +100,7 @@ struct PrefillProfileHarnessTests {
         let jsonData = try Data(contentsOf: jsonURL)
         let decoded = try JSONDecoder().decode(MetalPrefillProfile.self, from: jsonData)
         #expect(decoded.summary.entriesByCategory.first?.name == "projection")
-        #expect(decoded.summary.totalGpuMicroseconds == 25)
+        #expect(decoded.summary.totalGpuMicroseconds == 45)
 
         let csv = try String(contentsOf: csvURL, encoding: .utf8)
         #expect(csv.contains("gemv_seq_bf16_f32s"))
@@ -78,11 +108,13 @@ struct PrefillProfileHarnessTests {
         let categories = try String(contentsOf: categoryCSVURL, encoding: .utf8)
         #expect(categories.contains("percentageOfGpu"))
         let kernels = try String(contentsOf: kernelCSVURL, encoding: .utf8)
-        #expect(kernels.contains("gemv_seq_bf16_f32s,projection,1,1,25.000"))
+        #expect(kernels.contains("gemv_seq_bf16_f32s,projection,2,2,45.000"))
         let layers = try String(contentsOf: layerCSVURL, encoding: .utf8)
         #expect(layers.contains("0,projection,1,1,25.000"))
+        #expect(layers.contains("3,projection,1,1,20.000"))
         let weights = try String(contentsOf: weightCSVURL, encoding: .utf8)
         #expect(weights.contains("mlp.down_proj,projection,1,1,25.000"))
+        #expect(weights.contains("self_attn.q_proj+self_attn.k_proj,projection,1,1,20.000"))
     }
 
     private func repositoryRoot() -> URL {

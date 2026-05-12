@@ -177,6 +177,8 @@ flowchart TD
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits raw, category, kernel, layer, and weight-role CSVs |
 | 2026-05-12 | `swift build` | Pass after adding aggregated prefill profile artifacts |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes aggregate CSVs for both step and pass profiles at seqLen 16/64/128 |
+| 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; layer CSV now infers `layers.N` from weight tensor names and weight-role CSV supports batched semicolon-separated tensor groups |
+| 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
 
 ## Failed Experiments
 
@@ -384,13 +386,34 @@ the same post-processing contract:
 | `-layers.csv` | Layer/category totals for block-level fusion triage |
 | `-weights.csv` | Weight-role totals such as `mlp.down_proj` and `linear_attn.out_proj` |
 
+Layer aggregation uses explicit `layerIndex` metadata when available and falls
+back to `layers.N` parsed from `weightTensorName`. Batched projection steps
+store their participating tensor names as a semicolon-separated group, and
+weight-role aggregation summarizes them with `+`. This keeps sibling batches
+visible in the profile instead of hiding them in an unlabeled projection bucket.
+
 Latest Qwen artifact-generation smoke (2026-05-12, default route) produced:
 
 | Sequence length | Total prefill time | Projection share | SSM share | Artifact set |
 |---:|---:|---:|---:|---|
-| 16 | 43.629 ms | 73.9% | 20.8% | step + pass aggregate CSVs |
-| 64 | 159.259 ms | 76.1% | 21.7% | step + pass aggregate CSVs |
-| 128 | 313.932 ms | 75.9% | 22.0% | step + pass aggregate CSVs |
+| 16 | 102.734 ms | 75.0% | 20.0% | step + pass aggregate CSVs |
+| 64 | 162.248 ms | 76.4% | 21.5% | step + pass aggregate CSVs |
+| 128 | 318.643 ms | 76.2% | 21.8% | step + pass aggregate CSVs |
+
+The seqLen 128 weight-role aggregate now exposes all major projection groups:
+
+| Weight role | Count | Total time | Notes |
+|---|---:|---:|---|
+| `mlp.gate_proj+mlp.up_proj` | 24 | 86.707 ms | batched MLP input projections |
+| `linear_attn.in_proj_qkv+linear_attn.in_proj_z+linear_attn.in_proj_b+linear_attn.in_proj_a` | 18 | 75.093 ms | batched SSM input projections |
+| `mlp.down_proj` | 24 | 40.827 ms | dependent output projection |
+| `linear_attn.out_proj` | 18 | 17.334 ms | dependent output projection |
+| `self_attn.q_proj+self_attn.k_proj+self_attn.v_proj` | 6 | 15.304 ms | batched attention projections |
+| `self_attn.o_proj` | 6 | 5.832 ms | dependent output projection |
+
+The remaining unlabeled projection bucket is now the single output-head dispatch
+(`gemv_bf16_f32s`, 1.586 ms at seqLen 128), not a hidden group of layer
+projections.
 
 ## M1 Outcome
 
