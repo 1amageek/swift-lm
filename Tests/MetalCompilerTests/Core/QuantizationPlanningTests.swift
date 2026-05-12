@@ -108,6 +108,48 @@ struct QuantizationPlanningTests {
         #expect(isolatedGEMMStep.resolvedDescriptor(sequenceLength: 96).pipeline.label?.hasSuffix("_mtile64") == true)
     }
 
+    @Test("dense batched prefill projection rejects MPP when scratch output stride is padded")
+    func denseBatchedPrefillProjectionRejectsMPPWhenScratchOutputStrideIsPadded() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let config = makeConfig()
+        let graph = try resolvedGraph(config: config)
+        let target = try firstBatchedProjection(in: graph, device: device)
+        #expect(target.projections.allSatisfy { $0.outputDimension < config.intermediateSize })
+        let overrides = Dictionary(uniqueKeysWithValues: target.projections.map {
+            (
+                $0.tensorName,
+                TensorOverride(
+                    shape: [$0.outputDimension, $0.inputDimension],
+                    schemeIdentifier: .fp16RowMajor
+                )
+            )
+        })
+        let store = try makeWeightStore(for: graph, device: device, overrides: overrides)
+
+        let plan = try MetalInferenceCompiler().compilePrefill(
+            graph: graph,
+            hiddenSize: config.hiddenSize,
+            intermediateSize: config.intermediateSize,
+            vocabSize: config.vocabSize,
+            inferencePolicy: InferencePolicy(maximumSequenceLength: 16),
+            stafWeightStore: store,
+            device: device
+        )
+
+        let tensorNames = Set(target.projections.map(\.tensorName))
+        let projectionEntries = plan.quantizationPlan.entries.filter {
+            guard let tensorName = $0.tensorName else { return false }
+            return tensorNames.contains(tensorName)
+        }
+        #expect(projectionEntries.count == target.projections.count)
+        #expect(projectionEntries.allSatisfy { $0.kernelFamily != .mppGEMM })
+        #expect(projectionEntries.allSatisfy { $0.prefillGEMM?.selectedKernelName.hasPrefix("batched_gemm") != true })
+    }
+
     @Test("q4 prefill projection records direct kernel fallback when input stride is incompatible")
     func q4PrefillProjectionRecordsDirectKernelStrideFallback() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {

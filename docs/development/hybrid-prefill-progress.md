@@ -914,7 +914,7 @@ flowchart LR
 |---|---|---|
 | Batched MPP math | `SequenceProjectionEquivalenceTests/bf16BatchedMPPGEMMMatchesBatchedSequenceGEMVWithinMPPPrecision` passes for count 2 and 3 with uniform output dimensions | MPP is usable only under an MPP precision tolerance, not as a strict decode-equivalent replacement |
 | Input layout | `buildBatchedMPPGEMMStep` requires `inputRowStride == inputDimension` | keep |
-| Output layout | `buildBatchedMPPGEMMStep` now requires every `outputDimension` to match the scratch output row stride | keep |
+| Output layout | batched and single-projection MPP admission now requires every compact MPP output dimension to match the runtime output row stride | keep |
 | Qwen runtime promotion | forced experiment produced reference drift | rejected |
 
 The important result is that MPP is not a drop-in replacement for the
@@ -922,3 +922,8 @@ decode-equivalent sequence GEMV path. It may still be useful for projection
 groups whose input and output tensors are compact and whose correctness gate
 allows MPP-level numerical tolerance, but it must not be routed through padded
 scratch slots unless the kernel gains explicit output-row-stride support.
+
+Follow-up hardening extended the same guard to single projection MPP and added a
+planning regression for dense batched prefill projections whose scratch outputs
+are padded. The positive MPP paths remain available when the compact output
+dimension and runtime output row stride are identical.

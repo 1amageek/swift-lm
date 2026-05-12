@@ -996,6 +996,14 @@ private struct PrefillStepPlanner {
                     : slotDimension * scratchElementSize
                 perPositionStrides[0] = inputRowStride
             }
+            let outputRowStride: Int
+            if outputBuffer === buffers.hidden {
+                outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+            } else if outputBuffer === buffers.logits {
+                outputRowStride = projection.outputDimension
+            } else {
+                outputRowStride = slotDimension
+            }
             // Prefer direct quantized GEMM (dequant in registers) when available.
             // Falls back to dequant→AMX when no direct kernel exists.
             let directGEMM = resolveDirectQuantizedGEMM(for: quantizationDescriptor.schemeIdentifier)
@@ -1014,6 +1022,7 @@ private struct PrefillStepPlanner {
                 && !usesSequenceGEMVForStep
                 && mode == .batch
                 && inputRowStride == projection.inputDimension
+                && outputRowStride == projection.outputDimension
                 && (!quantizationDescriptor.schemeIdentifier.isWeightQuantized || canDequantForAMX)
             let usesDequantScratchForStep = !useDirectQuantizedGEMM
                 && canDequantForAMX
@@ -1188,14 +1197,6 @@ private struct PrefillStepPlanner {
                     ?? (mode == .batch && usesMPPForStep && !useDirectQuantizedGEMM ? 64 : nil),
                 tileVariantHeights: mppTileVariants.map(\.tileHeight)
             )
-            let outputRowStride: Int
-            if outputBuffer === buffers.hidden {
-                outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
-            } else if outputBuffer === buffers.logits {
-                outputRowStride = projection.outputDimension
-            } else {
-                outputRowStride = slotDimension
-            }
             return dequantSteps + [MetalPrefillStep(
                 pipeline: selectedPipeline,
                 gridSize: gridSize,
@@ -1538,6 +1539,7 @@ private struct PrefillStepPlanner {
             let weightTensorName = entry.parameterBindings.first(where: { $0.role == projection.field })?.tensorName
             let quantizationDescriptor = resolveProjectionWeightDescriptor(role: projection.field, entry: entry)
             let outputOffset = (firstOutputSlot + projectionIndex) * scratchSlotSize
+            let outputRowStride = slotDimension
             lastOutputOffset = outputOffset
             routingState.projectionIndex = firstOutputSlot + projectionIndex
 
@@ -1558,6 +1560,7 @@ private struct PrefillStepPlanner {
             let usesMPPForStep = usesMPP
                 && !usesSequenceGEMVForStep
                 && projInputRowStride == projection.inputDimension
+                && outputRowStride == projection.outputDimension
                 && (!quantizationDescriptor.schemeIdentifier.isWeightQuantized || canDequantForAMX)
             let usesDequantScratchForStep = !useDirectQuantizedGEMM
                 && canDequantForAMX
@@ -1710,7 +1713,7 @@ private struct PrefillStepPlanner {
                             uint32Binding(6, UInt32(projInputRowStride)),
                         ]
                         if usesSequenceGEMVForStep {
-                            bindings.append(uint32Binding(7, UInt32(slotDimension)))
+                            bindings.append(uint32Binding(7, UInt32(outputRowStride)))
                         }
                         return bindings
                     }(),
