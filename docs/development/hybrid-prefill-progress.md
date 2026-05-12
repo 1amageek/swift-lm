@@ -964,7 +964,8 @@ Evidence:
 | `MetalSourceGeneratorTests/specializedDecodeGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; specialized 2048-input and 8192-input decode GEMV variants keep inactive row groups through barriers and preserve output tail sentinels |
 | `MetalSourceGeneratorTests/specializedDecodeGEMVArgumentTableMatchesCPUReferenceWithOddOutputTail` | Pass; vocab, specialized 2048-input, and specialized 8192-input argument-table variants require explicit resource usage and match CPU reference with odd output tails |
 | `MetalSourceGeneratorTests/unifiedQuantizedGEMVMatchesCPUReferenceWithOddOutputTail` | Pass; unified Q4 decode GEMV keeps inactive row groups through barriers and preserves output tail sentinels |
-| `MetalSourceGeneratorTests` | 34/34 pass after adding Q8, batched Q4, dense decode GEMV, argument-table decode GEMV, specialized decode GEMV, and unified quantized decode GEMV row-tail coverage |
+| `MetalSourceGeneratorTests/qkNormDecodeOverdispatchUpdatesOnlyValidHeads` | Pass; QK norm decode and argument-table variants update valid heads only under over-dispatch |
+| `MetalSourceGeneratorTests` | 35/35 pass after adding Q8, batched Q4, dense decode GEMV, argument-table decode GEMV, specialized decode GEMV, unified quantized decode GEMV, and QK norm over-dispatch coverage |
 | `SequenceProjectionEquivalenceTests/bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride` | Pass; dense single sequence GEMV keeps inactive row groups through barriers and preserves padded output rows |
 | `SequenceProjectionEquivalenceTests/bf16BatchedSequenceGEMVHandlesOddTotalRowTailWithPaddedStride` | Pass; dense batched sequence GEMV keeps inactive row groups through barriers and preserves each padded output |
 | `SequenceProjectionEquivalenceTests` | 8/8 pass after adding dense odd-row tail coverage |
