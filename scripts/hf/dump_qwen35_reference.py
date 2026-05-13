@@ -49,6 +49,7 @@ def main() -> None:
     model_path = resolve_model_path(args.model)
     output_path = Path(args.output).expanduser()
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    linear_block_ordinals = parse_ordinal_list(args.linear_block_ordinals)
 
     model = AutoModelForCausalLM.from_pretrained(
         str(model_path),
@@ -60,11 +61,15 @@ def main() -> None:
 
     captures: dict[str, torch.Tensor] = {}
     current_phase = {"name": "ref.case_0.prefill"}
-    hooks = register_hooks(model, captures, current_phase)
+    hooks = register_hooks(model, captures, current_phase, linear_block_ordinals)
 
-    captures["ref.meta.schema_version"] = torch.tensor([4], dtype=torch.int32)
+    captures["ref.meta.schema_version"] = torch.tensor([5], dtype=torch.int32)
     captures["ref.meta.case_count"] = torch.tensor([len(REFERENCE_CASES)], dtype=torch.int32)
     captures["ref.meta.decode_steps"] = torch.tensor([args.decode_steps], dtype=torch.int32)
+    captures["ref.meta.linear_block_ordinals"] = torch.tensor(
+        sorted(linear_block_ordinals),
+        dtype=torch.int32,
+    )
     captures["ref.meta.config_sha256"] = config_sha256_tensor(model_path, model)
     captures["ref.meta.torch_version_utf8"] = utf8_tensor(torch.__version__)
     captures["ref.meta.transformers_version_utf8"] = utf8_tensor(TRANSFORMERS_VERSION)
@@ -107,7 +112,25 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Allow transformers to download the model when it is not cached.",
     )
+    parser.add_argument(
+        "--linear-block-ordinals",
+        default="0",
+        help="Comma-separated linear-attention ordinals to dump with block-boundary tensors.",
+    )
     return parser.parse_args()
+
+
+def parse_ordinal_list(value: str) -> set[int]:
+    ordinals: set[int] = set()
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        ordinal = int(item)
+        if ordinal < 0:
+            raise ValueError(f"linear block ordinal must be non-negative: {ordinal}")
+        ordinals.add(ordinal)
+    return ordinals
 
 
 def resolve_model_path(model: str | None) -> Path | str:
@@ -191,6 +214,7 @@ def register_hooks(
     model: Any,
     captures: dict[str, torch.Tensor],
     current_phase: dict[str, str],
+    linear_block_ordinals: set[int],
 ) -> list[Any]:
     hooks: list[Any] = []
     base_model = model.model
@@ -206,6 +230,7 @@ def register_hooks(
         )
     )
 
+    linear_ordinal = 0
     for layer_index, layer in enumerate(base_model.layers):
         hooks.append(
             layer.register_forward_hook(
@@ -229,11 +254,22 @@ def register_hooks(
         )
 
         if hasattr(layer, "linear_attn"):
+            if linear_ordinal in linear_block_ordinals:
+                hooks.extend(
+                    register_linear_attention_block_hooks(
+                        layer.linear_attn,
+                        captures,
+                        current_phase,
+                        linear_ordinal,
+                        layer_index,
+                    )
+                )
             hooks.append(
                 layer.linear_attn.register_forward_hook(
                     make_hook(captures, current_phase, f"layer_{layer_index}.after_op")
                 )
             )
+            linear_ordinal += 1
         if hasattr(layer, "self_attn"):
             hooks.append(
                 layer.self_attn.register_forward_hook(
@@ -242,6 +278,60 @@ def register_hooks(
             )
 
     return hooks
+
+
+def register_linear_attention_block_hooks(
+    block: Any,
+    captures: dict[str, torch.Tensor],
+    current_phase: dict[str, str],
+    linear_ordinal: int,
+    layer_index: int,
+) -> list[Any]:
+    prefix = f"linear_ordinal_{linear_ordinal}.block"
+    captures[f"ref.meta.linear_ordinal_{linear_ordinal}.layer_index"] = torch.tensor(
+        [layer_index],
+        dtype=torch.int32,
+    )
+    return [
+        block.in_proj_qkv.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.projected_qkv")
+        ),
+        block.in_proj_z.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.projected_z")
+        ),
+        block.in_proj_b.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.projected_beta")
+        ),
+        block.in_proj_a.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.projected_alpha")
+        ),
+        block.conv1d.register_forward_hook(
+            make_conv_silu_hook(captures, current_phase, f"{prefix}.conv_silu")
+        ),
+        block.norm.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.gated_recurrent_output")
+        ),
+        block.out_proj.register_forward_hook(
+            make_hook(captures, current_phase, f"{prefix}.out_projection")
+        ),
+    ]
+
+
+def make_conv_silu_hook(
+    captures: dict[str, torch.Tensor],
+    current_phase: dict[str, str],
+    suffix: str,
+) -> Any:
+    def hook(_module: Any, inputs: tuple[Any, ...], output: Any) -> None:
+        tensor = first_tensor(output)
+        input_tensor = first_tensor(inputs)
+        if tensor is None or input_tensor is None:
+            return
+        seq_len = input_tensor.shape[-1]
+        activated = torch.nn.functional.silu(tensor[:, :, :seq_len]).transpose(1, 2)
+        captures[f"{current_phase['name']}.{suffix}"] = to_reference_tensor(activated)
+
+    return hook
 
 
 def make_hook(

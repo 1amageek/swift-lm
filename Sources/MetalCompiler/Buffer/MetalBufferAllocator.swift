@@ -253,6 +253,16 @@ struct MetalBufferAllocator {
             dequantScratchBuffer = nil
         }
 
+        let ssmConvDebugBuffer: MTLBuffer?
+        if isSSMConvDebugEnabled(), recurrentStateRequirements.layerCount > 0 {
+            ssmConvDebugBuffer = context.device.makeBuffer(
+                length: maximumSequenceLength * slotDimension * f32ElementSize,
+                options: gpuOnlyOptions
+            )
+        } else {
+            ssmConvDebugBuffer = nil
+        }
+
         let bufferSet = PrefillBufferSet(
             bufferPrecision: .float32,
             hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: cpuGpuOptions)!,
@@ -288,6 +298,7 @@ struct MetalBufferAllocator {
             positions: context.device.makeBuffer(length: maximumSequenceLength * 4, options: [.storageModeShared])!,
             ropePositionAxes: context.device.makeBuffer(length: maximumSequenceLength * 3 * 4, options: [.storageModeShared])!,
             tokenOut: context.device.makeBuffer(length: 4, options: [.storageModeShared])!,
+            ssmConvDebug: ssmConvDebugBuffer,
             dequantScratch: dequantScratchBuffer,
             runtimeConstantBuffer: context.device.makeBuffer(
                 length: PrefillBufferSet.runtimeConstantBufferSize(maximumSequenceLength: maximumSequenceLength),
@@ -425,6 +436,10 @@ struct MetalBufferAllocator {
         blit.endEncoding()
         commandBuffer.commit()
         commandBuffer.waitUntilCompleted()
+    }
+
+    private func isSSMConvDebugEnabled() -> Bool {
+        getenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV") != nil
     }
 }
 

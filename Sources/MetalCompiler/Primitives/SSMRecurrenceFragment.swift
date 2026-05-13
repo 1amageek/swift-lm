@@ -100,6 +100,10 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_SHARED_RMS"] == "1"
     }
 
+    static var isConvDebugPrefillEnabled: Bool {
+        getenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV") != nil
+    }
+
     static func prefillThreadgroupWidthOverride(
         defaultThreads: Int,
         minimumActiveThreads: Int,
@@ -235,6 +239,18 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 weightFormat: context.kernelContext.weightFormat
             )
         let pipeline = try context.getPipeline(kernelName)
+        let convDebugEnabled = Self.isConvDebugPrefillEnabled
+        let convDebugBuffer: MTLBuffer
+        if convDebugEnabled {
+            guard let buffer = context.buffers.ssmConvDebug else {
+                throw MetalCompilerError.deviceSetupFailed(
+                    "SWIFTLM_PREFILL_DEBUG_SSM_CONV requires an SSM conv debug buffer"
+                )
+            }
+            convDebugBuffer = buffer
+        } else {
+            convDebugBuffer = context.buffers.scratch
+        }
         // Size threadgroup to cover Phase 1 (localDim channels) and Phase 2 (headsPerGroup × dv threads).
         // Each threadgroup owns one key-group and runs independently on its own GPU core.
         let safeGroupCount = max(groupCount, 1)
@@ -268,6 +284,7 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 (8, recurrentState, recurrentLayerOffset),
                 (9, convState, convLayerOffset),
                 (10, context.buffers.scratch, 0),
+                (18, convDebugBuffer, 0),
             ],
             bytesBindings: [
                 uint32Binding(11, UInt32(headCount)),
@@ -277,6 +294,8 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 uint32Binding(15, UInt32(convKernelSize)),
                 uint32Binding(16, 1),
                 uint32Binding(17, UInt32(context.slotDimension)),
+                uint32Binding(19, UInt32(context.slotDimension)),
+                uint32Binding(20, UInt32(convDebugEnabled ? 1 : 0)),
             ],
             threadgroupMemoryLength: 0,
             sync: .bufferBarrier,
@@ -288,7 +307,7 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 kernelName: kernelName,
                 bufferAccessPattern: .init(
                     reads: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9],
-                    writes: [8, 9, 10]
+                    writes: convDebugEnabled ? [8, 9, 10, 18] : [8, 9, 10]
                 )
             )
         )

@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-12
+Last updated: 2026-05-13
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -66,8 +66,8 @@ It does not yet authorize MPP or fused non-decode-equivalent kernels.
 |---|---|---|
 | LFM reference dump script | Existing | `scripts/hf/dump_lfm2_reference.py` |
 | LFM Swift reference comparison | Existing | `Tests/MetalCompilerTests/Models/LFM2/ReferenceComparisonTests.swift` |
-| Qwen reference dump script | Done | `scripts/hf/dump_qwen35_reference.py`; schema v4 supports multiple reference cases plus version metadata |
-| Qwen Swift reference comparison | Done | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v4 case |
+| Qwen reference dump script | Done / extended | `scripts/hf/dump_qwen35_reference.py`; schema v5 supports multiple reference cases, version metadata, and selected linear-attention block boundary tensors |
+| Qwen Swift reference comparison | Done / extended | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v5 case plus the first selected linear-attention block boundary |
 | Reference manifest | Done | `Tests/MetalCompilerTests/Core/ReferenceHarnessManifestTests.swift` |
 
 ## Confidence Audit
@@ -95,9 +95,9 @@ flowchart TD
 | Decode post-state is not checked | Closed | Qwen reference test checks `decode_0` logits, next token, conv state, and recurrent state |
 | KV cache corruption can pass | Closed | Qwen reference test checks prefill and `decode_0` key/value caches for all attention ordinals |
 | Metal readback failure can look like a numeric match | Closed | Buffer readback now throws on allocation, command-buffer, or range failure; length mismatch produces infinite error |
-| Single prompt / sequence length only | Closed | Qwen schema v4 stores multiple reference cases; Swift validates each case independently |
+| Single prompt / sequence length only | Closed | Qwen schema v5 stores multiple reference cases; Swift validates each case independently |
 | Q3 sequence prefill | Closed for current Qwen3.5 Q3 path | Q3 G16/G32/G64 projection sequence GEMV and embedding lookup have CPU-reference tests; real Q3 prompt ingestion uses sequence prefill and matches sequential ingestion trace |
-| HuggingFace backend variance | Closed for traceability | Qwen schema v4 records PyTorch version, Transformers version, and fast-backend availability |
+| HuggingFace backend variance | Closed for traceability | Qwen schema v5 records PyTorch version, Transformers version, and fast-backend availability |
 
 ## Evidence Log
 
@@ -182,6 +182,10 @@ flowchart TD
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
 | 2026-05-12 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; base batched sequence GEMV beats tile2/tile4 for the dominant Qwen3.5 BF16 batched projection shapes except small noisy cases |
 | 2026-05-12 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_MPP=1` | Fail; forcing BF16 dense batched MPP before decode-equivalent sequence GEMV drifts prefill token, hidden state, conv/recurrent state, and KV cache, so the diagnostic route was removed instead of kept as an opt-in |
+| 2026-05-13 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact schema v2 validates per-step byte estimates and block CSV rollups |
+| 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes `*-blocks.csv` artifacts and shape-derived projection byte estimates for seqLen 16/64/128 |
+| 2026-05-13 | `python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0` | Pass; wrote schema v5 Qwen3.5 HF reference snapshot with first linear-attention block boundary tensors including conv+SiLU |
+| 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; validates schema v5 metadata, existing prefill/decode gates, and `linear_ordinal_0` projected qkv/z/beta/alpha, conv+SiLU, gated recurrence output, and out projection against HF |
 
 ## Failed Experiments
 
@@ -206,7 +210,7 @@ flowchart TD
 | Best sequence tile size for M1 | tile4 is not acceptable as default; smaller or different tiling remains future work |
 | Whether M1 should default to tile4 or stay opt-in | Stay non-default |
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
-| Qwen reference dump schema for M2 | Implemented and validated as schema v4 multi-case |
+| Qwen reference dump schema for M2 | Implemented and validated as schema v5 multi-case with selected block-boundary capture |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
 | Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and remains the best current full-model fused shape, but default stays off. The lower-recompute rows-per-SIMD rps2 shape is correctness-green but regresses the full model |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
@@ -577,6 +581,144 @@ Next implementation order:
 | M3B.1 | Prototype batched SSM conv with exact final conv-state extraction as a reusable fused-block subroutine | Conv-state reference comparison across multiple prompt lengths |
 | M3B.2 | Prototype recurrent block scan/gated-delta fusion behind an explicit experiment flag | Recurrent-state and decode0 reference comparison |
 | M4 | Fuse a complete Qwen hybrid recurrent block where projections, conv, recurrence, norm/gate, and output projection can share layout and reduce intermediate memory traffic | Block-level reference dump plus end-to-end token trace plus baseline comparison |
+
+## Deep External Baseline Investigation (2026-05-12)
+
+The goal of the external review is to identify baseline techniques to beat, not
+to port another runtime. The useful comparison set is llama.cpp/ggml Metal for
+Ollama-style execution, MLX/MLX-LM for Apple Silicon kernels and Qwen-family
+model code, and MLC-LLM for compiler-pass fusion patterns.
+
+Reviewed snapshots:
+
+| Project | Snapshot | Files reviewed | Useful signal |
+|---|---|---|---|
+| llama.cpp / ggml Metal | `ef93e98d01d7c04dae1ebb145793a5e397a57133` | `src/llama-context.cpp`, `src/llama-batch.cpp`, `src/models/qwen3next.cpp`, `ggml/src/ggml-metal/ggml-metal-ops.cpp`, `ggml/src/ggml-metal/ggml-metal.metal` | Prompt batches are graph-level work; Metal routes matmul by shape and has explicit SSM / gated-delta kernels |
+| MLX | `8f4099d8243dfbc814b07ca6b4606196f0c490ce` | `mlx/backend/metal/matmul.cpp`, `mlx/backend/metal/scaled_dot_product_attention.cpp`, `mlx/backend/metal/kernels/steel/gemm/gemm.h`, `mlx/compile.cpp` | Steel GEMM uses simdgroup matrix tiles; graph compile fuses generic fusable tapes |
+| MLX-LM | `df1d3f3c9a7aae402dcbb8f41d4c36bcc13a50ae` | `mlx_lm/generate.py`, `mlx_lm/models/qwen3_5.py`, `mlx_lm/models/qwen3_next.py`, `mlx_lm/models/gated_delta.py` | Qwen prefill is chunked; gated delta has a sequence Metal kernel; Qwen3Next reduces projection groups to `qkvz` and `ba` |
+| MLC-LLM | `2008fe8343e1f40ef89ee57b9287aebcf1b86c98` | `python/mlc_llm/compiler_pass/fuse_dequantize_matmul_ewise.py`, `python/mlc_llm/compiler_pass/fuse_ft_dequantize_matmul_epilogue.py`, `cpp/serve/engine_actions/batch_prefill_base.cc` | Dequantize, matmul, and epilogue fusion is a compiler-pass concern; serving prefill is chunked and scheduled |
+
+Current swift-lm profile evidence still points to projection and recurrent
+block traffic, not attention:
+
+| Qwen3.5 BF16 seqLen 128 profile | Steps | Time | Share |
+|---|---:|---:|---:|
+| Projection | 97 | 242.683 ms | 76.2% |
+| SSM recurrence | 18 | 69.381 ms | 21.8% |
+| Attention | 6 | 3.943 ms | 1.2% |
+| Other / elementwise / structural | 166 | 2.637 ms | 0.8% |
+
+Projection time by semantic role:
+
+| Role | Dispatches | Time | Interpretation |
+|---|---:|---:|---|
+| `mlp.gate_proj+mlp.up_proj` | 24 | 86.707 ms | Already sibling-batched; remaining cost is large memory-bound sequence projection |
+| `linear_attn.in_proj_qkv+linear_attn.in_proj_z+linear_attn.in_proj_b+linear_attn.in_proj_a` | 18 | 75.093 ms | Main recurrent-block admission point; external Qwen3Next suggests this grouping deserves a family-level contract |
+| `ssm_recurrence_seq_bf16_f32` | 18 | 69.381 ms | Stateful sequence loop is correct but still standalone, with recurrent state and activation intermediates crossing memory |
+| `mlp.down_proj` | 24 | 40.827 ms | Producer-consumer fusion can help only if SwiGLU tiles are reused across enough output rows |
+| `linear_attn.out_proj` | 18 | 17.334 ms | Dependent projection; best candidate for block-level epilogue fusion after recurrence |
+| `self_attn.q_proj+k_proj+v_proj` | 6 | 15.304 ms | Attention is already not the primary bottleneck for this model/length |
+
+The fastest-design direction is therefore not a generic "replace GEMV with
+GEMM" change. The rejected BF16 MPP experiment showed that accumulation order
+and compact-layout assumptions can break the Qwen trace. The next design must
+use external implementations as lower-bound evidence, then specialize beyond
+their generic graph boundaries:
+
+```mermaid
+flowchart TD
+  A["External baseline facts"] --> B["Shape-routed prompt matmul"]
+  A --> C["Sequence recurrent kernels"]
+  A --> D["Matmul + epilogue compiler fusion"]
+  B --> E["swift-lm static family compiler"]
+  C --> E
+  D --> E
+  E --> F["Block-level reference harness"]
+  F --> G["Admit optimized kernel only after trace/state parity"]
+  G --> H["Benchmark against llama.cpp / MLX baseline"]
+```
+
+Gaps found during the review:
+
+| Gap | Why it matters | Required fix before optimization |
+|---|---|---|
+| Projection profile lacks byte-traffic accounting | Dispatch time alone cannot distinguish compute throughput from scratch materialization and redundant reads | Extend the profile artifact with estimated input, weight, output, and scratch bytes per step and per semantic block |
+| Reference harness is layer-oriented, not block-stage-oriented | MPP or block fusion can be correct at final logits while hiding state-local drift until later prompts | Add Qwen linear-attention block snapshots for projected `qkv`, `z`, `beta`, `alpha`, conv output, recurrent output, final recurrent state, and out projection |
+| MPP admission is still a kernel-family decision | The forced MPP route failed because layout and numerical contract were not owned by the consuming block | Make MPP a candidate inside a block contract, not a global projection replacement |
+| Current SSM sequence kernel already fuses conv, recurrence, RMS, and gate, but not surrounding projections | External gated-delta kernels show the recurrence loop belongs in one Metal kernel; swift-lm can go further by eliminating the projection/recurrent/out-proj memory round trips | Design a Qwen recurrent-block kernel family where projections feed recurrence through compiler-owned layout |
+| MLX-LM Qwen3.5 keeps `in_proj_qkv`, `in_proj_z`, `in_proj_b`, and `in_proj_a` separate while Qwen3Next groups `qkvz` and `ba` | Qwen3Next is a design hint, not proof that Qwen3.5 weights can be repacked without changing semantics | Add a model-family lowering audit before changing weight packing; do not assume Qwen3.5 and Qwen3Next are interchangeable |
+
+Decision: the next production-grade milestone is not another tile variant. It is
+a block-profile and block-reference harness, followed by a Qwen recurrent-block
+prototype. A single-kernel GEMM microbenchmark is only useful if it feeds this
+block-level admission path.
+
+Next implementation order:
+
+| Step | Deliverable | Gate |
+|---|---|---|
+| M3C.1 | Done: extend prefill profile artifacts with per-step byte estimates and per-block rollups | `PrefillProfileHarnessTests` plus Qwen profile artifact sanity check |
+| M3C.2 | Done for selected blocks: add Qwen recurrent-block reference dump and Swift comparison for boundary tensors | Focused `Qwen35ReferenceComparisonTests` case is green for every ordinal listed in `ref.meta.linear_block_ordinals`; conv+SiLU is materialized only when `SWIFTLM_PREFILL_DEBUG_SSM_CONV=1` is enabled by the reference harness |
+| M3C.3 | Prototype a recurrence-only MLX-style gated-delta kernel against the current `ssm_recurrence_seq_bf16_f32` contract | Isolated sequence equivalence and recurrent-state parity |
+| M3C.4 | Promote only if full-model Qwen trace is green and seqLen 64/128 profiles beat the current baseline in the same run | Correctness first, same-session benchmark second |
+
+### M3C.1 Profile Artifact Status (2026-05-13)
+
+M3C.1 is complete. The prefill profile artifact schema is now v2 and records
+estimated read bytes, write bytes, total bytes, and semantic block aggregates.
+The estimates are shape-derived for projection and SSM recurrence kernels, and
+fall back to binding-size accounting for kernels without a stable semantic
+traffic contract.
+
+Artifact flow:
+
+```mermaid
+flowchart LR
+  A["MetalPrefillStep"] --> B["Per-step profile entry"]
+  B --> C["Raw CSV + JSON"]
+  B --> D["Kernel / layer / weight-role CSV"]
+  B --> E["Semantic block CSV"]
+  E --> F["M3C.2 block reference target selection"]
+```
+
+Latest Qwen3.5 BF16 seqLen 128 block profile signal:
+
+| Semantic view | Evidence | Interpretation |
+|---|---:|---|
+| Projection byte estimates | `batched_gemv2_seq_bf16_f32s` totals 452,984,832 bytes; `gemv_seq_bf16_f32s` totals 371,195,904 bytes | Projection estimates now come from kernel dimensions instead of full resident buffer sizes |
+| Linear-attention recurrence | 18 `ssm_recurrence_seq_bf16_f32` entries total about 5.34 GB estimated traffic | Recurrent block fusion remains the next high-impact target |
+| Block CSV artifact | `qwen35-prefill-steps-seq128-blocks.csv` generated | M3C.2 can choose block-stage reference tensors from profile evidence instead of kernel-name guessing |
+
+### M3C.2 Block Reference Status (2026-05-13)
+
+M3C.2 now has a selected-block-stage reference gate for Qwen3.5 BF16 prefill.
+The HF dump schema is v5 and accepts `--linear-block-ordinals`; the Swift test
+reads `ref.meta.linear_block_ordinals` and verifies every selected ordinal. The
+current checked local artifact captures ordinal 0 so the default reference file
+stays small while the harness remains expandable.
+
+Block boundary gate:
+
+```mermaid
+flowchart LR
+  A["HF Qwen block ordinal 0"] --> B["Schema v5 safetensors"]
+  B --> C["Swift prefill binding probes"]
+  C --> D["Per-token row comparison"]
+  D --> E["Qwen35ReferenceComparisonTests"]
+```
+
+Current coverage:
+
+| Boundary | HF tensor | Metal probe source | Status |
+|---|---|---|---|
+| `in_proj_qkv` output | `projected_qkv` | batched projection binding 5 | Pass |
+| `in_proj_z` output | `projected_z` | batched projection binding 6 | Pass |
+| `in_proj_b` output | `projected_beta` | batched projection binding 7 | Pass |
+| `in_proj_a` output | `projected_alpha` | batched projection binding 8 | Pass |
+| conv+SiLU output | `conv_silu` | SSM recurrence debug binding 18 | Pass |
+| gated recurrent output | `gated_recurrent_output` | SSM recurrence binding 10 | Pass |
+| linear-attention output projection | `out_projection` | output projection binding 2 | Pass |
+| final conv / recurrent state | existing cache tensors | existing state comparison gate | Pass |
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

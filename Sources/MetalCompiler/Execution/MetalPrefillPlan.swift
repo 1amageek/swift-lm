@@ -350,6 +350,11 @@ public struct PrefillBufferSet: @unchecked Sendable {
     public let ropePositionAxes: MTLBuffer
     public let tokenOut: MTLBuffer
 
+    /// Optional debug-only materialization buffer for SSM conv+SiLU sequence
+    /// intermediates. Nil in production routing unless explicitly requested by
+    /// the reference harness.
+    public let ssmConvDebug: MTLBuffer?
+
     /// Scratch buffer for dequantized quantized→BF16 weights consumed by AMX matmul2d.
     /// Sized for the largest projection weight matrix: outputDim × inputDim × sizeof(bfloat16).
     /// Nil when no quantized weight dequantization is needed (e.g., BF16 or FP16 models).
@@ -382,6 +387,7 @@ public struct PrefillBufferSet: @unchecked Sendable {
             tokenIDs, positions, ropePositionAxes, tokenOut, runtimeConstantBuffer,
         ]
         if let dequantScratch { buffers.append(dequantScratch) }
+        if let ssmConvDebug { buffers.append(ssmConvDebug) }
         if let convState { buffers.append(convState) }
         if let recurrentState { buffers.append(recurrentState) }
         if let perLayerInputs { buffers.append(perLayerInputs) }

@@ -23,6 +23,9 @@ struct MetalPrefillProfile: Codable, Sendable {
         let bufferBindingCount: Int
         let inlineConstantBytes: Int
         let uniqueBoundBufferBytes: Int
+        let estimatedReadBytes: Int
+        let estimatedWriteBytes: Int
+        let estimatedTotalBytes: Int
         let estimatedDispatchCount: Int
         let totalGpuMicroseconds: Double
         let averageGpuMicroseconds: Double
@@ -65,7 +68,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         entries: [Entry],
         generatedAt: String = ISO8601DateFormatter().string(from: Date())
     ) {
-        self.schemaVersion = 1
+        self.schemaVersion = 2
         self.profileKind = profileKind
         self.sequenceLength = sequenceLength
         self.maximumSequenceLength = maximumSequenceLength
@@ -98,6 +101,9 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "bufferBindingCount",
                 "inlineConstantBytes",
                 "uniqueBoundBufferBytes",
+                "estimatedReadBytes",
+                "estimatedWriteBytes",
+                "estimatedTotalBytes",
                 "estimatedDispatchCount",
                 "averageGpuMicroseconds",
                 "averageWallMicroseconds",
@@ -105,7 +111,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         ]
         for entry in entries {
             var row: [String] = []
-            row.reserveCapacity(21)
+            row.reserveCapacity(24)
             row.append(entry.scope)
             row.append(String(entry.index))
             row.append(String(entry.rangeStart))
@@ -124,6 +130,9 @@ struct MetalPrefillProfile: Codable, Sendable {
             row.append(String(entry.bufferBindingCount))
             row.append(String(entry.inlineConstantBytes))
             row.append(String(entry.uniqueBoundBufferBytes))
+            row.append(String(entry.estimatedReadBytes))
+            row.append(String(entry.estimatedWriteBytes))
+            row.append(String(entry.estimatedTotalBytes))
             row.append(String(entry.estimatedDispatchCount))
             row.append(String(format: "%.3f", entry.averageGpuMicroseconds))
             row.append(String(format: "%.3f", entry.averageWallMicroseconds))
@@ -161,6 +170,9 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "category",
                 "entryCount",
                 "estimatedDispatchCount",
+                "estimatedReadBytes",
+                "estimatedWriteBytes",
+                "estimatedTotalBytes",
                 "totalGpuMicroseconds",
                 "averageGpuMicroseconds",
                 "totalWallMicroseconds",
@@ -179,6 +191,9 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "category",
                 "entryCount",
                 "estimatedDispatchCount",
+                "estimatedReadBytes",
+                "estimatedWriteBytes",
+                "estimatedTotalBytes",
                 "totalGpuMicroseconds",
                 "averageGpuMicroseconds",
                 "totalWallMicroseconds",
@@ -197,6 +212,9 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "category",
                 "entryCount",
                 "estimatedDispatchCount",
+                "estimatedReadBytes",
+                "estimatedWriteBytes",
+                "estimatedTotalBytes",
                 "totalGpuMicroseconds",
                 "averageGpuMicroseconds",
                 "totalWallMicroseconds",
@@ -204,6 +222,32 @@ struct MetalPrefillProfile: Codable, Sendable {
             ],
             groups: aggregateEntries(entries: entries) { entry in
                 [weightRoleSummary(entry.weightTensorName), entry.category]
+            }
+        )
+    }
+
+    var blockCSVString: String {
+        aggregateCSVString(
+            headers: [
+                "layerIndex",
+                "semanticBlock",
+                "category",
+                "entryCount",
+                "estimatedDispatchCount",
+                "estimatedReadBytes",
+                "estimatedWriteBytes",
+                "estimatedTotalBytes",
+                "totalGpuMicroseconds",
+                "averageGpuMicroseconds",
+                "totalWallMicroseconds",
+                "averageWallMicroseconds",
+            ],
+            groups: aggregateEntries(entries: entries) { entry in
+                [
+                    effectiveLayerIndex(entry).map(String.init) ?? "",
+                    semanticBlockSummary(entry),
+                    entry.category,
+                ]
             }
         )
     }
@@ -218,6 +262,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         let kernelCSVURL = directory.appendingPathComponent("\(basename)-kernels.csv")
         let layerCSVURL = directory.appendingPathComponent("\(basename)-layers.csv")
         let weightCSVURL = directory.appendingPathComponent("\(basename)-weights.csv")
+        let blockCSVURL = directory.appendingPathComponent("\(basename)-blocks.csv")
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -228,7 +273,8 @@ struct MetalPrefillProfile: Codable, Sendable {
         try Data(kernelCSVString.utf8).write(to: kernelCSVURL, options: .atomic)
         try Data(layerCSVString.utf8).write(to: layerCSVURL, options: .atomic)
         try Data(weightRoleCSVString.utf8).write(to: weightCSVURL, options: .atomic)
-        return [jsonURL, csvURL, categoryCSVURL, kernelCSVURL, layerCSVURL, weightCSVURL]
+        try Data(blockCSVString.utf8).write(to: blockCSVURL, options: .atomic)
+        return [jsonURL, csvURL, categoryCSVURL, kernelCSVURL, layerCSVURL, weightCSVURL, blockCSVURL]
     }
 
     private static func makeSummary(entries: [Entry]) -> Summary {
@@ -277,6 +323,9 @@ private struct PrefillProfileAggregate: Sendable {
     let keys: [String]
     var entryCount: Int
     var estimatedDispatchCount: Int
+    var estimatedReadBytes: Int
+    var estimatedWriteBytes: Int
+    var estimatedTotalBytes: Int
     var totalGpuMicroseconds: Double
     var totalWallMicroseconds: Double
 
@@ -301,11 +350,17 @@ private func aggregateEntries(
             keys: keys,
             entryCount: 0,
             estimatedDispatchCount: 0,
+            estimatedReadBytes: 0,
+            estimatedWriteBytes: 0,
+            estimatedTotalBytes: 0,
             totalGpuMicroseconds: 0,
             totalWallMicroseconds: 0
         )
         aggregate.entryCount += 1
         aggregate.estimatedDispatchCount += entry.estimatedDispatchCount
+        aggregate.estimatedReadBytes += entry.estimatedReadBytes
+        aggregate.estimatedWriteBytes += entry.estimatedWriteBytes
+        aggregate.estimatedTotalBytes += entry.estimatedTotalBytes
         aggregate.totalGpuMicroseconds += entry.averageGpuMicroseconds
         aggregate.totalWallMicroseconds += entry.averageWallMicroseconds
         aggregatesByKey[joinedKey] = aggregate
@@ -327,6 +382,9 @@ private func aggregateCSVString(
         var row = group.keys.map(csvEscape)
         row.append(String(group.entryCount))
         row.append(String(group.estimatedDispatchCount))
+        row.append(String(group.estimatedReadBytes))
+        row.append(String(group.estimatedWriteBytes))
+        row.append(String(group.estimatedTotalBytes))
         row.append(String(format: "%.3f", group.totalGpuMicroseconds))
         row.append(String(format: "%.3f", group.averageGpuMicroseconds))
         row.append(String(format: "%.3f", group.totalWallMicroseconds))
@@ -346,6 +404,26 @@ private func weightRoleSummary(_ tensorName: String?) -> String {
         .map(singleWeightRoleSummary)
         .filter { !$0.isEmpty }
     return roles.joined(separator: "+")
+}
+
+private func semanticBlockSummary(_ entry: MetalPrefillProfile.Entry) -> String {
+    let role = weightRoleSummary(entry.weightTensorName)
+    if role.contains("linear_attn.") || entry.category == "ssm_recurrence" {
+        return "linear_attn"
+    }
+    if role.contains("self_attn.") || entry.category == "attention" {
+        return "self_attn"
+    }
+    if role.contains("mlp.") {
+        return "mlp"
+    }
+    if role.contains("embed_tokens") || entry.category == "embedding" {
+        return "embedding"
+    }
+    if entry.category == "reduction" {
+        return "normalization"
+    }
+    return role.isEmpty ? entry.category : role
 }
 
 private func singleWeightRoleSummary(_ tensorName: String) -> String {
@@ -711,6 +789,7 @@ struct MetalPrefillProfileHarness: Sendable {
         iterations: Int
     ) -> MetalPrefillProfile.Entry {
         let grid = step.resolvedGridSize(sequenceLength: sequenceLength)
+        let byteTraffic = estimatedByteTraffic(for: step, sequenceLength: sequenceLength)
         return MetalPrefillProfile.Entry(
             scope: "step",
             index: index,
@@ -732,6 +811,9 @@ struct MetalPrefillProfileHarness: Sendable {
             bufferBindingCount: step.bindings.buffers.count,
             inlineConstantBytes: inlineConstantBytes(for: step),
             uniqueBoundBufferBytes: uniqueBoundBufferBytes(for: step),
+            estimatedReadBytes: byteTraffic.readBytes,
+            estimatedWriteBytes: byteTraffic.writeBytes,
+            estimatedTotalBytes: byteTraffic.totalBytes,
             estimatedDispatchCount: estimatedDispatchCount(for: step, sequenceLength: sequenceLength),
             totalGpuMicroseconds: timing.gpuMicroseconds,
             averageGpuMicroseconds: timing.gpuMicroseconds / Double(iterations),
@@ -754,6 +836,9 @@ struct MetalPrefillProfileHarness: Sendable {
         let bindingCount = steps.reduce(0) { $0 + $1.bindings.buffers.count }
         let inlineBytes = steps.reduce(0) { $0 + inlineConstantBytes(for: $1) }
         let uniqueBytes = uniqueBoundBufferBytes(for: Array(steps))
+        let byteTraffic = steps.reduce(PrefillByteTraffic.zero) { partial, step in
+            partial + estimatedByteTraffic(for: step, sequenceLength: sequenceLength)
+        }
         let dispatchCount = steps.reduce(0) {
             $0 + estimatedDispatchCount(for: $1, sequenceLength: sequenceLength)
         }
@@ -779,11 +864,32 @@ struct MetalPrefillProfileHarness: Sendable {
             bufferBindingCount: bindingCount,
             inlineConstantBytes: inlineBytes,
             uniqueBoundBufferBytes: uniqueBytes,
+            estimatedReadBytes: byteTraffic.readBytes,
+            estimatedWriteBytes: byteTraffic.writeBytes,
+            estimatedTotalBytes: byteTraffic.totalBytes,
             estimatedDispatchCount: dispatchCount,
             totalGpuMicroseconds: timing.gpuMicroseconds,
             averageGpuMicroseconds: timing.gpuMicroseconds / Double(iterations),
             totalWallMicroseconds: timing.wallMicroseconds,
             averageWallMicroseconds: timing.wallMicroseconds / Double(iterations)
+        )
+    }
+}
+
+private struct PrefillByteTraffic: Sendable {
+    static let zero = PrefillByteTraffic(readBytes: 0, writeBytes: 0)
+
+    let readBytes: Int
+    let writeBytes: Int
+
+    var totalBytes: Int {
+        readBytes + writeBytes
+    }
+
+    static func + (lhs: PrefillByteTraffic, rhs: PrefillByteTraffic) -> PrefillByteTraffic {
+        PrefillByteTraffic(
+            readBytes: lhs.readBytes + rhs.readBytes,
+            writeBytes: lhs.writeBytes + rhs.writeBytes
         )
     }
 }
@@ -839,6 +945,184 @@ private func uniqueBoundBufferBytes(for steps: [MetalPrefillStep]) -> Int {
         }
     }
     return lengthsByAddress.values.reduce(0, +)
+}
+
+private func estimatedByteTraffic(
+    for step: MetalPrefillStep,
+    sequenceLength: Int
+) -> PrefillByteTraffic {
+    let name = kernelName(for: step).lowercased()
+    if let projectionTraffic = estimatedProjectionByteTraffic(
+        for: step,
+        kernelName: name,
+        sequenceLength: sequenceLength
+    ) {
+        return projectionTraffic
+    }
+    if name.contains("ssm_recurrence_seq") {
+        return estimatedSSMRecurrenceByteTraffic(for: step, sequenceLength: sequenceLength)
+    }
+    return estimatedBindingByteTraffic(for: step)
+}
+
+private func estimatedProjectionByteTraffic(
+    for step: MetalPrefillStep,
+    kernelName: String,
+    sequenceLength: Int
+) -> PrefillByteTraffic? {
+    let inputBytesPerElement = projectionActivationBytes(for: kernelName)
+    let outputBytesPerElement = projectionActivationBytes(for: kernelName)
+    let weightBytesPerElement = projectionWeightBytes(for: kernelName)
+
+    if kernelName.hasPrefix("batched_gemv"),
+       let projectionCount = projectionCount(fromBatchedKernelName: kernelName),
+       let inputDimension = uint32Constant(step, index: 1 + 2 * projectionCount).map(Int.init) {
+        var outputDimensions: [Int] = []
+        outputDimensions.reserveCapacity(projectionCount)
+        for projectionIndex in 0..<projectionCount {
+            guard let dimension = uint32Constant(
+                step,
+                index: 2 + 2 * projectionCount + projectionIndex
+            ).map(Int.init) else {
+                return nil
+            }
+            outputDimensions.append(dimension)
+        }
+        let outputDimensionSum = outputDimensions.reduce(0, +)
+        let inputBytes = sequenceLength * inputDimension * inputBytesPerElement
+        let weightBytes = outputDimensionSum * inputDimension * weightBytesPerElement
+        let outputBytes = sequenceLength * outputDimensionSum * outputBytesPerElement
+        return PrefillByteTraffic(readBytes: inputBytes + weightBytes, writeBytes: outputBytes)
+    }
+
+    if (kernelName.hasPrefix("gemv_") || kernelName.hasPrefix("gemm_") || kernelName.contains("_gemv"))
+        && step.bindings.buffers.count >= 3,
+       let inputDimension = uint32Constant(step, index: 3).map(Int.init),
+       let outputDimension = uint32Constant(step, index: 4).map(Int.init) {
+        let inputBytes = sequenceLength * inputDimension * inputBytesPerElement
+        let weightBytes = outputDimension * inputDimension * weightBytesPerElement
+        let outputBytes = sequenceLength * outputDimension * outputBytesPerElement
+        return PrefillByteTraffic(readBytes: inputBytes + weightBytes, writeBytes: outputBytes)
+    }
+
+    return nil
+}
+
+private func estimatedSSMRecurrenceByteTraffic(
+    for step: MetalPrefillStep,
+    sequenceLength: Int
+) -> PrefillByteTraffic {
+    let activationBytes = 4
+    let weightBytes = projectionWeightBytes(for: kernelName(for: step).lowercased())
+    guard let headCount = uint32Constant(step, index: 11).map(Int.init),
+          let groupCount = uint32Constant(step, index: 12).map(Int.init),
+          let keyDimension = uint32Constant(step, index: 13).map(Int.init),
+          let valueDimension = uint32Constant(step, index: 14).map(Int.init),
+          let convKernelSize = uint32Constant(step, index: 15).map(Int.init),
+          let activationRowStride = uint32Constant(step, index: 17).map(Int.init) else {
+        return estimatedBindingByteTraffic(for: step)
+    }
+
+    let keyGroupDimension = groupCount * keyDimension
+    let convDimension = 2 * keyGroupDimension + headCount * valueDimension
+    let projectedQKVBytes = sequenceLength * activationRowStride * activationBytes
+    let projectedZBytes = sequenceLength * activationRowStride * activationBytes
+    let projectedBetaBytes = sequenceLength * activationRowStride * activationBytes
+    let projectedAlphaBytes = sequenceLength * activationRowStride * activationBytes
+    let convWeightBytes = convDimension * convKernelSize * weightBytes
+    let normWeightBytes = valueDimension * MemoryLayout<Float>.stride
+    let dtAndALogBytes = headCount * MemoryLayout<Float>.stride * 2
+    let recurrentStateBytesPerPass = sequenceLength
+        * headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride
+    let convStateBytesPerPass = sequenceLength
+        * convKernelSize * convDimension * weightBytes
+    let outputBytes = sequenceLength * activationRowStride * activationBytes
+
+    return PrefillByteTraffic(
+        readBytes: projectedQKVBytes + projectedZBytes + projectedBetaBytes + projectedAlphaBytes
+            + convWeightBytes + normWeightBytes + dtAndALogBytes
+            + recurrentStateBytesPerPass + convStateBytesPerPass,
+        writeBytes: recurrentStateBytesPerPass + convStateBytesPerPass + outputBytes
+    )
+}
+
+private func estimatedBindingByteTraffic(for step: MetalPrefillStep) -> PrefillByteTraffic {
+    guard let pattern = step.metadata.bufferAccessPattern else {
+        let bytes = step.bindings.buffers.reduce(0) { total, binding in
+            total + max(0, binding.buffer.length - binding.offset)
+        }
+        return PrefillByteTraffic(readBytes: bytes, writeBytes: 0)
+    }
+    var readBytes = 0
+    var writeBytes = 0
+    for binding in step.bindings.buffers {
+        let bytes = max(0, binding.buffer.length - binding.offset)
+        if pattern.readIndices.contains(binding.index) {
+            readBytes += bytes
+        }
+        if pattern.writeIndices.contains(binding.index) {
+            writeBytes += bytes
+        }
+    }
+    return PrefillByteTraffic(readBytes: readBytes, writeBytes: writeBytes)
+}
+
+private func uint32Constant(_ step: MetalPrefillStep, index: Int) -> UInt32? {
+    for binding in step.bindings.constants where binding.index == index {
+        switch binding {
+        case .inline(let bytes):
+            guard bytes.value.count >= MemoryLayout<UInt32>.size else {
+                return nil
+            }
+            return bytes.value.withUnsafeBytes { rawBuffer in
+                rawBuffer.loadUnaligned(fromByteOffset: 0, as: UInt32.self)
+            }
+        case .buffer(let buffer):
+            guard buffer.length >= MemoryLayout<UInt32>.size,
+                  buffer.offset + MemoryLayout<UInt32>.size <= buffer.buffer.length,
+                  buffer.buffer.storageMode != .private else {
+                return nil
+            }
+            return buffer.buffer.contents()
+                .advanced(by: buffer.offset)
+                .loadUnaligned(as: UInt32.self)
+        }
+    }
+    return nil
+}
+
+private func projectionCount(fromBatchedKernelName kernelName: String) -> Int? {
+    for prefix in ["batched_gemv", "batched_gemm"] {
+        guard let range = kernelName.range(of: prefix) else {
+            continue
+        }
+        let suffix = kernelName[range.upperBound...]
+        let digits = String(suffix.prefix { $0.isNumber })
+        if let count = Int(digits) {
+            return count
+        }
+    }
+    return nil
+}
+
+private func projectionActivationBytes(for kernelName: String) -> Int {
+    kernelName.contains("_f32") || kernelName.contains("f32s") ? 4 : 2
+}
+
+private func projectionWeightBytes(for kernelName: String) -> Int {
+    if kernelName.contains("_q3") {
+        return 1
+    }
+    if kernelName.contains("_q4") {
+        return 1
+    }
+    if kernelName.contains("_q8") {
+        return 1
+    }
+    if kernelName.contains("bf16") || kernelName.contains("f16") {
+        return 2
+    }
+    return 4
 }
 
 private func estimatedDispatchCount(for step: MetalPrefillStep, sequenceLength: Int) -> Int {

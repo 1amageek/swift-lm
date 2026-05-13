@@ -294,6 +294,7 @@ struct MetalResidencyOwnershipTests {
             positions: try requiredSharedBuffer(device, length: 16),
             ropePositionAxes: try requiredSharedBuffer(device, length: 48),
             tokenOut: try requiredSharedBuffer(device, length: 4),
+            ssmConvDebug: nil,
             dequantScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )
@@ -407,6 +408,7 @@ struct MetalResidencyOwnershipTests {
             positions: try requiredSharedBuffer(device, length: 16),
             ropePositionAxes: try requiredSharedBuffer(device, length: 48),
             tokenOut: try requiredSharedBuffer(device, length: 4),
+            ssmConvDebug: nil,
             dequantScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )

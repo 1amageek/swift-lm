@@ -10,6 +10,10 @@ struct ReferenceHarnessManifestTests {
 
         #expect(manifest.contains { $0.modelFamily == "LFM2" && $0.status == .ready })
         #expect(manifest.contains { $0.modelFamily == "Qwen3.5" && $0.status == .ready })
+        #expect(manifest.contains {
+            $0.modelFamily == "Qwen3.5"
+                && $0.command.contains("--linear-block-ordinals")
+        })
 
         for entry in manifest where entry.status == .ready {
             for path in entry.requiredPaths {
@@ -75,7 +79,7 @@ private enum ReferenceHarnessManifest {
                     repositoryRoot.appendingPathComponent("scripts/hf/dump_qwen35_reference.py"),
                     repositoryRoot.appendingPathComponent("Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift"),
                 ],
-                command: "python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2",
+                command: "python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0",
                 blocker: ""
             ),
         ]

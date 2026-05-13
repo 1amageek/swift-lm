@@ -153,6 +153,11 @@ private struct MetalCompiledModelRuntimeCloner {
         } else {
             nil
         }
+        let ssmConvDebug: MTLBuffer? = if let ssmConvDebug = buffers.ssmConvDebug {
+            try clonedRuntimeBuffer(ssmConvDebug)
+        } else {
+            nil
+        }
         return PrefillBufferSet(
             bufferPrecision: buffers.bufferPrecision,
             hidden: try clonedRuntimeBuffer(buffers.hidden),
@@ -173,6 +178,7 @@ private struct MetalCompiledModelRuntimeCloner {
             positions: try clonedRuntimeBuffer(buffers.positions),
             ropePositionAxes: try clonedRuntimeBuffer(buffers.ropePositionAxes),
             tokenOut: try clonedRuntimeBuffer(buffers.tokenOut),
+            ssmConvDebug: ssmConvDebug,
             dequantScratch: dequantScratch,
             runtimeConstantBuffer: try clonedRuntimeBuffer(buffers.runtimeConstantBuffer)
         )

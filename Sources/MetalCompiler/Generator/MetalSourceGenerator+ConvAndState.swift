@@ -647,6 +647,9 @@ public static func generateSSMRecurrenceSequence(
         constant uint& convKernelSize [[buffer(15)]],
         constant uint& sequenceLength [[buffer(16)]],
         constant uint& activationRowStride [[buffer(17)]],
+        device float* debugConvSilu [[buffer(18)]],
+        constant uint& debugConvRowStride [[buffer(19)]],
+        constant uint& debugConvEnabled [[buffer(20)]],
         uint tid [[thread_index_in_threadgroup]],
         uint tgSize [[threads_per_threadgroup]],
         uint tgid [[threadgroup_position_in_grid]]
@@ -713,7 +716,11 @@ public static func generateSSMRecurrenceSequence(
                 float newVal = \(activationStorageValue("float(projectedQKVPos[globalCh])"));
                 convState[(convKernelSize - 1) * convDim + globalCh] = \(writeConvState("newVal"));
                 sum += newVal * \(readWeight("convWeight[globalCh * convKernelSize + convKernelSize - 1]"));
-                convSiluCache[localCh] = sum * stable_sigmoid(sum);
+                float convSilu = sum * stable_sigmoid(sum);
+                convSiluCache[localCh] = convSilu;
+                if (debugConvEnabled != 0) {
+                    debugConvSilu[pos * debugConvRowStride + globalCh] = convSilu;
+                }
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 

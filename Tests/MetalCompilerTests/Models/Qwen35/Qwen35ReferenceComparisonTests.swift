@@ -37,6 +37,7 @@ struct Qwen35ReferenceComparisonTests {
             "ref.meta.schema_version",
             "ref.meta.case_count",
             "ref.meta.decode_steps",
+            "ref.meta.linear_block_ordinals",
             "ref.meta.config_sha256",
             "ref.meta.torch_version_utf8",
             "ref.meta.transformers_version_utf8",
@@ -50,18 +51,28 @@ struct Qwen35ReferenceComparisonTests {
         let caseCount = try Self.readRefInt32(env.ref, name: "ref.meta.case_count")
         let decodeSteps = try Self.readRefInt32(env.ref, name: "ref.meta.decode_steps")
         let fastBackendAvailable = try Self.readRefInt32(env.ref, name: "ref.meta.fast_backend_available")
+        let linearBlockOrdinals = try Self.readRefInt32Array(env.ref, name: "ref.meta.linear_block_ordinals")
         let referenceConfigHash = try Self.readRefUInt8Array(env.ref, name: "ref.meta.config_sha256")
         let torchVersion = try Self.readRefUInt8Array(env.ref, name: "ref.meta.torch_version_utf8")
         let transformersVersion = try Self.readRefUInt8Array(env.ref, name: "ref.meta.transformers_version_utf8")
         let bundleConfigHash = try Self.configSHA256(bundlePath: env.bundlePath)
 
-        #expect(schemaVersion == 4, "Unexpected Qwen35 reference schema version: \(schemaVersion)")
+        #expect(schemaVersion == 5, "Unexpected Qwen35 reference schema version: \(schemaVersion)")
         #expect(Int(caseCount) == Self.referenceCases.count)
         #expect(decodeSteps >= 1)
         #expect(fastBackendAvailable == 0 || fastBackendAvailable == 1)
+        #expect(!linearBlockOrdinals.isEmpty)
         #expect(!torchVersion.isEmpty)
         #expect(!transformersVersion.isEmpty)
         #expect(referenceConfigHash == bundleConfigHash, "Qwen35 reference config does not match the Swift bundle config")
+
+        for ordinal in linearBlockOrdinals {
+            let layerIndex = try Self.readRefInt32(
+                env.ref,
+                name: "ref.meta.linear_ordinal_\(ordinal).layer_index"
+            )
+            #expect(layerIndex >= 0)
+        }
 
         for referenceCase in Self.referenceCases {
             let prefix = referenceCase.prefix
@@ -89,6 +100,108 @@ struct Qwen35ReferenceComparisonTests {
             let referenceTokens = try Self.readRefInt32Array(env.ref, name: "\(prefix).meta.input_tokens")
             #expect(Int(tokenCount) == referenceCase.tokens.count)
             #expect(referenceTokens == referenceCase.tokens)
+
+            for ordinal in linearBlockOrdinals {
+                let requiredBlockTensors = [
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.projected_qkv",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.projected_z",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.projected_beta",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.projected_alpha",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.conv_silu",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.gated_recurrent_output",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.out_projection",
+                ]
+                for name in requiredBlockTensors {
+                    #expect(env.ref.tensors[name] != nil, "Missing Qwen35 reference tensor: \(name)")
+                }
+            }
+        }
+    }
+
+    @Test("Prefill linear-attention block boundaries match HuggingFace reference")
+    func prefillLinearAttentionBlockBoundariesMatchReference() throws {
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let env = try Self.setupOrSkip(enableSSMConvDebug: true)
+        let referenceCase = Self.referenceCases[0]
+        let linearBlockOrdinals = try Self.readRefInt32Array(env.ref, name: "ref.meta.linear_block_ordinals")
+        #expect(!linearBlockOrdinals.isEmpty)
+
+        var model = try Self.makeRuntimeIsolatedModel(from: env.model)
+        let prefillPlan = try #require(model.prefillPlan)
+
+        var lastProbeStepIndex = 0
+        var stages: [LinearAttentionBoundaryStage] = []
+        for ordinal in linearBlockOrdinals.map(Int.init) {
+            let layerIndex = Int(try Self.readRefInt32(
+                env.ref,
+                name: "ref.meta.linear_ordinal_\(ordinal).layer_index"
+            ))
+            let steps = try Self.linearAttentionBoundarySteps(
+                prefillPlan: prefillPlan,
+                layerIndex: layerIndex
+            )
+            lastProbeStepIndex = max(lastProbeStepIndex, steps.outProjection)
+            stages.append(contentsOf: Self.linearAttentionBoundaryStages(
+                referencePrefix: referenceCase.prefix,
+                ordinal: ordinal,
+                steps: steps,
+                slotDimension: prefillPlan.slotDimension
+            ))
+        }
+
+        var probes: [MetalInferenceModel.DebugPrefillBindingProbe] = []
+        for stage in stages {
+            for rowIndex in referenceCase.tokens.indices {
+                probes.append(MetalInferenceModel.DebugPrefillBindingProbe(
+                    label: "\(stage.name).row_\(rowIndex)",
+                    stepIndex: stage.stepIndex,
+                    bindingIndex: stage.bindingIndex,
+                    phase: .afterStep,
+                    rowIndex: rowIndex,
+                    rowStride: stage.rowStride,
+                    count: stage.count,
+                    precision: .float32
+                ))
+            }
+        }
+
+        model.resetState()
+        let snapshots = try model.debugPrefillBindingProbes(
+            tokens: referenceCase.tokens,
+            stepIndex: lastProbeStepIndex,
+            probes: probes
+        )
+
+        for stage in stages {
+            let referenceValues = try Self.readRefTensorAsFloats(env.ref, name: stage.referenceName)
+            let referenceRowStride = referenceValues.count / referenceCase.tokens.count
+            #expect(
+                referenceValues.count % referenceCase.tokens.count == 0,
+                "\(stage.referenceName) cannot be split by token rows"
+            )
+            #expect(
+                referenceRowStride >= stage.count,
+                "\(stage.referenceName) row stride \(referenceRowStride) is smaller than expected count \(stage.count)"
+            )
+
+            var worstError: Float = 0
+            for rowIndex in referenceCase.tokens.indices {
+                guard let metalValues = snapshots["\(stage.name).row_\(rowIndex)"] else {
+                    throw SetupError.tensorNotFound("metal.\(stage.name).row_\(rowIndex)")
+                }
+                let referenceStart = rowIndex * referenceRowStride
+                let reference = Array(referenceValues[referenceStart..<(referenceStart + stage.count)])
+                let error = Self.maxAbsoluteError(metalValues, reference)
+                worstError = max(worstError, error)
+                #expect(
+                    error < stage.tolerance,
+                    "\(stage.name) row \(rowIndex) drifted: maxErr=\(error)"
+                )
+            }
+            print("[Qwen35Ref] \(referenceCase.prefix).prefill.\(stage.name) maxErr=\(String(format: "%.4f", worstError))")
         }
     }
 
@@ -241,7 +354,23 @@ struct Qwen35ReferenceComparisonTests {
         let bundlePath: String
     }
 
-    private static func setupOrSkip() throws -> TestEnvironment {
+    private struct LinearAttentionBoundarySteps {
+        let projection: Int
+        let recurrence: Int
+        let outProjection: Int
+    }
+
+    private struct LinearAttentionBoundaryStage {
+        let name: String
+        let referenceName: String
+        let stepIndex: Int
+        let bindingIndex: Int
+        let rowStride: Int
+        let count: Int
+        let tolerance: Float
+    }
+
+    private static func setupOrSkip(enableSSMConvDebug: Bool = false) throws -> TestEnvironment {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw SetupError.noDevice
         }
@@ -258,6 +387,17 @@ struct Qwen35ReferenceComparisonTests {
         }
 
         let ref = try SafetensorsLoader().load(at: refURL, device: device)
+        let previousDebugValue = getenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV").map { String(cString: $0) }
+        if enableSSMConvDebug {
+            setenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV", "1", 1)
+        }
+        defer {
+            if let previousDebugValue {
+                setenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV", previousDebugValue, 1)
+            } else {
+                unsetenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV")
+            }
+        }
         let (model, _, _) = try BenchmarkSupport.setupFromBundle(
             bundlePath: bundlePath,
             inferencePolicy: InferencePolicy(maximumSequenceLength: 64)
@@ -287,6 +427,113 @@ struct Qwen35ReferenceComparisonTests {
     private static func makeRuntimeIsolatedModel(from model: MetalInferenceModel) throws -> MetalInferenceModel {
         let isolated = try model.compiledModel.makeRuntimeIsolatedCopy(device: model.device)
         return try MetalInferenceModel(compiledModel: isolated, device: model.device)
+    }
+
+    private static func linearAttentionBoundarySteps(
+        prefillPlan: MetalPrefillPlan,
+        layerIndex: Int
+    ) throws -> LinearAttentionBoundarySteps {
+        let layerToken = ".layers.\(layerIndex).linear_attn."
+        guard let projection = prefillPlan.steps.firstIndex(where: { step in
+            step.metadata.weightTensorName?.contains("\(layerToken)in_proj_qkv.weight") == true
+        }) else {
+            throw SetupError.stepNotFound("linear attention projection for layer \(layerIndex)")
+        }
+        guard let recurrence = prefillPlan.steps.indices.first(where: { index in
+            guard index > projection else { return false }
+            let step = prefillPlan.steps[index]
+            return (step.metadata.kernelName ?? step.pipeline.label ?? "").contains("ssm_recurrence_seq")
+        }) else {
+            throw SetupError.stepNotFound("linear attention recurrence for layer \(layerIndex)")
+        }
+        guard let outProjection = prefillPlan.steps.firstIndex(where: { step in
+            step.metadata.weightTensorName?.contains("\(layerToken)out_proj.weight") == true
+        }) else {
+            throw SetupError.stepNotFound("linear attention output projection for layer \(layerIndex)")
+        }
+        guard recurrence < outProjection else {
+            throw SetupError.stepNotFound("linear attention recurrence before output projection for layer \(layerIndex)")
+        }
+        return LinearAttentionBoundarySteps(
+            projection: projection,
+            recurrence: recurrence,
+            outProjection: outProjection
+        )
+    }
+
+    private static func linearAttentionBoundaryStages(
+        referencePrefix: String,
+        ordinal: Int,
+        steps: LinearAttentionBoundarySteps,
+        slotDimension: Int
+    ) -> [LinearAttentionBoundaryStage] {
+        let blockPrefix = "\(referencePrefix).prefill.linear_ordinal_\(ordinal).block"
+        let labelPrefix = "linear_ordinal_\(ordinal).block"
+        return [
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).projected_qkv",
+                referenceName: "\(blockPrefix).projected_qkv",
+                stepIndex: steps.projection,
+                bindingIndex: 5,
+                rowStride: slotDimension,
+                count: 6144,
+                tolerance: 1.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).projected_z",
+                referenceName: "\(blockPrefix).projected_z",
+                stepIndex: steps.projection,
+                bindingIndex: 6,
+                rowStride: slotDimension,
+                count: 2048,
+                tolerance: 1.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).projected_beta",
+                referenceName: "\(blockPrefix).projected_beta",
+                stepIndex: steps.projection,
+                bindingIndex: 7,
+                rowStride: slotDimension,
+                count: 16,
+                tolerance: 0.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).projected_alpha",
+                referenceName: "\(blockPrefix).projected_alpha",
+                stepIndex: steps.projection,
+                bindingIndex: 8,
+                rowStride: slotDimension,
+                count: 16,
+                tolerance: 0.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).conv_silu",
+                referenceName: "\(blockPrefix).conv_silu",
+                stepIndex: steps.recurrence,
+                bindingIndex: 18,
+                rowStride: slotDimension,
+                count: 6144,
+                tolerance: 1.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).gated_recurrent_output",
+                referenceName: "\(blockPrefix).gated_recurrent_output",
+                stepIndex: steps.recurrence,
+                bindingIndex: 10,
+                rowStride: slotDimension,
+                count: 2048,
+                tolerance: 1.25
+            ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).out_projection",
+                referenceName: "\(blockPrefix).out_projection",
+                stepIndex: steps.outProjection,
+                bindingIndex: 2,
+                rowStride: 1024,
+                count: 1024,
+                tolerance: 1.25
+            ),
+        ]
     }
 
     private static func readRefTensorAsFloats(
@@ -615,6 +862,7 @@ struct Qwen35ReferenceComparisonTests {
         case metalReadbackUnavailable
         case metalReadbackFailed(String)
         case bufferRangeOutOfBounds(offset: Int, byteCount: Int, length: Int)
+        case stepNotFound(String)
     }
 }
 #endif
