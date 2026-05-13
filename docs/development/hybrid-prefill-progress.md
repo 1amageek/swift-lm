@@ -841,11 +841,11 @@ flowchart LR
 
 | Shape | Decision | Numerical contract |
 |---|---|---|
-| Multi-group recurrent block with matching projection dimensions | Candidate | `referenceGated`; group partial sums change the output-projection reduction association |
+| Multi-group recurrent block with matching projection dimensions | Candidate | `referenceGated`; scratch-compatible partition partial sums change the output-projection reduction association |
 | Single recurrent group | Reject two-stage | single-dispatch path is structurally preferable |
 
 M3D.2 starts the two-stage kernel work from the safer second stage:
-`recurrent_block_partial_reduce` reduces a per-token, per-group partial-hidden
+`recurrent_block_partial_reduce` reduces a per-token, per-partition partial-hidden
 buffer into the final hidden row. This kernel does not route in production yet;
 it exists so the partial buffer layout and padded-stride semantics are fixed
 before the harder SSM+partial-GEMV stage is attempted.
@@ -856,19 +856,21 @@ explicit contract error instead of a missing-pipeline surprise.
 
 M3D.3 adds the first-stage partial projection kernel:
 `recurrent_block_partial_projection_seq_bf16_f32` computes one partial hidden
-row per `(token, group, output row)` from that group's recurrent-output slice
-and the matching `linear_attn.out_proj` weight slice. The standalone harness
+row per `(token, partition, output row)` from a contiguous recurrent-output
+slice and the matching `linear_attn.out_proj` weight slice. The standalone harness
 runs partial projection followed by partial reduce and compares the full hidden
-row against a CPU reference. This is still not production-routed.
+row against a CPU reference.
 
 The two-stage plan uses existing scratch storage: recurrence output remains in
-slot 0, and group partial hidden rows occupy slots `1..<1+groupCount`. For
-Qwen's four recurrent groups this consumes all five prefill scratch slots and
-does not require a new runtime buffer.
+slot 0, and partial hidden rows occupy slots `1..<1+partialPartitionCount`.
+The runtime chooses the largest divisor of the recurrent group count that fits
+the available scratch slots. Qwen's 16 recurrent groups therefore route as four
+contiguous partial partitions and consume the existing five prefill scratch
+slots without a new runtime buffer.
 
 The partial buffer layout is slot-major so production routing can bind the
 existing prefill scratch buffer without reshaping:
-`partial[group * maximumSequenceLength * slotDimension + token * slotDimension + row]`.
+`partial[partition * maximumSequenceLength * slotDimension + token * slotDimension + row]`.
 
 Validation:
 

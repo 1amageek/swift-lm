@@ -403,6 +403,13 @@ private struct SequenceGEMVKernelSelection: Equatable {
     var isTiled: Bool { sequenceTile > 1 }
 }
 
+private struct PendingRecurrentBlockOutputProjection {
+    let compositeID: Int?
+    let layerIndex: Int?
+    let recurrentGroupCount: Int
+    let recurrentOutputDimension: Int
+}
+
 private struct PrefillStepPlanner {
     private static let decodeEquivalentSequenceRowsPerThreadgroup = 2
 
@@ -479,6 +486,34 @@ private struct PrefillStepPlanner {
         return max(value, 1)
     }()
 
+    /// Process-wide BF16 recurrent block partial-projection feature flag.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1`, a matching
+    /// linear-attention `(SSM recurrence, out_proj)` pair routes through:
+    ///
+    ///   1. `recurrent_block_partial_projection_seq_bf16_f32`
+    ///   2. `recurrent_block_partial_reduce_seq_f32`
+    ///
+    /// The path is opt-in while real-bundle profile evidence is collected.
+    /// Admission is strict; a targeted recurrent out-projection that violates
+    /// the contract fails explicitly instead of falling back silently.
+    private static let bf16RecurrentBlockPartialProjectionEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    private static func largestDivisor(of value: Int, notExceeding maximum: Int) -> Int {
+        guard value > 0, maximum > 0 else { return 0 }
+        for candidate in stride(from: min(value, maximum), through: 1, by: -1) {
+            if value % candidate == 0 {
+                return candidate
+            }
+        }
+        return 0
+    }
+
     let buffers: PrefillBufferSet
     let stafWeightStore: STAFWeightStore?
     let hiddenSize: Int
@@ -500,6 +535,7 @@ private struct PrefillStepPlanner {
     var activeCompositeID: Int?
     var compositeInputSource: (buffer: MTLBuffer, offset: Int)?
     var quantizationEntries: [MetalQuantizationPlanEntry] = []
+    var pendingRecurrentBlockOutputProjection: PendingRecurrentBlockOutputProjection?
 
     var fusedMlpDownMinimumSequenceLength: Int {
         Self.fusedMlpDownMinimumSequenceLength
@@ -929,6 +965,15 @@ private struct PrefillStepPlanner {
         )
 
         if let linear = entry.fragment as? LinearFragment {
+            if let recurrentSteps = try buildRecurrentBlockPartialOutputProjectionSteps(
+                linear,
+                entry: entry,
+                weightResolver: weightResolver
+            ) {
+                return annotate(recurrentSteps, entryIndex: entry.index, layerIndex: entry.layerIndex)
+            }
+            pendingRecurrentBlockOutputProjection = nil
+
             let projection = linear
             let isOutput = linear.isOutput
             let resolved = try resolveDispatch(entry)
@@ -1357,8 +1402,210 @@ private struct PrefillStepPlanner {
             if result.resetsProjectionIndex {
                 refreshCompositeInputSource()
             }
+            if let recurrence = frag as? SSMRecurrenceFragment,
+               result.outputIsHidden == false,
+               result.resetsProjectionIndex {
+                pendingRecurrentBlockOutputProjection = PendingRecurrentBlockOutputProjection(
+                    compositeID: entry.compositeID,
+                    layerIndex: entry.layerIndex,
+                    recurrentGroupCount: max(recurrence.groupCount, 1),
+                    recurrentOutputDimension: recurrence.headCount * recurrence.valueHeadDimension
+                )
+            } else {
+                pendingRecurrentBlockOutputProjection = nil
+            }
             return annotate(result.steps, entryIndex: entry.index, layerIndex: entry.layerIndex)
         }
+    }
+
+    private mutating func buildRecurrentBlockPartialOutputProjectionSteps(
+        _ linear: LinearFragment,
+        entry: DispatchEntry,
+        weightResolver: WeightResolver
+    ) throws -> [MetalPrefillStep]? {
+        guard let pending = pendingRecurrentBlockOutputProjection else {
+            return nil
+        }
+        guard linear.field == "out_proj", linear.isOutput else {
+            pendingRecurrentBlockOutputProjection = nil
+            return nil
+        }
+
+        guard Self.bf16RecurrentBlockPartialProjectionEnabled else {
+            return nil
+        }
+        guard pending.recurrentGroupCount > 1 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires more than one recurrent partition"
+            )
+        }
+        guard entry.compositeID == pending.compositeID,
+              entry.layerIndex == pending.layerIndex else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires adjacent recurrence/output projection in the same layer"
+            )
+        }
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires prefill sequence precision"
+            )
+        }
+        guard !routingState.lastOutputIsHidden,
+              routingState.currentInputOffset == 0 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires recurrence output in scratch slot 0"
+            )
+        }
+        guard linear.inputDimension == pending.recurrentOutputDimension else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection input dimension \(linear.inputDimension) does not match recurrence output \(pending.recurrentOutputDimension)"
+            )
+        }
+        guard linear.outputDimension <= hiddenSize else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection does not support output-head projections"
+            )
+        }
+
+        let descriptor = resolveProjectionWeightDescriptor(role: linear.field, entry: entry)
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires BF16 row-major weights"
+            )
+        }
+
+        let scratchSlotSize = slotDimension * scratchElementSize * maximumSequenceLength
+        let availableScratchSlots = buffers.scratch.length / max(scratchSlotSize, 1)
+        let availablePartialSlots = max(availableScratchSlots - 1, 0)
+        let partialPartitionCount = Self.largestDivisor(
+            of: pending.recurrentGroupCount,
+            notExceeding: availablePartialSlots
+        )
+        guard partialPartitionCount > 1 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent block partial projection requires a scratch-compatible recurrent partition count"
+            )
+        }
+        guard pending.recurrentOutputDimension % partialPartitionCount == 0 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Recurrent output dimension \(pending.recurrentOutputDimension) is not divisible by partial partition count \(partialPartitionCount)"
+            )
+        }
+        let partitionInputDimension = pending.recurrentOutputDimension / partialPartitionCount
+
+        let projectionKernelName = "recurrent_block_partial_projection_seq_bf16_f32"
+        let reduceKernelName = "recurrent_block_partial_reduce_seq_f32"
+        guard let projectionPipeline = planBuildContext.pipelineCache[projectionKernelName] else {
+            throw MetalCompilerError.kernelNotFound(projectionKernelName)
+        }
+        guard let reducePipeline = planBuildContext.pipelineCache[reduceKernelName] else {
+            throw MetalCompilerError.kernelNotFound(reduceKernelName)
+        }
+
+        let (weightBuffer, weightOffset) = weightResolver.resolve(role: linear.field)
+        let weightTensorName = entry.parameterBindings.first(where: { $0.role == linear.field })?.tensorName
+        let inputRowStride = slotDimension
+        let partialRowStride = slotDimension
+        let outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+
+        let projectionSimdWidth = max(projectionPipeline.threadExecutionWidth, 1)
+        let projectionThreads = min(
+            projectionSimdWidth * Self.decodeEquivalentSequenceRowsPerThreadgroup,
+            projectionPipeline.maxTotalThreadsPerThreadgroup
+        )
+        let projectionRowsPerThreadgroup = max(1, projectionThreads / projectionSimdWidth)
+        let projectionStep = MetalPrefillStep(
+            pipeline: projectionPipeline,
+            gridSize: MTLSize(
+                width: (linear.outputDimension + projectionRowsPerThreadgroup - 1) / projectionRowsPerThreadgroup,
+                height: maximumSequenceLength,
+                depth: partialPartitionCount
+            ),
+            threadgroupSize: MTLSize(width: projectionThreads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, 0),
+                (1, weightBuffer, weightOffset),
+                (2, buffers.scratch, scratchSlotSize),
+            ],
+            bytesBindings: [
+                uint32Binding(3, UInt32(partitionInputDimension)),
+                uint32Binding(4, UInt32(linear.outputDimension)),
+                uint32Binding(5, UInt32(partialPartitionCount)),
+                uint32Binding(6, UInt32(maximumSequenceLength)),
+                uint32Binding(7, UInt32(inputRowStride)),
+                uint32Binding(8, UInt32(partialRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: projectionKernelName,
+                entryIndex: entry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2])
+            )
+        )
+
+        let reduceThreads = min(256, reducePipeline.maxTotalThreadsPerThreadgroup)
+        let reduceStep = MetalPrefillStep(
+            pipeline: reducePipeline,
+            gridSize: MTLSize(
+                width: (linear.outputDimension + reduceThreads - 1) / reduceThreads,
+                height: maximumSequenceLength,
+                depth: 1
+            ),
+            threadgroupSize: MTLSize(width: reduceThreads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, scratchSlotSize),
+                (1, buffers.hidden, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(2, UInt32(partialPartitionCount)),
+                uint32Binding(3, UInt32(linear.outputDimension)),
+                uint32Binding(4, UInt32(maximumSequenceLength)),
+                uint32Binding(5, UInt32(partialRowStride)),
+                uint32Binding(6, UInt32(outputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 4),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: reduceKernelName,
+                entryIndex: entry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0], writes: [1])
+            )
+        )
+
+        recordProjectionQuantization(
+            entry: entry,
+            descriptor: descriptor,
+            mode: .batch,
+            inputRowStride: inputRowStride,
+            inputDimension: linear.inputDimension,
+            outputDimension: linear.outputDimension,
+            outputRowStride: outputRowStride,
+            selectedKernelName: projectionKernelName,
+            usesMPPForStep: false,
+            usesSequenceGEMVForStep: true,
+            sequenceTileHeight: nil,
+            tileVariantHeights: []
+        )
+
+        routingState.lastOutputIsHidden = true
+        routingState.currentInputOffset = 0
+        routingState.projectionIndex = 1
+        pendingRecurrentBlockOutputProjection = nil
+        refreshCompositeInputSource()
+
+        return [projectionStep, reduceStep]
     }
 
     // MARK: - Projection-type fragment prefill decomposition

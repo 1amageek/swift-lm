@@ -204,6 +204,18 @@ enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
 }
 
 enum RecurrentBlockFusionPrototypePlanner {
+    private static let maximumPartialScratchSlotCount = 4
+
+    private static func largestDivisor(of value: Int, notExceeding maximum: Int) -> Int {
+        guard value > 0, maximum > 0 else { return 0 }
+        for candidate in stride(from: min(value, maximum), through: 1, by: -1) {
+            if value % candidate == 0 {
+                return candidate
+            }
+        }
+        return 0
+    }
+
     static func singleDispatchDecision(
         for window: RecurrentBlockFusionAdmissionWindow,
         entries: [DispatchEntry]
@@ -309,9 +321,15 @@ enum RecurrentBlockFusionPrototypePlanner {
             return .rejected(rejections)
         }
 
-        let partitionCount = recurrence.groupCount
+        let partitionCount = largestDivisor(
+            of: recurrence.groupCount,
+            notExceeding: maximumPartialScratchSlotCount
+        )
+        guard partitionCount > 1, recurrentOutputDimension % partitionCount == 0 else {
+            return .rejected([.singleDispatchPreferred(partitionCount: partitionCount)])
+        }
         let headsPerPartition = recurrence.headCount / partitionCount
-        let partitionInputDimension = headsPerPartition * recurrence.valueHeadDimension
+        let partitionInputDimension = recurrentOutputDimension / partitionCount
         return .candidate(RecurrentBlockFusionTwoStagePlan(
             layerIndex: window.layerIndex,
             partitionCount: partitionCount,

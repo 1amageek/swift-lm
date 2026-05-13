@@ -102,7 +102,14 @@ struct Qwen35PrefillProfileTests {
                 printSingleProjectionRoleBreakdown(profiles: profiles)
                 let windows = RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: profiles)
                 printLinearAttentionWindowSummary(windows: windows)
-                #expect(windows.count == 18)
+                let partialProjectionCount = profiles.filter {
+                    $0.kernelName == "recurrent_block_partial_projection_seq_bf16_f32"
+                }.count
+                if partialProjectionCount > 0 {
+                    #expect(partialProjectionCount == 18)
+                } else {
+                    #expect(windows.count == 18)
+                }
             }
             print("  artifacts: \(stepArtifacts.map(\.path).joined(separator: ", "))")
             print("  pass artifacts: \(passArtifacts.map(\.path).joined(separator: ", "))")

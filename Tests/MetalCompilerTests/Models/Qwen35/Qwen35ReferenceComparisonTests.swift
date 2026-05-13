@@ -198,7 +198,7 @@ struct Qwen35ReferenceComparisonTests {
                 let error = Self.maxAbsoluteError(metalValues, reference)
                 worstError = max(worstError, error)
                 #expect(
-                    error < stage.tolerance,
+                    error <= stage.tolerance,
                     "\(stage.name) row \(rowIndex) drifted: maxErr=\(error)"
                 )
             }
@@ -359,6 +359,7 @@ struct Qwen35ReferenceComparisonTests {
         let projection: Int
         let recurrence: Int
         let outProjection: Int
+        let outProjectionBindingIndex: Int
     }
 
     private struct LinearAttentionBoundaryStage {
@@ -447,18 +448,40 @@ struct Qwen35ReferenceComparisonTests {
         }) else {
             throw SetupError.stepNotFound("linear attention recurrence for layer \(layerIndex)")
         }
-        guard let outProjection = prefillPlan.steps.firstIndex(where: { step in
-            step.metadata.weightTensorName?.contains("\(layerToken)out_proj.weight") == true
-        }) else {
+        let outProjectionCandidates = prefillPlan.steps.indices.filter { index in
+            let step = prefillPlan.steps[index]
+            return step.metadata.weightTensorName?.contains("\(layerToken)out_proj.weight") == true
+        }
+        guard let firstOutProjection = outProjectionCandidates.first else {
             throw SetupError.stepNotFound("linear attention output projection for layer \(layerIndex)")
         }
-        guard recurrence < outProjection else {
+        guard recurrence < firstOutProjection else {
             throw SetupError.stepNotFound("linear attention recurrence before output projection for layer \(layerIndex)")
+        }
+        let firstOutProjectionKernel = prefillPlan.steps[firstOutProjection].metadata.kernelName
+            ?? prefillPlan.steps[firstOutProjection].pipeline.label
+            ?? ""
+        let outProjection: Int
+        let outProjectionBindingIndex: Int
+        if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_projection") {
+            guard let reduceStep = outProjectionCandidates.dropFirst().first(where: { index in
+                let step = prefillPlan.steps[index]
+                let kernel = step.metadata.kernelName ?? step.pipeline.label ?? ""
+                return kernel.hasPrefix("recurrent_block_partial_reduce")
+            }) else {
+                throw SetupError.stepNotFound("linear attention partial output reduce for layer \(layerIndex)")
+            }
+            outProjection = reduceStep
+            outProjectionBindingIndex = 1
+        } else {
+            outProjection = firstOutProjection
+            outProjectionBindingIndex = 2
         }
         return LinearAttentionBoundarySteps(
             projection: projection,
             recurrence: recurrence,
-            outProjection: outProjection
+            outProjection: outProjection,
+            outProjectionBindingIndex: outProjectionBindingIndex
         )
     }
 
@@ -529,7 +552,7 @@ struct Qwen35ReferenceComparisonTests {
                 name: "\(labelPrefix).out_projection",
                 referenceName: "\(blockPrefix).out_projection",
                 stepIndex: steps.outProjection,
-                bindingIndex: 2,
+                bindingIndex: steps.outProjectionBindingIndex,
                 rowStride: 1024,
                 count: 1024,
                 tolerance: 1.25

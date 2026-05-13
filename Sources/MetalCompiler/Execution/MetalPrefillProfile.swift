@@ -944,6 +944,10 @@ private func kernelName(for step: MetalPrefillStep) -> String {
 private func classify(_ kernelName: String) -> String {
     let name = kernelName.lowercased()
     if name.hasPrefix("embedding_lookup") || name.contains("gather") { return "embedding" }
+    if name.hasPrefix("recurrent_block_partial_projection")
+        || name.hasPrefix("recurrent_block_partial_reduce") {
+        return "projection"
+    }
     if name.hasPrefix("gemm_") || name.hasPrefix("gemv_")
         || name.contains("_gemm") || name.contains("_gemv") || name.contains("mpp") {
         return "projection"
