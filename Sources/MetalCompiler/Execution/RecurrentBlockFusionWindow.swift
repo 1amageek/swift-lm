@@ -153,6 +153,73 @@ enum RecurrentBlockFusionAdmissionScanner {
     }
 }
 
+enum RecurrentBlockFusionSingleDispatchRejection: Sendable, Equatable {
+    case missingInputProjection(entryIndex: Int)
+    case missingRecurrence(entryIndex: Int)
+    case missingOutputProjection(entryIndex: Int)
+    case inputProjectionShapeMismatch(expectedConvDimension: Int, actualQKVDimension: Int)
+    case gateProjectionShapeMismatch(expectedOutputDimension: Int, actualZDimension: Int)
+    case outputProjectionShapeMismatch(expectedInputDimension: Int, actualInputDimension: Int)
+    case outputProjectionRequiresCrossGroupFanIn(partitionCount: Int)
+}
+
+enum RecurrentBlockFusionSingleDispatchDecision: Sendable, Equatable {
+    case eligible
+    case rejected([RecurrentBlockFusionSingleDispatchRejection])
+}
+
+enum RecurrentBlockFusionPrototypePlanner {
+    static func singleDispatchDecision(
+        for window: RecurrentBlockFusionAdmissionWindow,
+        entries: [DispatchEntry]
+    ) -> RecurrentBlockFusionSingleDispatchDecision {
+        let byIndex = Dictionary(uniqueKeysWithValues: entries.map { ($0.index, $0) })
+        var rejections: [RecurrentBlockFusionSingleDispatchRejection] = []
+
+        guard let inputEntry = byIndex[window.inputProjectionEntryIndex],
+              let inputProjection = inputEntry.fragment as? BatchedProjection else {
+            return .rejected([.missingInputProjection(entryIndex: window.inputProjectionEntryIndex)])
+        }
+        guard let recurrenceEntry = byIndex[window.recurrenceEntryIndex],
+              let recurrence = recurrenceEntry.fragment as? SSMRecurrenceFragment else {
+            return .rejected([.missingRecurrence(entryIndex: window.recurrenceEntryIndex)])
+        }
+        guard let outputEntry = byIndex[window.outputProjectionEntryIndex],
+              let outputProjection = outputEntry.fragment as? LinearFragment else {
+            return .rejected([.missingOutputProjection(entryIndex: window.outputProjectionEntryIndex)])
+        }
+
+        let fields = Dictionary(uniqueKeysWithValues: inputProjection.projections.map { ($0.field, $0) })
+        if let qkv = fields["in_proj_qkv"], qkv.outputDimension != recurrence.convDimension {
+            rejections.append(.inputProjectionShapeMismatch(
+                expectedConvDimension: recurrence.convDimension,
+                actualQKVDimension: qkv.outputDimension
+            ))
+        }
+        let recurrentOutputDimension = recurrence.headCount * recurrence.valueHeadDimension
+        if let z = fields["in_proj_z"], z.outputDimension != recurrentOutputDimension {
+            rejections.append(.gateProjectionShapeMismatch(
+                expectedOutputDimension: recurrentOutputDimension,
+                actualZDimension: z.outputDimension
+            ))
+        }
+        if outputProjection.inputDimension != recurrentOutputDimension {
+            rejections.append(.outputProjectionShapeMismatch(
+                expectedInputDimension: recurrentOutputDimension,
+                actualInputDimension: outputProjection.inputDimension
+            ))
+        }
+
+        if recurrence.groupCount > 1 {
+            rejections.append(.outputProjectionRequiresCrossGroupFanIn(
+                partitionCount: recurrence.groupCount
+            ))
+        }
+
+        return rejections.isEmpty ? .eligible : .rejected(rejections)
+    }
+}
+
 enum RecurrentBlockFusionWindowScanner {
     static func linearAttentionWindows(
         in entries: [MetalPrefillProfile.Entry]

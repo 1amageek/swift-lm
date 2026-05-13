@@ -802,6 +802,7 @@ The contract now exists at two levels:
 | Level | Input | Purpose |
 |---|---|---|
 | Admission | `[DispatchEntry]` before prefill step lowering | Proves the compiler can identify the replaceable IR/fragment window before any runtime routing is added |
+| Prototype planning | Admission window plus fragment shapes | Rejects unsafe single-dispatch routes before kernel work begins |
 | Evidence | `MetalPrefillProfile.Entry` after step lowering | Proves the emitted plan still exposes the same block shape and records the measured window as artifacts |
 
 ```mermaid
@@ -822,11 +823,18 @@ Admission contract:
 | Bridge steps | Preserved explicitly as step indices; the current Qwen path has a round step between recurrence and out projection |
 | Rejection | Incomplete windows or cross-layer output projections are not paired |
 
+Single-dispatch fusion decision:
+
+| Shape | Decision | Reason |
+|---|---|---|
+| Single recurrent group with matching projection dimensions | Eligible for a one-dispatch prototype |
+| Multi-group recurrent block such as Qwen | Reject single-dispatch fusion | SSM recurrence is partitioned by group, while `linear_attn.out_proj` consumes all recurrent heads; replacing the whole block with one dispatch would require unsafe cross-group fan-in without a grid-wide synchronization point |
+
 Validation:
 
 | Gate | Result |
 |---|---|
-| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, and rejects incomplete/cross-layer windows |
+| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, rejects incomplete/cross-layer windows, and rejects Qwen-style multi-group single-dispatch fusion |
 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
 
 This is intentionally not a speed change. It is the routing precondition for

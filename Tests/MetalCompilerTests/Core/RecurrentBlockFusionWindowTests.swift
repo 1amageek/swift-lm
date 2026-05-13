@@ -67,6 +67,40 @@ struct RecurrentBlockFusionWindowTests {
         #expect(windows.isEmpty)
     }
 
+    @Test("Prototype planner rejects single-dispatch fusion when output projection crosses recurrence groups")
+    func prototypePlannerRejectsCrossGroupSingleDispatchFusion() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0, groups: 4),
+            dispatchRecurrence(index: 1, layer: 0, groups: 4),
+            dispatchOutputProjection(index: 2, layer: 0),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.singleDispatchDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .rejected([.outputProjectionRequiresCrossGroupFanIn(partitionCount: 4)]))
+    }
+
+    @Test("Prototype planner accepts shape-matched single-group dispatch window")
+    func prototypePlannerAcceptsSingleGroupDispatchWindow() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0, groups: 1),
+            dispatchRecurrence(index: 1, layer: 0, groups: 1),
+            dispatchOutputProjection(index: 2, layer: 0),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.singleDispatchDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .eligible)
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [
@@ -218,11 +252,11 @@ struct RecurrentBlockFusionWindowTests {
         ].joined(separator: ";")
     }
 
-    private func dispatchInputProjection(index: Int, layer: Int) -> DispatchEntry {
+    private func dispatchInputProjection(index: Int, layer: Int, groups: Int = 4) -> DispatchEntry {
         DispatchEntry(
             index: index,
             fragment: BatchedProjection(projections: [
-                .init(field: "in_proj_qkv", inputDimension: 2048, outputDimension: 256),
+                .init(field: "in_proj_qkv", inputDimension: 2048, outputDimension: (2 * groups * 64) + 256),
                 .init(field: "in_proj_z", inputDimension: 2048, outputDimension: 256),
                 .init(field: "in_proj_b", inputDimension: 2048, outputDimension: 16),
                 .init(field: "in_proj_a", inputDimension: 2048, outputDimension: 16),
@@ -233,6 +267,20 @@ struct RecurrentBlockFusionWindowTests {
                 .init(role: "in_proj_b", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_b.weight"),
                 .init(role: "in_proj_a", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_a.weight"),
             ],
+            layerIndex: layer
+        )
+    }
+
+    private func dispatchRecurrence(index: Int, layer: Int, groups: Int) -> DispatchEntry {
+        DispatchEntry(
+            index: index,
+            fragment: SSMRecurrenceFragment(
+                headCount: 16,
+                groupCount: groups,
+                keyHeadDimension: 64,
+                valueHeadDimension: 16,
+                convKernelSize: 4
+            ),
             layerIndex: layer
         )
     }
