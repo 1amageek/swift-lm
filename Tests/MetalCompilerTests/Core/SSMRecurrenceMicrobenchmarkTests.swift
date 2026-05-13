@@ -26,6 +26,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMVariant(name: "shared_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 128),
             SSMVariant(name: "shared_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 256),
             SSMVariant(name: "shared_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_shared_rms", threadgroupWidth: 384),
+            SSMVariant(name: "prewrite_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 128),
+            SSMVariant(name: "prewrite_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 256),
+            SSMVariant(name: "prewrite_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 384),
         ]
 
         var rows: [SSMResultRow] = []
@@ -195,6 +198,18 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 valueHeadDimension: 128,
                 shareRMSScale: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                prewriteDecayedState: true
+            ),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
         options.languageVersion = .version4_0
@@ -202,6 +217,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         let names = [
             "bench_ssm_recurrence_seq_bf16_f32",
             "bench_ssm_recurrence_seq_bf16_f32_shared_rms",
+            "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
         for name in names {
@@ -347,6 +363,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         encoder.setBuffer(recurrentState, offset: 0, index: 8)
         encoder.setBuffer(convState, offset: 0, index: 9)
         encoder.setBuffer(output, offset: 0, index: 10)
+        encoder.setBuffer(output, offset: 0, index: 18)
         setConstants(encoder: encoder, sequenceLength: sequenceLength)
         encoder.dispatchThreadgroups(geometry.grid, threadsPerThreadgroup: geometry.threadgroup)
         encoder.endEncoding()
@@ -366,6 +383,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         var kernel = UInt32(convKernelSize)
         var seqLen = UInt32(sequenceLength)
         var rowStride = UInt32(activationRowStride)
+        var debugEnabled: UInt32 = 0
         encoder.setBytes(&heads, length: MemoryLayout<UInt32>.stride, index: 11)
         encoder.setBytes(&groups, length: MemoryLayout<UInt32>.stride, index: 12)
         encoder.setBytes(&keyDim, length: MemoryLayout<UInt32>.stride, index: 13)
@@ -373,6 +391,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         encoder.setBytes(&kernel, length: MemoryLayout<UInt32>.stride, index: 15)
         encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 16)
         encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 17)
+        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 19)
+        encoder.setBytes(&debugEnabled, length: MemoryLayout<UInt32>.stride, index: 20)
     }
 
     private func reset(recurrentState: MTLBuffer, convState: MTLBuffer, output: MTLBuffer, sequenceLength: Int) {

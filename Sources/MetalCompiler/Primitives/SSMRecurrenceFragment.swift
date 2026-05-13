@@ -96,8 +96,19 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_shared_rms"
     }
 
+    static func prewriteDecaySequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_prewrite_decay"
+    }
+
     static var isSharedRMSPrefillEnabled: Bool {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_SHARED_RMS"] == "1"
+    }
+
+    static var isPrewriteDecayPrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PREWRITE_DECAY"] == "1"
     }
 
     static var isConvDebugPrefillEnabled: Bool {
@@ -229,15 +240,29 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             * context.buffers.convStateKernelSize
             * context.buffers.convStateDimension
             * MemoryLayout<Float16>.size
-        let kernelName = Self.isSharedRMSPrefillEnabled
-            ? Self.sharedRMSSequenceKernelName(
+        let sharedRMSPrefillEnabled = Self.isSharedRMSPrefillEnabled
+        let prewriteDecayPrefillEnabled = Self.isPrewriteDecayPrefillEnabled
+        if sharedRMSPrefillEnabled && prewriteDecayPrefillEnabled {
+            throw MetalCompilerError.deviceSetupFailed(
+                "SWIFTLM_PREFILL_SSM_SHARED_RMS and SWIFTLM_PREFILL_SSM_PREWRITE_DECAY cannot be enabled together"
+            )
+        }
+        let kernelName = if prewriteDecayPrefillEnabled {
+            Self.prewriteDecaySequenceKernelName(
                 bufferPrecision: context.kernelContext.bufferPrecision,
                 weightFormat: context.kernelContext.weightFormat
             )
-            : Self.sequenceKernelName(
+        } else if sharedRMSPrefillEnabled {
+            Self.sharedRMSSequenceKernelName(
                 bufferPrecision: context.kernelContext.bufferPrecision,
                 weightFormat: context.kernelContext.weightFormat
             )
+        } else {
+            Self.sequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        }
         let pipeline = try context.getPipeline(kernelName)
         let convDebugEnabled = Self.isConvDebugPrefillEnabled
         let convDebugBuffer: MTLBuffer

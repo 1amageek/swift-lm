@@ -548,7 +548,8 @@ public static func generateSSMRecurrenceSequence(
     groupCount: Int,
     keyHeadDimension: Int,
     valueHeadDimension: Int,
-    shareRMSScale: Bool = false
+    shareRMSScale: Bool = false,
+    prewriteDecayedState: Bool = false
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
@@ -626,6 +627,18 @@ public static func generateSSMRecurrenceSequence(
                     }
                 }
         """
+
+    let recurrencePass1StateLine = prewriteDecayedState
+        ? """
+                            float s = state[j * dv + d] * decay;
+                            state[j * dv + d] = s;
+        """
+        : """
+                            float s = state[j * dv + d] * decay;
+        """
+    let recurrencePass2StateExpr = prewriteDecayedState
+        ? "state[j * dv + d]"
+        : "state[j * dv + d] * decay"
 
     return """
     kernel void \(name)(
@@ -790,7 +803,7 @@ public static func generateSSMRecurrenceSequence(
                         float kvmemRaw = 0.0f;
                         float sqSum = 0.0f;
                         for (uint j = 0; j < dk; ++j) {
-                            float s = state[j * dv + d] * decay;
+                            \(recurrencePass1StateLine)
                             kvmemRaw += s * convSiluCache[kBase + j];
                             sqSum += s * convSiluCache[qBase + j];
                         }
@@ -801,7 +814,7 @@ public static func generateSSMRecurrenceSequence(
 
                         // Pass 2: write final state = decay·old + K·kInvDelta (full write, no RMW).
                         for (uint j = 0; j < dk; ++j) {
-                            state[j * dv + d] = state[j * dv + d] * decay + convSiluCache[kBase + j] * kInvDelta;
+                            state[j * dv + d] = \(recurrencePass2StateExpr) + convSiluCache[kBase + j] * kInvDelta;
                         }
 
                         float storedDot = \(activationStorageValue("dot"));

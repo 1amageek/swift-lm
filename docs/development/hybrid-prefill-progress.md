@@ -186,6 +186,9 @@ flowchart TD
 | 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes `*-blocks.csv` artifacts and shape-derived projection byte estimates for seqLen 16/64/128 |
 | 2026-05-13 | `python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0,9,17` | Pass; wrote schema v5 Qwen3.5 HF reference snapshot with early/middle/late linear-attention block boundary tensors including conv+SiLU |
 | 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; validates schema v5 metadata, existing prefill/decode gates, and selected `linear_ordinal_{0,9,17}` projected qkv/z/beta/alpha, conv+SiLU, gated recurrence output, and out projection against HF |
+| 2026-05-13 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; default, shared-RMS, prewrite-decay, and narrow threadgroup-width sequence SSM routes match repeated decode recurrence |
+| 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; opt-in prewrite-decay SSM route keeps Qwen prefill/decode reference gates green |
+| 2026-05-13 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated Qwen-shape SSM recurrence benchmark now includes prewrite-decay variants |
 
 ## Failed Experiments
 
@@ -659,7 +662,7 @@ Next implementation order:
 |---|---|---|
 | M3C.1 | Done: extend prefill profile artifacts with per-step byte estimates and per-block rollups | `PrefillProfileHarnessTests` plus Qwen profile artifact sanity check |
 | M3C.2 | Done for selected blocks: add Qwen recurrent-block reference dump and Swift comparison for boundary tensors | Focused `Qwen35ReferenceComparisonTests` case is green for every ordinal listed in `ref.meta.linear_block_ordinals`; conv+SiLU is materialized only when `SWIFTLM_PREFILL_DEBUG_SSM_CONV=1` is enabled by the reference harness |
-| M3C.3 | Prototype a recurrence-only MLX-style gated-delta kernel against the current `ssm_recurrence_seq_bf16_f32` contract | Isolated sequence equivalence and recurrent-state parity |
+| M3C.3 | Done as opt-in experiment: prewrite decayed recurrent state inside the current `ssm_recurrence_seq_bf16_f32` contract | Isolated sequence equivalence, Qwen reference gate, and SSM microbenchmark |
 | M3C.4 | Promote only if full-model Qwen trace is green and seqLen 64/128 profiles beat the current baseline in the same run | Correctness first, same-session benchmark second |
 
 ### M3C.1 Profile Artifact Status (2026-05-13)
@@ -719,6 +722,54 @@ Current coverage:
 | gated recurrent output | `gated_recurrent_output` | SSM recurrence binding 10 | Pass |
 | linear-attention output projection | `out_projection` | output projection binding 2 | Pass |
 | final conv / recurrent state | existing cache tensors | existing state comparison gate | Pass |
+
+### M3C.3 SSM Prewrite-Decay Experiment (2026-05-13)
+
+M3C.3 adds an opt-in recurrence variant that materializes the decayed recurrent
+state during the first recurrence pass, then reuses that materialized value for
+the final state update. This keeps the public kernel contract unchanged:
+`projectedQKV`, `projectedZ`, `projectedBeta`, `projectedAlpha`, conv state,
+recurrent state, and output bindings are identical to the base sequence kernel.
+
+```mermaid
+flowchart LR
+  A["state * decay"] --> B{"SWIFTLM_PREFILL_SSM_PREWRITE_DECAY"}
+  B -->|"unset"| C["keep value in accumulator only"]
+  B -->|"1"| D["write decayed state first"]
+  C --> E["final state update"]
+  D --> E
+  E --> F["same output/state contract"]
+```
+
+| Property | Base sequence SSM | Prewrite-decay opt-in |
+|---|---|---|
+| Kernel | `ssm_recurrence_seq_bf16_f32` | `ssm_recurrence_seq_bf16_f32_prewrite_decay` |
+| Routing flag | none | `SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` |
+| Production default | enabled | disabled |
+| Combination with shared-RMS | allowed by default route | explicitly rejected when both flags are set |
+
+Correctness evidence is green:
+
+| Gate | Result |
+|---|---|
+| `SSMRecurrenceSequenceEquivalenceTests` | prewrite-decay output, recurrent state, and conv state match repeated decode recurrence |
+| `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | pass; selected block boundaries, prefill output/state/KV, and decode0 gates remain green |
+| `MetalSourceGeneratorTests/ssmRecurrence` | pass; generated kernel names and prewrite source shape are covered |
+
+The isolated SSM recurrence benchmark shows this variant is not a default
+promotion candidate. It improves some short/mid sequence cases but regresses
+the long prompt case that currently matters most for prefill:
+
+| Sequence length | Best base | Best prewrite-decay | Decision |
+|---:|---:|---:|---|
+| 16 | 763.8 us | 522.5 us | favorable |
+| 64 | 2244.8 us | 2010.3 us | favorable |
+| 128 | 3737.5 us | 3850.9 us | reject default |
+
+Decision: keep `SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` as a correctness-gated
+experiment only. The next useful recurrence work should target larger structural
+savings, especially a scan/chunk formulation or recurrent-block fusion that
+eliminates projection/recurrence/out-projection memory traffic.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

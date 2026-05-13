@@ -25,6 +25,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let decodeKernelName = "ssm_recurrence_bf16_decode_equivalence"
         let sequenceKernelName = "ssm_recurrence_bf16_sequence_equivalence"
         let sharedRMSSequenceKernelName = "ssm_recurrence_bf16_sequence_shared_rms_equivalence"
+        let prewriteDecaySequenceKernelName = "ssm_recurrence_bf16_sequence_prewrite_decay_equivalence"
         let source = [
             MetalSourceGenerator.commonHeader,
             MetalSourceGenerator.generateSSMWeightIndependentHelpers(),
@@ -63,11 +64,24 @@ struct SSMRecurrenceSequenceEquivalenceTests {
                 valueHeadDimension: valueDimension,
                 shareRMSScale: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: prewriteDecaySequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                prewriteDecayedState: true
+            ),
         ].joined(separator: "\n")
         let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
         let decodePipeline = try harness.pipeline(named: decodeKernelName)
         let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
         let sharedRMSSequencePipeline = try harness.pipeline(named: sharedRMSSequenceKernelName)
+        let prewriteDecaySequencePipeline = try harness.pipeline(named: prewriteDecaySequenceKernelName)
 
         let projectedQKV = roundedBFloat16Values(
             count: sequenceLength * convDimension,
@@ -166,6 +180,26 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             convDimension: convDimension,
             outputDimension: outputDimension
         )
+        let prewriteDecaySequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: prewriteDecaySequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: outputDimension
+        )
 
         let outputMismatch = harness.firstMismatch(
             expected: decode.output,
@@ -210,6 +244,28 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         #expect(
             decode.convStateBits == sharedRMSSequence.convStateBits,
             "Shared-RMS SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(sharedRMSSequence.convStateBits)"
+        )
+        let prewriteDecayOutputMismatch = harness.firstMismatch(
+            expected: decode.output,
+            actual: prewriteDecaySequence.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            prewriteDecayOutputMismatch == nil,
+            "Prewrite-decay SSM output drifted: \(String(describing: prewriteDecayOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: prewriteDecaySequence.output))"
+        )
+        let prewriteDecayRecurrentMismatch = harness.firstMismatch(
+            expected: decode.recurrentState,
+            actual: prewriteDecaySequence.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            prewriteDecayRecurrentMismatch == nil,
+            "Prewrite-decay SSM recurrent state drifted: \(String(describing: prewriteDecayRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: prewriteDecaySequence.recurrentState))"
+        )
+        #expect(
+            decode.convStateBits == prewriteDecaySequence.convStateBits,
+            "Prewrite-decay SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(prewriteDecaySequence.convStateBits)"
         )
 
         for threadgroupWidth in [128, 256] {
@@ -452,6 +508,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         encoder.setBuffer(recurrentState, offset: 0, index: 8)
         encoder.setBuffer(convState, offset: 0, index: 9)
         encoder.setBuffer(outputBuffer, offset: 0, index: 10)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 18)
         setSSMConstants(
             encoder: encoder,
             headCount: headCount,
@@ -462,8 +519,11 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         )
         var seqLen = UInt32(sequenceLength)
         var rowStride = UInt32(activationRowStride)
+        var debugEnabled: UInt32 = 0
         encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 16)
         encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 17)
+        encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 19)
+        encoder.setBytes(&debugEnabled, length: MemoryLayout<UInt32>.stride, index: 20)
         encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: threadgroup)
         encoder.endEncoding()
         try harness.complete(commandBuffer)

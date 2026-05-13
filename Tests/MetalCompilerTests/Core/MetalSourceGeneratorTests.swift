@@ -1822,6 +1822,7 @@ struct MetalSourceGeneratorTests {
         #expect(fragment.kernelName(context: KernelContext(bufferPrecision: .float32, weightFormat: .float16)) == "ssm_recurrence_f32")
         #expect(fragment.kernelName(context: KernelContext(bufferPrecision: .float32, weightFormat: .bfloat16)) == "ssm_recurrence_bf16_f32")
         #expect(SSMRecurrenceFragment.sequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32")
+        #expect(SSMRecurrenceFragment.prewriteDecaySequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_prewrite_decay")
     }
 
     @Test("SSM recurrence reads Qwen gated norm weight directly")
@@ -1855,6 +1856,25 @@ struct MetalSourceGeneratorTests {
             #expect(!source.contains("1.0f + normWeight[d]"))
             #expect(!source.contains("bf16_to_float(normWeight[d])"))
         }
+    }
+
+    @Test("SSM recurrence prewrite decay variant materializes decayed state")
+    func ssmRecurrencePrewriteDecayVariantMaterializesDecayedState() {
+        let source = MetalSourceGenerator.generateSSMRecurrenceSequence(
+            name: "ssm_recurrence_seq_bf16_f32_prewrite_decay",
+            bufferPrecision: .float32,
+            weightFormat: .bfloat16,
+            convDimension: 4096,
+            maxThreadgroupSize: 1024,
+            headCount: 16,
+            groupCount: 16,
+            keyHeadDimension: 128,
+            valueHeadDimension: 128,
+            prewriteDecayedState: true
+        )
+
+        #expect(source.contains("state[j * dv + d] = s;"))
+        #expect(source.contains("state[j * dv + d] = state[j * dv + d] + convSiluCache[kBase + j] * kInvDelta;"))
     }
 
     @Test("Batched QK norm decode applies unit-offset weight bias")
