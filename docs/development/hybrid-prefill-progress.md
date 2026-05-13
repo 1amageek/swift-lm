@@ -67,7 +67,7 @@ It does not yet authorize MPP or fused non-decode-equivalent kernels.
 | LFM reference dump script | Existing | `scripts/hf/dump_lfm2_reference.py` |
 | LFM Swift reference comparison | Existing | `Tests/MetalCompilerTests/Models/LFM2/ReferenceComparisonTests.swift` |
 | Qwen reference dump script | Done / extended | `scripts/hf/dump_qwen35_reference.py`; schema v5 supports multiple reference cases, version metadata, and selected linear-attention block boundary tensors |
-| Qwen Swift reference comparison | Done / extended | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v5 case plus the first selected linear-attention block boundary |
+| Qwen Swift reference comparison | Done / extended | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v5 case plus selected early/middle/late linear-attention block boundaries |
 | Reference manifest | Done | `Tests/MetalCompilerTests/Core/ReferenceHarnessManifestTests.swift` |
 
 ## Confidence Audit
@@ -184,8 +184,8 @@ flowchart TD
 | 2026-05-12 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_MPP=1` | Fail; forcing BF16 dense batched MPP before decode-equivalent sequence GEMV drifts prefill token, hidden state, conv/recurrent state, and KV cache, so the diagnostic route was removed instead of kept as an opt-in |
 | 2026-05-13 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact schema v2 validates per-step byte estimates and block CSV rollups |
 | 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes `*-blocks.csv` artifacts and shape-derived projection byte estimates for seqLen 16/64/128 |
-| 2026-05-13 | `python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0` | Pass; wrote schema v5 Qwen3.5 HF reference snapshot with first linear-attention block boundary tensors including conv+SiLU |
-| 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; validates schema v5 metadata, existing prefill/decode gates, and `linear_ordinal_0` projected qkv/z/beta/alpha, conv+SiLU, gated recurrence output, and out projection against HF |
+| 2026-05-13 | `python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0,9,17` | Pass; wrote schema v5 Qwen3.5 HF reference snapshot with early/middle/late linear-attention block boundary tensors including conv+SiLU |
+| 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; validates schema v5 metadata, existing prefill/decode gates, and selected `linear_ordinal_{0,9,17}` projected qkv/z/beta/alpha, conv+SiLU, gated recurrence output, and out projection against HF |
 
 ## Failed Experiments
 
@@ -694,14 +694,14 @@ Latest Qwen3.5 BF16 seqLen 128 block profile signal:
 M3C.2 now has a selected-block-stage reference gate for Qwen3.5 BF16 prefill.
 The HF dump schema is v5 and accepts `--linear-block-ordinals`; the Swift test
 reads `ref.meta.linear_block_ordinals` and verifies every selected ordinal. The
-current checked local artifact captures ordinal 0 so the default reference file
-stays small while the harness remains expandable.
+default checked contract captures ordinals 0, 9, and 17, covering early, middle,
+and late recurrent blocks without dumping every layer boundary.
 
 Block boundary gate:
 
 ```mermaid
 flowchart LR
-  A["HF Qwen block ordinal 0"] --> B["Schema v5 safetensors"]
+  A["HF Qwen block ordinals 0 / 9 / 17"] --> B["Schema v5 safetensors"]
   B --> C["Swift prefill binding probes"]
   C --> D["Per-token row comparison"]
   D --> E["Qwen35ReferenceComparisonTests"]

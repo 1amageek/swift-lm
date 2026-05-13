@@ -25,6 +25,7 @@ struct Qwen35ReferenceComparisonTests {
         ReferenceCase(index: 0, tokens: defaultPromptTokens),
         ReferenceCase(index: 1, tokens: Array(defaultPromptTokens.prefix(8))),
     ]
+    private static let expectedLinearBlockOrdinals: [Int32] = [0, 9, 17]
 
     private static let referencePath = URL(fileURLWithPath: BenchmarkSupport.testDataPath)
         .appendingPathComponent("qwen35_reference.safetensors")
@@ -61,7 +62,7 @@ struct Qwen35ReferenceComparisonTests {
         #expect(Int(caseCount) == Self.referenceCases.count)
         #expect(decodeSteps >= 1)
         #expect(fastBackendAvailable == 0 || fastBackendAvailable == 1)
-        #expect(!linearBlockOrdinals.isEmpty)
+        #expect(linearBlockOrdinals == Self.expectedLinearBlockOrdinals)
         #expect(!torchVersion.isEmpty)
         #expect(!transformersVersion.isEmpty)
         #expect(referenceConfigHash == bundleConfigHash, "Qwen35 reference config does not match the Swift bundle config")

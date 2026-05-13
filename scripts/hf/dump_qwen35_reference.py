@@ -114,7 +114,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--linear-block-ordinals",
-        default="0",
+        default="0,9,17",
         help="Comma-separated linear-attention ordinals to dump with block-boundary tensors.",
     )
     return parser.parse_args()
