@@ -395,6 +395,14 @@ struct MetalKernelSourceCatalog {
                         }
                     }
                     if bufferPrecision.isPrefillSequencePrecision, let ssmFragment = fragment as? SSMRecurrenceFragment {
+                        let partialProjectionKernelName = "recurrent_block_partial_projection_seq_bf16_f32"
+                        if weightFormat == .bfloat16, generatedNames.insert(partialProjectionKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateRecurrentBlockPartialProjection(
+                                name: partialProjectionKernelName,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            ))
+                        }
                         let partialReduceKernelName = "recurrent_block_partial_reduce_seq_f32"
                         if generatedNames.insert(partialReduceKernelName).inserted {
                             sources.append(MetalSourceGenerator.generateRecurrentBlockPartialReduce(

@@ -854,12 +854,19 @@ The source catalog now emits `recurrent_block_partial_reduce_seq_f32` whenever a
 sequence SSM recurrence is present, so future opt-in routing can fail with an
 explicit contract error instead of a missing-pipeline surprise.
 
+M3D.3 adds the first-stage partial projection kernel:
+`recurrent_block_partial_projection_seq_bf16_f32` computes one partial hidden
+row per `(token, group, output row)` from that group's recurrent-output slice
+and the matching `linear_attn.out_proj` weight slice. The standalone harness
+runs partial projection followed by partial reduce and compares the full hidden
+row against a CPU reference. This is still not production-routed.
+
 Validation:
 
 | Gate | Result |
 |---|---|
 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, rejects incomplete/cross-layer windows, rejects Qwen-style multi-group single-dispatch fusion, and creates a reference-gated two-stage plan |
-| `swift test --filter RecurrentBlockFusionKernelTests` | Pass; stage2 partial reduce kernel matches CPU reference with padded partial and output strides |
+| `swift test --filter RecurrentBlockFusionKernelTests` | Pass; stage1 partial projection plus stage2 partial reduce matches CPU reference with padded input, partial, and output strides |
 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
 
 This is intentionally not a speed change. It is the routing precondition for
