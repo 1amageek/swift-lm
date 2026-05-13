@@ -861,6 +861,11 @@ and the matching `linear_attn.out_proj` weight slice. The standalone harness
 runs partial projection followed by partial reduce and compares the full hidden
 row against a CPU reference. This is still not production-routed.
 
+The two-stage plan uses existing scratch storage: recurrence output remains in
+slot 0, and group partial hidden rows occupy slots `1..<1+groupCount`. For
+Qwen's four recurrent groups this consumes all five prefill scratch slots and
+does not require a new runtime buffer.
+
 Validation:
 
 | Gate | Result |

@@ -123,6 +123,9 @@ struct RecurrentBlockFusionWindowTests {
             recurrentOutputDimension: 256,
             outputDimension: 2048,
             partialRowsPerToken: 8192,
+            partialScratchBaseSlot: 1,
+            partialScratchSlotCount: 4,
+            requiredScratchSlotCount: 5,
             numericalContract: .referenceGated
         )))
     }

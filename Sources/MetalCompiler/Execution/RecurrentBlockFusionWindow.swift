@@ -181,6 +181,9 @@ struct RecurrentBlockFusionTwoStagePlan: Sendable, Equatable {
     let recurrentOutputDimension: Int
     let outputDimension: Int
     let partialRowsPerToken: Int
+    let partialScratchBaseSlot: Int
+    let partialScratchSlotCount: Int
+    let requiredScratchSlotCount: Int
     let numericalContract: RecurrentBlockFusionNumericalContract
 }
 
@@ -317,6 +320,9 @@ enum RecurrentBlockFusionPrototypePlanner {
             recurrentOutputDimension: recurrentOutputDimension,
             outputDimension: outputProjection.outputDimension,
             partialRowsPerToken: partitionCount * outputProjection.outputDimension,
+            partialScratchBaseSlot: 1,
+            partialScratchSlotCount: partitionCount,
+            requiredScratchSlotCount: 1 + partitionCount,
             numericalContract: .referenceGated
         ))
     }
