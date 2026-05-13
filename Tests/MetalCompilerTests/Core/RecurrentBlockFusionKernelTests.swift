@@ -55,7 +55,7 @@ struct RecurrentBlockFusionKernelTests {
         let weights = (0..<(outputDimension * inputDimension)).map { index in
             BFloat16(Float((index * 7) % 29 - 14) * 0.015625)
         }
-        let partial = [Float](repeating: -777.0, count: sequenceLength * groupCount * partialRowStride)
+        let partial = [Float](repeating: -777.0, count: groupCount * sequenceLength * partialRowStride)
         let output = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
         let expected = expectedPartialProjectionAndReduce(
             input: input,
@@ -175,11 +175,11 @@ struct RecurrentBlockFusionKernelTests {
         let partialRowStride = 13
         let outputRowStride = 12
 
-        var partial = [Float](repeating: -777.0, count: sequenceLength * groupCount * partialRowStride)
+        var partial = [Float](repeating: -777.0, count: groupCount * sequenceLength * partialRowStride)
         for seq in 0..<sequenceLength {
             for group in 0..<groupCount {
                 for row in 0..<outputDimension {
-                    let index = seq * groupCount * partialRowStride + group * partialRowStride + row
+                    let index = group * sequenceLength * partialRowStride + seq * partialRowStride + row
                     partial[index] = Float((seq + 1) * 100 + group * 10 + row) * 0.03125
                 }
             }
@@ -248,7 +248,7 @@ struct RecurrentBlockFusionKernelTests {
             for row in 0..<outputDimension {
                 var sum: Float = 0
                 for group in 0..<groupCount {
-                    let index = seq * groupCount * partialRowStride + group * partialRowStride + row
+                    let index = group * sequenceLength * partialRowStride + seq * partialRowStride + row
                     sum += partial[index]
                 }
                 output[seq * outputRowStride + row] = sum

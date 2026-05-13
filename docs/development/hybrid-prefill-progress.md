@@ -866,6 +866,10 @@ slot 0, and group partial hidden rows occupy slots `1..<1+groupCount`. For
 Qwen's four recurrent groups this consumes all five prefill scratch slots and
 does not require a new runtime buffer.
 
+The partial buffer layout is slot-major so production routing can bind the
+existing prefill scratch buffer without reshaping:
+`partial[group * maximumSequenceLength * slotDimension + token * slotDimension + row]`.
+
 Validation:
 
 | Gate | Result |

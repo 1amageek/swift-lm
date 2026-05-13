@@ -412,9 +412,11 @@ extension MetalSourceGenerator {
             }
 
             float sum = 0.0f;
-            const uint tokenBase = seqPos * groupCount * partialRowStride;
             for (uint group = 0; group < groupCount; ++group) {
-                sum += float(partial[tokenBase + group * partialRowStride + row]);
+                const uint inputIndex = group * sequenceLength * partialRowStride
+                    + seqPos * partialRowStride
+                    + row;
+                sum += float(partial[inputIndex]);
             }
             output[seqPos * outputRowStride + row] = \(bt)(sum);
         }
@@ -484,8 +486,8 @@ extension MetalSourceGenerator {
             }
             sum = simd_sum(sum);
             if (active && tiisg == 0) {
-                const uint outputIndex = seqPos * groupCount * partialRowStride
-                    + group * partialRowStride
+                const uint outputIndex = group * sequenceLength * partialRowStride
+                    + seqPos * partialRowStride
                     + row;
                 partial[outputIndex] = \(bt)(sum);
             }
