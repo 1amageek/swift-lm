@@ -189,6 +189,7 @@ flowchart TD
 | 2026-05-13 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; default, shared-RMS, prewrite-decay, and narrow threadgroup-width sequence SSM routes match repeated decode recurrence |
 | 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; opt-in prewrite-decay SSM route keeps Qwen prefill/decode reference gates green |
 | 2026-05-13 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated Qwen-shape SSM recurrence benchmark now includes prewrite-decay variants |
+| 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; same-session full-model profile shows prewrite-decay routes all 18 SSM dispatches but does not beat baseline at seqLen 64/128, so it stays opt-in |
 
 ## Failed Experiments
 
@@ -663,7 +664,7 @@ Next implementation order:
 | M3C.1 | Done: extend prefill profile artifacts with per-step byte estimates and per-block rollups | `PrefillProfileHarnessTests` plus Qwen profile artifact sanity check |
 | M3C.2 | Done for selected blocks: add Qwen recurrent-block reference dump and Swift comparison for boundary tensors | Focused `Qwen35ReferenceComparisonTests` case is green for every ordinal listed in `ref.meta.linear_block_ordinals`; conv+SiLU is materialized only when `SWIFTLM_PREFILL_DEBUG_SSM_CONV=1` is enabled by the reference harness |
 | M3C.3 | Done as opt-in experiment: prewrite decayed recurrent state inside the current `ssm_recurrence_seq_bf16_f32` contract | Isolated sequence equivalence, Qwen reference gate, and SSM microbenchmark |
-| M3C.4 | Promote only if full-model Qwen trace is green and seqLen 64/128 profiles beat the current baseline in the same run | Correctness first, same-session benchmark second |
+| M3C.4 | Done / rejected for default: same-session full-model Qwen profile did not beat baseline at seqLen 64/128 | Correctness stayed green, but benchmark gate did not justify promotion |
 
 ### M3C.1 Profile Artifact Status (2026-05-13)
 
@@ -770,6 +771,22 @@ Decision: keep `SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` as a correctness-gated
 experiment only. The next useful recurrence work should target larger structural
 savings, especially a scan/chunk formulation or recurrent-block fusion that
 eliminates projection/recurrence/out-projection memory traffic.
+
+### M3C.4 Prewrite-Decay Promotion Gate (2026-05-13)
+
+M3C.4 is closed. The opt-in route fired in the full Qwen3.5 prefill plan, but
+same-session profile evidence does not support default promotion.
+
+| Sequence length | Baseline | Prewrite-decay | Delta | Decision |
+|---:|---:|---:|---:|---|
+| 16 | 75.826 ms | 56.833 ms | -25.0% | favorable but noisy |
+| 64 | 158.707 ms | 158.740 ms | +0.0% | no promotion |
+| 128 | 311.184 ms | 311.769 ms | +0.2% | reject default |
+
+The prewrite plan correctly replaces all 18 `ssm_recurrence_seq_bf16_f32`
+dispatches with `ssm_recurrence_seq_bf16_f32_prewrite_decay`, so this is not a
+routing failure. The experiment is correctness-gated and useful for future
+kernel-shape comparison, but it does not change production routing.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
