@@ -1,8 +1,72 @@
 import Testing
+import LMIR
 @testable import MetalCompiler
 
 @Suite("Recurrent Block Fusion Windows")
 struct RecurrentBlockFusionWindowTests {
+    @Test("Admission scanner finds dispatch-entry linear attention windows")
+    func admissionScannerFindsDispatchEntryWindows() {
+        let entries = [
+            dispatchInputProjection(index: 10, layer: 2),
+            DispatchEntry(
+                index: 11,
+                fragment: SSMRecurrenceFragment(
+                    headCount: 16,
+                    groupCount: 4,
+                    keyHeadDimension: 64,
+                    valueHeadDimension: 64,
+                    convKernelSize: 4
+                ),
+                layerIndex: 2
+            ),
+            DispatchEntry(
+                index: 12,
+                fragment: ElementwiseFragment(count: 256, kind: .geluGated),
+                layerIndex: 2
+            ),
+            dispatchOutputProjection(index: 13, layer: 2),
+            dispatchInputProjection(index: 20, layer: 6),
+            dispatchOutputProjection(index: 21, layer: 7),
+        ]
+
+        let windows = RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries)
+
+        #expect(windows.count == 1)
+        #expect(windows[0].layerIndex == 2)
+        #expect(windows[0].range == 10..<14)
+        #expect(windows[0].inputProjectionEntryIndex == 10)
+        #expect(windows[0].recurrenceEntryIndex == 11)
+        #expect(windows[0].bridgeEntryIndices == [12])
+        #expect(windows[0].outputProjectionEntryIndex == 13)
+        #expect(windows[0].inputProjectionFields == ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"])
+        #expect(windows[0].outputProjectionField == "out_proj")
+    }
+
+    @Test("Admission scanner rejects incomplete or cross-layer dispatch windows")
+    func admissionScannerRejectsIncompleteOrCrossLayerDispatchWindows() {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0),
+            dispatchOutputProjection(index: 1, layer: 0),
+            dispatchInputProjection(index: 2, layer: 1),
+            DispatchEntry(
+                index: 3,
+                fragment: SSMRecurrenceFragment(
+                    headCount: 16,
+                    groupCount: 4,
+                    keyHeadDimension: 64,
+                    valueHeadDimension: 64,
+                    convKernelSize: 4
+                ),
+                layerIndex: 1
+            ),
+            dispatchOutputProjection(index: 4, layer: 2),
+        ]
+
+        let windows = RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries)
+
+        #expect(windows.isEmpty)
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [
@@ -152,6 +216,41 @@ struct RecurrentBlockFusionWindowTests {
             "model.language_model.layers.\(layer).linear_attn.in_proj_b.weight",
             "model.language_model.layers.\(layer).linear_attn.in_proj_a.weight",
         ].joined(separator: ";")
+    }
+
+    private func dispatchInputProjection(index: Int, layer: Int) -> DispatchEntry {
+        DispatchEntry(
+            index: index,
+            fragment: BatchedProjection(projections: [
+                .init(field: "in_proj_qkv", inputDimension: 2048, outputDimension: 256),
+                .init(field: "in_proj_z", inputDimension: 2048, outputDimension: 256),
+                .init(field: "in_proj_b", inputDimension: 2048, outputDimension: 16),
+                .init(field: "in_proj_a", inputDimension: 2048, outputDimension: 16),
+            ]),
+            parameterBindings: [
+                .init(role: "in_proj_qkv", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_qkv.weight"),
+                .init(role: "in_proj_z", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_z.weight"),
+                .init(role: "in_proj_b", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_b.weight"),
+                .init(role: "in_proj_a", tensorName: "model.language_model.layers.\(layer).linear_attn.in_proj_a.weight"),
+            ],
+            layerIndex: layer
+        )
+    }
+
+    private func dispatchOutputProjection(index: Int, layer: Int) -> DispatchEntry {
+        DispatchEntry(
+            index: index,
+            fragment: LinearFragment(
+                field: "out_proj",
+                inputDimension: 256,
+                outputDimension: 2048,
+                isOutput: true
+            ),
+            parameterBindings: [
+                .init(role: "out_proj", tensorName: "model.language_model.layers.\(layer).linear_attn.out_proj.weight"),
+            ],
+            layerIndex: layer
+        )
     }
 
     private func profileEntry(

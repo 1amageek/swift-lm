@@ -797,6 +797,13 @@ The scanner uses semantic weight roles and recurrence kernels, not suffix-only
 kernel-name matching, to identify the dispatch window that future block fusion
 is allowed to replace.
 
+The contract now exists at two levels:
+
+| Level | Input | Purpose |
+|---|---|---|
+| Admission | `[DispatchEntry]` before prefill step lowering | Proves the compiler can identify the replaceable IR/fragment window before any runtime routing is added |
+| Evidence | `MetalPrefillProfile.Entry` after step lowering | Proves the emitted plan still exposes the same block shape and records the measured window as artifacts |
+
 ```mermaid
 flowchart LR
   A["linear_attn in_proj qkv/z/b/a"] --> B["SSM recurrence"]
@@ -819,7 +826,7 @@ Validation:
 
 | Gate | Result |
 |---|---|
-| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete windows and rejects incomplete/cross-layer windows |
+| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, and rejects incomplete/cross-layer windows |
 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
 
 This is intentionally not a speed change. It is the routing precondition for

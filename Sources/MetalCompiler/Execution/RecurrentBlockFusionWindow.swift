@@ -1,4 +1,5 @@
 import Foundation
+import LMIR
 
 struct RecurrentBlockFusionWindow: Sendable, Equatable {
     let layerIndex: Int
@@ -14,6 +15,141 @@ struct RecurrentBlockFusionWindow: Sendable, Equatable {
 
     var range: Range<Int> {
         rangeStart..<rangeEnd
+    }
+}
+
+struct RecurrentBlockFusionAdmissionWindow: Sendable, Equatable {
+    let layerIndex: Int
+    let rangeStart: Int
+    let rangeEnd: Int
+    let inputProjectionEntryIndex: Int
+    let recurrenceEntryIndex: Int
+    let bridgeEntryIndices: [Int]
+    let outputProjectionEntryIndex: Int
+    let inputProjectionFields: [String]
+    let outputProjectionField: String
+
+    var range: Range<Int> {
+        rangeStart..<rangeEnd
+    }
+}
+
+enum RecurrentBlockFusionAdmissionScanner {
+    static func linearAttentionWindows(
+        in entries: [DispatchEntry]
+    ) -> [RecurrentBlockFusionAdmissionWindow] {
+        let orderedEntries = entries.sorted { lhs, rhs in
+            lhs.index < rhs.index
+        }
+        var windows: [RecurrentBlockFusionAdmissionWindow] = []
+        var cursor = 0
+        while cursor < orderedEntries.count {
+            let inputEntry = orderedEntries[cursor]
+            guard let inputProjection = linearAttentionInputProjection(inputEntry),
+                  let inputLayerIndex = inputEntry.layerIndex ?? layerIndex(from: inputEntry.parameterBindings) else {
+                cursor += 1
+                continue
+            }
+
+            var recurrenceEntry: Optional<DispatchEntry> = Optional.none
+            var bridgeEntries: [DispatchEntry] = []
+            var outputEntry: Optional<DispatchEntry> = Optional.none
+            var scanIndex = cursor + 1
+
+            while scanIndex < orderedEntries.count {
+                let current = orderedEntries[scanIndex]
+                if linearAttentionInputProjection(current) != nil {
+                    break
+                }
+                if recurrenceEntry == nil, isLinearAttentionRecurrence(current) {
+                    recurrenceEntry = current
+                    scanIndex += 1
+                    continue
+                }
+                if let recurrenceEntry, isLinearAttentionOutputProjection(current),
+                   (current.layerIndex ?? layerIndex(from: current.parameterBindings)) == inputLayerIndex {
+                    outputEntry = current
+                    let bridgeRange = orderedEntries[(cursor + 1)..<scanIndex]
+                    bridgeEntries = bridgeRange.filter { entry in
+                        entry.index != recurrenceEntry.index
+                    }
+                    break
+                }
+                scanIndex += 1
+            }
+
+            if let recurrenceEntry, let outputEntry,
+               let outputProjection = outputEntry.fragment as? LinearFragment {
+                windows.append(
+                    RecurrentBlockFusionAdmissionWindow(
+                        layerIndex: inputLayerIndex,
+                        rangeStart: inputEntry.index,
+                        rangeEnd: outputEntry.index + 1,
+                        inputProjectionEntryIndex: inputEntry.index,
+                        recurrenceEntryIndex: recurrenceEntry.index,
+                        bridgeEntryIndices: bridgeEntries.map(\.index),
+                        outputProjectionEntryIndex: outputEntry.index,
+                        inputProjectionFields: inputProjection.projections.map(\.field),
+                        outputProjectionField: outputProjection.field
+                    )
+                )
+                cursor = scanIndex + 1
+            } else {
+                cursor += 1
+            }
+        }
+        return windows
+    }
+
+    private static func linearAttentionInputProjection(_ entry: DispatchEntry) -> BatchedProjection? {
+        guard let projection = entry.fragment as? BatchedProjection else {
+            return nil
+        }
+        let fields = Set(projection.projections.map(\.field))
+        guard fields == Set(["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"]) else {
+            return nil
+        }
+        let tensorNames = entry.parameterBindings.map(\.tensorName)
+        guard tensorNames.contains(where: { $0.contains("linear_attn.in_proj_qkv.weight") }),
+              tensorNames.contains(where: { $0.contains("linear_attn.in_proj_z.weight") }),
+              tensorNames.contains(where: { $0.contains("linear_attn.in_proj_b.weight") }),
+              tensorNames.contains(where: { $0.contains("linear_attn.in_proj_a.weight") }) else {
+            return nil
+        }
+        return projection
+    }
+
+    private static func isLinearAttentionRecurrence(_ entry: DispatchEntry) -> Bool {
+        entry.fragment is SSMRecurrenceFragment
+    }
+
+    private static func isLinearAttentionOutputProjection(_ entry: DispatchEntry) -> Bool {
+        guard let projection = entry.fragment as? LinearFragment,
+              projection.field == "out_proj",
+              projection.isOutput else {
+            return false
+        }
+        return entry.parameterBindings.contains {
+            $0.tensorName.contains("linear_attn.out_proj.weight")
+        }
+    }
+
+    private static func layerIndex(from parameterBindings: [LMIR.ParameterBinding]) -> Int? {
+        for binding in parameterBindings {
+            if let layer = layerIndex(from: binding.tensorName) {
+                return layer
+            }
+        }
+        return nil
+    }
+
+    private static func layerIndex(from tensorName: String) -> Int? {
+        let components = tensorName.split(separator: ".").map(String.init)
+        guard let layerTokenIndex = components.firstIndex(of: "layers"),
+              layerTokenIndex + 1 < components.count else {
+            return nil
+        }
+        return Int(components[layerTokenIndex + 1])
     }
 }
 
