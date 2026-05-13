@@ -844,11 +844,18 @@ flowchart LR
 | Multi-group recurrent block with matching projection dimensions | Candidate | `referenceGated`; group partial sums change the output-projection reduction association |
 | Single recurrent group | Reject two-stage | single-dispatch path is structurally preferable |
 
+M3D.2 starts the two-stage kernel work from the safer second stage:
+`recurrent_block_partial_reduce` reduces a per-token, per-group partial-hidden
+buffer into the final hidden row. This kernel does not route in production yet;
+it exists so the partial buffer layout and padded-stride semantics are fixed
+before the harder SSM+partial-GEMV stage is attempted.
+
 Validation:
 
 | Gate | Result |
 |---|---|
 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, rejects incomplete/cross-layer windows, rejects Qwen-style multi-group single-dispatch fusion, and creates a reference-gated two-stage plan |
+| `swift test --filter RecurrentBlockFusionKernelTests` | Pass; stage2 partial reduce kernel matches CPU reference with padded partial and output strides |
 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
 
 This is intentionally not a speed change. It is the routing precondition for

@@ -388,6 +388,39 @@ extension MetalSourceGenerator {
         """
     }
 
+    public static func generateRecurrentBlockPartialReduce(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String {
+        let bt = bufferPrecision.metalType
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* partial       [[buffer(0)]],
+            device \(bt)* output              [[buffer(1)]],
+            constant uint& groupCount         [[buffer(2)]],
+            constant uint& outputDimension    [[buffer(3)]],
+            constant uint& sequenceLength     [[buffer(4)]],
+            constant uint& partialRowStride   [[buffer(5)]],
+            constant uint& outputRowStride    [[buffer(6)]],
+            uint2 gid                         [[thread_position_in_grid]]
+        ) {
+            const uint row = gid.x;
+            const uint seqPos = gid.y;
+            if (row >= outputDimension || seqPos >= sequenceLength) {
+                return;
+            }
+
+            float sum = 0.0f;
+            const uint tokenBase = seqPos * groupCount * partialRowStride;
+            for (uint group = 0; group < groupCount; ++group) {
+                sum += float(partial[tokenBase + group * partialRowStride + row]);
+            }
+            output[seqPos * outputRowStride + row] = \(bt)(sum);
+        }
+        """
+    }
+
     /// Generate a sequence GEMV kernel that covers multiple tokens per threadgroup.
     ///
     /// Each SIMD group still owns one output row and one token, preserving the
