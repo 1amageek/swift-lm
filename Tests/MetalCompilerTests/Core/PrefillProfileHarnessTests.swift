@@ -96,7 +96,7 @@ struct PrefillProfileHarnessTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let urls = try profile.writeArtifacts(directory: root, basename: "synthetic")
 
-        #expect(urls.count == 7)
+        #expect(urls.count == 8)
         let jsonURL = root.appendingPathComponent("synthetic.json")
         let csvURL = root.appendingPathComponent("synthetic.csv")
         let categoryCSVURL = root.appendingPathComponent("synthetic-categories.csv")
@@ -104,6 +104,7 @@ struct PrefillProfileHarnessTests {
         let layerCSVURL = root.appendingPathComponent("synthetic-layers.csv")
         let weightCSVURL = root.appendingPathComponent("synthetic-weights.csv")
         let blockCSVURL = root.appendingPathComponent("synthetic-blocks.csv")
+        let recurrentWindowsCSVURL = root.appendingPathComponent("synthetic-recurrent-windows.csv")
         let jsonData = try Data(contentsOf: jsonURL)
         let decoded = try JSONDecoder().decode(MetalPrefillProfile.self, from: jsonData)
         #expect(decoded.schemaVersion == 2)
@@ -127,6 +128,8 @@ struct PrefillProfileHarnessTests {
         let blocks = try String(contentsOf: blockCSVURL, encoding: .utf8)
         #expect(blocks.contains("0,mlp,projection,1,1,2048,1024,3072,25.000"))
         #expect(blocks.contains("3,self_attn,projection,1,1,4096,2048,6144,20.000"))
+        let recurrentWindows = try String(contentsOf: recurrentWindowsCSVURL, encoding: .utf8)
+        #expect(recurrentWindows.contains("inputProjectionStepIndex"))
     }
 
     private func repositoryRoot() -> URL {

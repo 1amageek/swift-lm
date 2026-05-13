@@ -103,6 +103,48 @@ struct RecurrentBlockFusionWindowTests {
         #expect(windows.isEmpty)
     }
 
+    @Test("Profile emits recurrent block window CSV")
+    func profileEmitsRecurrentBlockWindowCSV() {
+        let profile = MetalPrefillProfile(
+            profileKind: "step",
+            sequenceLength: 128,
+            maximumSequenceLength: 128,
+            iterations: 1,
+            warmupIterations: 0,
+            stepCount: 4,
+            entries: [
+                profileEntry(
+                    index: 0,
+                    kernelName: "batched_gemv4_seq_bf16_f32s",
+                    category: "projection",
+                    weightTensorName: linearAttentionInputWeights(layer: 3)
+                ),
+                profileEntry(
+                    index: 1,
+                    kernelName: "ssm_recurrence_seq_bf16_f32",
+                    category: "ssm_recurrence"
+                ),
+                profileEntry(
+                    index: 2,
+                    kernelName: "round_bf16_seq_f32",
+                    category: "other"
+                ),
+                profileEntry(
+                    index: 3,
+                    kernelName: "gemv_seq_bf16_f32s",
+                    category: "projection",
+                    weightTensorName: "model.language_model.layers.3.linear_attn.out_proj.weight"
+                ),
+            ],
+            generatedAt: "2026-05-13T00:00:00Z"
+        )
+
+        let csv = profile.recurrentBlockWindowCSVString
+
+        #expect(csv.contains("layerIndex,rangeStart,rangeEnd"))
+        #expect(csv.contains("3,0,4,0,1,2,3"))
+    }
+
     private func linearAttentionInputWeights(layer: Int) -> String {
         [
             "model.language_model.layers.\(layer).linear_attn.in_proj_qkv.weight",

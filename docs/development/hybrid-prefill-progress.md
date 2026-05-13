@@ -443,6 +443,7 @@ the same post-processing contract:
 | `-kernels.csv` | Kernel-family totals for scaling and dispatch-count checks |
 | `-layers.csv` | Layer/category totals for block-level fusion triage |
 | `-weights.csv` | Weight-role totals such as `mlp.down_proj` and `linear_attn.out_proj` |
+| `-recurrent-windows.csv` | Linear-attention recurrent-block fusion admission windows |
 
 Layer aggregation uses explicit `layerIndex` metadata when available and falls
 back to `layers.N` parsed from `weightTensorName`. Batched projection steps
@@ -825,6 +826,10 @@ This is intentionally not a speed change. It is the routing precondition for
 the next recurrent-block kernel prototype: any future fused route should prove
 that it replaces exactly these windows before correctness and benchmark gates
 are considered.
+
+The profile writer now persists the same admission result as
+`*-recurrent-windows.csv`, so future analysis and routing experiments can
+consume the window list without scraping test logs.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

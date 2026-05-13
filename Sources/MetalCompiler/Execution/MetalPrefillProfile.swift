@@ -252,6 +252,38 @@ struct MetalPrefillProfile: Codable, Sendable {
         )
     }
 
+    var recurrentBlockWindowCSVString: String {
+        var lines: [String] = [
+            [
+                "layerIndex",
+                "rangeStart",
+                "rangeEnd",
+                "inputProjectionStepIndex",
+                "recurrenceStepIndex",
+                "bridgeStepIndices",
+                "outputProjectionStepIndex",
+                "inputProjectionKernelName",
+                "recurrenceKernelName",
+                "outputProjectionKernelName",
+            ].joined(separator: ","),
+        ]
+        for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
+            lines.append([
+                String(window.layerIndex),
+                String(window.rangeStart),
+                String(window.rangeEnd),
+                String(window.inputProjectionStepIndex),
+                String(window.recurrenceStepIndex),
+                csvEscape(window.bridgeStepIndices.map(String.init).joined(separator: ";")),
+                String(window.outputProjectionStepIndex),
+                csvEscape(window.inputProjectionKernelName),
+                csvEscape(window.recurrenceKernelName),
+                csvEscape(window.outputProjectionKernelName),
+            ].joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     func writeArtifacts(directory: URL, basename: String) throws -> [URL] {
         let manager = FileManager.default
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -263,6 +295,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         let layerCSVURL = directory.appendingPathComponent("\(basename)-layers.csv")
         let weightCSVURL = directory.appendingPathComponent("\(basename)-weights.csv")
         let blockCSVURL = directory.appendingPathComponent("\(basename)-blocks.csv")
+        let recurrentWindowsCSVURL = directory.appendingPathComponent("\(basename)-recurrent-windows.csv")
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -274,7 +307,17 @@ struct MetalPrefillProfile: Codable, Sendable {
         try Data(layerCSVString.utf8).write(to: layerCSVURL, options: .atomic)
         try Data(weightRoleCSVString.utf8).write(to: weightCSVURL, options: .atomic)
         try Data(blockCSVString.utf8).write(to: blockCSVURL, options: .atomic)
-        return [jsonURL, csvURL, categoryCSVURL, kernelCSVURL, layerCSVURL, weightCSVURL, blockCSVURL]
+        try Data(recurrentBlockWindowCSVString.utf8).write(to: recurrentWindowsCSVURL, options: .atomic)
+        return [
+            jsonURL,
+            csvURL,
+            categoryCSVURL,
+            kernelCSVURL,
+            layerCSVURL,
+            weightCSVURL,
+            blockCSVURL,
+            recurrentWindowsCSVURL,
+        ]
     }
 
     private static func makeSummary(entries: [Entry]) -> Summary {
