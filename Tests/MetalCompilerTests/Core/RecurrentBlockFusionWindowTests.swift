@@ -101,6 +101,49 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .eligible)
     }
 
+    @Test("Prototype planner creates reference-gated two-stage plan for multi-group recurrent block")
+    func prototypePlannerCreatesTwoStagePlanForMultiGroupWindow() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 4, groups: 4),
+            dispatchRecurrence(index: 1, layer: 4, groups: 4),
+            dispatchOutputProjection(index: 2, layer: 4),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.twoStageDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .candidate(RecurrentBlockFusionTwoStagePlan(
+            layerIndex: 4,
+            partitionCount: 4,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            partialRowsPerToken: 8192,
+            numericalContract: .referenceGated
+        )))
+    }
+
+    @Test("Prototype planner rejects two-stage plan when single dispatch is preferred")
+    func prototypePlannerRejectsTwoStagePlanForSingleGroupWindow() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0, groups: 1),
+            dispatchRecurrence(index: 1, layer: 0, groups: 1),
+            dispatchOutputProjection(index: 2, layer: 0),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.twoStageDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .rejected([.singleDispatchPreferred(partitionCount: 1)]))
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [

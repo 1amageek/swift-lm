@@ -168,6 +168,38 @@ enum RecurrentBlockFusionSingleDispatchDecision: Sendable, Equatable {
     case rejected([RecurrentBlockFusionSingleDispatchRejection])
 }
 
+enum RecurrentBlockFusionNumericalContract: Sendable, Equatable {
+    case strictDecodeEquivalent
+    case referenceGated
+}
+
+struct RecurrentBlockFusionTwoStagePlan: Sendable, Equatable {
+    let layerIndex: Int
+    let partitionCount: Int
+    let headsPerPartition: Int
+    let partitionInputDimension: Int
+    let recurrentOutputDimension: Int
+    let outputDimension: Int
+    let partialRowsPerToken: Int
+    let numericalContract: RecurrentBlockFusionNumericalContract
+}
+
+enum RecurrentBlockFusionTwoStageRejection: Sendable, Equatable {
+    case missingInputProjection(entryIndex: Int)
+    case missingRecurrence(entryIndex: Int)
+    case missingOutputProjection(entryIndex: Int)
+    case singleDispatchPreferred(partitionCount: Int)
+    case inputProjectionShapeMismatch(expectedConvDimension: Int, actualQKVDimension: Int)
+    case gateProjectionShapeMismatch(expectedOutputDimension: Int, actualZDimension: Int)
+    case outputProjectionShapeMismatch(expectedInputDimension: Int, actualInputDimension: Int)
+    case unevenHeadPartition(headCount: Int, partitionCount: Int)
+}
+
+enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
+    case candidate(RecurrentBlockFusionTwoStagePlan)
+    case rejected([RecurrentBlockFusionTwoStageRejection])
+}
+
 enum RecurrentBlockFusionPrototypePlanner {
     static func singleDispatchDecision(
         for window: RecurrentBlockFusionAdmissionWindow,
@@ -217,6 +249,76 @@ enum RecurrentBlockFusionPrototypePlanner {
         }
 
         return rejections.isEmpty ? .eligible : .rejected(rejections)
+    }
+
+    static func twoStageDecision(
+        for window: RecurrentBlockFusionAdmissionWindow,
+        entries: [DispatchEntry]
+    ) -> RecurrentBlockFusionTwoStageDecision {
+        let byIndex = Dictionary(uniqueKeysWithValues: entries.map { ($0.index, $0) })
+        var rejections: [RecurrentBlockFusionTwoStageRejection] = []
+
+        guard let inputEntry = byIndex[window.inputProjectionEntryIndex],
+              let inputProjection = inputEntry.fragment as? BatchedProjection else {
+            return .rejected([.missingInputProjection(entryIndex: window.inputProjectionEntryIndex)])
+        }
+        guard let recurrenceEntry = byIndex[window.recurrenceEntryIndex],
+              let recurrence = recurrenceEntry.fragment as? SSMRecurrenceFragment else {
+            return .rejected([.missingRecurrence(entryIndex: window.recurrenceEntryIndex)])
+        }
+        guard let outputEntry = byIndex[window.outputProjectionEntryIndex],
+              let outputProjection = outputEntry.fragment as? LinearFragment else {
+            return .rejected([.missingOutputProjection(entryIndex: window.outputProjectionEntryIndex)])
+        }
+
+        if recurrence.groupCount <= 1 {
+            rejections.append(.singleDispatchPreferred(partitionCount: recurrence.groupCount))
+        }
+        if recurrence.headCount % max(recurrence.groupCount, 1) != 0 {
+            rejections.append(.unevenHeadPartition(
+                headCount: recurrence.headCount,
+                partitionCount: recurrence.groupCount
+            ))
+        }
+
+        let fields = Dictionary(uniqueKeysWithValues: inputProjection.projections.map { ($0.field, $0) })
+        if let qkv = fields["in_proj_qkv"], qkv.outputDimension != recurrence.convDimension {
+            rejections.append(.inputProjectionShapeMismatch(
+                expectedConvDimension: recurrence.convDimension,
+                actualQKVDimension: qkv.outputDimension
+            ))
+        }
+        let recurrentOutputDimension = recurrence.headCount * recurrence.valueHeadDimension
+        if let z = fields["in_proj_z"], z.outputDimension != recurrentOutputDimension {
+            rejections.append(.gateProjectionShapeMismatch(
+                expectedOutputDimension: recurrentOutputDimension,
+                actualZDimension: z.outputDimension
+            ))
+        }
+        if outputProjection.inputDimension != recurrentOutputDimension {
+            rejections.append(.outputProjectionShapeMismatch(
+                expectedInputDimension: recurrentOutputDimension,
+                actualInputDimension: outputProjection.inputDimension
+            ))
+        }
+
+        guard rejections.isEmpty else {
+            return .rejected(rejections)
+        }
+
+        let partitionCount = recurrence.groupCount
+        let headsPerPartition = recurrence.headCount / partitionCount
+        let partitionInputDimension = headsPerPartition * recurrence.valueHeadDimension
+        return .candidate(RecurrentBlockFusionTwoStagePlan(
+            layerIndex: window.layerIndex,
+            partitionCount: partitionCount,
+            headsPerPartition: headsPerPartition,
+            partitionInputDimension: partitionInputDimension,
+            recurrentOutputDimension: recurrentOutputDimension,
+            outputDimension: outputProjection.outputDimension,
+            partialRowsPerToken: partitionCount * outputProjection.outputDimension,
+            numericalContract: .referenceGated
+        ))
     }
 }
 

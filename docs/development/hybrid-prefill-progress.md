@@ -830,11 +830,25 @@ Single-dispatch fusion decision:
 | Single recurrent group with matching projection dimensions | Eligible for a one-dispatch prototype |
 | Multi-group recurrent block such as Qwen | Reject single-dispatch fusion | SSM recurrence is partitioned by group, while `linear_attn.out_proj` consumes all recurrent heads; replacing the whole block with one dispatch would require unsafe cross-group fan-in without a grid-wide synchronization point |
 
+Two-stage fusion decision:
+
+```mermaid
+flowchart LR
+  A["SSM group output"] --> B["stage 1: per-group partial hidden"]
+  B --> C["partial buffer: group x hidden"]
+  C --> D["stage 2: reduce groups to hidden"]
+```
+
+| Shape | Decision | Numerical contract |
+|---|---|---|
+| Multi-group recurrent block with matching projection dimensions | Candidate | `referenceGated`; group partial sums change the output-projection reduction association |
+| Single recurrent group | Reject two-stage | single-dispatch path is structurally preferable |
+
 Validation:
 
 | Gate | Result |
 |---|---|
-| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, rejects incomplete/cross-layer windows, and rejects Qwen-style multi-group single-dispatch fusion |
+| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete dispatch-entry and profile windows, rejects incomplete/cross-layer windows, rejects Qwen-style multi-group single-dispatch fusion, and creates a reference-gated two-stage plan |
 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
 
 This is intentionally not a speed change. It is the routing precondition for
