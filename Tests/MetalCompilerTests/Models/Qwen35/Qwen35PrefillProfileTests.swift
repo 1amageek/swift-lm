@@ -100,6 +100,9 @@ struct Qwen35PrefillProfileTests {
             printCategoryBreakdown(profiles: profiles, iterations: Self.iterations, seqLen: seqLen)
             if seqLen == 128 {
                 printSingleProjectionRoleBreakdown(profiles: profiles)
+                let windows = RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: profiles)
+                printLinearAttentionWindowSummary(windows: windows)
+                #expect(windows.count == 18)
             }
             print("  artifacts: \(stepArtifacts.map(\.path).joined(separator: ", "))")
             print("  pass artifacts: \(passArtifacts.map(\.path).joined(separator: ", "))")
@@ -210,6 +213,21 @@ struct Qwen35PrefillProfileTests {
             let averageUs = aggregate.totalMicroseconds / Double(max(aggregate.count, 1))
             let share = total > 0 ? aggregate.totalMicroseconds / total * 100.0 : 0
             print("  \(role.padding(toLength: 24, withPad: " ", startingAt: 0)) count=\(aggregate.count) total=\(String(format: "%.3f", totalMs)) ms avg=\(String(format: "%.1f", averageUs)) us share=\(String(format: "%.1f", share))%")
+        }
+    }
+
+    private func printLinearAttentionWindowSummary(windows: [RecurrentBlockFusionWindow]) {
+        guard !windows.isEmpty else { return }
+        let first = windows.first
+        let last = windows.last
+        print()
+        print("=== Linear attention recurrent block windows (seqLen 128) ===")
+        print("  count=\(windows.count)")
+        if let first {
+            print("  first layer=\(first.layerIndex) range=\(first.rangeStart)..<\(first.rangeEnd)")
+        }
+        if let last {
+            print("  last layer=\(last.layerIndex) range=\(last.rangeStart)..<\(last.rangeEnd)")
         }
     }
 

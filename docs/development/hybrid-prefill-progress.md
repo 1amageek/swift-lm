@@ -665,6 +665,7 @@ Next implementation order:
 | M3C.2 | Done for selected blocks: add Qwen recurrent-block reference dump and Swift comparison for boundary tensors | Focused `Qwen35ReferenceComparisonTests` case is green for every ordinal listed in `ref.meta.linear_block_ordinals`; conv+SiLU is materialized only when `SWIFTLM_PREFILL_DEBUG_SSM_CONV=1` is enabled by the reference harness |
 | M3C.3 | Done as opt-in experiment: prewrite decayed recurrent state inside the current `ssm_recurrence_seq_bf16_f32` contract | Isolated sequence equivalence, Qwen reference gate, and SSM microbenchmark |
 | M3C.4 | Done / rejected for default: same-session full-model Qwen profile did not beat baseline at seqLen 64/128 | Correctness stayed green, but benchmark gate did not justify promotion |
+| M3D.1 | Done: add recurrent-block fusion window scanner | Synthetic contract test plus Qwen profile assertion identify all 18 linear-attention windows |
 
 ### M3C.1 Profile Artifact Status (2026-05-13)
 
@@ -787,6 +788,43 @@ The prewrite plan correctly replaces all 18 `ssm_recurrence_seq_bf16_f32`
 dispatches with `ssm_recurrence_seq_bf16_f32_prewrite_decay`, so this is not a
 routing failure. The experiment is correctness-gated and useful for future
 kernel-shape comparison, but it does not change production routing.
+
+### M3D.1 Recurrent-Block Fusion Admission Windows (2026-05-13)
+
+M3D.1 adds a structural scanner for linear-attention recurrent-block windows.
+The scanner uses semantic weight roles and recurrence kernels, not suffix-only
+kernel-name matching, to identify the dispatch window that future block fusion
+is allowed to replace.
+
+```mermaid
+flowchart LR
+  A["linear_attn in_proj qkv/z/b/a"] --> B["SSM recurrence"]
+  B --> C["bridge steps such as round"]
+  C --> D["linear_attn out_proj"]
+  D --> E["admissible fusion window"]
+```
+
+Admission contract:
+
+| Field | Requirement |
+|---|---|
+| Input projection | Batched projection whose tensor group contains `linear_attn.in_proj_qkv`, `in_proj_z`, `in_proj_b`, and `in_proj_a` |
+| Recurrence | `ssm_recurrence_seq*` step before the matching output projection |
+| Output projection | `linear_attn.out_proj` for the same `layers.N` tensor group |
+| Bridge steps | Preserved explicitly as step indices; the current Qwen path has a round step between recurrence and out projection |
+| Rejection | Incomplete windows or cross-layer output projections are not paired |
+
+Validation:
+
+| Gate | Result |
+|---|---|
+| `swift test --filter RecurrentBlockFusionWindowTests` | Pass; detects complete windows and rejects incomplete/cross-layer windows |
+| `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 profile detects 18 recurrent-block windows, first `3..<7`, last `263..<267` |
+
+This is intentionally not a speed change. It is the routing precondition for
+the next recurrent-block kernel prototype: any future fused route should prove
+that it replaces exactly these windows before correctness and benchmark gates
+are considered.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
