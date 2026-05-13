@@ -850,6 +850,10 @@ buffer into the final hidden row. This kernel does not route in production yet;
 it exists so the partial buffer layout and padded-stride semantics are fixed
 before the harder SSM+partial-GEMV stage is attempted.
 
+The source catalog now emits `recurrent_block_partial_reduce_seq_f32` whenever a
+sequence SSM recurrence is present, so future opt-in routing can fail with an
+explicit contract error instead of a missing-pipeline surprise.
+
 Validation:
 
 | Gate | Result |

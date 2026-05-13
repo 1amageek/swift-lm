@@ -395,6 +395,13 @@ struct MetalKernelSourceCatalog {
                         }
                     }
                     if bufferPrecision.isPrefillSequencePrecision, let ssmFragment = fragment as? SSMRecurrenceFragment {
+                        let partialReduceKernelName = "recurrent_block_partial_reduce_seq_f32"
+                        if generatedNames.insert(partialReduceKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateRecurrentBlockPartialReduce(
+                                name: partialReduceKernelName,
+                                bufferPrecision: bufferPrecision
+                            ))
+                        }
                         let sequenceKernelName = SSMRecurrenceFragment.sequenceKernelName(
                             bufferPrecision: bufferPrecision,
                             weightFormat: weightFormat
