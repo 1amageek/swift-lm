@@ -243,6 +243,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; state recurrence phase probe now hard-checks Metal output and recurrent state against a Swift CPU reference |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; register-block `state_recurrence_d2` phase candidate is CPU-reference equivalent but slower than the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; `state_recurrence_qkpar` preserves active value-lane parallelism and matches the CPU reference, but does not beat the baseline state phase |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase CSV now records state-loop stride, coalesced value lanes, and serial value lanes per thread for recurrence candidates |
 
 ## Failed Experiments
 
@@ -1691,10 +1692,18 @@ thread and instead improve memory coalescing or state staging without reducing
 thread-level parallelism.
 
 The phase CSV now records `activeThreadsPerThreadgroup`,
-`valueLanesPerThread`, and `laneParallelismPreserved` so future candidates are
-not judged by timing alone. The `d2` result is a concrete example: it is
-reference-equivalent and has the same estimated state traffic, but halves the
-active value-lane parallelism from 128 to 64 threads per group.
+`valueLanesPerThread`, `laneParallelismPreserved`,
+`stateInnerStrideElements`, `coalescedValueLanesPerStateRow`, and
+`serialStateLanesPerThread` so future candidates are not judged by timing
+alone. The `d2` result is a concrete example: it is reference-equivalent and
+has the same estimated state traffic, but halves the active value-lane
+parallelism from 128 to 64 threads per group.
+
+| Metric | Meaning | Baseline state phase |
+|---|---|---:|
+| `stateInnerStrideElements` | per-thread stride while walking `state[j * dv + d]` over `j` | 128 |
+| `coalescedValueLanesPerStateRow` | value lanes covered together for the same `j` row | 128 |
+| `serialStateLanesPerThread` | value lanes handled serially inside one thread | 1 |
 
 The second probe, `state_recurrence_qkpar`, keeps one value lane per active
 thread and parallelizes the small `qNorm/kNorm/kqSum` scalar setup before the
@@ -1706,6 +1715,12 @@ partials and barrier do not pay for themselves:
 | 16 | 366.1 us | 368.7 us | 128 -> 128 | reject/noise |
 | 64 | 1413.4 us | 1450.8 us | 128 -> 128 | reject |
 | 128 | 2811.8 us | 2822.0 us | 128 -> 128 | reject/noise |
+
+Latest single-run artifact showed a favorable 128-token `qkpar` sample
+(`3355.1 us -> 2788.0 us`) while 16-token and 64-token results stayed noise or
+slower. This is not enough for route promotion because the previous same-suite
+run showed no 128-token win. Treat `qkpar` as an unstable diagnostic until a
+multi-run summary proves a stable win and the full sequence/Qwen gates pass.
 
 Current decision: do not promote the `qkpar` shape into the production sequence
 kernel. The expensive region is the recurrent state loop, not the small scalar
