@@ -242,6 +242,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-isolation SSM microbench writes synthetic conv+SiLU, state recurrence, and RMS/gate lower-bound timing artifacts |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; state recurrence phase probe now hard-checks Metal output and recurrent state against a Swift CPU reference |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; register-block `state_recurrence_d2` phase candidate is CPU-reference equivalent but slower than the baseline state phase |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; `state_recurrence_qkpar` preserves active value-lane parallelism and matches the CPU reference, but does not beat the baseline state phase |
 
 ## Failed Experiments
 
@@ -1621,9 +1622,9 @@ Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 10.31% | 73.62% | 21.75% | state recurrence dominates |
-| 64 | 2.71% | 75.45% | 22.89% | state recurrence dominates |
-| 128 | 1.92% | 58.48% | 16.97% | state recurrence dominates, with noisy full-base denominator |
+| 16 | 3.13% | 75.01% | 22.40% | state recurrence dominates |
+| 64 | 2.69% | 75.55% | 25.19% | state recurrence dominates |
+| 128 | 1.99% | 58.10% | 17.80% | state recurrence dominates, with noisy full-base denominator |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
@@ -1694,6 +1695,22 @@ The phase CSV now records `activeThreadsPerThreadgroup`,
 not judged by timing alone. The `d2` result is a concrete example: it is
 reference-equivalent and has the same estimated state traffic, but halves the
 active value-lane parallelism from 128 to 64 threads per group.
+
+The second probe, `state_recurrence_qkpar`, keeps one value lane per active
+thread and parallelizes the small `qNorm/kNorm/kqSum` scalar setup before the
+state loop. It is also CPU-reference equivalent, but the extra threadgroup
+partials and barrier do not pay for themselves:
+
+| Sequence length | Baseline state phase | `qkpar` state phase | Active lanes | Decision |
+|---:|---:|---:|---:|---|
+| 16 | 366.1 us | 368.7 us | 128 -> 128 | reject/noise |
+| 64 | 1413.4 us | 1450.8 us | 128 -> 128 | reject |
+| 128 | 2811.8 us | 2822.0 us | 128 -> 128 | reject/noise |
+
+Current decision: do not promote the `qkpar` shape into the production sequence
+kernel. The expensive region is the recurrent state loop, not the small scalar
+setup. The next candidate should target state load/write structure directly
+while preserving 128 active value lanes.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

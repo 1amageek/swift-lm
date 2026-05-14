@@ -66,6 +66,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMPhaseVariant(name: "conv_silu", kernelName: "bench_ssm_phase_conv_silu_bf16_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence", kernelName: "bench_ssm_phase_state_recurrence_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_d2", kernelName: "bench_ssm_phase_state_recurrence_d2_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence_qkpar", kernelName: "bench_ssm_phase_state_recurrence_qkpar_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "rms_gate", kernelName: "bench_ssm_phase_rms_gate_f32", threadgroupWidth: 384),
         ]
 
@@ -112,6 +113,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         for kernelName in [
             "bench_ssm_phase_state_recurrence_f32",
             "bench_ssm_phase_state_recurrence_d2_f32",
+            "bench_ssm_phase_state_recurrence_qkpar_f32",
         ] {
             let validation = try harness.validateStateRecurrencePhase(kernelName: kernelName, sequenceLength: 5)
             #expect(
@@ -295,9 +297,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
         print("artifact: \(artifact.path)")
-        print("seq  phase                  avg_us  us/token  full_%  active  lanes  state_mb/tok")
+        print("seq  phase                      avg_us  us/token  full_%  active  lanes  state_mb/tok")
         for row in rows.sorted(by: phaseRowSort) {
-            let phase = row.phase.padding(toLength: 21, withPad: " ", startingAt: 0)
+            let phase = row.phase.padding(toLength: 25, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.estimatedStateTotalBytesPerToken) / 1_048_576.0
             print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%6d", row.activeThreadsPerThreadgroup))  \(String(format: "%5d", row.valueLanesPerThread))  \(String(format: "%12.3f", stateMegabytes))")
         }
@@ -579,6 +581,10 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 name: "bench_ssm_phase_state_recurrence_d2_f32",
                 valueLanesPerThread: 2
             ),
+            Self.generatePhaseStateRecurrenceKernel(
+                name: "bench_ssm_phase_state_recurrence_qkpar_f32",
+                parallelQKReduction: true
+            ),
             Self.generatePhaseRMSGateKernel(),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
@@ -591,6 +597,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_phase_conv_silu_bf16_f32",
             "bench_ssm_phase_state_recurrence_f32",
             "bench_ssm_phase_state_recurrence_d2_f32",
+            "bench_ssm_phase_state_recurrence_qkpar_f32",
             "bench_ssm_phase_rms_gate_f32",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
@@ -843,7 +850,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
 
     private static func generatePhaseStateRecurrenceKernel(
         name: String = "bench_ssm_phase_state_recurrence_f32",
-        valueLanesPerThread: Int = 1
+        valueLanesPerThread: Int = 1,
+        parallelQKReduction: Bool = false
     ) -> String {
         let valuesPerThread = max(1, valueLanesPerThread)
         let threadPlan = valuesPerThread == 1
@@ -862,6 +870,63 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             : """
                     const uint dStart = localTid * valuesPerThread;
                     const uint dEnd = min(dStart + valuesPerThread, dv);
+            """
+        let qkPartialStorage = parallelQKReduction
+            ? """
+            threadgroup float qNormSqPartials[128];
+            threadgroup float kNormSqPartials[128];
+            threadgroup float kqSumPartials[128];
+            """
+            : ""
+        let qkReductionPhase = parallelQKReduction
+            ? """
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid < dk) {
+                        float q = convSiluCache[localTid];
+                        float k = convSiluCache[dk + localTid];
+                        qNormSqPartials[localTid] = q * q;
+                        kNormSqPartials[localTid] = k * k;
+                        kqSumPartials[localTid] = q * k;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        float qNormSq = 0.0f;
+                        float kNormSq = 0.0f;
+                        float kqSum = 0.0f;
+                        for (uint j = 0; j < dk; ++j) {
+                            qNormSq += qNormSqPartials[j];
+                            kNormSq += kNormSqPartials[j];
+                            kqSum += kqSumPartials[j];
+                        }
+                        qInvCache[0] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                        kInvCache[0] = rsqrt(kNormSq + 1e-6f);
+                        kqSumCache[0] = kqSum;
+                    }
+                }
+            """
+            : """
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        float qNormSq = 0.0f;
+                        float kNormSq = 0.0f;
+                        float kqSum = 0.0f;
+                        for (uint j = 0; j < dk; ++j) {
+                            float q = convSiluCache[j];
+                            float k = convSiluCache[dk + j];
+                            qNormSq += q * q;
+                            kNormSq += k * k;
+                            kqSum += q * k;
+                        }
+                        qInvCache[0] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                        kInvCache[0] = rsqrt(kNormSq + 1e-6f);
+                        kqSumCache[0] = kqSum;
+                    }
+                }
             """
         return """
         kernel void \(name)(
@@ -904,6 +969,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             threadgroup float qInvCache[1];
             threadgroup float kInvCache[1];
             threadgroup float kqSumCache[1];
+            \(qkPartialStorage)
 
             for (uint pos = 0; pos < sequenceLength; ++pos) {
                 device const float* convSiluPos = convSilu + pos * activationRowStride;
@@ -926,24 +992,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
 
                 \(threadPlan)
                 const uint activeThreads = headsPerGroup * threadsPerHead;
-                if (tid < activeThreads) {
-                    const uint localTid = tid % threadsPerHead;
-                    if (localTid == 0) {
-                        float qNormSq = 0.0f;
-                        float kNormSq = 0.0f;
-                        float kqSum = 0.0f;
-                        for (uint j = 0; j < dk; ++j) {
-                            float q = convSiluCache[j];
-                            float k = convSiluCache[dk + j];
-                            qNormSq += q * q;
-                            kNormSq += k * k;
-                            kqSum += q * k;
-                        }
-                        qInvCache[0] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
-                        kInvCache[0] = rsqrt(kNormSq + 1e-6f);
-                        kqSumCache[0] = kqSum;
-                    }
-                }
+                \(qkReductionPhase)
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 if (tid < activeThreads) {
