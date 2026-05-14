@@ -70,11 +70,12 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
         print()
         print("=== BF16 SSM recurrence promotion decisions ===")
-        print("seq  best             best_us  base             base_us  speedup  decision")
+        print("seq  best             best_us  state_mb/tok  base             base_us  speedup  decision")
         for row in summaryRows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
             let bestVariant = row.bestVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
             let baseVariant = row.bestBaseVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
-            print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(row.decision)")
+            let stateMegabytes = Double(row.bestEstimatedStateTotalBytesPerToken) / 1_048_576.0
+            print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(String(format: "%12.3f", stateMegabytes))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(row.decision)")
         }
     }
 
@@ -98,6 +99,10 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "requestedThreadgroupWidth",
                 "averageGpuMicroseconds",
                 "microsecondsPerToken",
+                "stateElementsPerToken",
+                "estimatedStateReadBytesPerToken",
+                "estimatedStateWriteBytesPerToken",
+                "estimatedStateTotalBytesPerToken",
             ].joined(separator: ","),
         ]
         for row in rows.sorted(by: rowSort) {
@@ -115,6 +120,10 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.requestedThreadgroupWidth),
                 String(format: "%.3f", row.averageGpuMicroseconds),
                 String(format: "%.6f", row.microsecondsPerToken),
+                String(row.stateElementsPerToken),
+                String(row.estimatedStateReadBytesPerToken),
+                String(row.estimatedStateWriteBytesPerToken),
+                String(row.estimatedStateTotalBytesPerToken),
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -133,9 +142,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "bestThreadgroupWidth",
                 "bestAverageGpuMicroseconds",
                 "bestMicrosecondsPerToken",
+                "bestEstimatedStateTotalBytesPerToken",
                 "bestBaseVariant",
                 "bestBaseThreadgroupWidth",
                 "bestBaseAverageGpuMicroseconds",
+                "bestBaseEstimatedStateTotalBytesPerToken",
                 "speedupVsBestBasePercent",
                 "decision",
             ].joined(separator: ","),
@@ -147,9 +158,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.bestThreadgroupWidth),
                 String(format: "%.3f", row.bestAverageGpuMicroseconds),
                 String(format: "%.6f", row.bestMicrosecondsPerToken),
+                String(row.bestEstimatedStateTotalBytesPerToken),
                 row.bestBaseVariant,
                 String(row.bestBaseThreadgroupWidth),
                 String(format: "%.3f", row.bestBaseAverageGpuMicroseconds),
+                String(row.bestBaseEstimatedStateTotalBytesPerToken),
                 String(format: "%.3f", row.speedupVsBestBasePercent),
                 row.decision,
             ].joined(separator: ","))
@@ -229,6 +242,26 @@ private struct SSMResultRow {
     var microsecondsPerToken: Double {
         averageGpuMicroseconds / Double(sequenceLength)
     }
+
+    var stateElementsPerToken: Int {
+        headCount * keyDimension * valueDimension
+    }
+
+    var estimatedStateReadBytesPerToken: Int {
+        stateElementsPerToken * MemoryLayout<Float>.stride * 2
+    }
+
+    var estimatedStateWriteBytesPerToken: Int {
+        stateElementsPerToken * MemoryLayout<Float>.stride * stateWritePassesPerElement
+    }
+
+    var estimatedStateTotalBytesPerToken: Int {
+        estimatedStateReadBytesPerToken + estimatedStateWriteBytesPerToken
+    }
+
+    private var stateWritePassesPerElement: Int {
+        variant.hasPrefix("prewrite_") ? 2 : 1
+    }
 }
 
 private struct SSMSummaryRow {
@@ -237,9 +270,11 @@ private struct SSMSummaryRow {
     let bestThreadgroupWidth: Int
     let bestAverageGpuMicroseconds: Double
     let bestMicrosecondsPerToken: Double
+    let bestEstimatedStateTotalBytesPerToken: Int
     let bestBaseVariant: String
     let bestBaseThreadgroupWidth: Int
     let bestBaseAverageGpuMicroseconds: Double
+    let bestBaseEstimatedStateTotalBytesPerToken: Int
     let speedupVsBestBasePercent: Double
     let decision: String
 }
@@ -257,9 +292,11 @@ private enum SSMSummaryFactory {
             bestThreadgroupWidth: best.threadgroupWidth,
             bestAverageGpuMicroseconds: best.averageGpuMicroseconds,
             bestMicrosecondsPerToken: best.microsecondsPerToken,
+            bestEstimatedStateTotalBytesPerToken: best.estimatedStateTotalBytesPerToken,
             bestBaseVariant: bestBase.variant,
             bestBaseThreadgroupWidth: bestBase.threadgroupWidth,
             bestBaseAverageGpuMicroseconds: bestBase.averageGpuMicroseconds,
+            bestBaseEstimatedStateTotalBytesPerToken: bestBase.estimatedStateTotalBytesPerToken,
             speedupVsBestBasePercent: speedupVsBestBasePercent,
             decision: decision(bestVariant: best.variant, speedupVsBestBasePercent: speedupVsBestBasePercent)
         )

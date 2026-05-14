@@ -1551,8 +1551,8 @@ The SSM recurrence microbenchmark now emits two artifacts:
 
 | Artifact | Purpose |
 |---|---|
-| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing for each sequence length |
-| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, speedup against best base, and promotion decision |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing, grid shape, and estimated recurrent-state traffic for each sequence length |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1573,14 +1573,22 @@ Current local summary from the focused harness:
 
 | Sequence length | Best variant | Best base | Speedup vs best base | Decision |
 |---:|---|---|---:|---|
-| 16 | `base_tg384` | `base_tg384` | 0.00% | keep default |
-| 64 | `shared_tg384` | `base_tg256` | 3.07% | candidate shared-RMS |
-| 128 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 16 | `prewrite_tg128` | `base_tg384` | 9.60% | candidate prewrite-decay |
+| 64 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 128 | `shared_tg384` | `base_tg384` | 0.37% | keep default |
 
-Current decision: no runtime default changes. The harness shows that shared-RMS
-can win at seqLen 64 in isolation, but it does not beat the best base at seqLen
-128. Any route promotion still requires Qwen reference parity and a full-model
-profile win on the same path.
+Current decision: no runtime default changes. The best isolated variant moves
+with run-to-run variance and sequence length, while the longest measured
+sequence still stays within noise of the best base route. Any route promotion
+requires Qwen reference parity and a full-model profile win on the same path.
+
+The traffic model highlights why recurrence remains the next structural
+bottleneck: Qwen3.5 BF16 SSM recurrence touches `16 * 128 * 128` recurrent
+state elements per token. Base/shared-RMS variants perform two state reads and
+one state write per element, or roughly 3.0 MiB of recurrent-state traffic per
+token before counting conv/state-space input traffic. `prewrite` variants add a
+second write pass, which makes them useful diagnostics but a poor default
+candidate unless they win by enough to offset the extra write traffic.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
