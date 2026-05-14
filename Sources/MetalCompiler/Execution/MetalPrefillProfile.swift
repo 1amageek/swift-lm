@@ -1171,6 +1171,16 @@ private func estimatedProjectionByteTraffic(
     let outputBytesPerElement = projectionActivationBytes(for: kernelName)
     let weightBytesPerElement = projectionWeightBytes(for: kernelName)
 
+    if kernelName.hasPrefix("mlp_fused_swiglu_down"),
+       let intermediateDimension = uint32Constant(step, index: 4).map(Int.init),
+       let outputDimension = uint32Constant(step, index: 5).map(Int.init) {
+        let gateBytes = sequenceLength * intermediateDimension * inputBytesPerElement
+        let upBytes = sequenceLength * intermediateDimension * inputBytesPerElement
+        let weightBytes = outputDimension * intermediateDimension * weightBytesPerElement
+        let outputBytes = sequenceLength * outputDimension * outputBytesPerElement
+        return PrefillByteTraffic(readBytes: gateBytes + upBytes + weightBytes, writeBytes: outputBytes)
+    }
+
     if kernelName.hasPrefix("batched_gemv"),
        let projectionCount = projectionCount(fromBatchedKernelName: kernelName),
        let inputDimension = uint32Constant(step, index: 1 + 2 * projectionCount).map(Int.init) {

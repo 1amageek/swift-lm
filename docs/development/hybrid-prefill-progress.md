@@ -181,6 +181,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter MLPFusionWindowTests` | Pass; profile scanner detects both unfused and fused SwiGLU-down producer-consumer windows |
 | 2026-05-14 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits `*-mlp-windows.csv` alongside recurrent block windows |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen real-bundle profile writes `*-mlp-windows.csv` for seqLen 16/64/128 |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with adaptive fused MLP env | Pass; `*-mlp-windows.csv` shows fused route at seqLen 64/128 and corrected fused byte estimates |
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; layer CSV now infers `layers.N` from weight tensor names and weight-role CSV supports batched semicolon-separated tensor groups |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
 | 2026-05-12 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; base batched sequence GEMV beats tile2/tile4 for the dominant Qwen3.5 BF16 batched projection shapes except small noisy cases |
@@ -1494,3 +1495,17 @@ default production route:
 | 16 | 24 | `unfused_swiglu_down` |
 | 64 | 24 | `unfused_swiglu_down` |
 | 128 | 24 | `unfused_swiglu_down` |
+
+Adaptive fused rows=8 (`SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`,
+`SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8`,
+`SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH=64`) now produces a
+direct baseline-vs-fused MLP window comparison:
+
+| Sequence length | Baseline MLP window time | Fused MLP window time | Delta | Baseline estimated bytes | Fused estimated bytes |
+|---:|---:|---:|---:|---:|---:|
+| 64 | 336.730 ms | 321.467 ms | -4.5% | 2.268 GB | 0.629 GB |
+| 128 | 659.755 ms | 628.353 ms | -4.8% | 2.347 GB | 0.730 GB |
+
+The fused kernel has a dedicated byte-traffic estimator now. Previously it fell
+through to binding-size estimation and over-reported full-buffer traffic, which
+made the MLP window artifact misleading for promotion decisions.
