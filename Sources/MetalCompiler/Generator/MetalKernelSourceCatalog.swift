@@ -426,6 +426,25 @@ struct MetalKernelSourceCatalog {
                                 keyHeadDimension: ssmFragment.keyHeadDimension,
                                 valueHeadDimension: ssmFragment.valueHeadDimension))
                         }
+                        if weightFormat == .bfloat16 {
+                            let groupOwnedPartialSequenceKernelName = SSMRecurrenceFragment.groupOwnedPartialProjectionSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(groupOwnedPartialSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: groupOwnedPartialSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    emitsGroupOwnedPartialProjection: true))
+                            }
+                        }
                         if SSMRecurrenceFragment.isSharedRMSPrefillEnabled {
                             let sharedRMSSequenceKernelName = SSMRecurrenceFragment.sharedRMSSequenceKernelName(
                                 bufferPrecision: bufferPrecision,

@@ -225,6 +225,8 @@ flowchart TD
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission now emits a typed safe execution plan only when the window reduces dispatch count and keeps unsafe row-grid fusion disallowed |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic group-owned partial projection kernel writes the same partition partials and reduced output as the CPU reference without row-grid fan-out |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission rejects cases where partial partitions would merge multiple recurrent groups and require cross-threadgroup accumulation |
+| 2026-05-14 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; BF16 SSM sequence recurrence now has a group-owned partial-emission variant that preserves output, recurrent state, conv state, and partition partials in the synthetic harness |
+| 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete BF16 library includes `ssm_recurrence_seq_bf16_f32_group_owned_partial` |
 
 ## Failed Experiments
 
@@ -1075,6 +1077,23 @@ and partial fan-in contract for the safe fused-stage shape, but the eventual
 runtime kernel still needs to combine the real SSM recurrence state update with
 this group-owned partial-row emission and then pass the Qwen schema v6 reference
 gates.
+
+M3D.9 adds that combined kernel variant at the generator level. The
+`ssm_recurrence_seq_bf16_f32_group_owned_partial` variant runs the normal
+sequence recurrence, then each group-owned threadgroup emits its partition's
+output-projection partial rows from the freshly written gated recurrent output.
+The synthetic SSM test verifies four contracts at once:
+
+- normal sequence output stays bit-equivalent to the existing sequence kernel;
+- recurrent state stays unchanged;
+- convolution state stays unchanged;
+- emitted group-owned partial rows match CPU partial projection from the same
+  sequence output and BF16 output-projection weight.
+
+The variant is registered in the kernel catalog but not routed yet. Production
+routing still needs a step-builder path that binds `linear_attn.out_proj.weight`
+and scratch partial output to buffers 21/22, then keeps the existing partial
+reduce stage and Qwen schema v6 reference gates.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

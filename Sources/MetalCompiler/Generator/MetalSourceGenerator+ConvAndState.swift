@@ -549,7 +549,8 @@ public static func generateSSMRecurrenceSequence(
     keyHeadDimension: Int,
     valueHeadDimension: Int,
     shareRMSScale: Bool = false,
-    prewriteDecayedState: Bool = false
+    prewriteDecayedState: Bool = false,
+    emitsGroupOwnedPartialProjection: Bool = false
 ) -> String {
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
@@ -639,6 +640,45 @@ public static func generateSSMRecurrenceSequence(
     let recurrencePass2StateExpr = prewriteDecayedState
         ? "state[j * dv + d]"
         : "state[j * dv + d] * decay"
+    let partialProjectionSignature = emitsGroupOwnedPartialProjection
+        ? """
+        device const \(wt)* partialWeight [[buffer(21)]],
+        device \(bt)* partialOutput [[buffer(22)]],
+        constant uint& partialOutputDimension [[buffer(23)]],
+        constant uint& partialRowStride [[buffer(24)]],
+        constant uint& partialProjectionEnabled [[buffer(25)]],
+        """
+        : ""
+    let partialProjectionPhase = emitsGroupOwnedPartialProjection
+        ? """
+            if (partialProjectionEnabled != 0) {
+                threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                const uint partitionInputDimension = headsPerGroup * dv;
+                const uint inputDimension = safeGroupCount * partitionInputDimension;
+                const uint groupInputBase = groupIndex * partitionInputDimension;
+                const uint tiisg = tid % SIMD_WIDTH;
+                const uint sgitg = tid / SIMD_WIDTH;
+                const uint rowsPerThreadgroup = max(1u, tgSize / SIMD_WIDTH);
+                for (uint rowBase = 0; rowBase < partialOutputDimension; rowBase += rowsPerThreadgroup) {
+                    const uint row = rowBase + sgitg;
+                    float sum = 0.0f;
+                    if (row < partialOutputDimension) {
+                        device const \(wt)* weightRow = partialWeight + row * inputDimension + groupInputBase;
+                        for (uint j = tiisg; j < partitionInputDimension; j += SIMD_WIDTH) {
+                            sum += \(readWeight("weightRow[j]")) * float(outputPos[groupInputBase + j]);
+                        }
+                        sum = simd_sum(sum);
+                        if (tiisg == 0) {
+                            const uint outputIndex = groupIndex * sequenceLength * partialRowStride
+                                + pos * partialRowStride
+                                + row;
+                            partialOutput[outputIndex] = \(bt)(sum);
+                        }
+                    }
+                }
+            }
+        """
+        : ""
 
     return """
     kernel void \(name)(
@@ -663,6 +703,7 @@ public static func generateSSMRecurrenceSequence(
         device float* debugConvSilu [[buffer(18)]],
         constant uint& debugConvRowStride [[buffer(19)]],
         constant uint& debugConvEnabled [[buffer(20)]],
+        \(partialProjectionSignature)
         uint tid [[thread_index_in_threadgroup]],
         uint tgSize [[threads_per_threadgroup]],
         uint tgid [[threadgroup_position_in_grid]]
@@ -830,6 +871,7 @@ public static func generateSSMRecurrenceSequence(
 
             // Phase 3: RMS norm + gated activation for owned heads.
             \(rmsPhase)
+            \(partialProjectionPhase)
             // Skip barrier after final position — no subsequent iteration reads this state,
             // and the command encoder's implicit barrier handles cross-dispatch visibility.
             if (pos + 1 < sequenceLength) {

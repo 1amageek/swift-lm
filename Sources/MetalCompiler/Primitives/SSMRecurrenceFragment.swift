@@ -103,6 +103,13 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_prewrite_decay"
     }
 
+    static func groupOwnedPartialProjectionSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_group_owned_partial"
+    }
+
     static var isSharedRMSPrefillEnabled: Bool {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_SHARED_RMS"] == "1"
     }
