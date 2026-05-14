@@ -216,6 +216,10 @@ flowchart TD
 | 2026-05-14 | `swift test --filter ReferenceHarnessManifestTests` | Pass; Qwen schema v6 is treated as ready by the reference harness manifest |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; default route validates schema v6, HF partials, CPU-computed partition partials, reduced output, existing state/KV gates, and decode0 |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in partial route validates Metal scratch partial readback, final reduce, final hidden/logits, state/KV, and decode0 |
+| 2026-05-14 | `swift test --filter ReferenceHarnessManifestTests` | Pass; manifest now reads the Qwen safetensors header directly and hard-checks schema v6 plus required cross-group fan-in tensor names without loading Metal resources |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic partial projection/reduce harness remains green after manifest hardening |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; dispatch/profile window admission remains green after manifest hardening |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; default and opt-in partial routes both run the full 5-test Qwen reference suite after reducing unnecessary schema-test model/STAF loads |
 
 ## Failed Experiments
 
@@ -247,6 +251,8 @@ flowchart TD
 | Whether fused SwiGLU + down should default | Yes, narrowly: rows=8 is default only for stateful hybrid BF16 sequence prefill with runtime admission at seqLen >= 64; `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` disables it |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
+| Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
+| Next recurrent-block optimization unit | Prototype a dispatch-reducing recurrent-block kernel behind an explicit flag; it must satisfy schema v6 boundary, partial fan-in, state/KV, and decode0 gates before any profile result is considered |
 
 ## Current Production Prefill Profile
 
