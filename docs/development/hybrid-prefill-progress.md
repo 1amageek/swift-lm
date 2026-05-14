@@ -178,6 +178,9 @@ flowchart TD
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits raw, category, kernel, layer, and weight-role CSVs |
 | 2026-05-12 | `swift build` | Pass after adding aggregated prefill profile artifacts |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen profile writes aggregate CSVs for both step and pass profiles at seqLen 16/64/128 |
+| 2026-05-14 | `swift test --filter MLPFusionWindowTests` | Pass; profile scanner detects both unfused and fused SwiGLU-down producer-consumer windows |
+| 2026-05-14 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits `*-mlp-windows.csv` alongside recurrent block windows |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen real-bundle profile writes `*-mlp-windows.csv` for seqLen 16/64/128 |
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; layer CSV now infers `layers.N` from weight tensor names and weight-role CSV supports batched semicolon-separated tensor groups |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
 | 2026-05-12 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; base batched sequence GEMV beats tile2/tile4 for the dominant Qwen3.5 BF16 batched projection shapes except small noisy cases |
@@ -1449,3 +1452,45 @@ shape is useful evidence that row packing can help, but full-model timing says
 the next production path should combine row packing with a larger structural
 change, such as producer-consumer fusion for the specific dependent projections
 or a real batched matmul path that passes the reference gate.
+
+## MLP Fusion Window Profile Harness (2026-05-14)
+
+The profile harness now emits a first-class MLP producer-consumer window artifact:
+
+```text
+<basename>-mlp-windows.csv
+```
+
+This records each `gate_proj + up_proj -> swiglu -> down_proj` region as one
+logical window. It also supports the opt-in fused route, where the activation
+step is absent and `mlp_fused_swiglu_down_seq_bf16_f32s*` replaces the
+materialized `swiglu_seq_f32 + gemv_seq_bf16_f32s` pair.
+
+```mermaid
+flowchart LR
+  A["batched gate/up projection"] --> B["SwiGLU activation"]
+  B --> C["down projection"]
+  A --> D["fused SwiGLU down projection"]
+```
+
+| CSV field group | Purpose |
+|---|---|
+| step indices | Confirms which dispatches were replaced or retained |
+| kernel names | Separates base, row-tuned, and fused variants without manual log parsing |
+| route | `unfused_swiglu_down` or `fused_swiglu_down` |
+| timing split | Separates gate/up, activation, and down projection time |
+| estimated bytes | Tracks whether a fusion saves traffic or only changes scheduling |
+
+Current decision: use this harness before promoting any MLP fusion flag. The
+next promotion check should compare baseline and fused profiles using
+`*-mlp-windows.csv`, then require the existing Qwen reference gates before
+changing defaults.
+
+The first Qwen3.5 BF16 profile run confirms the artifact is populated on the
+default production route:
+
+| Sequence length | MLP windows | Route |
+|---:|---:|---|
+| 16 | 24 | `unfused_swiglu_down` |
+| 64 | 24 | `unfused_swiglu_down` |
+| 128 | 24 | `unfused_swiglu_down` |

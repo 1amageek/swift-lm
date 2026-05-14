@@ -303,6 +303,51 @@ struct MetalPrefillProfile: Codable, Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    var mlpFusionWindowCSVString: String {
+        var lines: [String] = [
+            [
+                "layerIndex",
+                "rangeStart",
+                "rangeEnd",
+                "gateUpProjectionStepIndex",
+                "activationStepIndex",
+                "downProjectionStepIndex",
+                "gateUpProjectionKernelName",
+                "activationKernelName",
+                "downProjectionKernelName",
+                "route",
+                "windowEntryCount",
+                "totalGpuMicroseconds",
+                "gateUpProjectionGpuMicroseconds",
+                "activationGpuMicroseconds",
+                "downProjectionGpuMicroseconds",
+                "estimatedTotalBytes",
+            ].joined(separator: ","),
+        ]
+        for window in MLPFusionWindowScanner.swigluDownWindows(in: entries) {
+            let timing = mlpFusionWindowTiming(for: window)
+            lines.append([
+                String(window.layerIndex),
+                String(window.rangeStart),
+                String(window.rangeEnd),
+                String(window.gateUpProjectionStepIndex),
+                window.activationStepIndex.map(String.init) ?? "",
+                String(window.downProjectionStepIndex),
+                csvEscape(window.gateUpProjectionKernelName),
+                csvEscape(window.activationKernelName ?? ""),
+                csvEscape(window.downProjectionKernelName),
+                window.route.rawValue,
+                String(timing.entryCount),
+                String(format: "%.3f", timing.totalGpuMicroseconds),
+                String(format: "%.3f", timing.gateUpProjectionGpuMicroseconds),
+                String(format: "%.3f", timing.activationGpuMicroseconds),
+                String(format: "%.3f", timing.downProjectionGpuMicroseconds),
+                String(timing.estimatedTotalBytes),
+            ].joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     private struct RecurrentBlockWindowTiming {
         let entryCount: Int
         let totalGpuMicroseconds: Double
@@ -346,6 +391,45 @@ struct MetalPrefillProfile: Codable, Sendable {
         )
     }
 
+    private struct MLPFusionWindowTiming {
+        let entryCount: Int
+        let totalGpuMicroseconds: Double
+        let gateUpProjectionGpuMicroseconds: Double
+        let activationGpuMicroseconds: Double
+        let downProjectionGpuMicroseconds: Double
+        let estimatedTotalBytes: Int
+    }
+
+    private func mlpFusionWindowTiming(
+        for window: MLPFusionWindow
+    ) -> MLPFusionWindowTiming {
+        let windowEntries = entries.filter { entry in
+            entry.rangeStart >= window.rangeStart && entry.rangeEnd <= window.rangeEnd
+        }
+        let gateUpProjectionGpuMicroseconds = windowEntries
+            .filter { $0.index == window.gateUpProjectionStepIndex }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let activationGpuMicroseconds = windowEntries
+            .filter { entry in
+                guard let activationStepIndex = window.activationStepIndex else {
+                    return false
+                }
+                return entry.index == activationStepIndex
+            }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let downProjectionGpuMicroseconds = windowEntries
+            .filter { $0.index == window.downProjectionStepIndex }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        return MLPFusionWindowTiming(
+            entryCount: windowEntries.count,
+            totalGpuMicroseconds: windowEntries.reduce(0) { $0 + $1.totalGpuMicroseconds },
+            gateUpProjectionGpuMicroseconds: gateUpProjectionGpuMicroseconds,
+            activationGpuMicroseconds: activationGpuMicroseconds,
+            downProjectionGpuMicroseconds: downProjectionGpuMicroseconds,
+            estimatedTotalBytes: windowEntries.reduce(0) { $0 + $1.estimatedTotalBytes }
+        )
+    }
+
     func writeArtifacts(directory: URL, basename: String) throws -> [URL] {
         let manager = FileManager.default
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -358,6 +442,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         let weightCSVURL = directory.appendingPathComponent("\(basename)-weights.csv")
         let blockCSVURL = directory.appendingPathComponent("\(basename)-blocks.csv")
         let recurrentWindowsCSVURL = directory.appendingPathComponent("\(basename)-recurrent-windows.csv")
+        let mlpWindowsCSVURL = directory.appendingPathComponent("\(basename)-mlp-windows.csv")
 
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
@@ -370,6 +455,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         try Data(weightRoleCSVString.utf8).write(to: weightCSVURL, options: .atomic)
         try Data(blockCSVString.utf8).write(to: blockCSVURL, options: .atomic)
         try Data(recurrentBlockWindowCSVString.utf8).write(to: recurrentWindowsCSVURL, options: .atomic)
+        try Data(mlpFusionWindowCSVString.utf8).write(to: mlpWindowsCSVURL, options: .atomic)
         return [
             jsonURL,
             csvURL,
@@ -379,6 +465,7 @@ struct MetalPrefillProfile: Codable, Sendable {
             weightCSVURL,
             blockCSVURL,
             recurrentWindowsCSVURL,
+            mlpWindowsCSVURL,
         ]
     }
 
@@ -1006,6 +1093,7 @@ private func kernelName(for step: MetalPrefillStep) -> String {
 private func classify(_ kernelName: String) -> String {
     let name = kernelName.lowercased()
     if name.hasPrefix("embedding_lookup") || name.contains("gather") { return "embedding" }
+    if name.hasPrefix("mlp_fused_swiglu_down") { return "projection" }
     if name.hasPrefix("recurrent_block_partial_projection")
         || name.hasPrefix("recurrent_block_partial_reduce") {
         return "projection"
