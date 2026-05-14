@@ -36,7 +36,7 @@ flowchart TD
 | M1 safe tiled sequence GEMV | Done / not default | Tile4 kernels compile and pass decode-equivalence tests; Qwen profile regressed when defaulted, so production planner stays on base sequence GEMV |
 | M2 reference harness | Done / hardened | LFM and Qwen3.5 both have reference dump scripts and manifest coverage; Qwen3.5 validates snapshot identity, prefill state, decode0 state, and KV cache |
 | M3 reference-equivalent MPP prefill | Pending | Requires M2 before adopting non decode-equivalent math |
-| M4 fused hybrid block prefill | Pending | Requires M2 and block-level reference probes |
+| M4 fused hybrid block prefill | In progress / partial default | BF16 SwiGLU+down fusion is default for stateful hybrid sequence prefill at seqLen >= 64; broader block fusion still requires reference probes |
 | M5 benchmark-backed release claim | Pending | Requires real-bundle correctness gates first |
 | External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 as a baseline to beat, not a target to copy |
 
@@ -182,6 +182,10 @@ flowchart TD
 | 2026-05-14 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits `*-mlp-windows.csv` alongside recurrent block windows |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; Qwen real-bundle profile writes `*-mlp-windows.csv` for seqLen 16/64/128 |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with adaptive fused MLP env | Pass; `*-mlp-windows.csv` shows fused route at seqLen 64/128 and corrected fused byte estimates |
+| 2026-05-14 | `swift build` | Pass after promoting adaptive BF16 fused MLP routing to the default stateful hybrid sequence-prefill path |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; default Qwen hybrid path keeps schema, prefill block-boundary, final hidden/logit, state, KV, and decode0 reference gates green |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default Qwen plan emits runtime-gated branches, executes seqLen 16 unfused and seqLen 64/128 fused rows=8 |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` | Pass; explicit override disables fused MLP routing and restores the 293-step unfused plan |
 | 2026-05-12 | `swift test --filter PrefillProfileHarnessTests` | Pass; layer CSV now infers `layers.N` from weight tensor names and weight-role CSV supports batched semicolon-separated tensor groups |
 | 2026-05-12 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; batched projection dispatches now carry tensor-group metadata, reducing the blank projection bucket at seqLen 128 from 49 dispatches to only the output-head dispatch |
 | 2026-05-12 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; base batched sequence GEMV beats tile2/tile4 for the dominant Qwen3.5 BF16 batched projection shapes except small noisy cases |
@@ -224,40 +228,47 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v5 multi-case with selected block-boundary capture |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | No; rows=8 is correctness-green and remains the best current full-model fused shape, but default stays off. The lower-recompute rows-per-SIMD rps2 shape is correctness-green but regresses the full model |
+| Whether fused SwiGLU + down should default | Yes, narrowly: rows=8 is default only for stateful hybrid BF16 sequence prefill with runtime admission at seqLen >= 64; `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` disables it |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
 
 ## Current Production Prefill Profile
 
-Latest focused Qwen profile (2026-05-09 re-run), with production planner using
-base decode-equivalent sequence GEMV:
+Latest focused Qwen profile (2026-05-14), with production planner using
+runtime-gated BF16 fused SwiGLU+down for stateful hybrid sequence prefill:
 
 | Sequence length | Total prefill time | Steps | Pass count |
 |---:|---:|---:|---:|
-| 16 | 44.373 ms | 293 | 1 |
-| 64 | 158.926 ms | 293 | 1 |
-| 128 | 308.411 ms | 293 | 1 |
+| 16 | 56.241 ms | 293 | 1 |
+| 64 | 159.820 ms | 269 | 1 |
+| 128 | 314.525 ms | 269 | 1 |
 
 Category share at seqLen=128:
 
 | Category | Steps | Time | Share |
 |---|---:|---:|---:|
-| `projection` | 97 | 233.408 ms | 75.7% |
-| `ssm_recurrence` | 18 | 68.643 ms | 22.3% |
-| `attention` | 6 | 3.840 ms | 1.2% |
-| `other` | 129 | 2.179 ms | 0.7% |
-| remaining | 43 | 0.342 ms | 0.1% |
+| `projection` | 97 | 240.207 ms | 76.4% |
+| `ssm_recurrence` | 18 | 68.589 ms | 21.8% |
+| `attention` | 6 | 3.837 ms | 1.2% |
+| `other` | 129 | 1.748 ms | 0.6% |
+| remaining | 19 | 0.143 ms | 0.0% |
 
 Kernel families confirmed in the plan:
 
 | Kernel | Count |
 |---|---:|
-| `gemv_seq_bf16_f32s` | 48 |
+| `gemv_seq_bf16_f32s` | 48 raw / 24 active at seqLen >= 64 |
+| `mlp_fused_swiglu_down_seq_bf16_f32s` | 24 raw / 24 active at seqLen >= 64 |
 | `batched_gemv2_seq_bf16_f32s` | 24 |
 | `batched_gemv4_seq_bf16_f32s` | 18 |
 | `batched_gemv3_seq_bf16_f32s` | 6 |
 | `gemv_bf16_f32s` (output head) | 1 |
+
+The raw plan has 341 steps because it carries both fused and unfused MLP
+branches. Active profile steps are the release-relevant number: short prompts
+below 64 tokens run the original unfused path, while seqLen 64/128 runs the
+fused rows=8 path. This is deterministic runtime admission, not silent
+fallback.
 
 ## Projection Bottleneck Breakdown (seqLen 128, 2026-05-09)
 
@@ -946,8 +957,9 @@ flowchart LR
   D --> E["hidden output"]
 ```
 
-Routing is controlled by `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`. Production
-default remains off.
+Routing is default-enabled only for stateful hybrid BF16 sequence prefill, with
+runtime admission at seqLen >= 64. `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0`
+explicitly disables it, and `=1` force-enables it for non-default experiments.
 
 | Gate | Requirement |
 |---|---|
@@ -959,9 +971,9 @@ default remains off.
 | Mode | Sequence prefill `.batch` only |
 | Failure mode | Missing fused kernel is an explicit `kernelNotFound`, not a silent fallback |
 
-Current routing effect from the opt-in Qwen profile:
+Current routing effect from the Qwen profile:
 
-| Metric | Default | Fused flag enabled |
+| Metric | Override disabled | Default fused route at seqLen >= 64 |
 |---|---:|---:|
 | Total prefill steps | 293 | 269 |
 | `swiglu_seq_f32` | 24 | 0 |
@@ -1060,13 +1072,10 @@ gate is green, but it does not justify default promotion.
 | 64 | 158.869 ms | 157.344 ms | -1.0% | favorable |
 | 128 | 313.777 ms | 308.725 ms | -1.6% | favorable |
 
-Next decision: keep rows=8 behind
-`SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1 SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS=8`
-and do not promote it as a default Qwen route. The next speed design should
-target a sequence-length-aware admission rule, a different short-sequence
-schedule, or a lower-recompute fused kernel. Default promotion still requires
-model-level correctness and a stable end-to-end prefill improvement across the
-release-relevant sequence lengths.
+This rows=8 evidence led to a sequence-length-aware admission rule rather than
+unconditional promotion. The production route now defaults to rows=8 only for
+stateful hybrid BF16 sequence prefill at seqLen >= 64. Short prompts keep the
+original unfused path.
 
 ### Runtime-gated rows=8 admission (2026-05-10)
 
@@ -1108,8 +1117,7 @@ The profile harness now reports active steps for the measured sequence length.
 
 The same adaptive route was then validated through the Xcode release path by
 injecting the environment into the xctestrun. Correctness remained green and
-the active branch selection matched the contract, but the timing was not stable
-enough for default promotion.
+the active branch selection matched the contract.
 
 | Sequence length | Xcode adaptive min64 | Active steps | Active route | Baseline comparator | Decision |
 |---:|---:|---:|---|---:|---|
@@ -1117,11 +1125,17 @@ enough for default promotion.
 | 64 | 157.996 ms | 269 | fused rows=8 | 158.869 ms | favorable but marginal |
 | 128 | 310.846 ms | 269 | fused rows=8 | 313.777 ms | favorable but marginal |
 
-Current decision: keep the adaptive route opt-in. It is structurally better
-than unconditional rows=8 because it avoids emitting fused work for short
-prompts, but the Xcode release-path timing is not stable enough to make it a
-production default. The next speed step should target a lower-recompute fused
-kernel or a broader benchmark set before changing default routing.
+Current decision after the 2026-05-14 default-route rerun: promote the adaptive
+route narrowly for stateful hybrid BF16 sequence prefill. The disabling
+override is intentionally retained so release validation can compare against
+the previous unfused 293-step plan without editing code.
+
+| Validation path | Result | Meaning |
+|---|---|---|
+| `swift build` | Pass | Planner change compiles |
+| `Qwen35ReferenceComparisonTests` default route | Pass, 5/5 | HF reference gates remain green |
+| `Qwen35PrefillProfileTests` default route | Pass | seqLen 16 unfused, seqLen 64/128 fused rows=8 |
+| `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` | Pass | Explicit override restores the unfused plan |
 
 ### Rows-per-SIMD lower-recompute experiment (2026-05-10)
 

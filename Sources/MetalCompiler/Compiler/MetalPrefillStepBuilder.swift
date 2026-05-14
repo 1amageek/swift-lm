@@ -36,10 +36,12 @@ struct MetalPrefillStepBuilder {
             // Lookahead admission: when the next entry is a compatible
             // `mlp.down_proj` and the current entry is the producing SwiGLU,
             // we may emit a single fused kernel instead of the two-step path.
-            // The admission check is gated by `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN`
-            // and only succeeds when every contract gate is satisfied. On
-            // success we consume two entries and continue; on failure we fall
-            // through to the per-entry path.
+            // The admission check is enabled by default for stateful hybrid
+            // sequence prefill and can be overridden with
+            // `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN`. It only succeeds when
+            // every contract gate is satisfied. On success we consume two
+            // entries and continue; on failure we fall through to the per-entry
+            // path.
             if index + 1 < fusedEntries.count {
                 let consumer = fusedEntries[index + 1]
                 if planner.usesRuntimeGatedFusedMlpDown {
@@ -442,18 +444,19 @@ private struct PrefillStepPlanner {
         return raw == "1" || raw.lowercased() == "true"
     }()
 
-    /// Process-wide BF16 fused SwiGLU+down_proj feature flag.
+    /// Process-wide BF16 fused SwiGLU+down_proj override.
     ///
-    /// When `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`, the planner replaces the
-    /// `swiglu_seq_f32 + gemv_seq_bf16_f32s` pair on `mlp.down_proj` with the
-    /// fused `mlp_fused_swiglu_down_seq_bf16_f32s` kernel. Admission requires
-    /// matching compositeID/layerIndex, BF16 sequence prefill precision, BF16
-    /// dense weight, output writing back to hidden, and `.batch` mode. Other
-    /// projections, schemes, and decode are unaffected. Read once per process
-    /// to avoid repeated `getenv` calls.
-    private static let bf16FusedMlpDownEnabled: Bool = {
+    /// By default the planner enables the fused route only for stateful hybrid
+    /// sequence prefill (`convState` or `recurrentState` present), where Qwen
+    /// reference gates and profile windows show a stable long-prompt benefit.
+    /// Set `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` to disable it, or `=1` to
+    /// force-enable it for experiments on non-hybrid plans. Admission still
+    /// requires matching compositeID/layerIndex, BF16 sequence prefill
+    /// precision, BF16 dense weight, output writing back to hidden, and `.batch`
+    /// mode. Other projections, schemes, and decode are unaffected.
+    private static let bf16FusedMlpDownOverride: Bool? = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN"] else {
-            return false
+            return nil
         }
         return raw == "1" || raw.lowercased() == "true"
     }()
@@ -488,16 +491,18 @@ private struct PrefillStepPlanner {
         return min(max(value, 1), 2)
     }()
 
-    /// Minimum sequence length for the opt-in fused SwiGLU+down prefill route.
+    /// Minimum sequence length for the fused SwiGLU+down prefill route.
     ///
     /// Values greater than 1 make the planner emit both the unfused and fused
     /// paths with explicit runtime execution conditions. This is deterministic
     /// runtime admission, not a fallback: short sequences run the existing
     /// unfused contract, and longer sequences run the admitted fused contract.
+    /// The default stays at 64 because the Qwen profile shows the fused route
+    /// is a long-prompt win while seqLen 16 should keep the original path.
     private static let fusedMlpDownMinimumSequenceLength: Int = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH"],
               let value = Int(raw) else {
-            return 1
+            return 64
         }
         return max(value, 1)
     }()
@@ -557,8 +562,12 @@ private struct PrefillStepPlanner {
         Self.fusedMlpDownMinimumSequenceLength
     }
 
+    var bf16FusedMlpDownEnabled: Bool {
+        Self.bf16FusedMlpDownOverride ?? needsDecodeEquivalentSequenceProjectionMath
+    }
+
     var usesRuntimeGatedFusedMlpDown: Bool {
-        Self.bf16FusedMlpDownEnabled && Self.fusedMlpDownMinimumSequenceLength > 1
+        bf16FusedMlpDownEnabled && Self.fusedMlpDownMinimumSequenceLength > 1
     }
 
     init(
@@ -794,7 +803,7 @@ private struct PrefillStepPlanner {
         producer: DispatchEntry,
         consumer: DispatchEntry
     ) throws -> [MetalPrefillStep]? {
-        guard Self.bf16FusedMlpDownEnabled else { return nil }
+        guard bf16FusedMlpDownEnabled else { return nil }
 
         // Gate 1: Fragment pair (SwiGLU producer + LinearFragment consumer).
         guard let swiglu = producer.fragment as? ElementwiseFragment,
