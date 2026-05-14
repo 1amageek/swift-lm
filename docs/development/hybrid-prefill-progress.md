@@ -985,6 +985,7 @@ The same artifact now includes timing columns for each replaceable window:
 | `outputProjectionGpuMicroseconds` | Final output projection cost, including partial projection and reduce when routed |
 | `estimatedTotalBytes` | Estimated traffic for the window entries |
 | `fusedStageCandidate`, `estimatedDispatchReduction` | Whether the default window can be replaced by a dispatch-reducing fused recurrence/partial-output stage and the estimated dispatch-count reduction |
+| `fusedStageExecutionShape`, `unsafeRowGridFusionAllowed` | Required safe execution shape for the next prototype; row-grid fan-out inside the recurrence dispatch is explicitly not allowed because it would duplicate recurrent state updates |
 
 M3D.5 completes the cross-group fan-in harness. The Qwen reference snapshot is
 now schema v6 and stores per-partition output-projection partials for selected
@@ -1023,6 +1024,13 @@ Latest Qwen seqLen 128 profile has 18 recurrent windows, all 18 marked as
 fused-stage candidates, with total estimated dispatch reduction 18. This does
 not claim a speedup. It only proves that the next kernel attempt has a
 structural dispatch-count target before correctness and timing gates are run.
+
+The required execution shape is
+`group-owned-state-update-then-partial-rows`: one threadgroup owner updates each
+recurrent group state exactly once, then emits that group's output-projection
+partial rows. A row-expanded recurrence grid is unsafe because multiple
+threadgroups would race or duplicate the same recurrent and convolution state
+updates before any grid-wide synchronization point exists.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

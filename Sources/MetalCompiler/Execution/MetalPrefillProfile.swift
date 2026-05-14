@@ -278,6 +278,8 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "currentReplaceableStepCount",
                 "targetFusedStageStepCount",
                 "estimatedDispatchReduction",
+                "fusedStageExecutionShape",
+                "unsafeRowGridFusionAllowed",
             ].joined(separator: ","),
         ]
         for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
@@ -306,6 +308,8 @@ struct MetalPrefillProfile: Codable, Sendable {
                 String(timing.currentReplaceableStepCount),
                 String(timing.targetFusedStageStepCount),
                 String(timing.estimatedDispatchReduction),
+                csvEscape(timing.fusedStageExecutionShape),
+                timing.unsafeRowGridFusionAllowed ? "true" : "false",
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
@@ -368,6 +372,8 @@ struct MetalPrefillProfile: Codable, Sendable {
         let currentReplaceableStepCount: Int
         let targetFusedStageStepCount: Int
         let estimatedDispatchReduction: Int
+        let fusedStageExecutionShape: String
+        let unsafeRowGridFusionAllowed: Bool
     }
 
     private func recurrentBlockWindowTiming(
@@ -399,6 +405,9 @@ struct MetalPrefillProfile: Codable, Sendable {
             $0.hasPrefix("recurrent_block_partial_")
         }
         let fusedStageCandidate = !outputProjectionAlreadySplit && estimatedDispatchReduction > 0
+        let fusedStageExecutionShape = fusedStageCandidate
+            ? "group-owned-state-update-then-partial-rows"
+            : "not-a-dispatch-reducing-fused-stage"
         return RecurrentBlockWindowTiming(
             entryCount: windowEntries.count,
             totalGpuMicroseconds: totalGpuMicroseconds,
@@ -410,7 +419,9 @@ struct MetalPrefillProfile: Codable, Sendable {
             fusedStageCandidate: fusedStageCandidate,
             currentReplaceableStepCount: currentReplaceableStepCount,
             targetFusedStageStepCount: targetFusedStageStepCount,
-            estimatedDispatchReduction: estimatedDispatchReduction
+            estimatedDispatchReduction: estimatedDispatchReduction,
+            fusedStageExecutionShape: fusedStageExecutionShape,
+            unsafeRowGridFusionAllowed: false
         )
     }
 

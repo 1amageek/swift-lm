@@ -343,8 +343,9 @@ struct RecurrentBlockFusionWindowTests {
         #expect(csv.contains("layerIndex,rangeStart,rangeEnd"))
         #expect(csv.contains("windowEntryCount,totalGpuMicroseconds"))
         #expect(csv.contains("fusedStageCandidate,currentReplaceableStepCount,targetFusedStageStepCount,estimatedDispatchReduction"))
+        #expect(csv.contains("fusedStageExecutionShape,unsafeRowGridFusionAllowed"))
         #expect(csv.contains("3,0,4,0,1,2,3,3"))
-        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,true,3,2,1"))
+        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,true,3,2,1,group-owned-state-update-then-partial-rows,false"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {
