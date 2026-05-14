@@ -214,6 +214,61 @@ struct RecurrentBlockFusionWindowTests {
         #expect(windows[1].recurrenceKernelName == "ssm_recurrence_seq_bf16_f32_prewrite_decay")
     }
 
+    @Test("Scanner treats partial projection, storage round, and reduce as one logical output projection")
+    func scannerIncludesPartialProjectionReduceOutputWindow() throws {
+        let entries = [
+            profileEntry(
+                index: 0,
+                kernelName: "batched_gemv4_seq_bf16_f32s",
+                category: "projection",
+                weightTensorName: linearAttentionInputWeights(layer: 5)
+            ),
+            profileEntry(
+                index: 1,
+                kernelName: "ssm_recurrence_seq_bf16_f32",
+                category: "ssm_recurrence"
+            ),
+            profileEntry(
+                index: 2,
+                kernelName: "recurrent_block_partial_projection_seq_bf16_f32",
+                category: "projection",
+                weightTensorName: "model.language_model.layers.5.linear_attn.out_proj.weight"
+            ),
+            profileEntry(
+                index: 3,
+                kernelName: "round_bf16_seq_f32",
+                category: "other"
+            ),
+            profileEntry(
+                index: 4,
+                kernelName: "recurrent_block_partial_reduce_seq_f32",
+                category: "projection",
+                weightTensorName: "model.language_model.layers.5.linear_attn.out_proj.weight"
+            ),
+            profileEntry(
+                index: 5,
+                kernelName: "batched_gemv2_seq_bf16_f32s",
+                category: "projection",
+                weightTensorName: [
+                    "model.language_model.layers.5.mlp.gate_proj.weight",
+                    "model.language_model.layers.5.mlp.up_proj.weight",
+                ].joined(separator: ";")
+            ),
+        ]
+
+        let window = try #require(RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries).first)
+
+        #expect(window.layerIndex == 5)
+        #expect(window.range == 0..<5)
+        #expect(window.outputProjectionStepIndex == 4)
+        #expect(window.outputProjectionStepIndices == [2, 4])
+        #expect(window.outputProjectionKernelName == "recurrent_block_partial_reduce_seq_f32")
+        #expect(window.outputProjectionKernelNames == [
+            "recurrent_block_partial_projection_seq_bf16_f32",
+            "recurrent_block_partial_reduce_seq_f32",
+        ])
+    }
+
     @Test("Scanner rejects incomplete or cross-layer windows")
     func scannerRejectsIncompleteOrCrossLayerWindows() {
         let entries = [
@@ -286,7 +341,7 @@ struct RecurrentBlockFusionWindowTests {
         let csv = profile.recurrentBlockWindowCSVString
 
         #expect(csv.contains("layerIndex,rangeStart,rangeEnd"))
-        #expect(csv.contains("3,0,4,0,1,2,3"))
+        #expect(csv.contains("3,0,4,0,1,2,3,3"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {

@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-13
+Last updated: 2026-05-14
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -190,6 +190,8 @@ flowchart TD
 | 2026-05-13 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; opt-in prewrite-decay SSM route keeps Qwen prefill/decode reference gates green |
 | 2026-05-13 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated Qwen-shape SSM recurrence benchmark now includes prewrite-decay variants |
 | 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; same-session full-model profile shows prewrite-decay routes all 18 SSM dispatches but does not beat baseline at seqLen 64/128, so it stays opt-in |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-block profile scanner treats `recurrent_block_partial_projection -> round_bf16 -> recurrent_block_partial_reduce` as one logical output projection |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; opt-in partial route still detects 18 recurrent-block windows and writes partial projection/reduce step indices to `*-recurrent-windows.csv` |
 
 ## Failed Experiments
 
@@ -888,6 +890,31 @@ are considered.
 The profile writer now persists the same admission result as
 `*-recurrent-windows.csv`, so future analysis and routing experiments can
 consume the window list without scraping test logs.
+
+M3D.4 hardens that profile window contract for the opt-in partial output route.
+The logical `linear_attn.out_proj` replacement window is now allowed to span the
+two output stages and the storage round between them:
+
+```mermaid
+flowchart LR
+  A["linear_attn in_proj qkv/z/b/a"] --> B["SSM recurrence"]
+  B --> C["round recurrence output"]
+  C --> D["partial out projection"]
+  D --> E["round partial rows"]
+  E --> F["partial reduce"]
+  F --> G["one logical out_proj window"]
+```
+
+| Route | Window output step indices | Decision |
+|---|---|---|
+| Default out projection | final `gemv_seq_bf16_f32s` only | unchanged |
+| Opt-in partial route | `recurrent_block_partial_projection_seq_bf16_f32`; `recurrent_block_partial_reduce_seq_f32` | tracked as one logical output projection |
+
+Validation with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` detects all 18
+Qwen3.5 linear-attention windows at seqLen 128. The first window is `3..<9` and
+the last is `314..<320`, reflecting the extra partial projection, partial round,
+and partial reduce steps. This is still not a production speed win; it is a
+harness fix so future block-fusion work measures the real replaceable window.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

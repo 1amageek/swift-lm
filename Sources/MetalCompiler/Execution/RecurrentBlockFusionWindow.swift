@@ -9,9 +9,11 @@ struct RecurrentBlockFusionWindow: Sendable, Equatable {
     let recurrenceStepIndex: Int
     let bridgeStepIndices: [Int]
     let outputProjectionStepIndex: Int
+    let outputProjectionStepIndices: [Int]
     let inputProjectionKernelName: String
     let recurrenceKernelName: String
     let outputProjectionKernelName: String
+    let outputProjectionKernelNames: [String]
 
     var range: Range<Int> {
         rangeStart..<rangeEnd
@@ -381,9 +383,13 @@ enum RecurrentBlockFusionWindowScanner {
                     scanIndex += 1
                     continue
                 }
-                if let recurrenceEntry, isLinearAttentionOutputProjection(current),
-                   layerIndex(from: current.weightTensorName) == inputLayerIndex {
-                    outputEntry = current
+                if let recurrenceEntry,
+                   let outputProjection = linearAttentionOutputProjection(
+                    startingAt: scanIndex,
+                    in: orderedEntries,
+                    layerIndex: inputLayerIndex
+                   ) {
+                    outputEntry = outputProjection.entries.last
                     let bridgeRange = orderedEntries[(cursor + 1)..<scanIndex]
                     bridgeEntries = bridgeRange.filter { entry in
                         entry.index != recurrenceEntry.index
@@ -394,6 +400,12 @@ enum RecurrentBlockFusionWindowScanner {
             }
 
             if let recurrenceEntry, let outputEntry {
+                let outputProjection = linearAttentionOutputProjection(
+                    startingAt: scanIndex,
+                    in: orderedEntries,
+                    layerIndex: inputLayerIndex
+                )
+                let outputProjectionEntries = outputProjection?.entries ?? [outputEntry]
                 windows.append(
                     RecurrentBlockFusionWindow(
                         layerIndex: inputLayerIndex,
@@ -403,12 +415,14 @@ enum RecurrentBlockFusionWindowScanner {
                         recurrenceStepIndex: recurrenceEntry.index,
                         bridgeStepIndices: bridgeEntries.map(\.index),
                         outputProjectionStepIndex: outputEntry.index,
+                        outputProjectionStepIndices: outputProjectionEntries.map(\.index),
                         inputProjectionKernelName: inputEntry.kernelName,
                         recurrenceKernelName: recurrenceEntry.kernelName,
-                        outputProjectionKernelName: outputEntry.kernelName
+                        outputProjectionKernelName: outputEntry.kernelName,
+                        outputProjectionKernelNames: outputProjectionEntries.map(\.kernelName)
                     )
                 )
-                cursor = scanIndex + 1
+                cursor = outputProjection?.nextCursor ?? scanIndex + 1
             } else {
                 cursor += 1
             }
@@ -438,6 +452,57 @@ enum RecurrentBlockFusionWindowScanner {
             return false
         }
         return tensorName.contains("linear_attn.out_proj.weight")
+    }
+
+    private struct LinearAttentionOutputProjection {
+        let entries: [MetalPrefillProfile.Entry]
+        let nextCursor: Int
+    }
+
+    private static func linearAttentionOutputProjection(
+        startingAt index: Int,
+        in entries: [MetalPrefillProfile.Entry],
+        layerIndex: Int
+    ) -> LinearAttentionOutputProjection? {
+        guard index < entries.count else { return nil }
+        let first = entries[index]
+        guard isLinearAttentionOutputProjection(first),
+              Self.layerIndex(from: first.weightTensorName) == layerIndex else {
+            return nil
+        }
+        guard !first.kernelName.hasPrefix("recurrent_block_partial_reduce") else {
+            return nil
+        }
+        guard first.kernelName.hasPrefix("recurrent_block_partial_projection") else {
+            return LinearAttentionOutputProjection(entries: [first], nextCursor: index + 1)
+        }
+
+        var scanIndex = index + 1
+        while scanIndex < entries.count {
+            let candidate = entries[scanIndex]
+            if isLinearAttentionInputProjection(candidate) {
+                return nil
+            }
+            if isLinearAttentionOutputProjection(candidate) {
+                guard Self.layerIndex(from: candidate.weightTensorName) == layerIndex,
+                      candidate.kernelName.hasPrefix("recurrent_block_partial_reduce") else {
+                    return nil
+                }
+                return LinearAttentionOutputProjection(
+                    entries: [first, candidate],
+                    nextCursor: scanIndex + 1
+                )
+            }
+            guard isPartialOutputBridge(candidate) else {
+                return nil
+            }
+            scanIndex += 1
+        }
+        return nil
+    }
+
+    private static func isPartialOutputBridge(_ entry: MetalPrefillProfile.Entry) -> Bool {
+        entry.category == "other" && entry.kernelName.hasPrefix("round_")
     }
 
     private static func layerIndex(from tensorName: String?) -> Int? {

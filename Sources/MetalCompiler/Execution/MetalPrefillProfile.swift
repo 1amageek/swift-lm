@@ -262,9 +262,11 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "recurrenceStepIndex",
                 "bridgeStepIndices",
                 "outputProjectionStepIndex",
+                "outputProjectionStepIndices",
                 "inputProjectionKernelName",
                 "recurrenceKernelName",
                 "outputProjectionKernelName",
+                "outputProjectionKernelNames",
             ].joined(separator: ","),
         ]
         for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
@@ -276,9 +278,11 @@ struct MetalPrefillProfile: Codable, Sendable {
                 String(window.recurrenceStepIndex),
                 csvEscape(window.bridgeStepIndices.map(String.init).joined(separator: ";")),
                 String(window.outputProjectionStepIndex),
+                csvEscape(window.outputProjectionStepIndices.map(String.init).joined(separator: ";")),
                 csvEscape(window.inputProjectionKernelName),
                 csvEscape(window.recurrenceKernelName),
                 csvEscape(window.outputProjectionKernelName),
+                csvEscape(window.outputProjectionKernelNames.joined(separator: ";")),
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
