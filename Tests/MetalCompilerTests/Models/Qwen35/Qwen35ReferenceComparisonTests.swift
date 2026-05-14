@@ -172,7 +172,7 @@ struct Qwen35ReferenceComparisonTests {
                 layerIndex: layerIndex,
                 partitionCount: partitionCount,
                 partialProjectionStepIndex: steps.partialProjection,
-                partialProjectionBindingIndex: 2
+                partialProjectionBindingIndex: steps.partialProjectionBindingIndex
             ))
         }
 
@@ -414,6 +414,7 @@ struct Qwen35ReferenceComparisonTests {
         let projection: Int
         let recurrence: Int
         let partialProjection: Int?
+        let partialProjectionBindingIndex: Int
         let outProjection: Int
         let outProjectionBindingIndex: Int
     }
@@ -566,6 +567,7 @@ struct Qwen35ReferenceComparisonTests {
             ?? prefillPlan.steps[firstOutProjection].pipeline.label
             ?? ""
         let partialProjection: Int?
+        let partialProjectionBindingIndex: Int
         let outProjection: Int
         let outProjectionBindingIndex: Int
         if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_projection") {
@@ -577,10 +579,17 @@ struct Qwen35ReferenceComparisonTests {
                 throw SetupError.stepNotFound("linear attention partial output reduce for layer \(layerIndex)")
             }
             partialProjection = firstOutProjection
+            partialProjectionBindingIndex = 2
             outProjection = reduceStep
+            outProjectionBindingIndex = 1
+        } else if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_reduce") {
+            partialProjection = recurrence
+            partialProjectionBindingIndex = 22
+            outProjection = firstOutProjection
             outProjectionBindingIndex = 1
         } else {
             partialProjection = nil
+            partialProjectionBindingIndex = 2
             outProjection = firstOutProjection
             outProjectionBindingIndex = 2
         }
@@ -588,6 +597,7 @@ struct Qwen35ReferenceComparisonTests {
             projection: projection,
             recurrence: recurrence,
             partialProjection: partialProjection,
+            partialProjectionBindingIndex: partialProjectionBindingIndex,
             outProjection: outProjection,
             outProjectionBindingIndex: outProjectionBindingIndex
         )

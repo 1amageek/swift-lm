@@ -207,11 +207,13 @@ enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
 
 enum RecurrentBlockFusionFusedStageExecutionShape: String, Sendable, Equatable {
     case groupOwnedStateUpdateThenPartialRows = "group-owned-state-update-then-partial-rows"
+    case partialPartitionOwnedStateUpdatesThenPartialRows = "partial-partition-owned-state-updates-then-partial-rows"
 }
 
 struct RecurrentBlockFusionFusedStagePlan: Sendable, Equatable {
     let layerIndex: Int
     let partitionCount: Int
+    let recurrentGroupsPerPartition: Int
     let headsPerPartition: Int
     let partitionInputDimension: Int
     let recurrentOutputDimension: Int
@@ -234,7 +236,7 @@ enum RecurrentBlockFusionFusedStageRejection: Sendable, Equatable {
     case outputProjectionShapeMismatch(expectedInputDimension: Int, actualInputDimension: Int)
     case unevenHeadPartition(headCount: Int, partitionCount: Int)
     case noScratchCompatiblePartition(groupCount: Int, maximumPartialScratchSlotCount: Int)
-    case partialPartitionDoesNotMatchRecurrentGroups(groupCount: Int, partitionCount: Int)
+    case unevenRecurrentGroupPartition(groupCount: Int, partitionCount: Int)
     case noDispatchReduction(currentStepCount: Int, targetStepCount: Int)
 }
 
@@ -447,8 +449,8 @@ enum RecurrentBlockFusionPrototypePlanner {
                 maximumPartialScratchSlotCount: maximumPartialScratchSlotCount
             ))
         }
-        if partitionCount > 1, partitionCount != recurrence.groupCount {
-            rejections.append(.partialPartitionDoesNotMatchRecurrentGroups(
+        if partitionCount > 1, recurrence.groupCount % partitionCount != 0 {
+            rejections.append(.unevenRecurrentGroupPartition(
                 groupCount: recurrence.groupCount,
                 partitionCount: partitionCount
             ))
@@ -467,11 +469,16 @@ enum RecurrentBlockFusionPrototypePlanner {
             return .rejected(rejections)
         }
 
+        let recurrentGroupsPerPartition = recurrence.groupCount / partitionCount
         let headsPerPartition = recurrence.headCount / partitionCount
         let partitionInputDimension = recurrentOutputDimension / partitionCount
+        let executionShape: RecurrentBlockFusionFusedStageExecutionShape = recurrentGroupsPerPartition == 1
+            ? .groupOwnedStateUpdateThenPartialRows
+            : .partialPartitionOwnedStateUpdatesThenPartialRows
         return .candidate(RecurrentBlockFusionFusedStagePlan(
             layerIndex: window.layerIndex,
             partitionCount: partitionCount,
+            recurrentGroupsPerPartition: recurrentGroupsPerPartition,
             headsPerPartition: headsPerPartition,
             partitionInputDimension: partitionInputDimension,
             recurrentOutputDimension: recurrentOutputDimension,
@@ -479,7 +486,7 @@ enum RecurrentBlockFusionPrototypePlanner {
             currentReplaceableStepCount: currentReplaceableStepCount,
             targetFusedStageStepCount: fusedStageStepCount,
             estimatedDispatchReduction: estimatedDispatchReduction,
-            executionShape: .groupOwnedStateUpdateThenPartialRows,
+            executionShape: executionShape,
             unsafeRowGridFusionAllowed: false,
             numericalContract: .referenceGated
         ))
@@ -608,8 +615,8 @@ enum RecurrentBlockFusionWindowScanner {
               Self.layerIndex(from: first.weightTensorName) == layerIndex else {
             return nil
         }
-        guard !first.kernelName.hasPrefix("recurrent_block_partial_reduce") else {
-            return nil
+        if first.kernelName.hasPrefix("recurrent_block_partial_reduce") {
+            return LinearAttentionOutputProjection(entries: [first], nextCursor: index + 1)
         }
         guard first.kernelName.hasPrefix("recurrent_block_partial_projection") else {
             return LinearAttentionOutputProjection(entries: [first], nextCursor: index + 1)

@@ -227,6 +227,10 @@ flowchart TD
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission rejects cases where partial partitions would merge multiple recurrent groups and require cross-threadgroup accumulation |
 | 2026-05-14 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; BF16 SSM sequence recurrence now has a group-owned partial-emission variant that preserves output, recurrent state, conv state, and partition partials in the synthetic harness |
 | 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete BF16 library includes `ssm_recurrence_seq_bf16_f32_group_owned_partial` |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission now distinguishes group-owned and partial-partition-owned execution shapes, and the profile CSV no longer claims a concrete shape without planner admission |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; default Qwen route remains schema v6 reference-equivalent after extending boundary probing for future fused recurrence partial-emission windows |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in partial route still validates Metal scratch partial readback and final reduce after the fused-window probe changes |
+| 2026-05-14 | `swift build`, `git diff --check`, changed-file `try?` scan | Pass; build and hygiene remain clean after correcting the fused-stage admission contract |
 
 ## Failed Experiments
 
@@ -245,6 +249,7 @@ flowchart TD
 | BF16 dense batched MPP priority | Reference comparison failed immediately: case 0 prefill token drifted from HF `760` to Metal `120905`, final hidden max error was `26.9375`, and state/KV drift propagated through decode0 | Rejected and not retained as an opt-in runtime route; any future MPP work must first make the MPP math/storage contract reference-equivalent in isolation |
 | Opt-in recurrent-block partial output projection | Correctness remains green, but latest Qwen profile after fused MLP default changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 67.771/163.120/320.098 ms | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
 | Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
+| Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 
 ## Open Decisions
 
@@ -259,7 +264,7 @@ flowchart TD
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
-| Next recurrent-block optimization unit | Prototype a dispatch-reducing recurrent-block kernel behind an explicit flag; it must satisfy schema v6 boundary, partial fan-in, state/KV, and decode0 gates before any profile result is considered |
+| Next recurrent-block optimization unit | Prototype a dispatch-reducing recurrent-block kernel behind an explicit flag; Qwen requires the partial-partition-owned execution shape, and it must satisfy schema v6 boundary, partial fan-in, state/KV, and decode0 gates before any profile result is considered |
 
 ## Current Production Prefill Profile
 
@@ -990,7 +995,7 @@ The same artifact now includes timing columns for each replaceable window:
 | `outputProjectionGpuMicroseconds` | Final output projection cost, including partial projection and reduce when routed |
 | `estimatedTotalBytes` | Estimated traffic for the window entries |
 | `fusedStageCandidate`, `estimatedDispatchReduction` | Whether the default window can be replaced by a dispatch-reducing fused recurrence/partial-output stage and the estimated dispatch-count reduction |
-| `fusedStageExecutionShape`, `unsafeRowGridFusionAllowed` | Required safe execution shape for the next prototype; row-grid fan-out inside the recurrence dispatch is explicitly not allowed because it would duplicate recurrent state updates |
+| `fusedStageExecutionShape`, `unsafeRowGridFusionAllowed` | Profile-side candidate label and row-grid safety flag; exact execution shape must come from the typed prototype planner because it depends on recurrent-group partitioning |
 
 M3D.5 completes the cross-group fan-in harness. The Qwen reference snapshot is
 now schema v6 and stores per-partition output-projection partials for selected
@@ -1030,40 +1035,44 @@ fused-stage candidates, with total estimated dispatch reduction 18. This does
 not claim a speedup. It only proves that the next kernel attempt has a
 structural dispatch-count target before correctness and timing gates are run.
 
-The required execution shape is
-`group-owned-state-update-then-partial-rows`: one threadgroup owner updates each
-recurrent group state exactly once, then emits that group's output-projection
-partial rows. A row-expanded recurrence grid is unsafe because multiple
-threadgroups would race or duplicate the same recurrent and convolution state
-updates before any grid-wide synchronization point exists.
+The profile-side execution-shape column intentionally reports
+`requires-prototype-planner-admission` for dispatch-reducing candidates. The
+profile artifact knows the window and dispatch-count opportunity, but the exact
+safe execution shape depends on recurrent-group partitioning and is decided by
+`RecurrentBlockFusionPrototypePlanner.fusedStageDecision`.
 
 M3D.7 moves that safety rule from profile documentation into planner state.
 `RecurrentBlockFusionPrototypePlanner.fusedStageDecision` now produces a typed
 `RecurrentBlockFusionFusedStagePlan` only when:
 
-- the recurrent block is multi-group and can be partitioned into the partial
-  scratch layout with one partial partition per recurrent group;
+- the recurrent block is multi-group and can be evenly partitioned into the
+  available partial scratch layout;
 - input projection, recurrence, and output projection dimensions match the
   Qwen linear-attention contract;
 - replacing `recurrence + bridge + output_projection` with
   `fused_recurrence_partial_projection + partial_reduce` removes at least one
   dispatch;
-- the execution shape is
-  `group-owned-state-update-then-partial-rows`, with
-  `unsafeRowGridFusionAllowed=false`.
+- the execution shape is either `group-owned-state-update-then-partial-rows`
+  when one partial partition owns one recurrent group, or
+  `partial-partition-owned-state-updates-then-partial-rows` when one partial
+  partition owns multiple recurrent groups and updates them serially before
+  emitting its partial rows;
+- `unsafeRowGridFusionAllowed=false`.
 
 This keeps the next kernel prototype behind an explicit admission contract. A
 window that has no bridge dispatch to remove is rejected even if it is otherwise
 shape-compatible, because it would add kernel risk without a dispatch-count
 benefit.
 
-The one-partition-per-recurrent-group rule is intentionally stricter than the
-existing two-stage partial projection route. A standalone partial projection can
-use a row-grid and split by any scratch-compatible divisor; a fused recurrence
-stage cannot, because each recurrent group has exactly one state-update owner.
-If a partial partition merged multiple recurrent groups, those group owners
-would need cross-threadgroup accumulation before the reduce stage. That is not
-admitted by the current safe design.
+The safe fused-stage rule is intentionally stricter than the existing two-stage
+partial projection route. A standalone partial projection can use a row-grid and
+split by any scratch-compatible divisor. A fused recurrence stage cannot expand
+rows inside the recurrence grid, because each recurrent group has exactly one
+state-update owner. When scratch has fewer partitions than recurrent groups, the
+admitted shape is partial-partition-owned: one partition owner updates all
+groups assigned to that partition serially and then emits that partition's
+partial rows. This preserves the one-state-update-owner invariant without
+requiring one scratch slot per recurrent group.
 
 M3D.8 adds the first kernel-level harness for that execution shape. The new
 synthetic `generateRecurrentBlockGroupOwnedPartialProjection` kernel dispatches

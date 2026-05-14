@@ -169,6 +169,7 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .candidate(RecurrentBlockFusionFusedStagePlan(
             layerIndex: 8,
             partitionCount: 4,
+            recurrentGroupsPerPartition: 1,
             headsPerPartition: 4,
             partitionInputDimension: 64,
             recurrentOutputDimension: 256,
@@ -199,8 +200,8 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .rejected([.noDispatchReduction(currentStepCount: 2, targetStepCount: 2)]))
     }
 
-    @Test("Prototype planner rejects fused-stage plan when partial partitions merge recurrent groups")
-    func prototypePlannerRejectsFusedStagePlanWhenPartitionsMergeGroups() throws {
+    @Test("Prototype planner creates partial-partition-owned plan when partial partitions cover multiple recurrent groups")
+    func prototypePlannerCreatesPartialPartitionOwnedFusedStagePlan() throws {
         let entries = [
             dispatchInputProjection(index: 0, layer: 8, groups: 8),
             dispatchRecurrence(index: 1, layer: 8, groups: 8),
@@ -218,9 +219,21 @@ struct RecurrentBlockFusionWindowTests {
             entries: entries
         )
 
-        #expect(decision == .rejected([
-            .partialPartitionDoesNotMatchRecurrentGroups(groupCount: 8, partitionCount: 4),
-        ]))
+        #expect(decision == .candidate(RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 8,
+            partitionCount: 4,
+            recurrentGroupsPerPartition: 2,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .partialPartitionOwnedStateUpdatesThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )))
     }
 
     @Test("Scanner finds linear attention recurrent block windows")
@@ -345,6 +358,49 @@ struct RecurrentBlockFusionWindowTests {
         ])
     }
 
+    @Test("Scanner treats fused recurrence partial emission and reduce as one logical output projection")
+    func scannerIncludesFusedRecurrencePartialEmissionOutputWindow() throws {
+        let entries = [
+            profileEntry(
+                index: 0,
+                kernelName: "batched_gemv4_seq_bf16_f32s",
+                category: "projection",
+                weightTensorName: linearAttentionInputWeights(layer: 5)
+            ),
+            profileEntry(
+                index: 1,
+                kernelName: "ssm_recurrence_seq_bf16_f32_group_owned_partial",
+                category: "ssm_recurrence"
+            ),
+            profileEntry(
+                index: 2,
+                kernelName: "round_bf16_seq_f32",
+                category: "other"
+            ),
+            profileEntry(
+                index: 3,
+                kernelName: "round_bf16_seq_f32",
+                category: "other"
+            ),
+            profileEntry(
+                index: 4,
+                kernelName: "recurrent_block_partial_reduce_seq_f32",
+                category: "projection",
+                weightTensorName: "model.language_model.layers.5.linear_attn.out_proj.weight"
+            ),
+        ]
+
+        let window = try #require(RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries).first)
+
+        #expect(window.layerIndex == 5)
+        #expect(window.range == 0..<5)
+        #expect(window.recurrenceKernelName == "ssm_recurrence_seq_bf16_f32_group_owned_partial")
+        #expect(window.bridgeStepIndices == [2, 3])
+        #expect(window.outputProjectionStepIndex == 4)
+        #expect(window.outputProjectionStepIndices == [4])
+        #expect(window.outputProjectionKernelName == "recurrent_block_partial_reduce_seq_f32")
+    }
+
     @Test("Scanner rejects incomplete or cross-layer windows")
     func scannerRejectsIncompleteOrCrossLayerWindows() {
         let entries = [
@@ -421,7 +477,7 @@ struct RecurrentBlockFusionWindowTests {
         #expect(csv.contains("fusedStageCandidate,currentReplaceableStepCount,targetFusedStageStepCount,estimatedDispatchReduction"))
         #expect(csv.contains("fusedStageExecutionShape,unsafeRowGridFusionAllowed"))
         #expect(csv.contains("3,0,4,0,1,2,3,3"))
-        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,true,3,2,1,group-owned-state-update-then-partial-rows,false"))
+        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,true,3,2,1,requires-prototype-planner-admission,false"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {

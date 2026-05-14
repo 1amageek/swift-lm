@@ -406,7 +406,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         }
         let fusedStageCandidate = !outputProjectionAlreadySplit && estimatedDispatchReduction > 0
         let fusedStageExecutionShape = fusedStageCandidate
-            ? "group-owned-state-update-then-partial-rows"
+            ? "requires-prototype-planner-admission"
             : "not-a-dispatch-reducing-fused-stage"
         return RecurrentBlockWindowTiming(
             entryCount: windowEntries.count,
