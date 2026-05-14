@@ -274,6 +274,10 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "bridgeGpuMicroseconds",
                 "outputProjectionGpuMicroseconds",
                 "estimatedTotalBytes",
+                "recurrenceThreadgroupCount",
+                "outputProjectionThreadgroupCount",
+                "rowGridParallelismPreserved",
+                "parallelismRisk",
                 "fusedStageCandidate",
                 "currentReplaceableStepCount",
                 "targetFusedStageStepCount",
@@ -304,6 +308,10 @@ struct MetalPrefillProfile: Codable, Sendable {
                 String(format: "%.3f", timing.bridgeGpuMicroseconds),
                 String(format: "%.3f", timing.outputProjectionGpuMicroseconds),
                 String(timing.estimatedTotalBytes),
+                String(timing.recurrenceThreadgroupCount),
+                String(timing.outputProjectionThreadgroupCount),
+                timing.rowGridParallelismPreserved ? "true" : "false",
+                csvEscape(timing.parallelismRisk),
                 timing.fusedStageCandidate ? "true" : "false",
                 String(timing.currentReplaceableStepCount),
                 String(timing.targetFusedStageStepCount),
@@ -368,6 +376,10 @@ struct MetalPrefillProfile: Codable, Sendable {
         let bridgeGpuMicroseconds: Double
         let outputProjectionGpuMicroseconds: Double
         let estimatedTotalBytes: Int
+        let recurrenceThreadgroupCount: Int
+        let outputProjectionThreadgroupCount: Int
+        let rowGridParallelismPreserved: Bool
+        let parallelismRisk: String
         let fusedStageCandidate: Bool
         let currentReplaceableStepCount: Int
         let targetFusedStageStepCount: Int
@@ -392,6 +404,21 @@ struct MetalPrefillProfile: Codable, Sendable {
         let outputProjectionGpuMicroseconds = windowEntries
             .filter { outputProjectionStepIndices.contains($0.index) }
             .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let recurrenceThreadgroupCount = windowEntries
+            .filter { $0.index == window.recurrenceStepIndex }
+            .reduce(0) { $0 + threadgroupCount($1) }
+        let outputProjectionThreadgroupCount = windowEntries
+            .filter { outputProjectionStepIndices.contains($0.index) }
+            .reduce(0) { $0 + threadgroupCount($1) }
+        let recurrenceEmitsPartials = window.recurrenceKernelName.hasPrefix("ssm_recurrence_seq")
+            && window.recurrenceKernelName.hasSuffix("_partial")
+        let outputProjectionIsReduceOnly = window.outputProjectionKernelNames.allSatisfy {
+            $0.hasPrefix("recurrent_block_partial_reduce")
+        }
+        let rowGridParallelismPreserved = !(recurrenceEmitsPartials && outputProjectionIsReduceOnly)
+        let parallelismRisk = rowGridParallelismPreserved
+            ? "none"
+            : "fused-recurrence-serializes-output-row-projection-inside-sequence-loop"
         let totalGpuMicroseconds = windowEntries.reduce(0) { $0 + $1.totalGpuMicroseconds }
         let bridgeGpuMicroseconds = totalGpuMicroseconds
             - inputProjectionGpuMicroseconds
@@ -416,6 +443,10 @@ struct MetalPrefillProfile: Codable, Sendable {
             bridgeGpuMicroseconds: bridgeGpuMicroseconds,
             outputProjectionGpuMicroseconds: outputProjectionGpuMicroseconds,
             estimatedTotalBytes: estimatedTotalBytes,
+            recurrenceThreadgroupCount: recurrenceThreadgroupCount,
+            outputProjectionThreadgroupCount: outputProjectionThreadgroupCount,
+            rowGridParallelismPreserved: rowGridParallelismPreserved,
+            parallelismRisk: parallelismRisk,
             fusedStageCandidate: fusedStageCandidate,
             currentReplaceableStepCount: currentReplaceableStepCount,
             targetFusedStageStepCount: targetFusedStageStepCount,
@@ -423,6 +454,10 @@ struct MetalPrefillProfile: Codable, Sendable {
             fusedStageExecutionShape: fusedStageExecutionShape,
             unsafeRowGridFusionAllowed: false
         )
+    }
+
+    private func threadgroupCount(_ entry: Entry) -> Int {
+        max(entry.gridWidth, 1) * max(entry.gridHeight, 1) * max(entry.gridDepth, 1)
     }
 
     private struct MLPFusionWindowTiming {

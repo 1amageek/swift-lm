@@ -433,6 +433,52 @@ struct RecurrentBlockFusionWindowTests {
         #expect(window.outputProjectionKernelName == "recurrent_block_partial_reduce_seq_f32")
     }
 
+    @Test("Profile flags fused recurrence partial emission row-grid parallelism risk")
+    func profileFlagsFusedRecurrencePartialEmissionParallelismRisk() {
+        let profile = MetalPrefillProfile(
+            profileKind: "step",
+            sequenceLength: 128,
+            maximumSequenceLength: 128,
+            iterations: 1,
+            warmupIterations: 0,
+            stepCount: 3,
+            entries: [
+                profileEntry(
+                    index: 0,
+                    kernelName: "batched_gemv4_seq_bf16_f32s",
+                    category: "projection",
+                    weightTensorName: linearAttentionInputWeights(layer: 6),
+                    gridWidth: 4112,
+                    gridHeight: 128,
+                    gridDepth: 1
+                ),
+                profileEntry(
+                    index: 1,
+                    kernelName: "ssm_recurrence_seq_bf16_f32_partition_owned_partial",
+                    category: "ssm_recurrence",
+                    gridWidth: 4,
+                    gridHeight: 1,
+                    gridDepth: 1
+                ),
+                profileEntry(
+                    index: 2,
+                    kernelName: "recurrent_block_partial_reduce_seq_f32",
+                    category: "projection",
+                    weightTensorName: "model.language_model.layers.6.linear_attn.out_proj.weight",
+                    gridWidth: 4,
+                    gridHeight: 128,
+                    gridDepth: 1
+                ),
+            ],
+            generatedAt: "2026-05-15T00:00:00Z"
+        )
+
+        let csv = profile.recurrentBlockWindowCSVString
+
+        #expect(csv.contains("recurrenceThreadgroupCount,outputProjectionThreadgroupCount,rowGridParallelismPreserved,parallelismRisk"))
+        #expect(csv.contains("4,512,false,fused-recurrence-serializes-output-row-projection-inside-sequence-loop"))
+    }
+
     @Test("Scanner rejects incomplete or cross-layer windows")
     func scannerRejectsIncompleteOrCrossLayerWindows() {
         let entries = [
@@ -506,10 +552,11 @@ struct RecurrentBlockFusionWindowTests {
 
         #expect(csv.contains("layerIndex,rangeStart,rangeEnd"))
         #expect(csv.contains("windowEntryCount,totalGpuMicroseconds"))
+        #expect(csv.contains("recurrenceThreadgroupCount,outputProjectionThreadgroupCount,rowGridParallelismPreserved,parallelismRisk"))
         #expect(csv.contains("fusedStageCandidate,currentReplaceableStepCount,targetFusedStageStepCount,estimatedDispatchReduction"))
         #expect(csv.contains("fusedStageExecutionShape,unsafeRowGridFusionAllowed"))
         #expect(csv.contains("3,0,4,0,1,2,3,3"))
-        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,true,3,2,1,requires-prototype-planner-admission,false"))
+        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,1,1,true,none,true,3,2,1,requires-prototype-planner-admission,false"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {
@@ -574,7 +621,10 @@ struct RecurrentBlockFusionWindowTests {
         index: Int,
         kernelName: String,
         category: String,
-        weightTensorName: String? = nil
+        weightTensorName: String? = nil,
+        gridWidth: Int = 1,
+        gridHeight: Int = 1,
+        gridDepth: Int = 1
     ) -> MetalPrefillProfile.Entry {
         MetalPrefillProfile.Entry(
             scope: "step",
@@ -587,9 +637,9 @@ struct RecurrentBlockFusionWindowTests {
             layerIndex: nil,
             entryIndex: index,
             weightTensorName: weightTensorName,
-            gridWidth: 1,
-            gridHeight: 1,
-            gridDepth: 1,
+            gridWidth: gridWidth,
+            gridHeight: gridHeight,
+            gridDepth: gridDepth,
             threadgroupWidth: 1,
             threadgroupHeight: 1,
             threadgroupDepth: 1,

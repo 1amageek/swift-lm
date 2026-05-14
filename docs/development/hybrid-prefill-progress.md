@@ -236,6 +236,8 @@ flowchart TD
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission can count the implicit decode-equivalent storage-round bridge inserted below dispatch-entry planning |
 | 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; opt-in fused recurrent partial-emission route validates schema v6 block boundaries, Metal scratch partials, reduced output, final hidden/logits, state/KV, and decode0 |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; route fires 18 `ssm_recurrence_seq_bf16_f32_partition_owned_partial` dispatches and removes `linear_attn.out_proj` GEMV, but regresses full-model prefill heavily |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window profile CSV now records recurrence/output threadgroup counts and flags fused recurrence partial-emission as output-row parallelism collapse |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; real Qwen recurrent-window artifact marks all fused partial-emission windows with `rowGridParallelismPreserved=false` and `fused-recurrence-serializes-output-row-projection-inside-sequence-loop` |
 
 ## Failed Experiments
 
@@ -298,6 +300,15 @@ flowchart LR
 The route remains useful because it proves that the reference harness can catch
 cross-group fan-in and partial scratch layout errors on the fused execution
 shape. It is not eligible for default routing.
+
+The profile harness now exposes the failure mode directly:
+
+| CSV column | Meaning |
+|---|---|
+| `recurrenceThreadgroupCount` | Number of threadgroups used by the recurrence-stage entry |
+| `outputProjectionThreadgroupCount` | Number of threadgroups used by the output-projection/reduce entries |
+| `rowGridParallelismPreserved` | `false` when a fused recurrence partial-emission kernel serializes output-row projection inside the sequence loop |
+| `parallelismRisk` | Machine-readable reason that must be cleared before default routing |
 
 ## Current Production Prefill Profile
 
