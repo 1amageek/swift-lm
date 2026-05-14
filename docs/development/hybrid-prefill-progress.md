@@ -192,6 +192,8 @@ flowchart TD
 | 2026-05-13 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_PREWRITE_DECAY=1` | Pass; same-session full-model profile shows prewrite-decay routes all 18 SSM dispatches but does not beat baseline at seqLen 64/128, so it stays opt-in |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-block profile scanner treats `recurrent_block_partial_projection -> round_bf16 -> recurrent_block_partial_reduce` as one logical output projection |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; opt-in partial route still detects 18 recurrent-block windows and writes partial projection/reduce step indices to `*-recurrent-windows.csv` |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes per-window GPU timing and estimated total bytes |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 timed windows with input projection, recurrence, bridge, and output projection timing columns |
 
 ## Failed Experiments
 
@@ -915,6 +917,17 @@ Qwen3.5 linear-attention windows at seqLen 128. The first window is `3..<9` and
 the last is `314..<320`, reflecting the extra partial projection, partial round,
 and partial reduce steps. This is still not a production speed win; it is a
 harness fix so future block-fusion work measures the real replaceable window.
+
+The same artifact now includes timing columns for each replaceable window:
+
+| Column group | Meaning |
+|---|---|
+| `windowEntryCount`, `totalGpuMicroseconds` | Whole replaceable window cost |
+| `inputProjectionGpuMicroseconds` | Batched `linear_attn.in_proj_*` cost |
+| `recurrenceGpuMicroseconds` | SSM recurrence cost |
+| `bridgeGpuMicroseconds` | Rounds and other non-core steps inside the window |
+| `outputProjectionGpuMicroseconds` | Final output projection cost, including partial projection and reduce when routed |
+| `estimatedTotalBytes` | Estimated traffic for the window entries |
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

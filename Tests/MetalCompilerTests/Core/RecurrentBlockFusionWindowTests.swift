@@ -341,7 +341,9 @@ struct RecurrentBlockFusionWindowTests {
         let csv = profile.recurrentBlockWindowCSVString
 
         #expect(csv.contains("layerIndex,rangeStart,rangeEnd"))
+        #expect(csv.contains("windowEntryCount,totalGpuMicroseconds"))
         #expect(csv.contains("3,0,4,0,1,2,3,3"))
+        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {

@@ -267,9 +267,17 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "recurrenceKernelName",
                 "outputProjectionKernelName",
                 "outputProjectionKernelNames",
+                "windowEntryCount",
+                "totalGpuMicroseconds",
+                "inputProjectionGpuMicroseconds",
+                "recurrenceGpuMicroseconds",
+                "bridgeGpuMicroseconds",
+                "outputProjectionGpuMicroseconds",
+                "estimatedTotalBytes",
             ].joined(separator: ","),
         ]
         for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
+            let timing = recurrentBlockWindowTiming(for: window)
             lines.append([
                 String(window.layerIndex),
                 String(window.rangeStart),
@@ -283,9 +291,59 @@ struct MetalPrefillProfile: Codable, Sendable {
                 csvEscape(window.recurrenceKernelName),
                 csvEscape(window.outputProjectionKernelName),
                 csvEscape(window.outputProjectionKernelNames.joined(separator: ";")),
+                String(timing.entryCount),
+                String(format: "%.3f", timing.totalGpuMicroseconds),
+                String(format: "%.3f", timing.inputProjectionGpuMicroseconds),
+                String(format: "%.3f", timing.recurrenceGpuMicroseconds),
+                String(format: "%.3f", timing.bridgeGpuMicroseconds),
+                String(format: "%.3f", timing.outputProjectionGpuMicroseconds),
+                String(timing.estimatedTotalBytes),
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
+    }
+
+    private struct RecurrentBlockWindowTiming {
+        let entryCount: Int
+        let totalGpuMicroseconds: Double
+        let inputProjectionGpuMicroseconds: Double
+        let recurrenceGpuMicroseconds: Double
+        let bridgeGpuMicroseconds: Double
+        let outputProjectionGpuMicroseconds: Double
+        let estimatedTotalBytes: Int
+    }
+
+    private func recurrentBlockWindowTiming(
+        for window: RecurrentBlockFusionWindow
+    ) -> RecurrentBlockWindowTiming {
+        let windowEntries = entries.filter { entry in
+            entry.rangeStart >= window.rangeStart && entry.rangeEnd <= window.rangeEnd
+        }
+        let inputProjectionGpuMicroseconds = windowEntries
+            .filter { $0.index == window.inputProjectionStepIndex }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let recurrenceGpuMicroseconds = windowEntries
+            .filter { $0.index == window.recurrenceStepIndex }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let outputProjectionStepIndices = Set(window.outputProjectionStepIndices)
+        let outputProjectionGpuMicroseconds = windowEntries
+            .filter { outputProjectionStepIndices.contains($0.index) }
+            .reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let totalGpuMicroseconds = windowEntries.reduce(0) { $0 + $1.totalGpuMicroseconds }
+        let bridgeGpuMicroseconds = totalGpuMicroseconds
+            - inputProjectionGpuMicroseconds
+            - recurrenceGpuMicroseconds
+            - outputProjectionGpuMicroseconds
+        let estimatedTotalBytes = windowEntries.reduce(0) { $0 + $1.estimatedTotalBytes }
+        return RecurrentBlockWindowTiming(
+            entryCount: windowEntries.count,
+            totalGpuMicroseconds: totalGpuMicroseconds,
+            inputProjectionGpuMicroseconds: inputProjectionGpuMicroseconds,
+            recurrenceGpuMicroseconds: recurrenceGpuMicroseconds,
+            bridgeGpuMicroseconds: bridgeGpuMicroseconds,
+            outputProjectionGpuMicroseconds: outputProjectionGpuMicroseconds,
+            estimatedTotalBytes: estimatedTotalBytes
+        )
     }
 
     func writeArtifacts(directory: URL, basename: String) throws -> [URL] {
