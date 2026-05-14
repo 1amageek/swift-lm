@@ -208,6 +208,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete generated library compiles with `attn_fused_sigmoid_o_seq_bf16_f32s` |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; opt-in attention output fusion remains reference-equivalent |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; route removes 6 `packed_sigmoid_gate_seq_f32` and 6 `self_attn.o_proj` GEMV dispatches but regresses total profile, so it stays non-default |
+| 2026-05-14 | `swift test --filter FusedPackedSigmoidOutputEquivalenceTests` | Pass; opt-in packed-sigmoid attention output fusion matches both Swift reference and the unfused two-kernel path |
 
 ## Failed Experiments
 
