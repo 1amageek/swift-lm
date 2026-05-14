@@ -667,6 +667,19 @@ struct MetalKernelSourceCatalog {
                     tileElements: 256
                 ))
             }
+            // Row2 keeps the sequence tile at 1 but lets each SIMD group compute
+            // two output rows while sharing the same staged input tile. This is
+            // an opt-in single-projection experiment for dependent output
+            // projections where tile2 did not improve full-model timing.
+            if generatedNames.insert("gemv_seq_bf16_f32s_rps2").inserted {
+                sources.append(MetalSourceGenerator.generateSequenceGEMV(
+                    name: "gemv_seq_bf16_f32s_rps2",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    tileElements: 256,
+                    rowsPerSimdgroup: 2
+                ))
+            }
             // Producer-consumer fusion of `swiglu_seq_f32` and the BF16 sequence
             // GEMV used by `mlp.down_proj`. Generated unconditionally so the
             // routing pass can pick it up when the feature flag is enabled, but

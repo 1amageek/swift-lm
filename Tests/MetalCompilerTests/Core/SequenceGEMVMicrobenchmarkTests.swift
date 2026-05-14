@@ -24,9 +24,10 @@ struct SequenceGEMVMicrobenchmarkTests {
             Shape(role: "mlp.down_proj", inputDimension: 3584, outputDimension: 1024),
         ]
         let variants = [
-            Variant(name: "base", kernelName: "bench_gemv_seq_bf16_f32s", sequenceTile: 1),
-            Variant(name: "tile2", kernelName: "bench_gemv_seq_bf16_f32s_tile2", sequenceTile: 2),
-            Variant(name: "tile4", kernelName: "bench_gemv_seq_bf16_f32s_tile4", sequenceTile: 4),
+            Variant(name: "base", kernelName: "bench_gemv_seq_bf16_f32s", sequenceTile: 1, rowsPerSimdgroup: 1),
+            Variant(name: "row2", kernelName: "bench_gemv_seq_bf16_f32s_rps2", sequenceTile: 1, rowsPerSimdgroup: 2),
+            Variant(name: "tile2", kernelName: "bench_gemv_seq_bf16_f32s_tile2", sequenceTile: 2, rowsPerSimdgroup: 1),
+            Variant(name: "tile4", kernelName: "bench_gemv_seq_bf16_f32s_tile4", sequenceTile: 4, rowsPerSimdgroup: 1),
         ]
 
         var rows: [ResultRow] = []
@@ -383,6 +384,7 @@ private struct Variant {
     let name: String
     let kernelName: String
     let sequenceTile: Int
+    let rowsPerSimdgroup: Int
 }
 
 private struct BatchedVariant {
@@ -484,6 +486,12 @@ private struct MicrobenchmarkHarness {
                 weightFormat: WeightFormats.bfloat16,
                 sequenceTile: 2
             ),
+            MetalSourceGenerator.generateSequenceGEMV(
+                name: "bench_gemv_seq_bf16_f32s_rps2",
+                bufferPrecision: .float32,
+                weightFormat: WeightFormats.bfloat16,
+                rowsPerSimdgroup: 2
+            ),
             MetalSourceGenerator.generateTiledSequenceGEMV(
                 name: "bench_gemv_seq_bf16_f32s_tile4",
                 bufferPrecision: .float32,
@@ -568,6 +576,7 @@ private struct MicrobenchmarkHarness {
         let names = [
             "bench_gemv_seq_bf16_f32s",
             "bench_gemv_seq_bf16_f32s_tile2",
+            "bench_gemv_seq_bf16_f32s_rps2",
             "bench_gemv_seq_bf16_f32s_tile4",
             "bench_batched_gemv2_seq_bf16_f32s",
             "bench_batched_gemv2_seq_bf16_f32s_tile2",
@@ -612,7 +621,8 @@ private struct MicrobenchmarkHarness {
             pipeline: pipeline,
             outputDimension: shape.outputDimension,
             sequenceLength: sequenceLength,
-            sequenceTile: variant.sequenceTile
+            sequenceTile: variant.sequenceTile,
+            rowsPerSimdgroup: variant.rowsPerSimdgroup
         )
 
         for _ in 0..<warmupIterations {
@@ -917,15 +927,17 @@ private struct MicrobenchmarkHarness {
         pipeline: MTLComputePipelineState,
         outputDimension: Int,
         sequenceLength: Int,
-        sequenceTile: Int
+        sequenceTile: Int,
+        rowsPerSimdgroup: Int = 1
     ) -> (grid: MTLSize, threadgroup: MTLSize) {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let rowsPerThreadgroup = 2
+        let simdgroupsPerThreadgroup = 2
         let threads = min(
-            simdWidth * rowsPerThreadgroup * sequenceTile,
+            simdWidth * simdgroupsPerThreadgroup * sequenceTile,
             pipeline.maxTotalThreadsPerThreadgroup
         )
-        let actualRowsPerThreadgroup = max(1, (threads / simdWidth) / sequenceTile)
+        let actualSimdgroupsPerThreadgroup = max(1, (threads / simdWidth) / sequenceTile)
+        let actualRowsPerThreadgroup = actualSimdgroupsPerThreadgroup * rowsPerSimdgroup
         let grid = MTLSize(
             width: (outputDimension + actualRowsPerThreadgroup - 1) / actualRowsPerThreadgroup,
             height: (sequenceLength + sequenceTile - 1) / sequenceTile,

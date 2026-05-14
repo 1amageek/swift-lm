@@ -326,8 +326,13 @@ extension MetalSourceGenerator {
         name: String,
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
-        tileElements: Int = 256
+        tileElements: Int = 256,
+        rowsPerSimdgroup: Int = 1
     ) -> String {
+        precondition(
+            rowsPerSimdgroup >= 1 && rowsPerSimdgroup <= 4,
+            "generateSequenceGEMV supports 1...4 rows per simdgroup"
+        )
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
@@ -336,6 +341,33 @@ extension MetalSourceGenerator {
                 ? MetalSourceGenerator.sequenceStorageValue(expr, weightFormat: weightFormat)
                 : expr
         }
+        let rowDeclarations = (0..<rowsPerSimdgroup)
+            .map { "            const uint row\($0) = rowBase + \($0)u;" }
+            .joined(separator: "\n")
+        let sumDeclarations = (0..<rowsPerSimdgroup)
+            .map { "            float sum\($0) = 0.0f;" }
+            .joined(separator: "\n")
+        let accumulationLines = (0..<rowsPerSimdgroup)
+            .map { rowOffset in
+                """
+                    if (row\(rowOffset) < outputDimension) {
+                        device const \(wt)* weightRow\(rowOffset) = weight + row\(rowOffset) * inputDimension;
+                        sum\(rowOffset) += \(readWeight("weightRow\(rowOffset)[base + j]")) * float(inputTile[j]);
+                    }
+                """
+            }
+            .joined(separator: "\n")
+        let reductionLines = (0..<rowsPerSimdgroup)
+            .map { rowOffset in
+                let stored = storeValue("sum\(rowOffset)")
+                return """
+                    sum\(rowOffset) = simd_sum(sum\(rowOffset));
+                    if (tiisg == 0 && row\(rowOffset) < outputDimension) {
+                        output[seqPos * outputRowStride + row\(rowOffset)] = \(bt)(\(stored));
+                    }
+                """
+            }
+            .joined(separator: "\n")
 
         return """
         kernel void \(name)(
@@ -354,17 +386,17 @@ extension MetalSourceGenerator {
             uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
         ) {
             const uint tileElements = \(tileElements);
-            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
-            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint rowsPerSimdgroup = \(rowsPerSimdgroup)u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint rowsPerThreadgroup = simdgroupsPerThreadgroup * rowsPerSimdgroup;
+            const uint rowBase = gid.x * rowsPerThreadgroup + sgitg * rowsPerSimdgroup;
             const uint seqPos = gid.y;
             if (seqPos >= sequenceLength) return;
-            const bool active = row < outputDimension;
+            \(rowDeclarations)
 
             threadgroup \(bt) inputTile[tileElements];
-            float sum = 0.0f;
+            \(sumDeclarations)
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
-            const uint safeRow = active ? row : 0;
-            device const \(wt)* weightRow = weight + safeRow * inputDimension;
             for (uint base = 0; base < inputDimension; base += tileElements) {
                 for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
                     const uint inputIndex = base + j;
@@ -373,17 +405,12 @@ extension MetalSourceGenerator {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 const uint tileCount = min(tileElements, inputDimension - base);
-                if (active) {
-                    for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                        sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
-                    }
+                for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                    \(accumulationLines)
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-            sum = simd_sum(sum);
-            if (active && tiisg == 0) {
-                output[seqPos * outputRowStride + row] = \(bt)(\(storeValue("sum")));
-            }
+            \(reductionLines)
         }
         """
     }

@@ -411,6 +411,78 @@ struct SequenceProjectionEquivalenceTests {
         )
     }
 
+    @Test("BF16 row2 single sequence GEMV matches repeated decode GEMV")
+    func bf16Row2SingleSequenceGEMVMatchesRepeatedDecodeGEMV() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 73
+        let outputDimension = 21
+        let sequenceLength = 9
+        let decodeKernelName = "gemv_bf16_single_decode_equivalence_row2"
+        let sequenceKernelName = "gemv_bf16_single_row2_sequence_equivalence"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateGEMV(
+                name: decodeKernelName,
+                bufferPrecision: BufferPrecision.bfloat16,
+                weightFormat: WeightFormats.bfloat16,
+                tileElements: 256
+            ),
+            MetalSourceGenerator.generateSequenceGEMV(
+                name: sequenceKernelName,
+                bufferPrecision: BufferPrecision.float32,
+                weightFormat: WeightFormats.bfloat16,
+                rowsPerSimdgroup: 2
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let decodePipeline = try harness.pipeline(named: decodeKernelName)
+        let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
+
+        let inputValues = (0..<(sequenceLength * inputDimension)).map { index in
+            Float(BFloat16(Float((index * 19) % 37 - 18) * 0.03125))
+        }
+        let weights = (0..<(outputDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 7) % 43 - 21) * 0.015625)
+        }
+
+        let expected = try runDecodeSingleProjectionTrace(
+            harness: harness,
+            pipeline: decodePipeline,
+            inputValues: inputValues,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength
+        )
+        let actual = try runSequenceSingleProjectionTrace(
+            harness: harness,
+            pipeline: sequencePipeline,
+            inputValues: inputValues,
+            weights: weights,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength,
+            sequenceTile: 1,
+            rowsPerSimdgroup: 2
+        )
+
+        let mismatch = harness.firstMismatch(
+            expected: expected,
+            actual: actual,
+            tolerance: 0.000_001
+        )
+        #expect(
+            mismatch == nil,
+            "single row2 projection drifted: \(String(describing: mismatch)), maxError=\(harness.maxAbsoluteError(expected: expected, actual: actual))"
+        )
+    }
+
     @Test("BF16 single sequence GEMV handles odd output tail with padded stride")
     func bf16SingleSequenceGEMVHandlesOddOutputTailWithPaddedStride() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {
@@ -750,7 +822,8 @@ struct SequenceProjectionEquivalenceTests {
         inputDimension: Int,
         outputDimension: Int,
         sequenceLength: Int,
-        sequenceTile: Int
+        sequenceTile: Int,
+        rowsPerSimdgroup: Int = 1
     ) throws -> [Float] {
         let inputBuffer = try harness.makeSharedBuffer(values: inputValues)
         let weightBuffer = try harness.makeSharedBuffer(values: weights)
@@ -759,7 +832,8 @@ struct SequenceProjectionEquivalenceTests {
         )
         let simdWidth = 32
         let threads = min(simdWidth * 2 * sequenceTile, pipeline.maxTotalThreadsPerThreadgroup)
-        let rowsPerThreadgroup = max(1, (threads / simdWidth) / sequenceTile)
+        let simdgroupsPerThreadgroup = max(1, (threads / simdWidth) / sequenceTile)
+        let rowsPerThreadgroup = simdgroupsPerThreadgroup * rowsPerSimdgroup
         let grid = MTLSize(
             width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
             height: (sequenceLength + sequenceTile - 1) / sequenceTile,

@@ -399,6 +399,7 @@ struct MetalPrefillStepBuilder {
 private struct SequenceGEMVKernelSelection: Equatable {
     let kernelName: String
     let sequenceTile: Int
+    let rowsPerSimdgroup: Int
 
     var isTiled: Bool { sequenceTile > 1 }
 }
@@ -421,6 +422,21 @@ private struct PrefillStepPlanner {
     /// per process to avoid repeated `getenv` calls.
     private static let bf16SingleTile2Enabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_SINGLE_TILE2"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    /// Process-wide BF16 single sequence GEMV row2 feature flag.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_SINGLE_RPS2=1`, BF16 single sequence GEMV
+    /// projections route to `gemv_seq_bf16_f32s_rps2`. This keeps the sequence
+    /// tile at 1 and computes two independent output rows per SIMD group,
+    /// sharing the staged input tile without changing each row's reduction
+    /// order. It is mutually conservative with the tile2 experiment: tile2
+    /// takes precedence when both flags are enabled.
+    private static let bf16SingleRowsPerSimdgroup2Enabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_SINGLE_RPS2"] else {
             return false
         }
         return raw == "1" || raw.lowercased() == "true"
@@ -630,32 +646,45 @@ private struct PrefillStepPlanner {
             if Self.bf16SingleTile2Enabled {
                 return SequenceGEMVKernelSelection(
                     kernelName: "gemv_seq_bf16_f32s_tile2",
-                    sequenceTile: 2
+                    sequenceTile: 2,
+                    rowsPerSimdgroup: 1
+                )
+            }
+            if Self.bf16SingleRowsPerSimdgroup2Enabled {
+                return SequenceGEMVKernelSelection(
+                    kernelName: "gemv_seq_bf16_f32s_rps2",
+                    sequenceTile: 1,
+                    rowsPerSimdgroup: 2
                 )
             }
             return SequenceGEMVKernelSelection(
                 kernelName: "gemv_seq_bf16_f32s",
-                sequenceTile: 1
+                sequenceTile: 1,
+                rowsPerSimdgroup: 1
             )
         case .fp16RowMajor:
             return SequenceGEMVKernelSelection(
                 kernelName: "gemv_seq_f32s",
-                sequenceTile: 1
+                sequenceTile: 1,
+                rowsPerSimdgroup: 1
             )
         case .q3Group16ScaleF16:
             return SequenceGEMVKernelSelection(
                 kernelName: "gemv_seq_q3_g16_f32s",
-                sequenceTile: 1
+                sequenceTile: 1,
+                rowsPerSimdgroup: 1
             )
         case .q3Group32ScaleF16:
             return SequenceGEMVKernelSelection(
                 kernelName: "gemv_seq_q3_g32_f32s",
-                sequenceTile: 1
+                sequenceTile: 1,
+                rowsPerSimdgroup: 1
             )
         case .q3Group64ScaleF16:
             return SequenceGEMVKernelSelection(
                 kernelName: "gemv_seq_q3_g64_f32s",
-                sequenceTile: 1
+                sequenceTile: 1,
+                rowsPerSimdgroup: 1
             )
         default:
             return nil
@@ -687,7 +716,7 @@ private struct PrefillStepPlanner {
         }
         // Batched path stays on the base (untiled) kernel. The tile2
         // feature flag is single-projection only by design.
-        return SequenceGEMVKernelSelection(kernelName: baseName, sequenceTile: 1)
+        return SequenceGEMVKernelSelection(kernelName: baseName, sequenceTile: 1, rowsPerSimdgroup: 1)
     }
 
     /// Resolve threadgroup shape and grid-height tile for a tiled sequence GEMV.
@@ -699,7 +728,8 @@ private struct PrefillStepPlanner {
     /// simdgroup) and we throw rather than silently fall back.
     private func decodeEquivalentSequenceThreadShape(
         pipeline: MTLComputePipelineState,
-        requestedSequenceTile: Int
+        requestedSequenceTile: Int,
+        rowsPerSimdgroup: Int = 1
     ) throws -> (sequenceTile: Int, rowsPerThreadgroup: Int, threadgroupSize: MTLSize) {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
         let maxSimdgroups = max(1, pipeline.maxTotalThreadsPerThreadgroup / simdWidth)
@@ -714,11 +744,12 @@ private struct PrefillStepPlanner {
             )
         }
         let sequenceTile = requestedSequenceTile
-        let rowsPerThreadgroup = min(
+        let simdgroupsPerThreadgroup = min(
             Self.decodeEquivalentSequenceRowsPerThreadgroup,
             max(1, maxSimdgroups / sequenceTile)
         )
-        let threads = simdWidth * sequenceTile * rowsPerThreadgroup
+        let rowsPerThreadgroup = simdgroupsPerThreadgroup * max(rowsPerSimdgroup, 1)
+        let threads = simdWidth * sequenceTile * simdgroupsPerThreadgroup
         return (
             sequenceTile,
             rowsPerThreadgroup,
@@ -1154,32 +1185,21 @@ private struct PrefillStepPlanner {
             let gridSize: MTLSize
             let threadgroupSize: MTLSize
             let sequenceGEMVTile: Int?
-            if let sequenceGEMVSelection, sequenceGEMVSelection.isTiled {
+            if let sequenceGEMVSelection {
                 let shape = try decodeEquivalentSequenceThreadShape(
                     pipeline: selectedPipeline,
-                    requestedSequenceTile: sequenceGEMVSelection.sequenceTile
+                    requestedSequenceTile: sequenceGEMVSelection.sequenceTile,
+                    rowsPerSimdgroup: sequenceGEMVSelection.rowsPerSimdgroup
                 )
-                sequenceGEMVTile = shape.sequenceTile
+                sequenceGEMVTile = sequenceGEMVSelection.isTiled ? shape.sequenceTile : nil
                 gridSize = MTLSize(
                     width: (projection.outputDimension + shape.rowsPerThreadgroup - 1) / shape.rowsPerThreadgroup,
-                    height: (maximumSequenceLength + shape.sequenceTile - 1) / shape.sequenceTile,
+                    height: sequenceGEMVSelection.isTiled
+                        ? (maximumSequenceLength + shape.sequenceTile - 1) / shape.sequenceTile
+                        : maximumSequenceLength,
                     depth: 1
                 )
                 threadgroupSize = shape.threadgroupSize
-            } else if usesSequenceGEMVForStep {
-                sequenceGEMVTile = nil
-                let simdWidth = max(selectedPipeline.threadExecutionWidth, 1)
-                let threads = min(
-                    simdWidth * Self.decodeEquivalentSequenceRowsPerThreadgroup,
-                    selectedPipeline.maxTotalThreadsPerThreadgroup
-                )
-                let rowsPerThreadgroup = max(1, threads / simdWidth)
-                gridSize = MTLSize(
-                    width: (projection.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
-                    height: maximumSequenceLength,
-                    depth: 1
-                )
-                threadgroupSize = MTLSize(width: threads, height: 1, depth: 1)
             } else if usesMPPForStep && !useDirectQuantizedGEMM {
                 sequenceGEMVTile = nil
                 let simdWidth = selectedPipeline.threadExecutionWidth

@@ -1389,3 +1389,63 @@ Evidence:
 Current decision: keep MPP admission conservative, but allow non-MPP GEMM
 families to handle padded scratch layouts directly through their row-stride
 binding.
+
+## BF16 Single Sequence GEMV Row2 Experiment (2026-05-14)
+
+After the sequence-tile experiments failed to produce a stable full-model win,
+the next single-projection variant keeps the sequence tile at 1 and changes only
+the row mapping inside each SIMD group:
+
+```mermaid
+flowchart LR
+  A["one token row"] --> B["stage input tile once"]
+  B --> C["SIMD group accumulator row 0"]
+  B --> D["SIMD group accumulator row 1"]
+  C --> E["store output row 0"]
+  D --> F["store output row 1"]
+```
+
+| Property | Base sequence GEMV | Row2 opt-in |
+|---|---|---|
+| Kernel | `gemv_seq_bf16_f32s` | `gemv_seq_bf16_f32s_rps2` |
+| Routing flag | none | `SWIFTLM_PREFILL_BF16_SINGLE_RPS2=1` |
+| Sequence tile | 1 | 1 |
+| Rows per SIMD group | 1 | 2 |
+| Reduction contract | one row x one token | same per output row |
+| Production default | enabled | disabled |
+
+The kernel keeps a separate F32 accumulator per output row and reduces each row
+with the same `simd_sum` pattern as the base sequence GEMV. It shares the staged
+input tile across two row accumulators, reducing input staging and grid width
+without changing the order of the dot-product loop for either output row.
+
+Correctness evidence is green:
+
+| Gate | Result |
+|---|---|
+| `SequenceProjectionEquivalenceTests` | 9/9 pass, including row2 vs repeated decode GEMV |
+| `Qwen35ReferenceComparisonTests` with `SWIFTLM_PREFILL_BF16_SINGLE_RPS2=1 ENABLE_METAL_PROBES=1` | 5/5 pass; prefill block, final hidden/logits, state, and decode0 gates remain green |
+
+Isolated real-shape microbench shows row2 is directionally favorable:
+
+| Role | Seq 16 | Seq 64 | Seq 128 |
+|---|---:|---:|---:|
+| `attn_or_ssm.out_proj` base | 803.8 us | 1877.2 us | 2452.3 us |
+| `attn_or_ssm.out_proj` row2 | 726.5 us | 1426.7 us | 1914.8 us |
+| `mlp.down_proj` base | 1394.3 us | 2731.9 us | 2916.8 us |
+| `mlp.down_proj` row2 | 1292.3 us | 2195.9 us | 2450.1 us |
+
+Full Qwen3.5 BF16 prefill profile confirms the route fires for all 48 single
+sequence projections, but it is not a promotion candidate yet:
+
+| Sequence length | Total prefill | Single GEMV kernel | Decision |
+|---:|---:|---|---|
+| 16 | 52.232 ms | `48x gemv_seq_bf16_f32s_rps2` | slower |
+| 64 | 165.676 ms | `48x gemv_seq_bf16_f32s_rps2` | slower |
+| 128 | 320.294 ms | `48x gemv_seq_bf16_f32s_rps2` | slower/noisy |
+
+Current decision: keep row2 as an opt-in diagnostic only. The isolated kernel
+shape is useful evidence that row packing can help, but full-model timing says
+the next production path should combine row packing with a larger structural
+change, such as producer-consumer fusion for the specific dependent projections
+or a real batched matmul path that passes the reference gate.
