@@ -735,6 +735,91 @@ extension MetalSourceGenerator {
         """
     }
 
+    public static func generateFusedPackedSigmoidGateOutputSequenceGEMV(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        tileElements: Int = 256
+    ) -> String {
+        precondition(
+            weightFormat.isBFloat16,
+            "generateFusedPackedSigmoidGateOutputSequenceGEMV currently supports only BF16 weight format"
+        )
+        precondition(
+            bufferPrecision.isPrefillSequencePrecision,
+            "generateFusedPackedSigmoidGateOutputSequenceGEMV requires the prefill sequence buffer precision"
+        )
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let stored = MetalSourceGenerator.sequenceStorageValue(
+            "sum",
+            weightFormat: weightFormat
+        )
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(bt)* packed             [[buffer(1)]],
+            device const \(wt)* weight             [[buffer(2)]],
+            device \(bt)* output                   [[buffer(3)]],
+            constant uint& inputDimension          [[buffer(4)]],
+            constant uint& outputDimension         [[buffer(5)]],
+            constant uint& headDimension           [[buffer(6)]],
+            constant uint& packedHeadStride        [[buffer(7)]],
+            constant uint& gateHeadOffset          [[buffer(8)]],
+            constant uint& sequenceLength          [[buffer(9)]],
+            constant uint& inputRowStride          [[buffer(10)]],
+            constant uint& packedRowStride         [[buffer(11)]],
+            constant uint& outputRowStride         [[buffer(12)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint tileElements = \(tileElements);
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * simdgroupsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength) return;
+
+            threadgroup \(bt) inputTile[tileElements];
+            float sum = 0.0f;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device const \(bt)* packedRow = packed + seqPos * packedRowStride;
+            device const \(wt)* weightRow = weight + min(row, outputDimension - 1u) * inputDimension;
+            for (uint base = 0; base < inputDimension; base += tileElements) {
+                for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
+                    const uint inputIndex = base + j;
+                    if (inputIndex < inputDimension) {
+                        const uint headIndex = inputIndex / headDimension;
+                        const uint lane = inputIndex % headDimension;
+                        const float g = float(packedRow[headIndex * packedHeadStride + gateHeadOffset + lane]);
+                        const float x = float(inputRow[inputIndex]);
+                        inputTile[j] = \(bt)(x * (1.0f / (1.0f + exp(-g))));
+                    } else {
+                        inputTile[j] = \(bt)(0.0f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint tileCount = min(tileElements, inputDimension - base);
+                if (row < outputDimension) {
+                    for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                        sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+            sum = simd_sum(sum);
+            if (tiisg == 0 && row < outputDimension) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(stored));
+            }
+        }
+        """
+    }
+
     /// Generate a GEMV kernel specialized for vocab/output-head style projections.
     ///
     /// The input dimension is expected to be 2048. The entire input vector is staged

@@ -705,6 +705,16 @@ struct MetalKernelSourceCatalog {
                     rowsPerSimdgroup: 2
                 ))
             }
+            // Opt-in producer-consumer fusion of `packed_sigmoid_gate_seq_f32`
+            // and the BF16 sequence GEMV used by attention `o_proj`.
+            if generatedNames.insert("attn_fused_sigmoid_o_seq_bf16_f32s").inserted {
+                sources.append(MetalSourceGenerator.generateFusedPackedSigmoidGateOutputSequenceGEMV(
+                    name: "attn_fused_sigmoid_o_seq_bf16_f32s",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: .bfloat16,
+                    tileElements: 256
+                ))
+            }
             if generatedNames.insert("gemv_seq_q3_g16_f32s").inserted {
                 sources.append(MetalSourceGenerator.generateUnifiedQuantizedSequenceGEMV(
                     name: "gemv_seq_q3_g16_f32s",

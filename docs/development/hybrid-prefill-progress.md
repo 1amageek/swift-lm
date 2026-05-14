@@ -204,6 +204,10 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 timed windows with input projection, recurrence, bridge, and output projection timing columns |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in recurrent-block partial projection remains reference-equivalent after the fused MLP default route |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; route removes 18 `linear_attn.out_proj` GEMV dispatches but adds partial projection/reduce stages and regresses total profile, so it stays non-default |
+| 2026-05-14 | `swift build` | Pass after adding the opt-in fused packed-sigmoid attention output kernel and router |
+| 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete generated library compiles with `attn_fused_sigmoid_o_seq_bf16_f32s` |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; opt-in attention output fusion remains reference-equivalent |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; route removes 6 `packed_sigmoid_gate_seq_f32` and 6 `self_attn.o_proj` GEMV dispatches but regresses total profile, so it stays non-default |
 
 ## Failed Experiments
 
@@ -221,6 +225,7 @@ flowchart TD
 | Batched BF16 sequence GEMV tile2/tile4 | Isolated real-shape benchmark passed, but base is faster for the dominant seqLen 64/128 MLP gate+up, SSM in-proj, and attention QKV shapes | Do not route tiled batched BF16 kernels by default; future batched work should change data movement or use a different math path, not just sequence tiling |
 | BF16 dense batched MPP priority | Reference comparison failed immediately: case 0 prefill token drifted from HF `760` to Metal `120905`, final hidden max error was `26.9375`, and state/KV drift propagated through decode0 | Rejected and not retained as an opt-in runtime route; any future MPP work must first make the MPP math/storage contract reference-equivalent in isolation |
 | Opt-in recurrent-block partial output projection | Correctness remains green, but latest Qwen profile after fused MLP default changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 67.771/163.120/320.098 ms | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
+| Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
 
 ## Open Decisions
 

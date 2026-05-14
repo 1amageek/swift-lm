@@ -1093,7 +1093,10 @@ private func kernelName(for step: MetalPrefillStep) -> String {
 private func classify(_ kernelName: String) -> String {
     let name = kernelName.lowercased()
     if name.hasPrefix("embedding_lookup") || name.contains("gather") { return "embedding" }
-    if name.hasPrefix("mlp_fused_swiglu_down") { return "projection" }
+    if name.hasPrefix("mlp_fused_swiglu_down")
+        || name.hasPrefix("attn_fused_sigmoid_o") {
+        return "projection"
+    }
     if name.hasPrefix("recurrent_block_partial_projection")
         || name.hasPrefix("recurrent_block_partial_reduce") {
         return "projection"
@@ -1179,6 +1182,16 @@ private func estimatedProjectionByteTraffic(
         let weightBytes = outputDimension * intermediateDimension * weightBytesPerElement
         let outputBytes = sequenceLength * outputDimension * outputBytesPerElement
         return PrefillByteTraffic(readBytes: gateBytes + upBytes + weightBytes, writeBytes: outputBytes)
+    }
+
+    if kernelName.hasPrefix("attn_fused_sigmoid_o"),
+       let inputDimension = uint32Constant(step, index: 4).map(Int.init),
+       let outputDimension = uint32Constant(step, index: 5).map(Int.init) {
+        let inputBytes = sequenceLength * inputDimension * inputBytesPerElement
+        let gateBytes = sequenceLength * inputDimension * inputBytesPerElement
+        let weightBytes = outputDimension * inputDimension * weightBytesPerElement
+        let outputBytes = sequenceLength * outputDimension * outputBytesPerElement
+        return PrefillByteTraffic(readBytes: inputBytes + gateBytes + weightBytes, writeBytes: outputBytes)
     }
 
     if kernelName.hasPrefix("batched_gemv"),

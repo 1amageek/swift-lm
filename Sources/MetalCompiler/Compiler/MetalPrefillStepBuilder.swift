@@ -33,15 +33,10 @@ struct MetalPrefillStepBuilder {
         var index = 0
         while index < fusedEntries.count {
             let entry = fusedEntries[index]
-            // Lookahead admission: when the next entry is a compatible
-            // `mlp.down_proj` and the current entry is the producing SwiGLU,
-            // we may emit a single fused kernel instead of the two-step path.
-            // The admission check is enabled by default for stateful hybrid
-            // sequence prefill and can be overridden with
-            // `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN`. It only succeeds when
-            // every contract gate is satisfied. On success we consume two
-            // entries and continue; on failure we fall through to the per-entry
-            // path.
+            // Lookahead admission: compatible producer-consumer pairs may emit
+            // one fused kernel instead of the two-step path. Each fusion has
+            // explicit admission gates; success consumes two entries and
+            // failure falls through to the per-entry path.
             if index + 1 < fusedEntries.count {
                 let consumer = fusedEntries[index + 1]
                 if planner.usesRuntimeGatedFusedMlpDown {
@@ -69,6 +64,14 @@ struct MetalPrefillStepBuilder {
                         continue
                     }
                 } else if let fusedSteps = try planner.tryBuildFusedSwigluDownSteps(
+                    producer: entry,
+                    consumer: consumer
+                ) {
+                    steps.append(contentsOf: fusedSteps)
+                    index += 2
+                    continue
+                }
+                if let fusedSteps = try planner.tryBuildFusedPackedSigmoidGateOutputSteps(
                     producer: entry,
                     consumer: consumer
                 ) {
@@ -505,6 +508,18 @@ private struct PrefillStepPlanner {
             return 64
         }
         return max(value, 1)
+    }()
+
+    /// Process-wide BF16 fused packed-sigmoid attention output feature flag.
+    ///
+    /// This is an opt-in experiment for `packed_sigmoid_gate_seq_f32 + o_proj`.
+    /// It is intentionally not a default route until Qwen profile evidence shows
+    /// a stable full-model win.
+    private static let bf16FusedAttentionOutputEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
     }()
 
     /// Process-wide BF16 recurrent block partial-projection feature flag.
@@ -992,6 +1007,130 @@ private struct PrefillStepPlanner {
 
         let annotated = annotate([fusedStep], entryIndex: consumer.index, layerIndex: consumer.layerIndex)
         return annotated
+    }
+
+    mutating func tryBuildFusedPackedSigmoidGateOutputSteps(
+        producer: DispatchEntry,
+        consumer: DispatchEntry
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16FusedAttentionOutputEnabled else { return nil }
+        guard let gate = producer.fragment as? PackedSigmoidGateFragment,
+              let linear = consumer.fragment as? LinearFragment else {
+            return nil
+        }
+        guard linear.field == "o_proj", linear.isOutput else {
+            return nil
+        }
+        guard let composite = producer.compositeID,
+              consumer.compositeID == composite,
+              producer.layerIndex == consumer.layerIndex else {
+            return nil
+        }
+        guard gate.dimension == linear.inputDimension,
+              linear.outputDimension <= hiddenSize else {
+            return nil
+        }
+        guard !routingState.lastOutputIsHidden,
+              routingState.currentInputOffset == 0 else {
+            return nil
+        }
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            return nil
+        }
+
+        let descriptor = resolveProjectionWeightDescriptor(role: linear.field, entry: consumer)
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            return nil
+        }
+
+        let fusedKernelName = "attn_fused_sigmoid_o_seq_bf16_f32s"
+        guard let pipeline = planBuildContext.pipelineCache[fusedKernelName] else {
+            throw MetalCompilerError.kernelNotFound(fusedKernelName)
+        }
+
+        let weightResolver = WeightResolver(
+            entry: consumer,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .prefill,
+            accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
+        )
+        let (weightBuffer, weightOffset) = weightResolver.resolve(role: linear.field)
+        let weightTensorName = consumer.parameterBindings.first(where: { $0.role == linear.field })?.tensorName
+
+        let scratchSlotSize = slotDimension * scratchElementSize * maximumSequenceLength
+        let inputRowStride = slotDimension
+        let packedRowStride = slotDimension
+        let outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let simdgroupsPerThreadgroup = max(
+            1,
+            min(Self.decodeEquivalentSequenceRowsPerThreadgroup, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
+        )
+        let rowsPerThreadgroup = simdgroupsPerThreadgroup
+        let threads = simdWidth * simdgroupsPerThreadgroup
+        let fusedStep = MetalPrefillStep(
+            pipeline: pipeline,
+            gridSize: MTLSize(
+                width: (linear.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+                height: maximumSequenceLength,
+                depth: 1
+            ),
+            threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, 0),
+                (1, buffers.scratch, gate.packedSourceSlotIndex * scratchSlotSize),
+                (2, weightBuffer, weightOffset),
+                (3, buffers.hidden, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(4, UInt32(linear.inputDimension)),
+                uint32Binding(5, UInt32(linear.outputDimension)),
+                uint32Binding(6, UInt32(gate.headDimension)),
+                uint32Binding(7, UInt32(gate.packedHeadStride)),
+                uint32Binding(8, UInt32(gate.gateHeadOffset)),
+                uint32Binding(9, UInt32(maximumSequenceLength)),
+                uint32Binding(10, UInt32(inputRowStride)),
+                uint32Binding(11, UInt32(packedRowStride)),
+                uint32Binding(12, UInt32(outputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 9),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: fusedKernelName,
+                entryIndex: consumer.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0, 1, 2], writes: [3])
+            )
+        )
+
+        recordProjectionQuantization(
+            entry: consumer,
+            descriptor: descriptor,
+            mode: .batch,
+            inputRowStride: inputRowStride,
+            inputDimension: linear.inputDimension,
+            outputDimension: linear.outputDimension,
+            outputRowStride: outputRowStride,
+            selectedKernelName: fusedKernelName,
+            usesMPPForStep: false,
+            usesSequenceGEMVForStep: true,
+            sequenceTileHeight: nil,
+            tileVariantHeights: []
+        )
+
+        routingState.lastOutputIsHidden = true
+        routingState.currentInputOffset = 0
+        routingState.projectionIndex = 1
+        activeCompositeID = composite
+        refreshCompositeInputSource()
+
+        return annotate([fusedStep], entryIndex: consumer.index, layerIndex: consumer.layerIndex)
     }
 
     mutating func buildSteps(for entry: DispatchEntry) throws -> [MetalPrefillStep] {
