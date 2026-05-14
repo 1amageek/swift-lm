@@ -224,6 +224,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 fused-stage candidates with estimated dispatch reduction 18 total |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission now emits a typed safe execution plan only when the window reduces dispatch count and keeps unsafe row-grid fusion disallowed |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic group-owned partial projection kernel writes the same partition partials and reduced output as the CPU reference without row-grid fan-out |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission rejects cases where partial partitions would merge multiple recurrent groups and require cross-threadgroup accumulation |
 
 ## Failed Experiments
 
@@ -1039,7 +1040,7 @@ M3D.7 moves that safety rule from profile documentation into planner state.
 `RecurrentBlockFusionFusedStagePlan` only when:
 
 - the recurrent block is multi-group and can be partitioned into the partial
-  scratch layout;
+  scratch layout with one partial partition per recurrent group;
 - input projection, recurrence, and output projection dimensions match the
   Qwen linear-attention contract;
 - replacing `recurrence + bridge + output_projection` with
@@ -1053,6 +1054,14 @@ This keeps the next kernel prototype behind an explicit admission contract. A
 window that has no bridge dispatch to remove is rejected even if it is otherwise
 shape-compatible, because it would add kernel risk without a dispatch-count
 benefit.
+
+The one-partition-per-recurrent-group rule is intentionally stricter than the
+existing two-stage partial projection route. A standalone partial projection can
+use a row-grid and split by any scratch-compatible divisor; a fused recurrence
+stage cannot, because each recurrent group has exactly one state-update owner.
+If a partial partition merged multiple recurrent groups, those group owners
+would need cross-threadgroup accumulation before the reduce stage. That is not
+admitted by the current safe design.
 
 M3D.8 adds the first kernel-level harness for that execution shape. The new
 synthetic `generateRecurrentBlockGroupOwnedPartialProjection` kernel dispatches

@@ -234,6 +234,7 @@ enum RecurrentBlockFusionFusedStageRejection: Sendable, Equatable {
     case outputProjectionShapeMismatch(expectedInputDimension: Int, actualInputDimension: Int)
     case unevenHeadPartition(headCount: Int, partitionCount: Int)
     case noScratchCompatiblePartition(groupCount: Int, maximumPartialScratchSlotCount: Int)
+    case partialPartitionDoesNotMatchRecurrentGroups(groupCount: Int, partitionCount: Int)
     case noDispatchReduction(currentStepCount: Int, targetStepCount: Int)
 }
 
@@ -444,6 +445,12 @@ enum RecurrentBlockFusionPrototypePlanner {
             rejections.append(.noScratchCompatiblePartition(
                 groupCount: recurrence.groupCount,
                 maximumPartialScratchSlotCount: maximumPartialScratchSlotCount
+            ))
+        }
+        if partitionCount > 1, partitionCount != recurrence.groupCount {
+            rejections.append(.partialPartitionDoesNotMatchRecurrentGroups(
+                groupCount: recurrence.groupCount,
+                partitionCount: partitionCount
             ))
         }
 

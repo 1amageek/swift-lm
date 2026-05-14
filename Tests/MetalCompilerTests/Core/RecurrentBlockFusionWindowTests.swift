@@ -199,6 +199,30 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .rejected([.noDispatchReduction(currentStepCount: 2, targetStepCount: 2)]))
     }
 
+    @Test("Prototype planner rejects fused-stage plan when partial partitions merge recurrent groups")
+    func prototypePlannerRejectsFusedStagePlanWhenPartitionsMergeGroups() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 8, groups: 8),
+            dispatchRecurrence(index: 1, layer: 8, groups: 8),
+            DispatchEntry(
+                index: 2,
+                fragment: ElementwiseFragment(count: 256, kind: .swiglu),
+                layerIndex: 8
+            ),
+            dispatchOutputProjection(index: 3, layer: 8, inputDimension: 256),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.fusedStageDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .rejected([
+            .partialPartitionDoesNotMatchRecurrentGroups(groupCount: 8, partitionCount: 4),
+        ]))
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [
@@ -442,12 +466,12 @@ struct RecurrentBlockFusionWindowTests {
         )
     }
 
-    private func dispatchOutputProjection(index: Int, layer: Int) -> DispatchEntry {
+    private func dispatchOutputProjection(index: Int, layer: Int, inputDimension: Int = 256) -> DispatchEntry {
         DispatchEntry(
             index: index,
             fragment: LinearFragment(
                 field: "out_proj",
-                inputDimension: 256,
+                inputDimension: inputDimension,
                 outputDimension: 2048,
                 isOutput: true
             ),
