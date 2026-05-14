@@ -390,7 +390,8 @@ enum RecurrentBlockFusionPrototypePlanner {
 
     static func fusedStageDecision(
         for window: RecurrentBlockFusionAdmissionWindow,
-        entries: [DispatchEntry]
+        entries: [DispatchEntry],
+        implicitBridgeStepCount: Int = 0
     ) -> RecurrentBlockFusionFusedStageDecision {
         let byIndex = Dictionary(uniqueKeysWithValues: entries.map { ($0.index, $0) })
         var rejections: [RecurrentBlockFusionFusedStageRejection] = []
@@ -456,7 +457,7 @@ enum RecurrentBlockFusionPrototypePlanner {
             ))
         }
 
-        let currentReplaceableStepCount = 1 + window.bridgeEntryIndices.count + 1
+        let currentReplaceableStepCount = 1 + window.bridgeEntryIndices.count + implicitBridgeStepCount + 1
         let estimatedDispatchReduction = currentReplaceableStepCount - fusedStageStepCount
         if estimatedDispatchReduction <= 0 {
             rejections.append(.noDispatchReduction(

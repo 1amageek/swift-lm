@@ -560,9 +560,6 @@ struct Qwen35ReferenceComparisonTests {
         guard let firstOutProjection = outProjectionCandidates.first else {
             throw SetupError.stepNotFound("linear attention output projection for layer \(layerIndex)")
         }
-        guard recurrence < firstOutProjection else {
-            throw SetupError.stepNotFound("linear attention recurrence before output projection for layer \(layerIndex)")
-        }
         let firstOutProjectionKernel = prefillPlan.steps[firstOutProjection].metadata.kernelName
             ?? prefillPlan.steps[firstOutProjection].pipeline.label
             ?? ""
@@ -570,28 +567,47 @@ struct Qwen35ReferenceComparisonTests {
         let partialProjectionBindingIndex: Int
         let outProjection: Int
         let outProjectionBindingIndex: Int
-        if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_projection") {
+        if firstOutProjection == recurrence,
+           firstOutProjectionKernel.hasPrefix("ssm_recurrence_seq"),
+           firstOutProjectionKernel.hasSuffix("_partial") {
             guard let reduceStep = outProjectionCandidates.dropFirst().first(where: { index in
                 let step = prefillPlan.steps[index]
                 let kernel = step.metadata.kernelName ?? step.pipeline.label ?? ""
                 return kernel.hasPrefix("recurrent_block_partial_reduce")
             }) else {
-                throw SetupError.stepNotFound("linear attention partial output reduce for layer \(layerIndex)")
+                throw SetupError.stepNotFound("linear attention fused partial output reduce for layer \(layerIndex)")
             }
-            partialProjection = firstOutProjection
-            partialProjectionBindingIndex = 2
-            outProjection = reduceStep
-            outProjectionBindingIndex = 1
-        } else if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_reduce") {
             partialProjection = recurrence
             partialProjectionBindingIndex = 22
-            outProjection = firstOutProjection
+            outProjection = reduceStep
             outProjectionBindingIndex = 1
         } else {
-            partialProjection = nil
-            partialProjectionBindingIndex = 2
-            outProjection = firstOutProjection
-            outProjectionBindingIndex = 2
+            guard recurrence < firstOutProjection else {
+                throw SetupError.stepNotFound("linear attention recurrence before output projection for layer \(layerIndex)")
+            }
+            if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_projection") {
+                guard let reduceStep = outProjectionCandidates.dropFirst().first(where: { index in
+                    let step = prefillPlan.steps[index]
+                    let kernel = step.metadata.kernelName ?? step.pipeline.label ?? ""
+                    return kernel.hasPrefix("recurrent_block_partial_reduce")
+                }) else {
+                    throw SetupError.stepNotFound("linear attention partial output reduce for layer \(layerIndex)")
+                }
+                partialProjection = firstOutProjection
+                partialProjectionBindingIndex = 2
+                outProjection = reduceStep
+                outProjectionBindingIndex = 1
+            } else if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_reduce") {
+                partialProjection = recurrence
+                partialProjectionBindingIndex = 22
+                outProjection = firstOutProjection
+                outProjectionBindingIndex = 1
+            } else {
+                partialProjection = nil
+                partialProjectionBindingIndex = 2
+                outProjection = firstOutProjection
+                outProjectionBindingIndex = 2
+            }
         }
         return LinearAttentionBoundarySteps(
             projection: projection,

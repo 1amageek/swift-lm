@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-14
+Last updated: 2026-05-15
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -233,6 +233,9 @@ flowchart TD
 | 2026-05-14 | `swift build`, `git diff --check`, changed-file `try?` scan | Pass; build and hygiene remain clean after correcting the fused-stage admission contract |
 | 2026-05-14 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; BF16 SSM sequence recurrence now has a partition-owned partial-emission variant that preserves output, recurrent state, conv state, and partition partials when scratch partitions cover multiple recurrent groups |
 | 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete BF16 library includes `ssm_recurrence_seq_bf16_f32_partition_owned_partial` |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission can count the implicit decode-equivalent storage-round bridge inserted below dispatch-entry planning |
+| 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; opt-in fused recurrent partial-emission route validates schema v6 block boundaries, Metal scratch partials, reduced output, final hidden/logits, state/KV, and decode0 |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; route fires 18 `ssm_recurrence_seq_bf16_f32_partition_owned_partial` dispatches and removes `linear_attn.out_proj` GEMV, but regresses full-model prefill heavily |
 
 ## Failed Experiments
 
@@ -252,6 +255,7 @@ flowchart TD
 | Opt-in recurrent-block partial output projection | Correctness remains green, but latest Qwen profile after fused MLP default changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 67.771/163.120/320.098 ms | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
 | Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
+| Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
 
 ## Open Decisions
 
@@ -266,7 +270,34 @@ flowchart TD
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
-| Next recurrent-block optimization unit | Prototype a dispatch-reducing recurrent-block kernel behind an explicit flag; Qwen requires the partial-partition-owned execution shape, and it must satisfy schema v6 boundary, partial fan-in, state/KV, and decode0 gates before any profile result is considered |
+| Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
+| Next recurrent-block optimization unit | Redesign the partition-owned fused kernel to avoid recomputing/re-reading the full partial projection per partition. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
+
+## Opt-in Fused Recurrent Partial-Emission Status
+
+The current fused recurrent route is a correctness-complete experiment, not a
+production speed path:
+
+```mermaid
+flowchart LR
+  A["SSM recurrence"] --> B["implicit BF16 round"]
+  B --> C["linear_attn.out_proj GEMV"]
+  C --> D["hidden"]
+  A2["fused partition-owned SSM partial"] --> B2["BF16 round"]
+  B2 --> C2["partial reduce"]
+  C2 --> D
+```
+
+| Gate | Status | Evidence |
+|---|---|---|
+| Admission contract | Pass | `RecurrentBlockFusionWindowTests` counts the implicit storage-round bridge |
+| Qwen reference correctness | Pass | schema v6 boundary, partial fan-in readback, final hidden/logits, state/KV, decode0 |
+| Route activation | Pass | profile shows 18 `ssm_recurrence_seq_bf16_f32_partition_owned_partial` dispatches |
+| Performance | Fail | seqLen 128 grows from the production-profile 314.525 ms to 955.549 ms |
+
+The route remains useful because it proves that the reference harness can catch
+cross-group fan-in and partial scratch layout errors on the fused execution
+shape. It is not eligible for default routing.
 
 ## Current Production Prefill Profile
 

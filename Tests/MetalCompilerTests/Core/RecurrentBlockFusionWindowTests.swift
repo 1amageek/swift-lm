@@ -200,6 +200,38 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .rejected([.noDispatchReduction(currentStepCount: 2, targetStepCount: 2)]))
     }
 
+    @Test("Prototype planner counts implicit storage-round bridge for fused-stage routing")
+    func prototypePlannerCountsImplicitStorageRoundBridgeForFusedStageRouting() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0, groups: 4),
+            dispatchRecurrence(index: 1, layer: 0, groups: 4),
+            dispatchOutputProjection(index: 2, layer: 0),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.fusedStageDecision(
+            for: window,
+            entries: entries,
+            implicitBridgeStepCount: 1
+        )
+
+        #expect(decision == .candidate(RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 0,
+            partitionCount: 4,
+            recurrentGroupsPerPartition: 1,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .groupOwnedStateUpdateThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )))
+    }
+
     @Test("Prototype planner creates partial-partition-owned plan when partial partitions cover multiple recurrent groups")
     func prototypePlannerCreatesPartialPartitionOwnedFusedStagePlan() throws {
         let entries = [

@@ -30,6 +30,12 @@ struct MetalPrefillStepBuilder {
             resolveDispatch: resolveDispatch
         )
 
+        let recurrentWindowsByRecurrenceIndex = Dictionary(
+            uniqueKeysWithValues: RecurrentBlockFusionAdmissionScanner
+                .linearAttentionWindows(in: fusedEntries)
+                .map { ($0.recurrenceEntryIndex, $0) }
+        )
+        let entriesByIndex = Dictionary(uniqueKeysWithValues: fusedEntries.map { ($0.index, $0) })
         var index = 0
         while index < fusedEntries.count {
             let entry = fusedEntries[index]
@@ -79,6 +85,19 @@ struct MetalPrefillStepBuilder {
                     index += 2
                     continue
                 }
+            }
+            if let window = recurrentWindowsByRecurrenceIndex[entry.index],
+               let recurrentSteps = try planner.tryBuildFusedRecurrentBlockPartialSteps(
+                   window: window,
+                   entriesByIndex: entriesByIndex
+               ) {
+                steps.append(contentsOf: recurrentSteps)
+                if let nextIndex = fusedEntries.firstIndex(where: { $0.index > window.outputProjectionEntryIndex }) {
+                    index = nextIndex
+                } else {
+                    index = fusedEntries.count
+                }
+                continue
             }
             let prefillSteps = try planner.buildSteps(for: entry)
             steps.append(contentsOf: prefillSteps)
@@ -535,6 +554,20 @@ private struct PrefillStepPlanner {
     /// the contract fails explicitly instead of falling back silently.
     private static let bf16RecurrentBlockPartialProjectionEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    /// Process-wide BF16 recurrent block fused partial-emission feature flag.
+    ///
+    /// This is an opt-in route for the dispatch-reducing recurrent-block
+    /// prototype. It replaces `SSM recurrence + bridge + out_proj` with a
+    /// partition-owned partial-emitting recurrence followed by the existing
+    /// partial reduce. Admission is hard-failing while the route is
+    /// experimental.
+    private static let bf16RecurrentBlockFusedPartialEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL"] else {
             return false
         }
         return raw == "1" || raw.lowercased() == "true"
@@ -1583,6 +1616,291 @@ private struct PrefillStepPlanner {
                 pendingRecurrentBlockOutputProjection = nil
             }
             return annotate(result.steps, entryIndex: entry.index, layerIndex: entry.layerIndex)
+        }
+    }
+
+    mutating func tryBuildFusedRecurrentBlockPartialSteps(
+        window: RecurrentBlockFusionAdmissionWindow,
+        entriesByIndex: [Int: DispatchEntry]
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16RecurrentBlockFusedPartialEnabled else {
+            return nil
+        }
+        guard let recurrenceEntry = entriesByIndex[window.recurrenceEntryIndex],
+              let recurrence = recurrenceEntry.fragment as? SSMRecurrenceFragment,
+              let outputEntry = entriesByIndex[window.outputProjectionEntryIndex],
+              let linear = outputEntry.fragment as? LinearFragment else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires recurrence and output projection entries"
+            )
+        }
+        updateCompositeInputSource(for: recurrenceEntry)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.fusedStageDecision(
+            for: window,
+            entries: Array(entriesByIndex.values),
+            implicitBridgeStepCount: fusedRecurrentBlockImplicitBridgeStepCount()
+        )
+        let plan: RecurrentBlockFusionFusedStagePlan
+        switch decision {
+        case .candidate(let candidate):
+            plan = candidate
+        case .rejected(let rejections):
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection rejected: \(rejections)"
+            )
+        }
+
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires prefill sequence precision"
+            )
+        }
+        guard linear.field == "out_proj", linear.isOutput else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires linear_attn.out_proj output projection"
+            )
+        }
+        guard linear.inputDimension == plan.recurrentOutputDimension,
+              linear.outputDimension == plan.outputDimension else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection shape mismatch"
+            )
+        }
+        guard !routingState.lastOutputIsHidden else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires recurrence inputs in scratch"
+            )
+        }
+
+        let recurrenceResolver = WeightResolver(
+            entry: recurrenceEntry,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .prefill,
+            accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
+        )
+        let outputResolver = WeightResolver(
+            entry: outputEntry,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .prefill,
+            accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
+        )
+        let descriptor = resolveProjectionWeightDescriptor(role: linear.field, entry: outputEntry)
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires BF16 row-major output weights"
+            )
+        }
+
+        let scratchSlotSize = slotDimension * scratchElementSize * maximumSequenceLength
+        let availableScratchSlots = buffers.scratch.length / max(scratchSlotSize, 1)
+        guard availableScratchSlots >= 1 + plan.partitionCount else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires \(1 + plan.partitionCount) scratch slots, found \(availableScratchSlots)"
+            )
+        }
+
+        let fusedKernelName: String
+        switch plan.executionShape {
+        case .groupOwnedStateUpdateThenPartialRows:
+            fusedKernelName = SSMRecurrenceFragment.groupOwnedPartialProjectionSequenceKernelName(
+                bufferPrecision: planBuildContext.kernelContext.bufferPrecision,
+                weightFormat: planBuildContext.kernelContext.weightFormat
+            )
+        case .partialPartitionOwnedStateUpdatesThenPartialRows:
+            fusedKernelName = SSMRecurrenceFragment.partitionOwnedPartialProjectionSequenceKernelName(
+                bufferPrecision: planBuildContext.kernelContext.bufferPrecision,
+                weightFormat: planBuildContext.kernelContext.weightFormat
+            )
+        }
+        let reduceKernelName = "recurrent_block_partial_reduce_seq_f32"
+        guard let fusedPipeline = planBuildContext.pipelineCache[fusedKernelName] else {
+            throw MetalCompilerError.kernelNotFound(fusedKernelName)
+        }
+        guard let reducePipeline = planBuildContext.pipelineCache[reduceKernelName] else {
+            throw MetalCompilerError.kernelNotFound(reduceKernelName)
+        }
+
+        let (convWeightBuffer, convWeightOffset) = recurrenceResolver.resolve(role: "conv_weight")
+        let (normWeightBuffer, normWeightOffset) = recurrenceResolver.resolve(role: "scale")
+        let (dtBiasBuffer, dtBiasOffset) = recurrenceResolver.resolve(role: "dt_bias")
+        let (aLogBuffer, aLogOffset) = recurrenceResolver.resolve(role: "A_log")
+        let (outputWeightBuffer, outputWeightOffset) = outputResolver.resolve(role: linear.field)
+        guard let recurrentState = buffers.recurrentState else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires recurrent state buffer"
+            )
+        }
+        guard let convState = buffers.convState else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block partial projection requires conv state buffer"
+            )
+        }
+
+        let convDebugEnabled = SSMRecurrenceFragment.isConvDebugPrefillEnabled
+        let convDebugBuffer: MTLBuffer
+        if convDebugEnabled {
+            guard let buffer = buffers.ssmConvDebug else {
+                throw MetalCompilerError.deviceSetupFailed(
+                    "SWIFTLM_PREFILL_DEBUG_SSM_CONV requires an SSM conv debug buffer"
+                )
+            }
+            convDebugBuffer = buffer
+        } else {
+            convDebugBuffer = buffers.scratch
+        }
+
+        let recurrentLayerOffset = routingState.recurrentLayerIndex * buffers.recurrentStateBytesPerLayer
+        let convLayerOffset = routingState.convLayerIndex
+            * buffers.convStateKernelSize
+            * buffers.convStateDimension
+            * MemoryLayout<Float16>.size
+        let headsPerGroup = max(1, recurrence.headCount / max(recurrence.groupCount, 1))
+        let localDimension = 2 * recurrence.keyHeadDimension + headsPerGroup * recurrence.valueHeadDimension
+        let phase2Threads = headsPerGroup * min(recurrence.valueHeadDimension, 256)
+        let desiredThreads = max(localDimension, phase2Threads)
+        let defaultThreads = min(
+            min(SSMRecurrenceFragment.maxThreadgroupSize, desiredThreads),
+            fusedPipeline.maxTotalThreadsPerThreadgroup
+        )
+        let minimumActiveThreads = headsPerGroup * min(recurrence.valueHeadDimension, 256)
+        let fusedThreads = try SSMRecurrenceFragment.prefillThreadgroupWidthOverride(
+            defaultThreads: defaultThreads,
+            minimumActiveThreads: minimumActiveThreads,
+            simdWidth: max(fusedPipeline.threadExecutionWidth, 1)
+        )
+        let weightTensorName = outputEntry.parameterBindings.first(where: { $0.role == linear.field })?.tensorName
+        let partialRowStride = slotDimension
+        let outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+        let partialProjectionEnabled: UInt32 = 1
+
+        var fusedBytes = [
+            uint32Binding(11, UInt32(recurrence.headCount)),
+            uint32Binding(12, UInt32(recurrence.groupCount)),
+            uint32Binding(13, UInt32(recurrence.keyHeadDimension)),
+            uint32Binding(14, UInt32(recurrence.valueHeadDimension)),
+            uint32Binding(15, UInt32(recurrence.convKernelSize)),
+            uint32Binding(16, UInt32(maximumSequenceLength)),
+            uint32Binding(17, UInt32(slotDimension)),
+            uint32Binding(19, UInt32(slotDimension)),
+            uint32Binding(20, UInt32(convDebugEnabled ? 1 : 0)),
+            uint32Binding(23, UInt32(linear.outputDimension)),
+            uint32Binding(24, UInt32(partialRowStride)),
+            uint32Binding(25, partialProjectionEnabled),
+        ]
+        if plan.executionShape == .partialPartitionOwnedStateUpdatesThenPartialRows {
+            fusedBytes.append(uint32Binding(26, UInt32(plan.partitionCount)))
+        }
+
+        let fusedStep = MetalPrefillStep(
+            pipeline: fusedPipeline,
+            gridSize: MTLSize(width: plan.partitionCount, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: fusedThreads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, 1 * scratchSlotSize),
+                (1, buffers.scratch, 2 * scratchSlotSize),
+                (2, buffers.scratch, 3 * scratchSlotSize),
+                (3, buffers.scratch, 4 * scratchSlotSize),
+                (4, convWeightBuffer, convWeightOffset),
+                (5, normWeightBuffer, normWeightOffset),
+                (6, dtBiasBuffer, dtBiasOffset),
+                (7, aLogBuffer, aLogOffset),
+                (8, recurrentState, recurrentLayerOffset),
+                (9, convState, convLayerOffset),
+                (10, buffers.scratch, 0),
+                (18, convDebugBuffer, 0),
+                (21, outputWeightBuffer, outputWeightOffset),
+                (22, buffers.scratch, scratchSlotSize),
+            ],
+            bytesBindings: fusedBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bind(index: 16),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: fusedKernelName,
+                entryIndex: recurrenceEntry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(
+                    reads: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 21],
+                    writes: convDebugEnabled ? [8, 9, 10, 18, 22] : [8, 9, 10, 22]
+                )
+            )
+        )
+
+        let reduceThreads = min(256, reducePipeline.maxTotalThreadsPerThreadgroup)
+        let reduceStep = MetalPrefillStep(
+            pipeline: reducePipeline,
+            gridSize: MTLSize(
+                width: (linear.outputDimension + reduceThreads - 1) / reduceThreads,
+                height: maximumSequenceLength,
+                depth: 1
+            ),
+            threadgroupSize: MTLSize(width: reduceThreads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, scratchSlotSize),
+                (1, buffers.hidden, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(2, UInt32(plan.partitionCount)),
+                uint32Binding(3, UInt32(linear.outputDimension)),
+                uint32Binding(4, UInt32(maximumSequenceLength)),
+                uint32Binding(5, UInt32(partialRowStride)),
+                uint32Binding(6, UInt32(outputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 4),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: reduceKernelName,
+                entryIndex: outputEntry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0], writes: [1])
+            )
+        )
+
+        recordProjectionQuantization(
+            entry: outputEntry,
+            descriptor: descriptor,
+            mode: .batch,
+            inputRowStride: slotDimension,
+            inputDimension: linear.inputDimension,
+            outputDimension: linear.outputDimension,
+            outputRowStride: outputRowStride,
+            selectedKernelName: fusedKernelName,
+            usesMPPForStep: false,
+            usesSequenceGEMVForStep: true,
+            sequenceTileHeight: nil,
+            tileVariantHeights: []
+        )
+
+        routingState.convLayerIndex += 1
+        routingState.recurrentLayerIndex += 1
+        routingState.lastOutputIsHidden = true
+        routingState.currentInputOffset = 0
+        routingState.projectionIndex = 1
+        pendingRecurrentBlockOutputProjection = nil
+        activeCompositeID = outputEntry.compositeID
+        refreshCompositeInputSource()
+
+        return [fusedStep, reduceStep]
+    }
+
+    private func fusedRecurrentBlockImplicitBridgeStepCount() -> Int {
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            return 0
+        }
+        switch planBuildContext.compileContext.decodeBufferPrecision {
+        case .float16, .bfloat16:
+            return 1
+        case .float32, .float32Decode:
+            return 0
         }
     }
 
