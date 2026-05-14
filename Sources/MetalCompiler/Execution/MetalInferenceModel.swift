@@ -2210,7 +2210,7 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 throw MetalCompilerError.deviceSetupFailed("Debug probe staging buffer missing for \(probe.label)")
             }
             let rowIndex = probe.rowIndex ?? lastTokenIndex
-            guard rowIndex >= 0, rowIndex <= lastTokenIndex else {
+            guard rowIndex >= 0 else {
                 throw MetalCompilerError.deviceSetupFailed("Debug probe row index out of range for \(probe.label)")
             }
             guard probe.elementOffset >= 0, probe.elementOffset + staging.count <= probe.rowStride else {
@@ -2219,6 +2219,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
             let sourceOffset = binding.offset
                 + (rowIndex * probe.rowStride + probe.elementOffset) * probe.precision.byteSize
             let size = staging.count * probe.precision.byteSize
+            guard sourceOffset >= 0, sourceOffset + size <= binding.buffer.length else {
+                throw MetalCompilerError.deviceSetupFailed("Debug probe source range out of bounds for \(probe.label)")
+            }
             encoder.copy(
                 sourceBuffer: binding.buffer,
                 sourceOffset: sourceOffset,

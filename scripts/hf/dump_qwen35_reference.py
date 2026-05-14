@@ -43,6 +43,8 @@ REFERENCE_CASES = [
     DEFAULT_INPUT_TOKENS[:8],
 ]
 
+MAX_PARTIAL_SCRATCH_SLOTS = 4
+
 
 def main() -> None:
     args = parse_args()
@@ -63,7 +65,7 @@ def main() -> None:
     current_phase = {"name": "ref.case_0.prefill"}
     hooks = register_hooks(model, captures, current_phase, linear_block_ordinals)
 
-    captures["ref.meta.schema_version"] = torch.tensor([5], dtype=torch.int32)
+    captures["ref.meta.schema_version"] = torch.tensor([6], dtype=torch.int32)
     captures["ref.meta.case_count"] = torch.tensor([len(REFERENCE_CASES)], dtype=torch.int32)
     captures["ref.meta.decode_steps"] = torch.tensor([args.decode_steps], dtype=torch.int32)
     captures["ref.meta.linear_block_ordinals"] = torch.tensor(
@@ -288,8 +290,13 @@ def register_linear_attention_block_hooks(
     layer_index: int,
 ) -> list[Any]:
     prefix = f"linear_ordinal_{linear_ordinal}.block"
+    partition_count = partition_count_for_block(block)
     captures[f"ref.meta.linear_ordinal_{linear_ordinal}.layer_index"] = torch.tensor(
         [layer_index],
+        dtype=torch.int32,
+    )
+    captures[f"ref.meta.linear_ordinal_{linear_ordinal}.partition_count"] = torch.tensor(
+        [partition_count],
         dtype=torch.int32,
     )
     return [
@@ -312,9 +319,28 @@ def register_linear_attention_block_hooks(
             make_hook(captures, current_phase, f"{prefix}.gated_recurrent_output")
         ),
         block.out_proj.register_forward_hook(
-            make_hook(captures, current_phase, f"{prefix}.out_projection")
+            make_out_projection_hook(
+                captures,
+                current_phase,
+                f"{prefix}.out_projection",
+                partition_count,
+            )
         ),
     ]
+
+
+def partition_count_for_block(block: Any) -> int:
+    group_count = int(getattr(block, "num_k_heads", 1))
+    return largest_divisor(group_count, min(group_count, MAX_PARTIAL_SCRATCH_SLOTS))
+
+
+def largest_divisor(value: int, maximum: int) -> int:
+    if value <= 0 or maximum <= 0:
+        return 1
+    for candidate in range(min(value, maximum), 0, -1):
+        if value % candidate == 0:
+            return candidate
+    return 1
 
 
 def make_conv_silu_hook(
@@ -344,6 +370,45 @@ def make_hook(
         if tensor is None:
             return
         captures[f"{current_phase['name']}.{suffix}"] = to_reference_tensor(tensor)
+
+    return hook
+
+
+def make_out_projection_hook(
+    captures: dict[str, torch.Tensor],
+    current_phase: dict[str, str],
+    suffix: str,
+    partition_count: int,
+) -> Any:
+    def hook(module: Any, inputs: tuple[Any, ...], output: Any) -> None:
+        output_tensor = first_tensor(output)
+        input_tensor = first_tensor(inputs)
+        if output_tensor is None or input_tensor is None:
+            return
+
+        captures[f"{current_phase['name']}.{suffix}"] = to_reference_tensor(output_tensor)
+
+        projected = input_tensor.detach().to(dtype=torch.float32)
+        if projected.ndim == 3 and projected.shape[0] == 1:
+            projected = projected.squeeze(0)
+        weight = module.weight.detach().to(dtype=torch.float32)
+        input_dim = int(projected.shape[-1])
+        output_dim = int(weight.shape[0])
+        if input_dim % partition_count != 0:
+            raise ValueError(
+                f"out projection input dimension {input_dim} is not divisible by partition count {partition_count}"
+            )
+        partition_input_dim = input_dim // partition_count
+        partials: list[torch.Tensor] = []
+        for partition in range(partition_count):
+            start = partition * partition_input_dim
+            end = start + partition_input_dim
+            partial = projected[..., start:end] @ weight[:, start:end].transpose(0, 1)
+            partials.append(partial)
+        stacked = torch.stack(partials, dim=1).reshape(-1, partition_count, output_dim)
+        reduced = stacked.sum(dim=1)
+        captures[f"{current_phase['name']}.{suffix}_partials"] = to_reference_tensor(stacked)
+        captures[f"{current_phase['name']}.{suffix}_reduced"] = to_reference_tensor(reduced)
 
     return hook
 

@@ -66,8 +66,8 @@ It does not yet authorize MPP or fused non-decode-equivalent kernels.
 |---|---|---|
 | LFM reference dump script | Existing | `scripts/hf/dump_lfm2_reference.py` |
 | LFM Swift reference comparison | Existing | `Tests/MetalCompilerTests/Models/LFM2/ReferenceComparisonTests.swift` |
-| Qwen reference dump script | Done / extended | `scripts/hf/dump_qwen35_reference.py`; schema v5 supports multiple reference cases, version metadata, and selected linear-attention block boundary tensors |
-| Qwen Swift reference comparison | Done / extended | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v5 case plus selected early/middle/late linear-attention block boundaries |
+| Qwen reference dump script | Done / extended | `scripts/hf/dump_qwen35_reference.py`; schema v6 supports multiple reference cases, version metadata, selected linear-attention block boundary tensors, and cross-group output-projection partials |
+| Qwen Swift reference comparison | Done / extended | `Tests/MetalCompilerTests/Models/Qwen35/Qwen35ReferenceComparisonTests.swift`; validates every schema v6 case plus selected early/middle/late linear-attention block boundaries and partition partial fan-in |
 | Reference manifest | Done | `Tests/MetalCompilerTests/Core/ReferenceHarnessManifestTests.swift` |
 
 ## Confidence Audit
@@ -95,9 +95,10 @@ flowchart TD
 | Decode post-state is not checked | Closed | Qwen reference test checks `decode_0` logits, next token, conv state, and recurrent state |
 | KV cache corruption can pass | Closed | Qwen reference test checks prefill and `decode_0` key/value caches for all attention ordinals |
 | Metal readback failure can look like a numeric match | Closed | Buffer readback now throws on allocation, command-buffer, or range failure; length mismatch produces infinite error |
-| Single prompt / sequence length only | Closed | Qwen schema v5 stores multiple reference cases; Swift validates each case independently |
+| Single prompt / sequence length only | Closed | Qwen schema v6 stores multiple reference cases; Swift validates each case independently |
 | Q3 sequence prefill | Closed for current Qwen3.5 Q3 path | Q3 G16/G32/G64 projection sequence GEMV and embedding lookup have CPU-reference tests; real Q3 prompt ingestion uses sequence prefill and matches sequential ingestion trace |
-| HuggingFace backend variance | Closed for traceability | Qwen schema v5 records PyTorch version, Transformers version, and fast-backend availability |
+| HuggingFace backend variance | Closed for traceability | Qwen schema v6 records PyTorch version, Transformers version, and fast-backend availability |
+| Cross-group fan-in hidden by final reduce | Closed | Qwen schema v6 stores `out_projection_partials` and `out_projection_reduced`; Swift compares CPU-computed partials in default mode and Metal scratch partials when the opt-in route is enabled |
 
 ## Evidence Log
 
@@ -209,6 +210,12 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; opt-in attention output fusion remains reference-equivalent |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O=1` | Pass; route removes 6 `packed_sigmoid_gate_seq_f32` and 6 `self_attn.o_proj` GEMV dispatches but regresses total profile, so it stays non-default |
 | 2026-05-14 | `swift test --filter FusedPackedSigmoidOutputEquivalenceTests` | Pass; opt-in packed-sigmoid attention output fusion matches both Swift reference and the unfused two-kernel path |
+| 2026-05-14 | `python3 scripts/hf/dump_qwen35_reference.py --output TestData/qwen35_reference.safetensors --decode-steps 2 --linear-block-ordinals 0,9,17` | Pass; wrote schema v6 Qwen3.5 HF reference snapshot with 1488 tensors, including partition partials and reduced output projection tensors |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic partial projection harness now validates both the intermediate partial buffer and final reduce output, including padded stride sentinel regions |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; partial projection route remains one logical recurrent-block output window |
+| 2026-05-14 | `swift test --filter ReferenceHarnessManifestTests` | Pass; Qwen schema v6 is treated as ready by the reference harness manifest |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; default route validates schema v6, HF partials, CPU-computed partition partials, reduced output, existing state/KV gates, and decode0 |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in partial route validates Metal scratch partial readback, final reduce, final hidden/logits, state/KV, and decode0 |
 
 ## Failed Experiments
 
@@ -235,7 +242,7 @@ flowchart TD
 | Best sequence tile size for M1 | tile4 is not acceptable as default; smaller or different tiling remains future work |
 | Whether M1 should default to tile4 or stay opt-in | Stay non-default |
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
-| Qwen reference dump schema for M2 | Implemented and validated as schema v5 multi-case with selected block-boundary capture |
+| Qwen reference dump schema for M2 | Implemented and validated as schema v6 multi-case with selected block-boundary capture and cross-group fan-in partial tensors |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
 | Whether fused SwiGLU + down should default | Yes, narrowly: rows=8 is default only for stateful hybrid BF16 sequence prefill with runtime admission at seqLen >= 64; `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` disables it |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
@@ -898,7 +905,10 @@ slots without a new runtime buffer.
 
 The partial buffer layout is slot-major so production routing can bind the
 existing prefill scratch buffer without reshaping:
-`partial[partition * maximumSequenceLength * slotDimension + token * slotDimension + row]`.
+`partial[partition * runtimeSequenceLength * slotDimension + token * slotDimension + row]`.
+The route intentionally packs only the active runtime sequence, and the
+reference harness probes the same layout so unwritten scratch capacity cannot
+hide a row-stride bug.
 
 Validation:
 
@@ -966,6 +976,30 @@ The same artifact now includes timing columns for each replaceable window:
 | `bridgeGpuMicroseconds` | Rounds and other non-core steps inside the window |
 | `outputProjectionGpuMicroseconds` | Final output projection cost, including partial projection and reduce when routed |
 | `estimatedTotalBytes` | Estimated traffic for the window entries |
+
+M3D.5 completes the cross-group fan-in harness. The Qwen reference snapshot is
+now schema v6 and stores per-partition output-projection partials for selected
+linear-attention ordinals:
+
+```mermaid
+flowchart LR
+  A["gated recurrent output"] --> B["partitioned out_proj matmul"]
+  B --> C["HF partials: seq x partition x hidden"]
+  C --> D["HF reduced out_proj"]
+  B --> E["Metal partial scratch when route is enabled"]
+  E --> F["Metal partial reduce"]
+```
+
+| Route | Fan-in gate |
+|---|---|
+| Default route | Swift computes partition partials from Metal `gated_recurrent_output` and STAF `linear_attn.out_proj.weight`, then compares them with HF schema v6 partial tensors |
+| Opt-in partial route | Metal scratch partial rows are read back with the runtime-sequence packed layout and compared partition-by-partition with HF schema v6 partial tensors |
+| Both routes | HF `out_projection_reduced` must match the existing HF `out_projection`, so the partial reference cannot drift from the block boundary contract |
+
+This closes the main harness gap for future recurrent-block fusion: a kernel can
+no longer pass only because the final reduced hidden row happens to match. It
+must also expose the cross-group partial fan-in contract when it opts into the
+partial route.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

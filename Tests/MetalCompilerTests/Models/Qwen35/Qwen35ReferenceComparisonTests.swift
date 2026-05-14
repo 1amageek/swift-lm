@@ -58,7 +58,7 @@ struct Qwen35ReferenceComparisonTests {
         let transformersVersion = try Self.readRefUInt8Array(env.ref, name: "ref.meta.transformers_version_utf8")
         let bundleConfigHash = try Self.configSHA256(bundlePath: env.bundlePath)
 
-        #expect(schemaVersion == 5, "Unexpected Qwen35 reference schema version: \(schemaVersion)")
+        #expect(schemaVersion == 6, "Unexpected Qwen35 reference schema version: \(schemaVersion)")
         #expect(Int(caseCount) == Self.referenceCases.count)
         #expect(decodeSteps >= 1)
         #expect(fastBackendAvailable == 0 || fastBackendAvailable == 1)
@@ -73,6 +73,11 @@ struct Qwen35ReferenceComparisonTests {
                 name: "ref.meta.linear_ordinal_\(ordinal).layer_index"
             )
             #expect(layerIndex >= 0)
+            let partitionCount = try Self.readRefInt32(
+                env.ref,
+                name: "ref.meta.linear_ordinal_\(ordinal).partition_count"
+            )
+            #expect(partitionCount > 1)
         }
 
         for referenceCase in Self.referenceCases {
@@ -111,6 +116,8 @@ struct Qwen35ReferenceComparisonTests {
                     "\(prefix).prefill.linear_ordinal_\(ordinal).block.conv_silu",
                     "\(prefix).prefill.linear_ordinal_\(ordinal).block.gated_recurrent_output",
                     "\(prefix).prefill.linear_ordinal_\(ordinal).block.out_projection",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.out_projection_partials",
+                    "\(prefix).prefill.linear_ordinal_\(ordinal).block.out_projection_reduced",
                 ]
                 for name in requiredBlockTensors {
                     #expect(env.ref.tensors[name] != nil, "Missing Qwen35 reference tensor: \(name)")
@@ -135,21 +142,37 @@ struct Qwen35ReferenceComparisonTests {
 
         var lastProbeStepIndex = 0
         var stages: [LinearAttentionBoundaryStage] = []
+        var fanInChecks: [LinearAttentionFanInCheck] = []
         for ordinal in linearBlockOrdinals.map(Int.init) {
             let layerIndex = Int(try Self.readRefInt32(
                 env.ref,
                 name: "ref.meta.linear_ordinal_\(ordinal).layer_index"
+            ))
+            let partitionCount = Int(try Self.readRefInt32(
+                env.ref,
+                name: "ref.meta.linear_ordinal_\(ordinal).partition_count"
             ))
             let steps = try Self.linearAttentionBoundarySteps(
                 prefillPlan: prefillPlan,
                 layerIndex: layerIndex
             )
             lastProbeStepIndex = max(lastProbeStepIndex, steps.outProjection)
+            if let partialProjection = steps.partialProjection {
+                lastProbeStepIndex = max(lastProbeStepIndex, partialProjection)
+            }
             stages.append(contentsOf: Self.linearAttentionBoundaryStages(
                 referencePrefix: referenceCase.prefix,
                 ordinal: ordinal,
                 steps: steps,
                 slotDimension: prefillPlan.slotDimension
+            ))
+            fanInChecks.append(LinearAttentionFanInCheck(
+                referencePrefix: referenceCase.prefix,
+                ordinal: ordinal,
+                layerIndex: layerIndex,
+                partitionCount: partitionCount,
+                partialProjectionStepIndex: steps.partialProjection,
+                partialProjectionBindingIndex: 2
             ))
         }
 
@@ -166,6 +189,23 @@ struct Qwen35ReferenceComparisonTests {
                     count: stage.count,
                     precision: .float32
                 ))
+            }
+        }
+        for check in fanInChecks {
+            guard let partialProjectionStepIndex = check.partialProjectionStepIndex else { continue }
+            for partition in 0..<check.partitionCount {
+                for rowIndex in referenceCase.tokens.indices {
+                    probes.append(MetalInferenceModel.DebugPrefillBindingProbe(
+                        label: check.partialProbeLabel(partition: partition, rowIndex: rowIndex),
+                        stepIndex: partialProjectionStepIndex,
+                        bindingIndex: check.partialProjectionBindingIndex,
+                        phase: .afterStep,
+                        rowIndex: partition * referenceCase.tokens.count + rowIndex,
+                        rowStride: prefillPlan.slotDimension,
+                        count: 1024,
+                        precision: .float32
+                    ))
+                }
             }
         }
 
@@ -203,6 +243,15 @@ struct Qwen35ReferenceComparisonTests {
                 )
             }
             print("[Qwen35Ref] \(referenceCase.prefix).prefill.\(stage.name) maxErr=\(String(format: "%.4f", worstError))")
+        }
+
+        for check in fanInChecks {
+            try Self.expectLinearAttentionFanInMatchesReference(
+                check: check,
+                env: env,
+                snapshots: snapshots,
+                tokenCount: referenceCase.tokens.count
+            )
         }
     }
 
@@ -352,12 +401,14 @@ struct Qwen35ReferenceComparisonTests {
     private struct TestEnvironment {
         let model: MetalInferenceModel
         let ref: MetalWeightFile
+        let staf: STAFWeightStore
         let bundlePath: String
     }
 
     private struct LinearAttentionBoundarySteps {
         let projection: Int
         let recurrence: Int
+        let partialProjection: Int?
         let outProjection: Int
         let outProjectionBindingIndex: Int
     }
@@ -370,6 +421,31 @@ struct Qwen35ReferenceComparisonTests {
         let rowStride: Int
         let count: Int
         let tolerance: Float
+    }
+
+    private struct LinearAttentionFanInCheck {
+        let referencePrefix: String
+        let ordinal: Int
+        let layerIndex: Int
+        let partitionCount: Int
+        let partialProjectionStepIndex: Int?
+        let partialProjectionBindingIndex: Int
+
+        var labelPrefix: String {
+            "linear_ordinal_\(ordinal).block"
+        }
+
+        var referenceBlockPrefix: String {
+            "\(referencePrefix).prefill.linear_ordinal_\(ordinal).block"
+        }
+
+        func gatedLabel(rowIndex: Int) -> String {
+            "\(labelPrefix).gated_recurrent_output.row_\(rowIndex)"
+        }
+
+        func partialProbeLabel(partition: Int, rowIndex: Int) -> String {
+            "\(labelPrefix).out_projection_partials.partition_\(partition).row_\(rowIndex)"
+        }
     }
 
     private static func setupOrSkip(enableSSMConvDebug: Bool = false) throws -> TestEnvironment {
@@ -404,7 +480,12 @@ struct Qwen35ReferenceComparisonTests {
             bundlePath: bundlePath,
             inferencePolicy: InferencePolicy(maximumSequenceLength: 64)
         )
-        return TestEnvironment(model: model, ref: ref, bundlePath: bundlePath)
+        let stafURL = URL(fileURLWithPath: bundlePath).appendingPathComponent("model.staf")
+        guard FileManager.default.fileExists(atPath: stafURL.path) else {
+            throw SetupError.tensorNotFound(stafURL.path)
+        }
+        let staf = try STAFLoader().load(at: stafURL, device: device)
+        return TestEnvironment(model: model, ref: ref, staf: staf, bundlePath: bundlePath)
     }
 
     private static func resolveBundle() throws -> String? {
@@ -461,6 +542,7 @@ struct Qwen35ReferenceComparisonTests {
         let firstOutProjectionKernel = prefillPlan.steps[firstOutProjection].metadata.kernelName
             ?? prefillPlan.steps[firstOutProjection].pipeline.label
             ?? ""
+        let partialProjection: Int?
         let outProjection: Int
         let outProjectionBindingIndex: Int
         if firstOutProjectionKernel.hasPrefix("recurrent_block_partial_projection") {
@@ -471,15 +553,18 @@ struct Qwen35ReferenceComparisonTests {
             }) else {
                 throw SetupError.stepNotFound("linear attention partial output reduce for layer \(layerIndex)")
             }
+            partialProjection = firstOutProjection
             outProjection = reduceStep
             outProjectionBindingIndex = 1
         } else {
+            partialProjection = nil
             outProjection = firstOutProjection
             outProjectionBindingIndex = 2
         }
         return LinearAttentionBoundarySteps(
             projection: projection,
             recurrence: recurrence,
+            partialProjection: partialProjection,
             outProjection: outProjection,
             outProjectionBindingIndex: outProjectionBindingIndex
         )
@@ -557,7 +642,164 @@ struct Qwen35ReferenceComparisonTests {
                 count: 1024,
                 tolerance: 1.25
             ),
+            LinearAttentionBoundaryStage(
+                name: "\(labelPrefix).out_projection_reduced",
+                referenceName: "\(blockPrefix).out_projection_reduced",
+                stepIndex: steps.outProjection,
+                bindingIndex: steps.outProjectionBindingIndex,
+                rowStride: 1024,
+                count: 1024,
+                tolerance: 1.25
+            ),
         ]
+    }
+
+    private static func expectLinearAttentionFanInMatchesReference(
+        check: LinearAttentionFanInCheck,
+        env: TestEnvironment,
+        snapshots: [String: [Float]],
+        tokenCount: Int
+    ) throws {
+        let gatedRows = try (0..<tokenCount).map { rowIndex in
+            guard let row = snapshots[check.gatedLabel(rowIndex: rowIndex)] else {
+                throw SetupError.tensorNotFound("metal.\(check.gatedLabel(rowIndex: rowIndex))")
+            }
+            return row
+        }
+        let weightTensorName = "model.language_model.layers.\(check.layerIndex).linear_attn.out_proj.weight"
+        let (weight, weightShape) = try readSTAFTensorAsFloats(env.staf, name: weightTensorName)
+        guard weightShape.count == 2 else {
+            throw SetupError.unsupportedTensorDType(weightTensorName, "rank\(weightShape.count)")
+        }
+        let outputDimension = weightShape[0]
+        let inputDimension = weightShape[1]
+        let computedPartials = try computePartitionedOutputProjection(
+            inputRows: gatedRows,
+            weight: weight,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            partitionCount: check.partitionCount
+        )
+        let referencePartials = try readRefTensorAsFloats(
+            env.ref,
+            name: "\(check.referenceBlockPrefix).out_projection_partials"
+        )
+        let partialError = maxAbsoluteError(computedPartials.partials, referencePartials)
+        print("[Qwen35Ref] \(check.referenceBlockPrefix).out_projection_partials computed maxErr=\(String(format: "%.4f", partialError))")
+        #expect(
+            partialError <= 1.25,
+            "\(check.referenceBlockPrefix).out_projection_partials computed drifted: maxErr=\(partialError)"
+        )
+
+        if check.partialProjectionStepIndex != nil {
+            var metalPartials: [Float] = []
+            metalPartials.reserveCapacity(referencePartials.count)
+            for rowIndex in 0..<tokenCount {
+                for partition in 0..<check.partitionCount {
+                    guard let values = snapshots[check.partialProbeLabel(partition: partition, rowIndex: rowIndex)] else {
+                        throw SetupError.tensorNotFound("metal.\(check.partialProbeLabel(partition: partition, rowIndex: rowIndex))")
+                    }
+                    metalPartials.append(contentsOf: values)
+                }
+            }
+            let metalPartialError = maxAbsoluteError(metalPartials, referencePartials)
+            print("[Qwen35Ref] \(check.referenceBlockPrefix).out_projection_partials metal maxErr=\(String(format: "%.4f", metalPartialError))")
+            if metalPartialError > 1.25,
+               let mismatch = largestMismatch(
+                actual: metalPartials,
+                expected: referencePartials,
+                outputDimension: outputDimension,
+                partitionCount: check.partitionCount
+               ) {
+                print(
+                    "[Qwen35Ref] partial mismatch token=\(mismatch.token) partition=\(mismatch.partition) output=\(mismatch.output) metal=\(mismatch.actual) ref=\(mismatch.expected)"
+                )
+            }
+            #expect(
+                metalPartialError <= 1.25,
+                "\(check.referenceBlockPrefix).out_projection_partials metal drifted: maxErr=\(metalPartialError)"
+            )
+        }
+
+        let referenceReduced = try readRefTensorAsFloats(
+            env.ref,
+            name: "\(check.referenceBlockPrefix).out_projection_reduced"
+        )
+        let reducedError = maxAbsoluteError(computedPartials.reduced, referenceReduced)
+        #expect(
+            reducedError <= 1.25,
+            "\(check.referenceBlockPrefix).out_projection_reduced computed drifted: maxErr=\(reducedError)"
+        )
+        let referenceOut = try readRefTensorAsFloats(
+            env.ref,
+            name: "\(check.referenceBlockPrefix).out_projection"
+        )
+        let reducedOutError = maxAbsoluteError(referenceReduced, referenceOut)
+        #expect(
+            reducedOutError <= 1.25,
+            "\(check.referenceBlockPrefix).out_projection_reduced differs from out_projection: maxErr=\(reducedOutError)"
+        )
+    }
+
+    private static func computePartitionedOutputProjection(
+        inputRows: [[Float]],
+        weight: [Float],
+        inputDimension: Int,
+        outputDimension: Int,
+        partitionCount: Int
+    ) throws -> (partials: [Float], reduced: [Float]) {
+        guard inputDimension % partitionCount == 0 else {
+            throw SetupError.unsupportedTensorDType("partitioned output projection", "inputDim=\(inputDimension), partitions=\(partitionCount)")
+        }
+        let partitionInputDimension = inputDimension / partitionCount
+        var partials = [Float](repeating: 0, count: inputRows.count * partitionCount * outputDimension)
+        var reduced = [Float](repeating: 0, count: inputRows.count * outputDimension)
+        for rowIndex in inputRows.indices {
+            let input = inputRows[rowIndex]
+            guard input.count >= inputDimension else {
+                throw SetupError.unsupportedTensorDType("partitioned output projection input", "count=\(input.count)")
+            }
+            for partition in 0..<partitionCount {
+                let inputBase = partition * partitionInputDimension
+                for row in 0..<outputDimension {
+                    var sum: Float = 0
+                    let weightBase = row * inputDimension + inputBase
+                    for column in 0..<partitionInputDimension {
+                        sum += input[inputBase + column] * weight[weightBase + column]
+                    }
+                    let partialIndex = rowIndex * partitionCount * outputDimension
+                        + partition * outputDimension
+                        + row
+                    partials[partialIndex] = sum
+                    reduced[rowIndex * outputDimension + row] += sum
+                }
+            }
+        }
+        return (partials, reduced)
+    }
+
+    private static func largestMismatch(
+        actual: [Float],
+        expected: [Float],
+        outputDimension: Int,
+        partitionCount: Int
+    ) -> (token: Int, partition: Int, output: Int, actual: Float, expected: Float)? {
+        guard actual.count == expected.count, outputDimension > 0, partitionCount > 0 else {
+            return nil
+        }
+        var bestIndex = 0
+        var bestError = Float.zero
+        for index in actual.indices {
+            let error = abs(actual[index] - expected[index])
+            if error > bestError {
+                bestError = error
+                bestIndex = index
+            }
+        }
+        let output = bestIndex % outputDimension
+        let partition = (bestIndex / outputDimension) % partitionCount
+        let token = bestIndex / (partitionCount * outputDimension)
+        return (token, partition, output, actual[bestIndex], expected[bestIndex])
     }
 
     private static func readRefTensorAsFloats(
@@ -581,6 +823,30 @@ struct Qwen35ReferenceComparisonTests {
             return Array(UnsafeBufferPointer(start: pointer, count: count))
         default:
             throw SetupError.unsupportedTensorDType(name, info.dtype.rawValue)
+        }
+    }
+
+    private static func readSTAFTensorAsFloats(
+        _ store: STAFWeightStore,
+        name: String
+    ) throws -> ([Float], [Int]) {
+        guard let entry = store.entries[name] else {
+            throw SetupError.tensorNotFound(name)
+        }
+        let count = entry.shape.reduce(1, *)
+        let base = store.buffer.contents() + entry.bufferOffset
+        switch entry.schemeIdentifier {
+        case .fp16RowMajor:
+            let pointer = base.bindMemory(to: Float16.self, capacity: count)
+            return ((0..<count).map { Float(pointer[$0]) }, entry.shape)
+        case .bf16RowMajor:
+            let pointer = base.bindMemory(to: BFloat16.self, capacity: count)
+            return ((0..<count).map { Float(pointer[$0]) }, entry.shape)
+        case .fp32RowMajor:
+            let pointer = base.bindMemory(to: Float.self, capacity: count)
+            return (Array(UnsafeBufferPointer(start: pointer, count: count)), entry.shape)
+        default:
+            throw SetupError.unsupportedTensorDType(name, "\(entry.schemeIdentifier)")
         }
     }
 

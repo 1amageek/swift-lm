@@ -57,6 +57,17 @@ struct RecurrentBlockFusionKernelTests {
         }
         let partial = [Float](repeating: -777.0, count: groupCount * sequenceLength * partialRowStride)
         let output = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
+        let expectedPartial = expectedPartialProjection(
+            input: input,
+            weights: weights,
+            groupCount: groupCount,
+            partitionInputDimension: partitionInputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            partialRowStride: partialRowStride,
+            sentinel: -777.0
+        )
         let expected = expectedPartialProjectionAndReduce(
             input: input,
             weights: weights,
@@ -132,6 +143,21 @@ struct RecurrentBlockFusionKernelTests {
         commandBuffer.waitUntilCompleted()
 
         #expect(commandBuffer.error == nil)
+        let partialPointer = partialBuffer.contents().assumingMemoryBound(to: Float.self)
+        let actualPartial = (0..<partial.count).map { partialPointer[$0] }
+        let partialMaxError = zip(expectedPartial, actualPartial).reduce(Float.zero) { current, pair in
+            max(current, abs(pair.0 - pair.1))
+        }
+        #expect(partialMaxError <= 0.000_01, "partial projection buffer maxError=\(partialMaxError)")
+        for group in 0..<groupCount {
+            for seq in 0..<sequenceLength {
+                for row in outputDimension..<partialRowStride {
+                    let index = group * sequenceLength * partialRowStride + seq * partialRowStride + row
+                    #expect(actualPartial[index] == -777.0)
+                }
+            }
+        }
+
         let pointer = outputBuffer.contents().assumingMemoryBound(to: Float.self)
         let actual = (0..<output.count).map { pointer[$0] }
         let maxError = zip(expected, actual).reduce(Float.zero) { current, pair in
@@ -255,6 +281,36 @@ struct RecurrentBlockFusionKernelTests {
             }
         }
         return output
+    }
+
+    private func expectedPartialProjection(
+        input: [Float],
+        weights: [BFloat16],
+        groupCount: Int,
+        partitionInputDimension: Int,
+        outputDimension: Int,
+        sequenceLength: Int,
+        inputRowStride: Int,
+        partialRowStride: Int,
+        sentinel: Float
+    ) -> [Float] {
+        let inputDimension = groupCount * partitionInputDimension
+        var partial = [Float](repeating: sentinel, count: groupCount * sequenceLength * partialRowStride)
+        for group in 0..<groupCount {
+            let groupInputBase = group * partitionInputDimension
+            for seq in 0..<sequenceLength {
+                for row in 0..<outputDimension {
+                    var sum: Float = 0
+                    for column in 0..<partitionInputDimension {
+                        let inputValue = input[seq * inputRowStride + groupInputBase + column]
+                        let weightValue = Float(weights[row * inputDimension + groupInputBase + column])
+                        sum += inputValue * weightValue
+                    }
+                    partial[group * sequenceLength * partialRowStride + seq * partialRowStride + row] = sum
+                }
+            }
+        }
+        return partial
     }
 
     private func expectedPartialProjectionAndReduce(
