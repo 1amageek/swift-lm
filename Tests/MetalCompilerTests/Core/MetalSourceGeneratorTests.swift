@@ -1824,6 +1824,7 @@ struct MetalSourceGeneratorTests {
         #expect(SSMRecurrenceFragment.sequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32")
         #expect(SSMRecurrenceFragment.prewriteDecaySequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_prewrite_decay")
         #expect(SSMRecurrenceFragment.groupOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_group_owned_partial")
+        #expect(SSMRecurrenceFragment.partitionOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_partition_owned_partial")
     }
 
     @Test("SSM recurrence reads Qwen gated norm weight directly")
@@ -2288,6 +2289,7 @@ struct MetalSourceGeneratorTests {
             "ssm_recurrence_seq_bf16",
             "ssm_recurrence_seq_bf16_f32",
             "ssm_recurrence_seq_bf16_f32_group_owned_partial",
+            "ssm_recurrence_seq_bf16_f32_partition_owned_partial",
         ] {
             #expect(library.makeFunction(name: name) != nil, "Missing: \(name)")
         }

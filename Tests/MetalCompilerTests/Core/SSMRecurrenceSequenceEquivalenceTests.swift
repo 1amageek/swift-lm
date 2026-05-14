@@ -493,6 +493,186 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         )
     }
 
+    @Test("BF16 SSM sequence recurrence can emit partition-owned partial projection")
+    func bf16SSMSequenceRecurrenceEmitsPartitionOwnedPartialProjection() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let headCount = 8
+        let groupCount = 8
+        let partitionCount = 4
+        let keyDimension = 8
+        let valueDimension = 4
+        let convKernelSize = 3
+        let sequenceLength = 5
+        let keyGroupDimension = groupCount * keyDimension
+        let convDimension = 2 * keyGroupDimension + headCount * valueDimension
+        let recurrentOutputDimension = headCount * valueDimension
+        let outputDimension = 7
+        let sequenceKernelName = "ssm_recurrence_bf16_sequence_partition_partial_source"
+        let partialKernelName = "ssm_recurrence_bf16_sequence_partition_partial_emission"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateSSMWeightIndependentHelpers(),
+            MetalSourceGenerator.generateSSMConvSiluHelper(weightFormat: .bfloat16),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: sequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension
+            ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: partialKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                emitsPartitionOwnedPartialProjection: true
+            ),
+        ].joined(separator: "\n")
+        let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
+        let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
+        let partialPipeline = try harness.pipeline(named: partialKernelName)
+
+        let projectedQKV = roundedBFloat16Values(
+            count: sequenceLength * convDimension,
+            multiplier: 13,
+            modulus: 23,
+            scale: 0.125
+        )
+        let projectedZ = roundedBFloat16Values(
+            count: sequenceLength * recurrentOutputDimension,
+            multiplier: 17,
+            modulus: 19,
+            scale: 0.125
+        )
+        let projectedBeta = roundedBFloat16Values(
+            count: sequenceLength * headCount,
+            multiplier: 7,
+            modulus: 11,
+            scale: 0.125
+        )
+        let projectedAlpha = roundedBFloat16Values(
+            count: sequenceLength * headCount,
+            multiplier: 5,
+            modulus: 13,
+            scale: 0.125
+        )
+        let convWeight = (0..<(convDimension * convKernelSize)).map { index in
+            BFloat16(Float((index * 11) % 17 - 8) * 0.03125)
+        }
+        let normWeight = (0..<valueDimension).map { index in
+            0.75 + Float(index) * 0.0625
+        }
+        let dtBias = (0..<headCount).map { index in
+            BFloat16(Float(index - 1) * 0.03125)
+        }
+        let aLog = (0..<headCount).map { index in
+            Float(index) * 0.0625 - 0.125
+        }
+        let partialWeight = (0..<(outputDimension * recurrentOutputDimension)).map { index in
+            BFloat16(Float((index * 11) % 31 - 15) * 0.015625)
+        }
+
+        let sequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: sequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: recurrentOutputDimension
+        )
+        let partial = try runSequenceSSMTraceWithPartialProjection(
+            harness: harness,
+            pipeline: partialPipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            partialWeight: partialWeight,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            recurrentOutputDimension: recurrentOutputDimension,
+            partialOutputDimension: outputDimension,
+            partialPartitionCount: partitionCount
+        )
+
+        let outputMismatch = harness.firstMismatch(
+            expected: sequence.output,
+            actual: partial.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            outputMismatch == nil,
+            "Partition partial SSM output drifted: \(String(describing: outputMismatch)), maxError=\(harness.maxAbsoluteError(expected: sequence.output, actual: partial.output))"
+        )
+        let recurrentMismatch = harness.firstMismatch(
+            expected: sequence.recurrentState,
+            actual: partial.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            recurrentMismatch == nil,
+            "Partition partial SSM recurrent state drifted: \(String(describing: recurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: sequence.recurrentState, actual: partial.recurrentState))"
+        )
+        #expect(
+            sequence.convStateBits == partial.convStateBits,
+            "Partition partial SSM conv state drifted"
+        )
+
+        let expectedPartials = expectedPartitionOwnedPartials(
+            input: sequence.output,
+            weights: partialWeight,
+            partitionCount: partitionCount,
+            partitionInputDimension: recurrentOutputDimension / partitionCount,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength
+        )
+        let partialMismatch = harness.firstMismatch(
+            expected: expectedPartials,
+            actual: partial.partials,
+            tolerance: 0.000_01
+        )
+        #expect(
+            partialMismatch == nil,
+            "Partition partial SSM partials drifted: \(String(describing: partialMismatch)), maxError=\(harness.maxAbsoluteError(expected: expectedPartials, actual: partial.partials))"
+        )
+    }
+
     private func roundedBFloat16Values(
         count: Int,
         multiplier: Int,
@@ -750,10 +930,12 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         sequenceLength: Int,
         convDimension: Int,
         recurrentOutputDimension: Int,
-        partialOutputDimension: Int
+        partialOutputDimension: Int,
+        partialPartitionCount: Int? = nil
     ) throws -> (output: [Float], recurrentState: [Float], convStateBits: [UInt16], partials: [Float]) {
         let activationRowStride = max(convDimension, recurrentOutputDimension, headCount)
         let partialRowStride = partialOutputDimension + 3
+        let effectivePartialPartitionCount = partialPartitionCount ?? groupCount
         let qkvBuffer = try harness.makeSharedBuffer(values: paddedRows(
             projectedQKV,
             rowCount: sequenceLength,
@@ -794,7 +976,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         )
         let partialBuffer = try harness.makeSharedBuffer(values: [Float](
             repeating: -777.0,
-            count: groupCount * sequenceLength * partialRowStride
+            count: effectivePartialPartitionCount * sequenceLength * partialRowStride
         ))
         let threads = ssmThreadCount(
             pipeline: pipeline,
@@ -803,7 +985,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             keyDimension: keyDimension,
             valueDimension: valueDimension
         )
-        let grid = MTLSize(width: max(groupCount, 1), height: 1, depth: 1)
+        let grid = MTLSize(width: max(effectivePartialPartitionCount, 1), height: 1, depth: 1)
         let threadgroup = MTLSize(width: threads, height: 1, depth: 1)
 
         let (commandBuffer, encoder) = try harness.makeCommandEncoder()
@@ -836,6 +1018,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         var partialRows = UInt32(partialOutputDimension)
         var partialStride = UInt32(partialRowStride)
         var partialEnabled: UInt32 = 1
+        var partitionCount = UInt32(effectivePartialPartitionCount)
         encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.stride, index: 16)
         encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 17)
         encoder.setBytes(&rowStride, length: MemoryLayout<UInt32>.stride, index: 19)
@@ -843,6 +1026,9 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         encoder.setBytes(&partialRows, length: MemoryLayout<UInt32>.stride, index: 23)
         encoder.setBytes(&partialStride, length: MemoryLayout<UInt32>.stride, index: 24)
         encoder.setBytes(&partialEnabled, length: MemoryLayout<UInt32>.stride, index: 25)
+        if partialPartitionCount != nil {
+            encoder.setBytes(&partitionCount, length: MemoryLayout<UInt32>.stride, index: 26)
+        }
         encoder.dispatchThreadgroups(grid, threadsPerThreadgroup: threadgroup)
         encoder.endEncoding()
         try harness.complete(commandBuffer)
@@ -859,11 +1045,11 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         }
         let paddedPartial = harness.readFloat32(
             partialBuffer,
-            count: groupCount * sequenceLength * partialRowStride
+            count: effectivePartialPartitionCount * sequenceLength * partialRowStride
         )
         var partials: [Float] = []
-        partials.reserveCapacity(groupCount * sequenceLength * partialOutputDimension)
-        for group in 0..<groupCount {
+        partials.reserveCapacity(effectivePartialPartitionCount * sequenceLength * partialOutputDimension)
+        for group in 0..<effectivePartialPartitionCount {
             for position in 0..<sequenceLength {
                 let start = group * sequenceLength * partialRowStride + position * partialRowStride
                 partials.append(contentsOf: paddedPartial[start..<(start + partialOutputDimension)])
@@ -906,6 +1092,34 @@ struct SSMRecurrenceSequenceEquivalenceTests {
                     for column in 0..<partitionInputDimension {
                         let inputValue = input[position * inputDimension + groupInputBase + column]
                         let weightValue = Float(weights[row * inputDimension + groupInputBase + column])
+                        sum += inputValue * weightValue
+                    }
+                    partials.append(sum)
+                }
+            }
+        }
+        return partials
+    }
+
+    private func expectedPartitionOwnedPartials(
+        input: [Float],
+        weights: [BFloat16],
+        partitionCount: Int,
+        partitionInputDimension: Int,
+        outputDimension: Int,
+        sequenceLength: Int
+    ) -> [Float] {
+        let inputDimension = partitionCount * partitionInputDimension
+        var partials: [Float] = []
+        partials.reserveCapacity(partitionCount * sequenceLength * outputDimension)
+        for partition in 0..<partitionCount {
+            let partitionInputBase = partition * partitionInputDimension
+            for position in 0..<sequenceLength {
+                for row in 0..<outputDimension {
+                    var sum: Float = 0
+                    for column in 0..<partitionInputDimension {
+                        let inputValue = input[position * inputDimension + partitionInputBase + column]
+                        let weightValue = Float(weights[row * inputDimension + partitionInputBase + column])
                         sum += inputValue * weightValue
                     }
                     partials.append(sum)

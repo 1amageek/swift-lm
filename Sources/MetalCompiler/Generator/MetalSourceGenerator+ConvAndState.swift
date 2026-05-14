@@ -550,8 +550,13 @@ public static func generateSSMRecurrenceSequence(
     valueHeadDimension: Int,
     shareRMSScale: Bool = false,
     prewriteDecayedState: Bool = false,
-    emitsGroupOwnedPartialProjection: Bool = false
+    emitsGroupOwnedPartialProjection: Bool = false,
+    emitsPartitionOwnedPartialProjection: Bool = false
 ) -> String {
+    precondition(
+        !(emitsGroupOwnedPartialProjection && emitsPartitionOwnedPartialProjection),
+        "SSM partial projection ownership modes are mutually exclusive"
+    )
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
     let ct = convStateStorageType(weightFormat: weightFormat)
@@ -640,22 +645,30 @@ public static func generateSSMRecurrenceSequence(
     let recurrencePass2StateExpr = prewriteDecayedState
         ? "state[j * dv + d]"
         : "state[j * dv + d] * decay"
-    let partialProjectionSignature = emitsGroupOwnedPartialProjection
+    let emitsPartialProjection = emitsGroupOwnedPartialProjection || emitsPartitionOwnedPartialProjection
+    let partialPartitionCountSignature = emitsPartitionOwnedPartialProjection
+        ? "constant uint& partialPartitionCount [[buffer(26)]],\n        "
+        : ""
+    let ownerPartitionCountExpression = emitsPartitionOwnedPartialProjection
+        ? "max(1u, min(partialPartitionCount, safeGroupCount))"
+        : "safeGroupCount"
+    let partialProjectionSignature = emitsPartialProjection
         ? """
         device const \(wt)* partialWeight [[buffer(21)]],
         device \(bt)* partialOutput [[buffer(22)]],
         constant uint& partialOutputDimension [[buffer(23)]],
         constant uint& partialRowStride [[buffer(24)]],
         constant uint& partialProjectionEnabled [[buffer(25)]],
+        \(partialPartitionCountSignature)
         """
         : ""
-    let partialProjectionPhase = emitsGroupOwnedPartialProjection
+    let partialProjectionPhase = emitsPartialProjection
         ? """
             if (partialProjectionEnabled != 0) {
                 threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
-                const uint partitionInputDimension = headsPerGroup * dv;
-                const uint inputDimension = safeGroupCount * partitionInputDimension;
-                const uint groupInputBase = groupIndex * partitionInputDimension;
+                const uint partitionInputDimension = groupsPerOwner * headsPerGroup * dv;
+                const uint inputDimension = safeGroupCount * headsPerGroup * dv;
+                const uint partitionInputBase = ownerIndex * partitionInputDimension;
                 const uint tiisg = tid % SIMD_WIDTH;
                 const uint sgitg = tid / SIMD_WIDTH;
                 const uint rowsPerThreadgroup = max(1u, tgSize / SIMD_WIDTH);
@@ -663,13 +676,13 @@ public static func generateSSMRecurrenceSequence(
                     const uint row = rowBase + sgitg;
                     float sum = 0.0f;
                     if (row < partialOutputDimension) {
-                        device const \(wt)* weightRow = partialWeight + row * inputDimension + groupInputBase;
+                        device const \(wt)* weightRow = partialWeight + row * inputDimension + partitionInputBase;
                         for (uint j = tiisg; j < partitionInputDimension; j += SIMD_WIDTH) {
-                            sum += \(readWeight("weightRow[j]")) * float(outputPos[groupInputBase + j]);
+                            sum += \(readWeight("weightRow[j]")) * float(outputPos[partitionInputBase + j]);
                         }
                         sum = simd_sum(sum);
                         if (tiisg == 0) {
-                            const uint outputIndex = groupIndex * sequenceLength * partialRowStride
+                            const uint outputIndex = ownerIndex * sequenceLength * partialRowStride
                                 + pos * partialRowStride
                                 + row;
                             partialOutput[outputIndex] = \(bt)(sum);
@@ -715,23 +728,26 @@ public static func generateSSMRecurrenceSequence(
         const uint safeGroupCount = max(groupCount, 1u);
         const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
 
-        // Each threadgroup owns exactly one key-group. Work across groups is
-        // dispatched in parallel by the host (grid = (groupCount, 1, 1)).
-        const uint groupIndex = tgid;
-        if (groupIndex >= safeGroupCount) {
+        // Each threadgroup owns one execution partition. In the default and
+        // group-owned partial modes, an execution partition is one recurrent
+        // group. In partition-owned partial mode, it may cover multiple
+        // recurrent groups and updates them serially before emitting partial
+        // rows for that partition.
+        const uint ownerPartitionCount = \(ownerPartitionCountExpression);
+        if (ownerPartitionCount == 0u || safeGroupCount % ownerPartitionCount != 0u) {
             return;
         }
-        const uint headStart = groupIndex * headsPerGroup;
+        const uint ownerIndex = tgid;
+        if (ownerIndex >= ownerPartitionCount) {
+            return;
+        }
+        const uint groupsPerOwner = max(1u, safeGroupCount / ownerPartitionCount);
+        const uint ownerGroupStart = ownerIndex * groupsPerOwner;
 
-        // Global conv-channel offsets owned by this threadgroup.
-        const uint qBaseGlobal = groupIndex * dk;
-        const uint kBaseGlobal = keyGroupDim + groupIndex * dk;
-        const uint vBaseGlobal = 2u * keyGroupDim + headStart * dv;
-
-        // Local channel layout inside convSiluCache:
-        //   [0, dk)            : Q for this group
-        //   [dk, 2*dk)         : K for this group
-        //   [2*dk, localDim)   : V for this group (headsPerGroup * dv values)
+        // Local channel layout inside convSiluCache for one recurrent group:
+        //   [0, dk)            : Q
+        //   [dk, 2*dk)         : K
+        //   [2*dk, localDim)   : V (headsPerGroup * dv values)
         const uint localDim = 2u * dk + headsPerGroup * dv;
 
         threadgroup float convSiluCache[\(localDim)];
@@ -748,129 +764,139 @@ public static func generateSSMRecurrenceSequence(
             device const \(bt)* projectedAlphaPos = projectedAlpha + pos * activationRowStride;
             device \(bt)* outputPos = output + pos * activationRowStride;
 
-            // Phase 1: fused conv-shift + SiLU for this threadgroup's owned channels.
-            // Each threadgroup touches only its own Q/K/V channels in convState and convWeight.
-            // No cross-threadgroup write conflicts — disjoint channel partitions.
-            for (uint localCh = tid; localCh < localDim; localCh += tgSize) {
-                uint globalCh;
-                if (localCh < dk) {
-                    globalCh = qBaseGlobal + localCh;
-                } else if (localCh < 2u * dk) {
-                    globalCh = kBaseGlobal + (localCh - dk);
-                } else {
-                    globalCh = vBaseGlobal + (localCh - 2u * dk);
-                }
+            for (uint ownerGroupOffset = 0; ownerGroupOffset < groupsPerOwner; ++ownerGroupOffset) {
+                const uint groupIndex = ownerGroupStart + ownerGroupOffset;
+                const uint headStart = groupIndex * headsPerGroup;
 
-                float sum = 0.0f;
-                for (uint k = 0; k + 1 < convKernelSize; ++k) {
-                    float val = \(readConvState("convState[(k + 1) * convDim + globalCh]"));
-                    convState[k * convDim + globalCh] = \(writeConvState("val"));
-                    sum += val * \(readWeight("convWeight[globalCh * convKernelSize + k]"));
-                }
-                float newVal = \(activationStorageValue("float(projectedQKVPos[globalCh])"));
-                convState[(convKernelSize - 1) * convDim + globalCh] = \(writeConvState("newVal"));
-                sum += newVal * \(readWeight("convWeight[globalCh * convKernelSize + convKernelSize - 1]"));
-                float convSilu = sum * stable_sigmoid(sum);
-                convSiluCache[localCh] = convSilu;
-                if (debugConvEnabled != 0) {
-                    debugConvSilu[pos * debugConvRowStride + globalCh] = convSilu;
-                }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Global conv-channel offsets owned by this recurrent group.
+                const uint qBaseGlobal = groupIndex * dk;
+                const uint kBaseGlobal = keyGroupDim + groupIndex * dk;
+                const uint vBaseGlobal = 2u * keyGroupDim + headStart * dv;
 
-            // Phase 2: per-head recurrence restricted to owned heads.
-            // recurrentState partition is disjoint per head, so disjoint per threadgroup.
-            {
-                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
-                const uint activeThreads = headsPerGroup * threadsPerHead;
-                if (tid < activeThreads) {
-                    const uint localHead = tid / threadsPerHead;
-                    const uint localTid = tid % threadsPerHead;
-                    if (localTid == 0) {
-                        const uint qBase = 0u;
-                        const uint kBase = dk;
-                        float qNormSq = 0.0f;
-                        float kNormSq = 0.0f;
-                        float kqSum = 0.0f;
-                        for (uint j = 0; j < dk; ++j) {
-                            float q = convSiluCache[qBase + j];
-                            float k = convSiluCache[kBase + j];
-                            qNormSq += q * q;
-                            kNormSq += k * k;
-                            kqSum += q * k;
-                        }
-                        qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
-                        kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
-                        kqSumCache[localHead] = kqSum;
+                // Phase 1: fused conv-shift + SiLU for this recurrent group's channels.
+                // Each execution owner touches only the Q/K/V channels assigned to its groups.
+                for (uint localCh = tid; localCh < localDim; localCh += tgSize) {
+                    uint globalCh;
+                    if (localCh < dk) {
+                        globalCh = qBaseGlobal + localCh;
+                    } else if (localCh < 2u * dk) {
+                        globalCh = kBaseGlobal + (localCh - dk);
+                    } else {
+                        globalCh = vBaseGlobal + (localCh - 2u * dk);
+                    }
+
+                    float sum = 0.0f;
+                    for (uint k = 0; k + 1 < convKernelSize; ++k) {
+                        float val = \(readConvState("convState[(k + 1) * convDim + globalCh]"));
+                        convState[k * convDim + globalCh] = \(writeConvState("val"));
+                        sum += val * \(readWeight("convWeight[globalCh * convKernelSize + k]"));
+                    }
+                    float newVal = \(activationStorageValue("float(projectedQKVPos[globalCh])"));
+                    convState[(convKernelSize - 1) * convDim + globalCh] = \(writeConvState("newVal"));
+                    sum += newVal * \(readWeight("convWeight[globalCh * convKernelSize + convKernelSize - 1]"));
+                    float convSilu = sum * stable_sigmoid(sum);
+                    convSiluCache[localCh] = convSilu;
+                    if (debugConvEnabled != 0) {
+                        debugConvSilu[pos * debugConvRowStride + globalCh] = convSilu;
                     }
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                if (tid < activeThreads) {
-                    const uint localHead = tid / threadsPerHead;
-                    const uint headIndex = headStart + localHead;
-                    const uint localTid = tid % threadsPerHead;
-                    const uint dChunk = dv / threadsPerHead;
-                    const uint dStart = localTid * dChunk;
-                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
-
-                    float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
-                    float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
-                    float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
-                    float beta = stable_sigmoid(betaInput);
-                    device float* state = recurrentState + headIndex * dk * dv;
-
-                    // Local cache indices for this threadgroup:
-                    const uint qBase = 0u;
-                    const uint kBase = dk;
-                    const uint vBase = 2u * dk + localHead * dv;
-                    float qInv = qInvCache[localHead];
-                    float kInv = kInvCache[localHead];
-                    float kqSum = kqSumCache[localHead];
-
-                    // Algebraic identity used below:
-                    //   state_after[j] = state_before[j]·decay + K[j]·kInvDelta
-                    //   dot = Σ state_after[j]·Q[j]
-                    //       = Σ (state_before[j]·decay)·Q[j] + kInvDelta · Σ K[j]·Q[j]
-                    //       = sqSum + kInvDelta · kqSum
-                    // This lets us compute `dot` from sqSum (one accumulator gathered
-                    // during the decay pass) + a precomputed kqSum, eliminating the
-                    // second Σ over updated state. Per j we now do 2 state reads + 1
-                    // state write (vs 3 reads + 2 writes previously).
-                    float localNormSq = 0.0f;
-                    for (uint d = dStart; d < dEnd; ++d) {
-                        // Pass 1: read state, accumulate kvmemRaw and sqSum.
-                        // No state write here — deferred to Pass 2 for a single full write.
-                        float kvmemRaw = 0.0f;
-                        float sqSum = 0.0f;
-                        for (uint j = 0; j < dk; ++j) {
-                            \(recurrencePass1StateLine)
-                            kvmemRaw += s * convSiluCache[kBase + j];
-                            sqSum += s * convSiluCache[qBase + j];
+                // Phase 2: per-head recurrence restricted to owned heads.
+                // recurrentState partition is disjoint per head, so disjoint per execution owner.
+                {
+                    const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                    const uint activeThreads = headsPerGroup * threadsPerHead;
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint localTid = tid % threadsPerHead;
+                        if (localTid == 0) {
+                            const uint qBase = 0u;
+                            const uint kBase = dk;
+                            float qNormSq = 0.0f;
+                            float kNormSq = 0.0f;
+                            float kqSum = 0.0f;
+                            for (uint j = 0; j < dk; ++j) {
+                                float q = convSiluCache[qBase + j];
+                                float k = convSiluCache[kBase + j];
+                                qNormSq += q * q;
+                                kNormSq += k * k;
+                                kqSum += q * k;
+                            }
+                            qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                            kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
+                            kqSumCache[localHead] = kqSum;
                         }
-
-                        float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
-                        float kInvDelta = kInv * delta;
-                        float dot = (sqSum + kInvDelta * kqSum) * qInv;
-
-                        // Pass 2: write final state = decay·old + K·kInvDelta (full write, no RMW).
-                        for (uint j = 0; j < dk; ++j) {
-                            state[j * dv + d] = \(recurrencePass2StateExpr) + convSiluCache[kBase + j] * kInvDelta;
-                        }
-
-                        float storedDot = \(activationStorageValue("dot"));
-                        dotCache[localHead * dv + d] = storedDot;
-                        outputPos[headIndex * dv + d] = \(bt)(storedDot);
-                        localNormSq += dot * dot;
                     }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                    normPartials[tid] = localNormSq;
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint headIndex = headStart + localHead;
+                        const uint localTid = tid % threadsPerHead;
+                        const uint dChunk = dv / threadsPerHead;
+                        const uint dStart = localTid * dChunk;
+                        const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+
+                        float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
+                        float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
+                        float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
+                        float beta = stable_sigmoid(betaInput);
+                        device float* state = recurrentState + headIndex * dk * dv;
+
+                        // Local cache indices for this recurrent group:
+                        const uint qBase = 0u;
+                        const uint kBase = dk;
+                        const uint vBase = 2u * dk + localHead * dv;
+                        float qInv = qInvCache[localHead];
+                        float kInv = kInvCache[localHead];
+                        float kqSum = kqSumCache[localHead];
+
+                        // Algebraic identity used below:
+                        //   state_after[j] = state_before[j]·decay + K[j]·kInvDelta
+                        //   dot = Σ state_after[j]·Q[j]
+                        //       = Σ (state_before[j]·decay)·Q[j] + kInvDelta · Σ K[j]·Q[j]
+                        //       = sqSum + kInvDelta · kqSum
+                        // This lets us compute `dot` from sqSum (one accumulator gathered
+                        // during the decay pass) + a precomputed kqSum, eliminating the
+                        // second Σ over updated state. Per j we now do 2 state reads + 1
+                        // state write (vs 3 reads + 2 writes previously).
+                        float localNormSq = 0.0f;
+                        for (uint d = dStart; d < dEnd; ++d) {
+                            // Pass 1: read state, accumulate kvmemRaw and sqSum.
+                            // No state write here — deferred to Pass 2 for a single full write.
+                            float kvmemRaw = 0.0f;
+                            float sqSum = 0.0f;
+                            for (uint j = 0; j < dk; ++j) {
+                                \(recurrencePass1StateLine)
+                                kvmemRaw += s * convSiluCache[kBase + j];
+                                sqSum += s * convSiluCache[qBase + j];
+                            }
+
+                            float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
+                            float kInvDelta = kInv * delta;
+                            float dot = (sqSum + kInvDelta * kqSum) * qInv;
+
+                            // Pass 2: write final state = decay·old + K·kInvDelta (full write, no RMW).
+                            for (uint j = 0; j < dk; ++j) {
+                                state[j * dv + d] = \(recurrencePass2StateExpr) + convSiluCache[kBase + j] * kInvDelta;
+                            }
+
+                            float storedDot = \(activationStorageValue("dot"));
+                            dotCache[localHead * dv + d] = storedDot;
+                            outputPos[headIndex * dv + d] = \(bt)(storedDot);
+                            localNormSq += dot * dot;
+                        }
+
+                        normPartials[tid] = localNormSq;
+                    }
                 }
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Phase 3: RMS norm + gated activation for owned heads.
-            \(rmsPhase)
+                // Phase 3: RMS norm + gated activation for owned heads.
+                \(rmsPhase)
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
             \(partialProjectionPhase)
             // Skip barrier after final position — no subsequent iteration reads this state,
             // and the command encoder's implicit barrier handles cross-dispatch visibility.

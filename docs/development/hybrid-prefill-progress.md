@@ -231,6 +231,8 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` | Pass; default Qwen route remains schema v6 reference-equivalent after extending boundary probing for future fused recurrence partial-emission windows |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in partial route still validates Metal scratch partial readback and final reduce after the fused-window probe changes |
 | 2026-05-14 | `swift build`, `git diff --check`, changed-file `try?` scan | Pass; build and hygiene remain clean after correcting the fused-stage admission contract |
+| 2026-05-14 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; BF16 SSM sequence recurrence now has a partition-owned partial-emission variant that preserves output, recurrent state, conv state, and partition partials when scratch partitions cover multiple recurrent groups |
+| 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete BF16 library includes `ssm_recurrence_seq_bf16_f32_partition_owned_partial` |
 
 ## Failed Experiments
 
@@ -1103,6 +1105,24 @@ The variant is registered in the kernel catalog but not routed yet. Production
 routing still needs a step-builder path that binds `linear_attn.out_proj.weight`
 and scratch partial output to buffers 21/22, then keeps the existing partial
 reduce stage and Qwen schema v6 reference gates.
+
+M3D.10 extends the combined kernel harness to the Qwen-compatible
+partial-partition-owned shape. The
+`ssm_recurrence_seq_bf16_f32_partition_owned_partial` variant dispatches one
+owner per partial scratch partition. Each owner updates the recurrent groups
+assigned to that partition serially, preserving the one-state-update-owner
+invariant, then emits that partition's output-projection partial rows. The
+synthetic SSM test validates:
+
+- normal sequence output stays equivalent to the existing sequence kernel;
+- recurrent state stays unchanged;
+- convolution state stays unchanged;
+- emitted partition-owned partial rows match CPU partial projection when one
+  scratch partition covers multiple recurrent groups.
+
+This is still not routed in production. The next step is a feature-flagged
+step-builder route for Qwen that uses this partition-owned kernel, not the
+group-owned kernel, followed by schema v6 Qwen reference gates.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
