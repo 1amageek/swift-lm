@@ -98,6 +98,27 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(rows.allSatisfy { $0.outputChecksum.isFinite && $0.outputChecksum > 0 })
     }
 
+    @Test("BF16 SSM state recurrence phase matches CPU reference")
+    func bf16SSMStateRecurrencePhaseMatchesCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let harness = try SSMRecurrenceMicrobenchmarkHarness(device: device)
+        let validation = try harness.validateStateRecurrencePhase(sequenceLength: 5)
+        #expect(
+            validation.outputMaxError <= 0.000_5,
+            "state recurrence phase output drifted: maxError=\(validation.outputMaxError)"
+        )
+        #expect(
+            validation.recurrentStateMaxError <= 0.000_5,
+            "state recurrence phase recurrent state drifted: maxError=\(validation.recurrentStateMaxError)"
+        )
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -405,6 +426,11 @@ private struct SSMPhaseResultRow {
     }
 }
 
+private struct SSMStatePhaseValidation {
+    let outputMaxError: Float
+    let recurrentStateMaxError: Float
+}
+
 private struct SSMSummaryRow {
     let sequenceLength: Int
     let bestVariant: String
@@ -671,6 +697,42 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             averageGpuMicroseconds: totalMicroseconds / Double(iterations),
             fullBaseAverageGpuMicroseconds: fullBaseAverageGpuMicroseconds,
             outputChecksum: outputChecksum
+        )
+    }
+
+    func validateStateRecurrencePhase(sequenceLength: Int) throws -> SSMStatePhaseValidation {
+        let kernelName = "bench_ssm_phase_state_recurrence_f32"
+        guard let pipeline = pipelines[kernelName] else {
+            throw MetalCompilerError.kernelNotFound(kernelName)
+        }
+        let inputs = try makeInputs(sequenceLength: sequenceLength)
+        let recurrentState = try makeZeroedSharedBuffer(
+            byteLength: headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride
+        )
+        let convState = try makeZeroedSharedBuffer(
+            byteLength: convKernelSize * convDimension * MemoryLayout<BFloat16>.stride
+        )
+        let output = try makeZeroedSharedBuffer(
+            byteLength: sequenceLength * activationRowStride * MemoryLayout<Float>.stride
+        )
+        let geometry = dispatchGeometry(pipeline: pipeline, requestedThreadgroupWidth: 384)
+        reset(recurrentState: recurrentState, convState: convState, output: output, sequenceLength: sequenceLength)
+        _ = try execute(
+            pipeline: pipeline,
+            inputs: inputs,
+            recurrentState: recurrentState,
+            convState: convState,
+            output: output,
+            sequenceLength: sequenceLength,
+            geometry: geometry
+        )
+
+        let actualOutput = readFloatBuffer(output, count: sequenceLength * activationRowStride)
+        let actualState = readFloatBuffer(recurrentState, count: headCount * keyDimension * valueDimension)
+        let reference = cpuStateRecurrenceReference(inputs: inputs, sequenceLength: sequenceLength)
+        return SSMStatePhaseValidation(
+            outputMaxError: maxAbsoluteError(actualOutput, reference.output),
+            recurrentStateMaxError: maxAbsoluteError(actualState, reference.recurrentState)
         )
     }
 
@@ -960,47 +1022,52 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
     }
 
     private func makeInputs(sequenceLength: Int) throws -> SSMInputs {
-        let qkv = try makeSharedBuffer(values: paddedRows(
+        let qkvValues = paddedRows(
             makeFloatValues(count: sequenceLength * convDimension, multiplier: 13, modulus: 23, scale: 0.125),
             rowCount: sequenceLength,
             logicalWidth: convDimension
-        ))
-        let z = try makeSharedBuffer(values: paddedRows(
+        )
+        let zValues = paddedRows(
             makeFloatValues(count: sequenceLength * outputDimension, multiplier: 17, modulus: 19, scale: 0.125),
             rowCount: sequenceLength,
             logicalWidth: outputDimension
-        ))
-        let beta = try makeSharedBuffer(values: paddedRows(
+        )
+        let betaValues = paddedRows(
             makeFloatValues(count: sequenceLength * headCount, multiplier: 7, modulus: 11, scale: 0.125),
             rowCount: sequenceLength,
             logicalWidth: headCount
-        ))
-        let alpha = try makeSharedBuffer(values: paddedRows(
+        )
+        let alphaValues = paddedRows(
             makeFloatValues(count: sequenceLength * headCount, multiplier: 5, modulus: 13, scale: 0.125),
             rowCount: sequenceLength,
             logicalWidth: headCount
-        ))
-        let convWeight = try makeSharedBuffer(values: (0..<(convDimension * convKernelSize)).map { index in
+        )
+        let convWeightValues = (0..<(convDimension * convKernelSize)).map { index in
             BFloat16(Float((index * 11) % 17 - 8) * 0.03125)
-        })
-        let normWeight = try makeSharedBuffer(values: (0..<valueDimension).map { index in
+        }
+        let normWeightValues = (0..<valueDimension).map { index in
             0.75 + Float(index) * 0.0625
-        })
-        let dtBias = try makeSharedBuffer(values: (0..<headCount).map { index in
+        }
+        let dtBiasValues = (0..<headCount).map { index in
             BFloat16(Float(index - 1) * 0.03125)
-        })
-        let aLog = try makeSharedBuffer(values: (0..<headCount).map { index in
+        }
+        let aLogValues = (0..<headCount).map { index in
             Float(index) * 0.0625 - 0.125
-        })
+        }
         return SSMInputs(
-            qkv: qkv,
-            z: z,
-            beta: beta,
-            alpha: alpha,
-            convWeight: convWeight,
-            normWeight: normWeight,
-            dtBias: dtBias,
-            aLog: aLog
+            qkv: try makeSharedBuffer(values: qkvValues),
+            z: try makeSharedBuffer(values: zValues),
+            beta: try makeSharedBuffer(values: betaValues),
+            alpha: try makeSharedBuffer(values: alphaValues),
+            convWeight: try makeSharedBuffer(values: convWeightValues),
+            normWeight: try makeSharedBuffer(values: normWeightValues),
+            dtBias: try makeSharedBuffer(values: dtBiasValues),
+            aLog: try makeSharedBuffer(values: aLogValues),
+            qkvValues: qkvValues,
+            betaValues: betaValues,
+            alphaValues: alphaValues,
+            dtBiasValues: dtBiasValues,
+            aLogValues: aLogValues
         )
     }
 
@@ -1081,6 +1148,94 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         return checksum
     }
 
+    private func readFloatBuffer(_ buffer: MTLBuffer, count: Int) -> [Float] {
+        let values = buffer.contents().bindMemory(to: Float.self, capacity: count)
+        return (0..<count).map { values[$0] }
+    }
+
+    private func cpuStateRecurrenceReference(
+        inputs: SSMInputs,
+        sequenceLength: Int
+    ) -> (output: [Float], recurrentState: [Float]) {
+        let headsPerGroup = max(1, headCount / max(groupCount, 1))
+        var recurrentState = [Float](repeating: .zero, count: headCount * keyDimension * valueDimension)
+        var output = [Float](repeating: .zero, count: sequenceLength * activationRowStride)
+
+        for pos in 0..<sequenceLength {
+            let rowBase = pos * activationRowStride
+            for groupIndex in 0..<groupCount {
+                let headStart = groupIndex * headsPerGroup
+                let qBaseGlobal = groupIndex * keyDimension
+                let kBaseGlobal = keyGroupDimension + groupIndex * keyDimension
+                let vBaseGlobal = 2 * keyGroupDimension + headStart * valueDimension
+                for localHead in 0..<headsPerGroup {
+                    let headIndex = headStart + localHead
+                    let qBase = rowBase + qBaseGlobal
+                    let kBase = rowBase + kBaseGlobal
+                    let vBase = rowBase + vBaseGlobal + localHead * valueDimension
+                    var qNormSq: Float = 0
+                    var kNormSq: Float = 0
+                    var kqSum: Float = 0
+                    for j in 0..<keyDimension {
+                        let q = inputs.qkvValues[qBase + j]
+                        let k = inputs.qkvValues[kBase + j]
+                        qNormSq += q * q
+                        kNormSq += k * k
+                        kqSum += q * k
+                    }
+                    let qInv = rsqrt(qNormSq + 1e-6) * rsqrt(Float(keyDimension))
+                    let kInv = rsqrt(kNormSq + 1e-6)
+                    let alpha = inputs.alphaValues[rowBase + headIndex]
+                    let betaInput = inputs.betaValues[rowBase + headIndex]
+                    let decay = exp(-exp(inputs.aLogValues[headIndex]) * stableSoftplus(alpha + Float(inputs.dtBiasValues[headIndex])))
+                    let beta = stableSigmoid(betaInput)
+                    let stateHeadBase = headIndex * keyDimension * valueDimension
+                    for d in 0..<valueDimension {
+                        var kvmemRaw: Float = 0
+                        var sqSum: Float = 0
+                        for j in 0..<keyDimension {
+                            let stateIndex = stateHeadBase + j * valueDimension + d
+                            let s = recurrentState[stateIndex] * decay
+                            kvmemRaw += s * inputs.qkvValues[kBase + j]
+                            sqSum += s * inputs.qkvValues[qBase + j]
+                        }
+                        let delta = beta * (inputs.qkvValues[vBase + d] - kvmemRaw * kInv)
+                        let kInvDelta = kInv * delta
+                        let dot = (sqSum + kInvDelta * kqSum) * qInv
+                        for j in 0..<keyDimension {
+                            let stateIndex = stateHeadBase + j * valueDimension + d
+                            recurrentState[stateIndex] = recurrentState[stateIndex] * decay
+                                + inputs.qkvValues[kBase + j] * kInvDelta
+                        }
+                        output[rowBase + headIndex * valueDimension + d] = dot
+                    }
+                }
+            }
+        }
+        return (output, recurrentState)
+    }
+
+    private func maxAbsoluteError(_ lhs: [Float], _ rhs: [Float]) -> Float {
+        precondition(lhs.count == rhs.count)
+        var result: Float = 0
+        for index in lhs.indices {
+            result = max(result, abs(lhs[index] - rhs[index]))
+        }
+        return result
+    }
+
+    private func stableSigmoid(_ value: Float) -> Float {
+        1.0 / (1.0 + Float(Foundation.exp(Double(-value))))
+    }
+
+    private func stableSoftplus(_ value: Float) -> Float {
+        max(value, 0) + Float(Foundation.log1p(Foundation.exp(Double(-abs(value)))))
+    }
+
+    private func rsqrt(_ value: Float) -> Float {
+        1.0 / Foundation.sqrt(value)
+    }
+
     private func dispatchGeometry(
         pipeline: MTLComputePipelineState,
         requestedThreadgroupWidth: Int
@@ -1155,4 +1310,9 @@ private struct SSMInputs {
     let normWeight: MTLBuffer
     let dtBias: MTLBuffer
     let aLog: MTLBuffer
+    let qkvValues: [Float]
+    let betaValues: [Float]
+    let alphaValues: [Float]
+    let dtBiasValues: [BFloat16]
+    let aLogValues: [Float]
 }

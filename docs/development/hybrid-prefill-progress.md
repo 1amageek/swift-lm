@@ -240,6 +240,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; real Qwen recurrent-window artifact marks all fused partial-emission windows with `rowGridParallelismPreserved=false` and `fused-recurrence-serializes-output-row-projection-inside-sequence-loop` |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated SSM microbench now writes both raw timing and per-sequence promotion-decision summary artifacts |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-isolation SSM microbench writes synthetic conv+SiLU, state recurrence, and RMS/gate lower-bound timing artifacts |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; state recurrence phase probe now hard-checks Metal output and recurrent state against a Swift CPU reference |
 
 ## Failed Experiments
 
@@ -1601,13 +1602,18 @@ behavior. The harness records an output checksum so broken or all-zero probes
 are visible, but its purpose is to identify which stage deserves the next
 reference harness or kernel rewrite.
 
+The state recurrence phase also has a strict synthetic CPU reference gate. The
+gate compares both the phase output and final recurrent state, so future state
+phase rewrites can fail locally before they corrupt the full sequence SSM path.
+
 ```mermaid
 flowchart LR
   A["Full SSM sequence kernel"] --> B["conv + SiLU probe"]
   A --> C["state recurrence probe"]
   A --> D["RMS + gate probe"]
-  C --> E["state traffic model"]
-  E --> F["next structural optimization"]
+  C --> E["CPU reference gate"]
+  E --> F["state traffic model"]
+  F --> G["next structural optimization"]
 ```
 
 Current local phase-isolation result:
