@@ -241,6 +241,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated SSM microbench now writes both raw timing and per-sequence promotion-decision summary artifacts |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-isolation SSM microbench writes synthetic conv+SiLU, state recurrence, and RMS/gate lower-bound timing artifacts |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; state recurrence phase probe now hard-checks Metal output and recurrent state against a Swift CPU reference |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; register-block `state_recurrence_d2` phase candidate is CPU-reference equivalent but slower than the baseline state phase |
 
 ## Failed Experiments
 
@@ -1620,9 +1621,9 @@ Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 3.16% | 75.30% | 23.44% | state recurrence dominates |
-| 64 | 2.71% | 85.99% | 27.09% | state recurrence dominates |
-| 128 | 2.80% | 121.10% | 17.32% | standalone state recurrence is slower than the measured full base |
+| 16 | 10.31% | 73.62% | 21.75% | state recurrence dominates |
+| 64 | 2.71% | 75.45% | 22.89% | state recurrence dominates |
+| 128 | 1.92% | 58.48% | 16.97% | state recurrence dominates, with noisy full-base denominator |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
@@ -1669,6 +1670,24 @@ Unsafe until separately proven:
 | cross-position parallel scan | recurrence state is sequential; numerical and state order contract changes |
 | fusing output projection inside recurrence owner | collapses output-row fan-out and already regressed heavily |
 | prewriting decayed state as default | adds a second state write pass and only wins in noisy isolated cases |
+
+The first register-block probe, `state_recurrence_d2`, is intentionally kept as
+a phase-only candidate. It processes two adjacent value lanes per active
+thread, preserves the CPU reference contract, and records the same estimated
+3.0 MiB/token recurrent-state traffic as the baseline state phase. The timing is
+not favorable:
+
+| Sequence length | Baseline state phase | `d2` state phase | Decision |
+|---:|---:|---:|---|
+| 16 | 374.5 us | 631.4 us | reject |
+| 64 | 1411.9 us | 2529.7 us | reject |
+| 128 | 2938.0 us | 4737.2 us | reject |
+
+Current decision: do not promote the `d2` shape into the production sequence
+kernel. It likely reduces active-lane parallelism more than it benefits from
+scalar reuse. The next candidate should preserve one value lane per active
+thread and instead improve memory coalescing or state staging without reducing
+thread-level parallelism.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

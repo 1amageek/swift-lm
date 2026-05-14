@@ -65,6 +65,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         let phases = [
             SSMPhaseVariant(name: "conv_silu", kernelName: "bench_ssm_phase_conv_silu_bf16_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence", kernelName: "bench_ssm_phase_state_recurrence_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence_d2", kernelName: "bench_ssm_phase_state_recurrence_d2_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "rms_gate", kernelName: "bench_ssm_phase_rms_gate_f32", threadgroupWidth: 384),
         ]
 
@@ -108,15 +109,20 @@ struct SSMRecurrenceMicrobenchmarkTests {
         defer { gpuLock.release() }
 
         let harness = try SSMRecurrenceMicrobenchmarkHarness(device: device)
-        let validation = try harness.validateStateRecurrencePhase(sequenceLength: 5)
-        #expect(
-            validation.outputMaxError <= 0.000_5,
-            "state recurrence phase output drifted: maxError=\(validation.outputMaxError)"
-        )
-        #expect(
-            validation.recurrentStateMaxError <= 0.000_5,
-            "state recurrence phase recurrent state drifted: maxError=\(validation.recurrentStateMaxError)"
-        )
+        for kernelName in [
+            "bench_ssm_phase_state_recurrence_f32",
+            "bench_ssm_phase_state_recurrence_d2_f32",
+        ] {
+            let validation = try harness.validateStateRecurrencePhase(kernelName: kernelName, sequenceLength: 5)
+            #expect(
+                validation.outputMaxError <= 0.000_5,
+                "\(kernelName) output drifted: maxError=\(validation.outputMaxError)"
+            )
+            #expect(
+                validation.recurrentStateMaxError <= 0.000_5,
+                "\(kernelName) recurrent state drifted: maxError=\(validation.recurrentStateMaxError)"
+            )
+        }
     }
 
     private func printReport(
@@ -283,9 +289,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
         print("artifact: \(artifact.path)")
-        print("seq  phase              avg_us  us/token  full_%  state_mb/tok")
+        print("seq  phase                  avg_us  us/token  full_%  state_mb/tok")
         for row in rows.sorted(by: phaseRowSort) {
-            let phase = row.phase.padding(toLength: 17, withPad: " ", startingAt: 0)
+            let phase = row.phase.padding(toLength: 21, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.estimatedStateTotalBytesPerToken) / 1_048_576.0
             print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%12.3f", stateMegabytes))")
         }
@@ -420,7 +426,7 @@ private struct SSMPhaseResultRow {
     }
 
     var estimatedStateTotalBytesPerToken: Int {
-        phase == "state_recurrence"
+        phase.hasPrefix("state_recurrence")
             ? headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride * 3
             : 0
     }
@@ -547,6 +553,10 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             ),
             Self.generatePhaseConvSiluKernel(),
             Self.generatePhaseStateRecurrenceKernel(),
+            Self.generatePhaseStateRecurrenceKernel(
+                name: "bench_ssm_phase_state_recurrence_d2_f32",
+                valueLanesPerThread: 2
+            ),
             Self.generatePhaseRMSGateKernel(),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
@@ -558,6 +568,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
             "bench_ssm_phase_conv_silu_bf16_f32",
             "bench_ssm_phase_state_recurrence_f32",
+            "bench_ssm_phase_state_recurrence_d2_f32",
             "bench_ssm_phase_rms_gate_f32",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
@@ -700,8 +711,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         )
     }
 
-    func validateStateRecurrencePhase(sequenceLength: Int) throws -> SSMStatePhaseValidation {
-        let kernelName = "bench_ssm_phase_state_recurrence_f32"
+    func validateStateRecurrencePhase(kernelName: String, sequenceLength: Int) throws -> SSMStatePhaseValidation {
         guard let pipeline = pipelines[kernelName] else {
             throw MetalCompilerError.kernelNotFound(kernelName)
         }
@@ -809,9 +819,30 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         """
     }
 
-    private static func generatePhaseStateRecurrenceKernel() -> String {
-        """
-        kernel void bench_ssm_phase_state_recurrence_f32(
+    private static func generatePhaseStateRecurrenceKernel(
+        name: String = "bench_ssm_phase_state_recurrence_f32",
+        valueLanesPerThread: Int = 1
+    ) -> String {
+        let valuesPerThread = max(1, valueLanesPerThread)
+        let threadPlan = valuesPerThread == 1
+            ? "const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);"
+            : """
+                const uint valuesPerThread = \(valuesPerThread)u;
+                const uint valueThreadCount = (dv + valuesPerThread - 1u) / valuesPerThread;
+                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), valueThreadCount);
+            """
+        let valueRange = valuesPerThread == 1
+            ? """
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+            """
+            : """
+                    const uint dStart = localTid * valuesPerThread;
+                    const uint dEnd = min(dStart + valuesPerThread, dv);
+            """
+        return """
+        kernel void \(name)(
             device const float* convSilu [[buffer(0)]],
             device const float* projectedZ [[buffer(1)]],
             device const float* projectedBeta [[buffer(2)]],
@@ -871,7 +902,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
-                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                \(threadPlan)
                 const uint activeThreads = headsPerGroup * threadsPerHead;
                 if (tid < activeThreads) {
                     const uint localTid = tid % threadsPerHead;
@@ -896,9 +927,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 if (tid < activeThreads) {
                     const uint headIndex = headStart;
                     const uint localTid = tid % threadsPerHead;
-                    const uint dChunk = dv / threadsPerHead;
-                    const uint dStart = localTid * dChunk;
-                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    \(valueRange)
                     float alpha = alphaPos[headIndex];
                     float betaInput = betaPos[headIndex];
                     float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + bf16_to_float(dtBias[headIndex])));
