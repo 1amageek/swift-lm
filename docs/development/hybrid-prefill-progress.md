@@ -1629,6 +1629,47 @@ recurrence phase first. Conv+SiLU is too small to justify more routing
 complexity, and RMS/gate is secondary unless it can be fused without increasing
 state traffic or reducing group parallelism.
 
+### State Recurrence Rewrite Contract
+
+The current decode-equivalent state recurrence computes one head's `dk x dv`
+state update with independent `d` lanes:
+
+```mermaid
+flowchart TD
+  A["state_before[j,d]"] --> B["decay multiply"]
+  B --> C["kvmemRaw and sqSum reductions over j"]
+  C --> D["delta and dot"]
+  D --> E["state_after[j,d] write"]
+  D --> F["dot output[d]"]
+```
+
+Any new state recurrence kernel must preserve these contracts:
+
+| Contract | Requirement |
+|---|---|
+| Temporal order | positions remain sequential for each head; no cross-position parallelism unless it is mathematically proven equivalent |
+| Ownership | one recurrent head state is written by exactly one execution owner per position |
+| State reads | `state_before` used for `kvmemRaw` and `sqSum` must be the same state snapshot |
+| State writes | final `state_after` must be visible before the next position for the same head |
+| Reduction order | changes to the `j` reduction order require a reference tolerance decision before routing |
+| Traffic budget | a candidate should reduce or hide the 3.0 MiB/token state traffic; adding writes needs a measured full-model win |
+
+Safe next candidates:
+
+| Candidate | Rationale | Required gate |
+|---|---|---|
+| register-block multiple `d` lanes per thread | reuses `q/k` and scalar `decay/beta/qInv/kInv/kqSum` across adjacent value lanes | state phase CPU reference, sequence equivalence, Qwen reference, full profile |
+| split state load and final write into vectorized contiguous chunks | improves memory coalescing without changing math | state phase CPU reference and sequence equivalence |
+| cache `q/k` scalar reductions per head once per position | already partly done; further changes must avoid extra barriers | state phase CPU reference |
+
+Unsafe until separately proven:
+
+| Candidate | Risk |
+|---|---|
+| cross-position parallel scan | recurrence state is sequential; numerical and state order contract changes |
+| fusing output projection inside recurrence owner | collapses output-row fan-out and already regressed heavily |
+| prewriting decayed state as default | adds a second state write pass and only wins in noisy isolated cases |
+
 ## Batched MPP Equivalence Harness (2026-05-12)
 
 The forced BF16 batched-MPP routing experiment was rejected after Qwen3.5
