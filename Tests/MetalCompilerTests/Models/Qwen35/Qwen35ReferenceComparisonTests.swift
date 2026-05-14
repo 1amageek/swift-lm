@@ -33,7 +33,7 @@ struct Qwen35ReferenceComparisonTests {
 
     @Test("Reference snapshot schema is complete")
     func referenceSnapshotSchemaIsComplete() throws {
-        let env = try Self.setupOrSkip()
+        let env = try Self.setupReferenceOrSkip()
         let requiredTensors = [
             "ref.meta.schema_version",
             "ref.meta.case_count",
@@ -132,7 +132,7 @@ struct Qwen35ReferenceComparisonTests {
         defer { gpuLock.release() }
         BenchmarkSupport.settleGPU()
 
-        let env = try Self.setupOrSkip(enableSSMConvDebug: true)
+        let env = try Self.setupOrSkip(enableSSMConvDebug: true, loadSTAF: true)
         let referenceCase = Self.referenceCases[0]
         let linearBlockOrdinals = try Self.readRefInt32Array(env.ref, name: "ref.meta.linear_block_ordinals")
         #expect(!linearBlockOrdinals.isEmpty)
@@ -401,7 +401,12 @@ struct Qwen35ReferenceComparisonTests {
     private struct TestEnvironment {
         let model: MetalInferenceModel
         let ref: MetalWeightFile
-        let staf: STAFWeightStore
+        let staf: STAFWeightStore?
+        let bundlePath: String
+    }
+
+    private struct ReferenceEnvironment {
+        let ref: MetalWeightFile
         let bundlePath: String
     }
 
@@ -448,7 +453,7 @@ struct Qwen35ReferenceComparisonTests {
         }
     }
 
-    private static func setupOrSkip(enableSSMConvDebug: Bool = false) throws -> TestEnvironment {
+    private static func setupReferenceOrSkip() throws -> ReferenceEnvironment {
         guard let device = MTLCreateSystemDefaultDevice() else {
             throw SetupError.noDevice
         }
@@ -465,6 +470,14 @@ struct Qwen35ReferenceComparisonTests {
         }
 
         let ref = try SafetensorsLoader().load(at: refURL, device: device)
+        return ReferenceEnvironment(ref: ref, bundlePath: bundlePath)
+    }
+
+    private static func setupOrSkip(
+        enableSSMConvDebug: Bool = false,
+        loadSTAF: Bool = false
+    ) throws -> TestEnvironment {
+        let referenceEnv = try setupReferenceOrSkip()
         let previousDebugValue = getenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV").map { String(cString: $0) }
         if enableSSMConvDebug {
             setenv("SWIFTLM_PREFILL_DEBUG_SSM_CONV", "1", 1)
@@ -477,15 +490,25 @@ struct Qwen35ReferenceComparisonTests {
             }
         }
         let (model, _, _) = try BenchmarkSupport.setupFromBundle(
-            bundlePath: bundlePath,
+            bundlePath: referenceEnv.bundlePath,
             inferencePolicy: InferencePolicy(maximumSequenceLength: 64)
         )
-        let stafURL = URL(fileURLWithPath: bundlePath).appendingPathComponent("model.staf")
-        guard FileManager.default.fileExists(atPath: stafURL.path) else {
-            throw SetupError.tensorNotFound(stafURL.path)
+        let staf: STAFWeightStore?
+        if loadSTAF {
+            let stafURL = URL(fileURLWithPath: referenceEnv.bundlePath).appendingPathComponent("model.staf")
+            guard FileManager.default.fileExists(atPath: stafURL.path) else {
+                throw SetupError.tensorNotFound(stafURL.path)
+            }
+            staf = try STAFLoader().load(at: stafURL, device: model.device)
+        } else {
+            staf = nil
         }
-        let staf = try STAFLoader().load(at: stafURL, device: device)
-        return TestEnvironment(model: model, ref: ref, staf: staf, bundlePath: bundlePath)
+        return TestEnvironment(
+            model: model,
+            ref: referenceEnv.ref,
+            staf: staf,
+            bundlePath: referenceEnv.bundlePath
+        )
     }
 
     private static func resolveBundle() throws -> String? {
@@ -667,7 +690,10 @@ struct Qwen35ReferenceComparisonTests {
             return row
         }
         let weightTensorName = "model.language_model.layers.\(check.layerIndex).linear_attn.out_proj.weight"
-        let (weight, weightShape) = try readSTAFTensorAsFloats(env.staf, name: weightTensorName)
+        guard let staf = env.staf else {
+            throw SetupError.tensorNotFound("model.staf")
+        }
+        let (weight, weightShape) = try readSTAFTensorAsFloats(staf, name: weightTensorName)
         guard weightShape.count == 2 else {
             throw SetupError.unsupportedTensorDType(weightTensorName, "rank\(weightShape.count)")
         }
