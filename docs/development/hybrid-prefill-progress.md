@@ -1556,7 +1556,7 @@ The SSM recurrence microbenchmark now emits three artifacts:
 |---|---|
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing, grid shape, and estimated recurrent-state traffic for each sequence length |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
-| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, active-thread shape, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1679,15 +1679,21 @@ not favorable:
 
 | Sequence length | Baseline state phase | `d2` state phase | Decision |
 |---:|---:|---:|---|
-| 16 | 374.5 us | 631.4 us | reject |
-| 64 | 1411.9 us | 2529.7 us | reject |
-| 128 | 2938.0 us | 4737.2 us | reject |
+| 16 | 365.9 us | 604.7 us | reject |
+| 64 | 1400.2 us | 2447.8 us | reject |
+| 128 | 3397.2 us | 4763.4 us | reject |
 
 Current decision: do not promote the `d2` shape into the production sequence
 kernel. It likely reduces active-lane parallelism more than it benefits from
 scalar reuse. The next candidate should preserve one value lane per active
 thread and instead improve memory coalescing or state staging without reducing
 thread-level parallelism.
+
+The phase CSV now records `activeThreadsPerThreadgroup`,
+`valueLanesPerThread`, and `laneParallelismPreserved` so future candidates are
+not judged by timing alone. The `d2` result is a concrete example: it is
+reference-equivalent and has the same estimated state traffic, but halves the
+active value-lane parallelism from 128 to 64 threads per group.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

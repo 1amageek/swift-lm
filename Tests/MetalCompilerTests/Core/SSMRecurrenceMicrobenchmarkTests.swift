@@ -261,6 +261,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "microsecondsPerToken",
                 "fullBaseAverageGpuMicroseconds",
                 "relativeToFullBasePercent",
+                "activeThreadsPerThreadgroup",
+                "valueLanesPerThread",
+                "laneParallelismPreserved",
                 "estimatedStateTotalBytesPerToken",
                 "outputChecksum",
             ].joined(separator: ","),
@@ -277,6 +280,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(format: "%.6f", row.microsecondsPerToken),
                 String(format: "%.3f", row.fullBaseAverageGpuMicroseconds),
                 String(format: "%.3f", row.relativeToFullBasePercent),
+                String(row.activeThreadsPerThreadgroup),
+                String(row.valueLanesPerThread),
+                String(row.laneParallelismPreserved),
                 String(row.estimatedStateTotalBytesPerToken),
                 String(format: "%.6f", row.outputChecksum),
             ].joined(separator: ","))
@@ -289,11 +295,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
         print("artifact: \(artifact.path)")
-        print("seq  phase                  avg_us  us/token  full_%  state_mb/tok")
+        print("seq  phase                  avg_us  us/token  full_%  active  lanes  state_mb/tok")
         for row in rows.sorted(by: phaseRowSort) {
             let phase = row.phase.padding(toLength: 21, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.estimatedStateTotalBytesPerToken) / 1_048_576.0
-            print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%12.3f", stateMegabytes))")
+            print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%6d", row.activeThreadsPerThreadgroup))  \(String(format: "%5d", row.valueLanesPerThread))  \(String(format: "%12.3f", stateMegabytes))")
         }
     }
 
@@ -429,6 +435,22 @@ private struct SSMPhaseResultRow {
         phase.hasPrefix("state_recurrence")
             ? headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride * 3
             : 0
+    }
+
+    var valueLanesPerThread: Int {
+        phase == "state_recurrence_d2" ? 2 : 1
+    }
+
+    var activeThreadsPerThreadgroup: Int {
+        if phase == "conv_silu" {
+            return threadgroupWidth
+        }
+        let valueThreadCount = (valueDimension + valueLanesPerThread - 1) / valueLanesPerThread
+        return min(threadgroupWidth, valueThreadCount)
+    }
+
+    var laneParallelismPreserved: Bool {
+        valueLanesPerThread == 1
     }
 }
 
