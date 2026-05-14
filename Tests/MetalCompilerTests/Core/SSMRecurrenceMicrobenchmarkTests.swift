@@ -8,6 +8,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
     private static let sequenceLengths = [16, 64, 128]
     private static let iterations = 5
     private static let warmupIterations = 1
+    private static let stabilitySamples = 3
+    private static let stabilityIterations = 3
 
     @Test("BF16 SSM recurrence real-shape microbench")
     func bf16SSMRecurrenceRealShapeMicrobench() throws {
@@ -125,6 +127,62 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "\(kernelName) recurrent state drifted: maxError=\(validation.recurrentStateMaxError)"
             )
         }
+    }
+
+    @Test("BF16 SSM state recurrence candidate stability microbench")
+    func bf16SSMStateRecurrenceCandidateStabilityMicrobench() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let harness = try SSMRecurrenceMicrobenchmarkHarness(device: device)
+        let sequenceLength = 128
+        let baselinePhase = SSMPhaseVariant(
+            name: "state_recurrence",
+            kernelName: "bench_ssm_phase_state_recurrence_f32",
+            threadgroupWidth: 384
+        )
+        let candidatePhases = [
+            SSMPhaseVariant(
+                name: "state_recurrence_d2",
+                kernelName: "bench_ssm_phase_state_recurrence_d2_f32",
+                threadgroupWidth: 384
+            ),
+            SSMPhaseVariant(
+                name: "state_recurrence_qkpar",
+                kernelName: "bench_ssm_phase_state_recurrence_qkpar_f32",
+                threadgroupWidth: 384
+            ),
+        ]
+
+        var rows: [SSMPhaseStabilityRow] = []
+        for sampleIndex in 0..<Self.stabilitySamples {
+            let baseline = try harness.measurePhase(
+                phase: baselinePhase,
+                sequenceLength: sequenceLength,
+                fullBaseAverageGpuMicroseconds: 1.0,
+                iterations: Self.stabilityIterations,
+                warmupIterations: Self.warmupIterations
+            )
+            for candidate in candidatePhases {
+                let candidateRow = try harness.measurePhase(
+                    phase: candidate,
+                    sequenceLength: sequenceLength,
+                    fullBaseAverageGpuMicroseconds: 1.0,
+                    iterations: Self.stabilityIterations,
+                    warmupIterations: Self.warmupIterations
+                )
+                rows.append(SSMPhaseStabilityRow(sampleIndex: sampleIndex, baseline: baseline, candidate: candidateRow))
+            }
+        }
+
+        let artifact = try writePhaseStabilityCSV(rows: rows)
+        printPhaseStabilityReport(rows: rows, artifact: artifact)
+        #expect(rows.count == Self.stabilitySamples * candidatePhases.count)
+        #expect(rows.allSatisfy { $0.candidateOutputChecksum.isFinite && $0.candidateOutputChecksum > 0 })
     }
 
     private func printReport(
@@ -299,6 +357,51 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
+    private func writePhaseStabilityCSV(rows: [SSMPhaseStabilityRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phase-stability.csv")
+        var lines = [
+            [
+                "sampleIndex",
+                "sequenceLength",
+                "candidatePhase",
+                "baselineAverageGpuMicroseconds",
+                "candidateAverageGpuMicroseconds",
+                "candidateDeltaPercent",
+                "candidateWins",
+                "activeThreadsPerThreadgroup",
+                "valueLanesPerThread",
+                "laneParallelismPreserved",
+                "stateInnerStrideElements",
+                "coalescedValueLanesPerStateRow",
+                "serialStateLanesPerThread",
+                "candidateOutputChecksum",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: phaseStabilityRowSort) {
+            lines.append([
+                String(row.sampleIndex),
+                String(row.sequenceLength),
+                row.candidatePhase,
+                String(format: "%.3f", row.baselineAverageGpuMicroseconds),
+                String(format: "%.3f", row.candidateAverageGpuMicroseconds),
+                String(format: "%.3f", row.candidateDeltaPercent),
+                String(row.candidateWins),
+                String(row.activeThreadsPerThreadgroup),
+                String(row.valueLanesPerThread),
+                String(row.laneParallelismPreserved),
+                String(row.stateInnerStrideElements),
+                String(row.coalescedValueLanesPerStateRow),
+                String(row.serialStateLanesPerThread),
+                String(format: "%.6f", row.candidateOutputChecksum),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL) {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
@@ -308,6 +411,17 @@ struct SSMRecurrenceMicrobenchmarkTests {
             let phase = row.phase.padding(toLength: 25, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.estimatedStateTotalBytesPerToken) / 1_048_576.0
             print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%6d", row.activeThreadsPerThreadgroup))  \(String(format: "%5d", row.valueLanesPerThread))  \(String(format: "%6d", row.stateInnerStrideElements))  \(String(format: "%9d", row.coalescedValueLanesPerStateRow))  \(String(format: "%12.3f", stateMegabytes))")
+        }
+    }
+
+    private func printPhaseStabilityReport(rows: [SSMPhaseStabilityRow], artifact: URL) {
+        print()
+        print("=== BF16 SSM state recurrence candidate stability ===")
+        print("artifact: \(artifact.path)")
+        print("sample  candidate                 base_us  cand_us  delta_%  wins")
+        for row in rows.sorted(by: phaseStabilityRowSort) {
+            let candidate = row.candidatePhase.padding(toLength: 25, withPad: " ", startingAt: 0)
+            print("  \(String(format: "%3d", row.sampleIndex))   \(candidate) \(String(format: "%7.1f", row.baselineAverageGpuMicroseconds))  \(String(format: "%7.1f", row.candidateAverageGpuMicroseconds))  \(String(format: "%7.2f", row.candidateDeltaPercent))  \(row.candidateWins)")
         }
     }
 
@@ -363,6 +477,13 @@ struct SSMRecurrenceMicrobenchmarkTests {
             return lhs.sequenceLength < rhs.sequenceLength
         }
         return lhs.phase < rhs.phase
+    }
+
+    private func phaseStabilityRowSort(_ lhs: SSMPhaseStabilityRow, _ rhs: SSMPhaseStabilityRow) -> Bool {
+        if lhs.sampleIndex != rhs.sampleIndex {
+            return lhs.sampleIndex < rhs.sampleIndex
+        }
+        return lhs.candidatePhase < rhs.candidatePhase
     }
 }
 
@@ -471,6 +592,45 @@ private struct SSMPhaseResultRow {
 
     var serialStateLanesPerThread: Int {
         phase.hasPrefix("state_recurrence") ? valueLanesPerThread : 0
+    }
+}
+
+private struct SSMPhaseStabilityRow {
+    let sampleIndex: Int
+    let sequenceLength: Int
+    let candidatePhase: String
+    let baselineAverageGpuMicroseconds: Double
+    let candidateAverageGpuMicroseconds: Double
+    let candidateOutputChecksum: Double
+    let activeThreadsPerThreadgroup: Int
+    let valueLanesPerThread: Int
+    let laneParallelismPreserved: Bool
+    let stateInnerStrideElements: Int
+    let coalescedValueLanesPerStateRow: Int
+    let serialStateLanesPerThread: Int
+
+    init(sampleIndex: Int, baseline: SSMPhaseResultRow, candidate: SSMPhaseResultRow) {
+        self.sampleIndex = sampleIndex
+        self.sequenceLength = candidate.sequenceLength
+        self.candidatePhase = candidate.phase
+        self.baselineAverageGpuMicroseconds = baseline.averageGpuMicroseconds
+        self.candidateAverageGpuMicroseconds = candidate.averageGpuMicroseconds
+        self.candidateOutputChecksum = candidate.outputChecksum
+        self.activeThreadsPerThreadgroup = candidate.activeThreadsPerThreadgroup
+        self.valueLanesPerThread = candidate.valueLanesPerThread
+        self.laneParallelismPreserved = candidate.laneParallelismPreserved
+        self.stateInnerStrideElements = candidate.stateInnerStrideElements
+        self.coalescedValueLanesPerStateRow = candidate.coalescedValueLanesPerStateRow
+        self.serialStateLanesPerThread = candidate.serialStateLanesPerThread
+    }
+
+    var candidateDeltaPercent: Double {
+        (candidateAverageGpuMicroseconds - baselineAverageGpuMicroseconds)
+            / baselineAverageGpuMicroseconds * 100.0
+    }
+
+    var candidateWins: Bool {
+        candidateAverageGpuMicroseconds < baselineAverageGpuMicroseconds
     }
 }
 

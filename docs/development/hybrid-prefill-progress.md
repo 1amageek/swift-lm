@@ -244,6 +244,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; register-block `state_recurrence_d2` phase candidate is CPU-reference equivalent but slower than the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; `state_recurrence_qkpar` preserves active value-lane parallelism and matches the CPU reference, but does not beat the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase CSV now records state-loop stride, coalesced value lanes, and serial value lanes per thread for recurrence candidates |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase stability CSV shows `qkpar` wins 3/3 at seqLen 128 while `d2` loses 3/3 |
 
 ## Failed Experiments
 
@@ -1552,13 +1553,14 @@ width until a full-model profile shows a stable win.
 
 ## SSM Recurrence Decision Summary Harness (2026-05-15)
 
-The SSM recurrence microbenchmark now emits three artifacts:
+The SSM recurrence microbenchmark now emits four artifacts:
 
 | Artifact | Purpose |
 |---|---|
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing, grid shape, and estimated recurrent-state traffic for each sequence length |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, active-thread shape, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-stability.csv` | Repeated 128-token phase candidate samples compared against the baseline state phase in the same test process |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1716,16 +1718,20 @@ partials and barrier do not pay for themselves:
 | 64 | 1413.4 us | 1450.8 us | 128 -> 128 | reject |
 | 128 | 2811.8 us | 2822.0 us | 128 -> 128 | reject/noise |
 
-Latest single-run artifact showed a favorable 128-token `qkpar` sample
-(`3355.1 us -> 2788.0 us`) while 16-token and 64-token results stayed noise or
-slower. This is not enough for route promotion because the previous same-suite
-run showed no 128-token win. Treat `qkpar` as an unstable diagnostic until a
-multi-run summary proves a stable win and the full sequence/Qwen gates pass.
+The stability harness then measures 128-token state candidates repeatedly in
+the same process:
 
-Current decision: do not promote the `qkpar` shape into the production sequence
-kernel. The expensive region is the recurrent state loop, not the small scalar
-setup. The next candidate should target state load/write structure directly
-while preserving 128 active value lanes.
+| Sample | Baseline state phase | `d2` delta | `qkpar` delta |
+|---:|---:|---:|---:|
+| 0 | 3629.4 us | +35.03% | -11.93% |
+| 1 | 3991.7 us | +62.00% | -11.68% |
+| 2 | 3472.9 us | +51.12% | -14.96% |
+
+Current decision: `d2` remains rejected. `qkpar` is promoted from unstable
+diagnostic to the next sequence-kernel experiment candidate, but it is still
+not a production route. The required next gates are sequence recurrence
+equivalence, Qwen reference comparison, and full Qwen profile with the same
+kernel shape.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
