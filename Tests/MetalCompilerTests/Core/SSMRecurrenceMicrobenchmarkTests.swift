@@ -95,6 +95,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         let artifact = try writePhaseCSV(rows: rows)
         printPhaseReport(rows: rows, artifact: artifact)
         #expect(rows.count == Self.sequenceLengths.count * phases.count)
+        #expect(rows.allSatisfy { $0.outputChecksum.isFinite && $0.outputChecksum > 0 })
     }
 
     private func printReport(
@@ -234,6 +235,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "fullBaseAverageGpuMicroseconds",
                 "relativeToFullBasePercent",
                 "estimatedStateTotalBytesPerToken",
+                "outputChecksum",
             ].joined(separator: ","),
         ]
         for row in rows.sorted(by: phaseRowSort) {
@@ -249,6 +251,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(format: "%.3f", row.fullBaseAverageGpuMicroseconds),
                 String(format: "%.3f", row.relativeToFullBasePercent),
                 String(row.estimatedStateTotalBytesPerToken),
+                String(format: "%.6f", row.outputChecksum),
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -385,6 +388,7 @@ private struct SSMPhaseResultRow {
     let requestedThreadgroupWidth: Int
     let averageGpuMicroseconds: Double
     let fullBaseAverageGpuMicroseconds: Double
+    let outputChecksum: Double
 
     var microsecondsPerToken: Double {
         averageGpuMicroseconds / Double(sequenceLength)
@@ -652,6 +656,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 geometry: geometry
             )
         }
+        let outputChecksum = checksum(output: output, sequenceLength: sequenceLength)
 
         return SSMPhaseResultRow(
             sequenceLength: sequenceLength,
@@ -664,7 +669,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             threadgroupWidth: geometry.threadgroup.width,
             requestedThreadgroupWidth: phase.threadgroupWidth,
             averageGpuMicroseconds: totalMicroseconds / Double(iterations),
-            fullBaseAverageGpuMicroseconds: fullBaseAverageGpuMicroseconds
+            fullBaseAverageGpuMicroseconds: fullBaseAverageGpuMicroseconds,
+            outputChecksum: outputChecksum
         )
     }
 
@@ -1059,6 +1065,20 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         memset(recurrentState.contents(), 0, recurrentState.length)
         memset(convState.contents(), 0, convState.length)
         memset(output.contents(), 0, sequenceLength * activationRowStride * MemoryLayout<Float>.stride)
+    }
+
+    private func checksum(output: MTLBuffer, sequenceLength: Int) -> Double {
+        let elementCount = sequenceLength * activationRowStride
+        let values = output.contents().bindMemory(to: Float.self, capacity: elementCount)
+        var checksum = 0.0
+        for index in 0..<elementCount {
+            let value = values[index]
+            guard value.isFinite else {
+                return .nan
+            }
+            checksum += Double(abs(value))
+        }
+        return checksum
     }
 
     private func dispatchGeometry(

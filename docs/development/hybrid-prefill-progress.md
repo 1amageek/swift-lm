@@ -1554,7 +1554,7 @@ The SSM recurrence microbenchmark now emits three artifacts:
 |---|---|
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing, grid shape, and estimated recurrent-state traffic for each sequence length |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
-| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic lower-bound timing for conv+SiLU, state recurrence, and RMS/gate phases |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1595,8 +1595,11 @@ candidate unless they win by enough to offset the extra write traffic.
 The phase-isolation harness is intentionally synthetic: each probe uses the same
 Qwen3.5 dimensions and dispatch shape but isolates only one stage. It is not a
 correctness path and must not be used for production routing decisions by
-itself. Its purpose is to identify which stage deserves the next reference
-harness or kernel rewrite.
+itself. The per-phase timings are not additive and are not guaranteed lower
+bounds because isolated dispatches change cache, occupancy, and barrier
+behavior. The harness records an output checksum so broken or all-zero probes
+are visible, but its purpose is to identify which stage deserves the next
+reference harness or kernel rewrite.
 
 ```mermaid
 flowchart LR
@@ -1607,13 +1610,13 @@ flowchart LR
   E --> F["next structural optimization"]
 ```
 
-Current local phase lower-bound result:
+Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 3.16% | 76.28% | 23.43% | state recurrence dominates |
-| 64 | 2.67% | 75.48% | 23.80% | state recurrence dominates |
-| 128 | 1.90% | 65.26% | 19.42% | state recurrence dominates |
+| 16 | 3.16% | 75.30% | 23.44% | state recurrence dominates |
+| 64 | 2.71% | 85.99% | 27.09% | state recurrence dominates |
+| 128 | 2.80% | 121.10% | 17.32% | standalone state recurrence is slower than the measured full base |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
