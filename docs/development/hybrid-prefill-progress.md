@@ -222,6 +222,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; default and opt-in partial routes both run the full 5-test Qwen reference suite after reducing unnecessary schema-test model/STAF loads |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now labels dispatch-reducing fused-stage candidates and records current/target step counts |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 fused-stage candidates with estimated dispatch reduction 18 total |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission now emits a typed safe execution plan only when the window reduces dispatch count and keeps unsafe row-grid fusion disallowed |
 
 ## Failed Experiments
 
@@ -1031,6 +1032,26 @@ recurrent group state exactly once, then emits that group's output-projection
 partial rows. A row-expanded recurrence grid is unsafe because multiple
 threadgroups would race or duplicate the same recurrent and convolution state
 updates before any grid-wide synchronization point exists.
+
+M3D.7 moves that safety rule from profile documentation into planner state.
+`RecurrentBlockFusionPrototypePlanner.fusedStageDecision` now produces a typed
+`RecurrentBlockFusionFusedStagePlan` only when:
+
+- the recurrent block is multi-group and can be partitioned into the partial
+  scratch layout;
+- input projection, recurrence, and output projection dimensions match the
+  Qwen linear-attention contract;
+- replacing `recurrence + bridge + output_projection` with
+  `fused_recurrence_partial_projection + partial_reduce` removes at least one
+  dispatch;
+- the execution shape is
+  `group-owned-state-update-then-partial-rows`, with
+  `unsafeRowGridFusionAllowed=false`.
+
+This keeps the next kernel prototype behind an explicit admission contract. A
+window that has no bridge dispatch to remove is rejected even if it is otherwise
+shape-compatible, because it would add kernel risk without a dispatch-count
+benefit.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 

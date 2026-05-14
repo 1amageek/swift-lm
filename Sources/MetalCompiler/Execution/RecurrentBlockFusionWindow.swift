@@ -205,8 +205,46 @@ enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
     case rejected([RecurrentBlockFusionTwoStageRejection])
 }
 
+enum RecurrentBlockFusionFusedStageExecutionShape: String, Sendable, Equatable {
+    case groupOwnedStateUpdateThenPartialRows = "group-owned-state-update-then-partial-rows"
+}
+
+struct RecurrentBlockFusionFusedStagePlan: Sendable, Equatable {
+    let layerIndex: Int
+    let partitionCount: Int
+    let headsPerPartition: Int
+    let partitionInputDimension: Int
+    let recurrentOutputDimension: Int
+    let outputDimension: Int
+    let currentReplaceableStepCount: Int
+    let targetFusedStageStepCount: Int
+    let estimatedDispatchReduction: Int
+    let executionShape: RecurrentBlockFusionFusedStageExecutionShape
+    let unsafeRowGridFusionAllowed: Bool
+    let numericalContract: RecurrentBlockFusionNumericalContract
+}
+
+enum RecurrentBlockFusionFusedStageRejection: Sendable, Equatable {
+    case missingInputProjection(entryIndex: Int)
+    case missingRecurrence(entryIndex: Int)
+    case missingOutputProjection(entryIndex: Int)
+    case singleDispatchPreferred(partitionCount: Int)
+    case inputProjectionShapeMismatch(expectedConvDimension: Int, actualQKVDimension: Int)
+    case gateProjectionShapeMismatch(expectedOutputDimension: Int, actualZDimension: Int)
+    case outputProjectionShapeMismatch(expectedInputDimension: Int, actualInputDimension: Int)
+    case unevenHeadPartition(headCount: Int, partitionCount: Int)
+    case noScratchCompatiblePartition(groupCount: Int, maximumPartialScratchSlotCount: Int)
+    case noDispatchReduction(currentStepCount: Int, targetStepCount: Int)
+}
+
+enum RecurrentBlockFusionFusedStageDecision: Sendable, Equatable {
+    case candidate(RecurrentBlockFusionFusedStagePlan)
+    case rejected([RecurrentBlockFusionFusedStageRejection])
+}
+
 enum RecurrentBlockFusionPrototypePlanner {
     private static let maximumPartialScratchSlotCount = 4
+    private static let fusedStageStepCount = 2
 
     private static func largestDivisor(of value: Int, notExceeding maximum: Int) -> Int {
         guard value > 0, maximum > 0 else { return 0 }
@@ -343,6 +381,99 @@ enum RecurrentBlockFusionPrototypePlanner {
             partialScratchBaseSlot: 1,
             partialScratchSlotCount: partitionCount,
             requiredScratchSlotCount: 1 + partitionCount,
+            numericalContract: .referenceGated
+        ))
+    }
+
+    static func fusedStageDecision(
+        for window: RecurrentBlockFusionAdmissionWindow,
+        entries: [DispatchEntry]
+    ) -> RecurrentBlockFusionFusedStageDecision {
+        let byIndex = Dictionary(uniqueKeysWithValues: entries.map { ($0.index, $0) })
+        var rejections: [RecurrentBlockFusionFusedStageRejection] = []
+
+        guard let inputEntry = byIndex[window.inputProjectionEntryIndex],
+              let inputProjection = inputEntry.fragment as? BatchedProjection else {
+            return .rejected([.missingInputProjection(entryIndex: window.inputProjectionEntryIndex)])
+        }
+        guard let recurrenceEntry = byIndex[window.recurrenceEntryIndex],
+              let recurrence = recurrenceEntry.fragment as? SSMRecurrenceFragment else {
+            return .rejected([.missingRecurrence(entryIndex: window.recurrenceEntryIndex)])
+        }
+        guard let outputEntry = byIndex[window.outputProjectionEntryIndex],
+              let outputProjection = outputEntry.fragment as? LinearFragment else {
+            return .rejected([.missingOutputProjection(entryIndex: window.outputProjectionEntryIndex)])
+        }
+
+        if recurrence.groupCount <= 1 {
+            rejections.append(.singleDispatchPreferred(partitionCount: recurrence.groupCount))
+        }
+        if recurrence.headCount % max(recurrence.groupCount, 1) != 0 {
+            rejections.append(.unevenHeadPartition(
+                headCount: recurrence.headCount,
+                partitionCount: recurrence.groupCount
+            ))
+        }
+
+        let fields = Dictionary(uniqueKeysWithValues: inputProjection.projections.map { ($0.field, $0) })
+        if let qkv = fields["in_proj_qkv"], qkv.outputDimension != recurrence.convDimension {
+            rejections.append(.inputProjectionShapeMismatch(
+                expectedConvDimension: recurrence.convDimension,
+                actualQKVDimension: qkv.outputDimension
+            ))
+        }
+        let recurrentOutputDimension = recurrence.headCount * recurrence.valueHeadDimension
+        if let z = fields["in_proj_z"], z.outputDimension != recurrentOutputDimension {
+            rejections.append(.gateProjectionShapeMismatch(
+                expectedOutputDimension: recurrentOutputDimension,
+                actualZDimension: z.outputDimension
+            ))
+        }
+        if outputProjection.inputDimension != recurrentOutputDimension {
+            rejections.append(.outputProjectionShapeMismatch(
+                expectedInputDimension: recurrentOutputDimension,
+                actualInputDimension: outputProjection.inputDimension
+            ))
+        }
+
+        let partitionCount = largestDivisor(
+            of: recurrence.groupCount,
+            notExceeding: maximumPartialScratchSlotCount
+        )
+        if partitionCount <= 1 || recurrentOutputDimension % max(partitionCount, 1) != 0 {
+            rejections.append(.noScratchCompatiblePartition(
+                groupCount: recurrence.groupCount,
+                maximumPartialScratchSlotCount: maximumPartialScratchSlotCount
+            ))
+        }
+
+        let currentReplaceableStepCount = 1 + window.bridgeEntryIndices.count + 1
+        let estimatedDispatchReduction = currentReplaceableStepCount - fusedStageStepCount
+        if estimatedDispatchReduction <= 0 {
+            rejections.append(.noDispatchReduction(
+                currentStepCount: currentReplaceableStepCount,
+                targetStepCount: fusedStageStepCount
+            ))
+        }
+
+        guard rejections.isEmpty else {
+            return .rejected(rejections)
+        }
+
+        let headsPerPartition = recurrence.headCount / partitionCount
+        let partitionInputDimension = recurrentOutputDimension / partitionCount
+        return .candidate(RecurrentBlockFusionFusedStagePlan(
+            layerIndex: window.layerIndex,
+            partitionCount: partitionCount,
+            headsPerPartition: headsPerPartition,
+            partitionInputDimension: partitionInputDimension,
+            recurrentOutputDimension: recurrentOutputDimension,
+            outputDimension: outputProjection.outputDimension,
+            currentReplaceableStepCount: currentReplaceableStepCount,
+            targetFusedStageStepCount: fusedStageStepCount,
+            estimatedDispatchReduction: estimatedDispatchReduction,
+            executionShape: .groupOwnedStateUpdateThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
             numericalContract: .referenceGated
         ))
     }

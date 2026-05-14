@@ -147,6 +147,58 @@ struct RecurrentBlockFusionWindowTests {
         #expect(decision == .rejected([.singleDispatchPreferred(partitionCount: 1)]))
     }
 
+    @Test("Prototype planner creates safe fused-stage plan only when it reduces dispatches")
+    func prototypePlannerCreatesSafeFusedStagePlanForDispatchReducingWindow() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 8, groups: 4),
+            dispatchRecurrence(index: 1, layer: 8, groups: 4),
+            DispatchEntry(
+                index: 2,
+                fragment: ElementwiseFragment(count: 256, kind: .swiglu),
+                layerIndex: 8
+            ),
+            dispatchOutputProjection(index: 3, layer: 8),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.fusedStageDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .candidate(RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 8,
+            partitionCount: 4,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .groupOwnedStateUpdateThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )))
+    }
+
+    @Test("Prototype planner rejects fused-stage plan when no dispatch is removed")
+    func prototypePlannerRejectsFusedStagePlanWithoutDispatchReduction() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 0, groups: 4),
+            dispatchRecurrence(index: 1, layer: 0, groups: 4),
+            dispatchOutputProjection(index: 2, layer: 0),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.fusedStageDecision(
+            for: window,
+            entries: entries
+        )
+
+        #expect(decision == .rejected([.noDispatchReduction(currentStepCount: 2, targetStepCount: 2)]))
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [
