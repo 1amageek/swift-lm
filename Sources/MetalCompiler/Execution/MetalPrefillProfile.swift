@@ -274,6 +274,10 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "bridgeGpuMicroseconds",
                 "outputProjectionGpuMicroseconds",
                 "estimatedTotalBytes",
+                "fusedStageCandidate",
+                "currentReplaceableStepCount",
+                "targetFusedStageStepCount",
+                "estimatedDispatchReduction",
             ].joined(separator: ","),
         ]
         for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
@@ -298,6 +302,10 @@ struct MetalPrefillProfile: Codable, Sendable {
                 String(format: "%.3f", timing.bridgeGpuMicroseconds),
                 String(format: "%.3f", timing.outputProjectionGpuMicroseconds),
                 String(timing.estimatedTotalBytes),
+                timing.fusedStageCandidate ? "true" : "false",
+                String(timing.currentReplaceableStepCount),
+                String(timing.targetFusedStageStepCount),
+                String(timing.estimatedDispatchReduction),
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
@@ -356,6 +364,10 @@ struct MetalPrefillProfile: Codable, Sendable {
         let bridgeGpuMicroseconds: Double
         let outputProjectionGpuMicroseconds: Double
         let estimatedTotalBytes: Int
+        let fusedStageCandidate: Bool
+        let currentReplaceableStepCount: Int
+        let targetFusedStageStepCount: Int
+        let estimatedDispatchReduction: Int
     }
 
     private func recurrentBlockWindowTiming(
@@ -380,6 +392,13 @@ struct MetalPrefillProfile: Codable, Sendable {
             - recurrenceGpuMicroseconds
             - outputProjectionGpuMicroseconds
         let estimatedTotalBytes = windowEntries.reduce(0) { $0 + $1.estimatedTotalBytes }
+        let currentReplaceableStepCount = 1 + window.bridgeStepIndices.count + window.outputProjectionStepIndices.count
+        let targetFusedStageStepCount = 2
+        let estimatedDispatchReduction = max(0, currentReplaceableStepCount - targetFusedStageStepCount)
+        let outputProjectionAlreadySplit = window.outputProjectionKernelNames.contains {
+            $0.hasPrefix("recurrent_block_partial_")
+        }
+        let fusedStageCandidate = !outputProjectionAlreadySplit && estimatedDispatchReduction > 0
         return RecurrentBlockWindowTiming(
             entryCount: windowEntries.count,
             totalGpuMicroseconds: totalGpuMicroseconds,
@@ -387,7 +406,11 @@ struct MetalPrefillProfile: Codable, Sendable {
             recurrenceGpuMicroseconds: recurrenceGpuMicroseconds,
             bridgeGpuMicroseconds: bridgeGpuMicroseconds,
             outputProjectionGpuMicroseconds: outputProjectionGpuMicroseconds,
-            estimatedTotalBytes: estimatedTotalBytes
+            estimatedTotalBytes: estimatedTotalBytes,
+            fusedStageCandidate: fusedStageCandidate,
+            currentReplaceableStepCount: currentReplaceableStepCount,
+            targetFusedStageStepCount: targetFusedStageStepCount,
+            estimatedDispatchReduction: estimatedDispatchReduction
         )
     }
 

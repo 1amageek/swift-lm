@@ -220,6 +220,8 @@ flowchart TD
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic partial projection/reduce harness remains green after manifest hardening |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; dispatch/profile window admission remains green after manifest hardening |
 | 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1` and with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; default and opt-in partial routes both run the full 5-test Qwen reference suite after reducing unnecessary schema-test model/STAF loads |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now labels dispatch-reducing fused-stage candidates and records current/target step counts |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 fused-stage candidates with estimated dispatch reduction 18 total |
 
 ## Failed Experiments
 
@@ -982,6 +984,7 @@ The same artifact now includes timing columns for each replaceable window:
 | `bridgeGpuMicroseconds` | Rounds and other non-core steps inside the window |
 | `outputProjectionGpuMicroseconds` | Final output projection cost, including partial projection and reduce when routed |
 | `estimatedTotalBytes` | Estimated traffic for the window entries |
+| `fusedStageCandidate`, `estimatedDispatchReduction` | Whether the default window can be replaced by a dispatch-reducing fused recurrence/partial-output stage and the estimated dispatch-count reduction |
 
 M3D.5 completes the cross-group fan-in harness. The Qwen reference snapshot is
 now schema v6 and stores per-partition output-projection partials for selected
@@ -1006,6 +1009,20 @@ This closes the main harness gap for future recurrent-block fusion: a kernel can
 no longer pass only because the final reduced hidden row happens to match. It
 must also expose the cross-group partial fan-in contract when it opts into the
 partial route.
+
+M3D.6 adds the profile-side admission label for the next dispatch-reducing
+prototype. The profile writer now marks default recurrent windows as
+`fusedStageCandidate=true` only when replacing
+`recurrence + bridge + output_projection` with
+`fused_recurrence_partial_projection + partial_reduce` would reduce dispatch
+count. The opt-in partial route remains non-default and is not promoted by this
+label; the label exists to point the next kernel prototype at the windows that
+can actually reduce dispatches.
+
+Latest Qwen seqLen 128 profile has 18 recurrent windows, all 18 marked as
+fused-stage candidates, with total estimated dispatch reduction 18. This does
+not claim a speedup. It only proves that the next kernel attempt has a
+structural dispatch-count target before correctness and timing gates are run.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
