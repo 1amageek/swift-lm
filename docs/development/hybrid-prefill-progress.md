@@ -202,6 +202,8 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; opt-in partial route still detects 18 recurrent-block windows and writes partial projection/reduce step indices to `*-recurrent-windows.csv` |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes per-window GPU timing and estimated total bytes |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 timed windows with input projection, recurrence, bridge, and output projection timing columns |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in recurrent-block partial projection remains reference-equivalent after the fused MLP default route |
+| 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; route removes 18 `linear_attn.out_proj` GEMV dispatches but adds partial projection/reduce stages and regresses total profile, so it stays non-default |
 
 ## Failed Experiments
 
@@ -218,6 +220,7 @@ flowchart TD
 | Feature-flagged SSM recurrence threadgroup-width override | Correctness passed at `tg=128` and `tg=256`, but Qwen full-model profile with `tg=256` was 43.813/160.583/315.422 ms for seqLen 16/64/128 and did not beat the default profile | Kept behind `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH`; default SSM sequence kernel keeps the device-derived width |
 | Batched BF16 sequence GEMV tile2/tile4 | Isolated real-shape benchmark passed, but base is faster for the dominant seqLen 64/128 MLP gate+up, SSM in-proj, and attention QKV shapes | Do not route tiled batched BF16 kernels by default; future batched work should change data movement or use a different math path, not just sequence tiling |
 | BF16 dense batched MPP priority | Reference comparison failed immediately: case 0 prefill token drifted from HF `760` to Metal `120905`, final hidden max error was `26.9375`, and state/KV drift propagated through decode0 | Rejected and not retained as an opt-in runtime route; any future MPP work must first make the MPP math/storage contract reference-equivalent in isolation |
+| Opt-in recurrent-block partial output projection | Correctness remains green, but latest Qwen profile after fused MLP default changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 67.771/163.120/320.098 ms | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
 
 ## Open Decisions
 
@@ -932,6 +935,20 @@ Qwen3.5 linear-attention windows at seqLen 128. The first window is `3..<9` and
 the last is `314..<320`, reflecting the extra partial projection, partial round,
 and partial reduce steps. This is still not a production speed win; it is a
 harness fix so future block-fusion work measures the real replaceable window.
+
+After the fused MLP route became the default stateful hybrid path, the partial
+route was rerun as a promotion check:
+
+| Route | seqLen 16 | seqLen 64 | seqLen 128 | Active steps at 128 | Decision |
+|---|---:|---:|---:|---:|---|
+| Default fused MLP | 56.241 ms | 159.820 ms | 314.525 ms | 269 | production route |
+| Recurrent partial enabled | 67.771 ms | 163.120 ms | 320.098 ms | 323 | keep opt-in |
+
+The partial route removes the 18 `linear_attn.out_proj` GEMV dispatches, but it
+adds 18 partial projections, 18 partial reduces, and additional rounding work.
+The resulting plan is correctness-valid but not a speed path. The next
+recurrent-block attempt must reduce dispatch count or fuse recurrence with the
+output projection more directly; splitting the existing GEMV is insufficient.
 
 The same artifact now includes timing columns for each replaceable window:
 
