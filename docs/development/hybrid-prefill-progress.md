@@ -239,6 +239,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window profile CSV now records recurrence/output threadgroup counts and flags fused recurrence partial-emission as output-row parallelism collapse |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; real Qwen recurrent-window artifact marks all fused partial-emission windows with `rowGridParallelismPreserved=false` and `fused-recurrence-serializes-output-row-projection-inside-sequence-loop` |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated SSM microbench now writes both raw timing and per-sequence promotion-decision summary artifacts |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-isolation SSM microbench writes synthetic conv+SiLU, state recurrence, and RMS/gate lower-bound timing artifacts |
 
 ## Failed Experiments
 
@@ -1547,12 +1548,13 @@ width until a full-model profile shows a stable win.
 
 ## SSM Recurrence Decision Summary Harness (2026-05-15)
 
-The SSM recurrence microbenchmark now emits two artifacts:
+The SSM recurrence microbenchmark now emits three artifacts:
 
 | Artifact | Purpose |
 |---|---|
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing, grid shape, and estimated recurrent-state traffic for each sequence length |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic lower-bound timing for conv+SiLU, state recurrence, and RMS/gate phases |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1589,6 +1591,34 @@ one state write per element, or roughly 3.0 MiB of recurrent-state traffic per
 token before counting conv/state-space input traffic. `prewrite` variants add a
 second write pass, which makes them useful diagnostics but a poor default
 candidate unless they win by enough to offset the extra write traffic.
+
+The phase-isolation harness is intentionally synthetic: each probe uses the same
+Qwen3.5 dimensions and dispatch shape but isolates only one stage. It is not a
+correctness path and must not be used for production routing decisions by
+itself. Its purpose is to identify which stage deserves the next reference
+harness or kernel rewrite.
+
+```mermaid
+flowchart LR
+  A["Full SSM sequence kernel"] --> B["conv + SiLU probe"]
+  A --> C["state recurrence probe"]
+  A --> D["RMS + gate probe"]
+  C --> E["state traffic model"]
+  E --> F["next structural optimization"]
+```
+
+Current local phase lower-bound result:
+
+| Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
+|---:|---:|---:|---:|---|
+| 16 | 3.16% | 76.28% | 23.43% | state recurrence dominates |
+| 64 | 2.67% | 75.48% | 23.80% | state recurrence dominates |
+| 128 | 1.90% | 65.26% | 19.42% | state recurrence dominates |
+
+Current decision: the next serious SSM speed project should target the state
+recurrence phase first. Conv+SiLU is too small to justify more routing
+complexity, and RMS/gate is secondary unless it can be fused without increasing
+state traffic or reducing group parallelism.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

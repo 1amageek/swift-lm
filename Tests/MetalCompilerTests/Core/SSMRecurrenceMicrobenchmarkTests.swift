@@ -52,6 +52,51 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(summaryRows.count == Self.sequenceLengths.count)
     }
 
+    @Test("BF16 SSM recurrence phase-isolation microbench")
+    func bf16SSMRecurrencePhaseIsolationMicrobench() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let harness = try SSMRecurrenceMicrobenchmarkHarness(device: device)
+        let phases = [
+            SSMPhaseVariant(name: "conv_silu", kernelName: "bench_ssm_phase_conv_silu_bf16_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence", kernelName: "bench_ssm_phase_state_recurrence_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "rms_gate", kernelName: "bench_ssm_phase_rms_gate_f32", threadgroupWidth: 384),
+        ]
+
+        var rows: [SSMPhaseResultRow] = []
+        for sequenceLength in Self.sequenceLengths {
+            let fullBase = try harness.measure(
+                variant: SSMVariant(
+                    name: "base_tg384",
+                    kernelName: "bench_ssm_recurrence_seq_bf16_f32",
+                    threadgroupWidth: 384
+                ),
+                sequenceLength: sequenceLength,
+                iterations: Self.iterations,
+                warmupIterations: Self.warmupIterations
+            )
+            for phase in phases {
+                let row = try harness.measurePhase(
+                    phase: phase,
+                    sequenceLength: sequenceLength,
+                    fullBaseAverageGpuMicroseconds: fullBase.averageGpuMicroseconds,
+                    iterations: Self.iterations,
+                    warmupIterations: Self.warmupIterations
+                )
+                rows.append(row)
+            }
+        }
+
+        let artifact = try writePhaseCSV(rows: rows)
+        printPhaseReport(rows: rows, artifact: artifact)
+        #expect(rows.count == Self.sequenceLengths.count * phases.count)
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -171,6 +216,57 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
+    private func writePhaseCSV(rows: [SSMPhaseResultRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phases.csv")
+        var lines = [
+            [
+                "sequenceLength",
+                "phase",
+                "gridWidth",
+                "gridHeight",
+                "threadgroupWidth",
+                "requestedThreadgroupWidth",
+                "averageGpuMicroseconds",
+                "microsecondsPerToken",
+                "fullBaseAverageGpuMicroseconds",
+                "relativeToFullBasePercent",
+                "estimatedStateTotalBytesPerToken",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: phaseRowSort) {
+            lines.append([
+                String(row.sequenceLength),
+                row.phase,
+                String(row.gridWidth),
+                String(row.gridHeight),
+                String(row.threadgroupWidth),
+                String(row.requestedThreadgroupWidth),
+                String(format: "%.3f", row.averageGpuMicroseconds),
+                String(format: "%.6f", row.microsecondsPerToken),
+                String(format: "%.3f", row.fullBaseAverageGpuMicroseconds),
+                String(format: "%.3f", row.relativeToFullBasePercent),
+                String(row.estimatedStateTotalBytesPerToken),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL) {
+        print()
+        print("=== BF16 SSM recurrence phase-isolation microbench ===")
+        print("artifact: \(artifact.path)")
+        print("seq  phase              avg_us  us/token  full_%  state_mb/tok")
+        for row in rows.sorted(by: phaseRowSort) {
+            let phase = row.phase.padding(toLength: 17, withPad: " ", startingAt: 0)
+            let stateMegabytes = Double(row.estimatedStateTotalBytesPerToken) / 1_048_576.0
+            print("  \(String(format: "%3d", row.sequenceLength))  \(phase) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(String(format: "%6.2f", row.relativeToFullBasePercent))  \(String(format: "%12.3f", stateMegabytes))")
+        }
+    }
+
     private func summarize(rows: [SSMResultRow]) -> [SSMSummaryRow] {
         Self.sequenceLengths.compactMap { sequenceLength in
             let sequenceRows = rows.filter { $0.sequenceLength == sequenceLength }
@@ -217,9 +313,22 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
         return lhs.variant < rhs.variant
     }
+
+    private func phaseRowSort(_ lhs: SSMPhaseResultRow, _ rhs: SSMPhaseResultRow) -> Bool {
+        if lhs.sequenceLength != rhs.sequenceLength {
+            return lhs.sequenceLength < rhs.sequenceLength
+        }
+        return lhs.phase < rhs.phase
+    }
 }
 
 private struct SSMVariant {
+    let name: String
+    let kernelName: String
+    let threadgroupWidth: Int
+}
+
+private struct SSMPhaseVariant {
     let name: String
     let kernelName: String
     let threadgroupWidth: Int
@@ -261,6 +370,34 @@ private struct SSMResultRow {
 
     private var stateWritePassesPerElement: Int {
         variant.hasPrefix("prewrite_") ? 2 : 1
+    }
+}
+
+private struct SSMPhaseResultRow {
+    let sequenceLength: Int
+    let phase: String
+    let headCount: Int
+    let keyDimension: Int
+    let valueDimension: Int
+    let gridWidth: Int
+    let gridHeight: Int
+    let threadgroupWidth: Int
+    let requestedThreadgroupWidth: Int
+    let averageGpuMicroseconds: Double
+    let fullBaseAverageGpuMicroseconds: Double
+
+    var microsecondsPerToken: Double {
+        averageGpuMicroseconds / Double(sequenceLength)
+    }
+
+    var relativeToFullBasePercent: Double {
+        averageGpuMicroseconds / fullBaseAverageGpuMicroseconds * 100.0
+    }
+
+    var estimatedStateTotalBytesPerToken: Int {
+        phase == "state_recurrence"
+            ? headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride * 3
+            : 0
     }
 }
 
@@ -378,6 +515,9 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 valueHeadDimension: 128,
                 prewriteDecayedState: true
             ),
+            Self.generatePhaseConvSiluKernel(),
+            Self.generatePhaseStateRecurrenceKernel(),
+            Self.generatePhaseRMSGateKernel(),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
         options.languageVersion = .version4_0
@@ -386,6 +526,9 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_recurrence_seq_bf16_f32",
             "bench_ssm_recurrence_seq_bf16_f32_shared_rms",
             "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
+            "bench_ssm_phase_conv_silu_bf16_f32",
+            "bench_ssm_phase_state_recurrence_f32",
+            "bench_ssm_phase_rms_gate_f32",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
         for name in names {
@@ -459,6 +602,355 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             requestedThreadgroupWidth: variant.threadgroupWidth,
             averageGpuMicroseconds: totalMicroseconds / Double(iterations)
         )
+    }
+
+    func measurePhase(
+        phase: SSMPhaseVariant,
+        sequenceLength: Int,
+        fullBaseAverageGpuMicroseconds: Double,
+        iterations: Int,
+        warmupIterations: Int
+    ) throws -> SSMPhaseResultRow {
+        guard let pipeline = pipelines[phase.kernelName] else {
+            throw MetalCompilerError.kernelNotFound(phase.kernelName)
+        }
+        let inputs = try makeInputs(sequenceLength: sequenceLength)
+        let recurrentState = try makeZeroedSharedBuffer(
+            byteLength: headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride
+        )
+        let convState = try makeZeroedSharedBuffer(
+            byteLength: convKernelSize * convDimension * MemoryLayout<BFloat16>.stride
+        )
+        let output = try makeZeroedSharedBuffer(
+            byteLength: sequenceLength * activationRowStride * MemoryLayout<Float>.stride
+        )
+        let geometry = dispatchGeometry(pipeline: pipeline, requestedThreadgroupWidth: phase.threadgroupWidth)
+
+        for _ in 0..<warmupIterations {
+            reset(recurrentState: recurrentState, convState: convState, output: output, sequenceLength: sequenceLength)
+            _ = try execute(
+                pipeline: pipeline,
+                inputs: inputs,
+                recurrentState: recurrentState,
+                convState: convState,
+                output: output,
+                sequenceLength: sequenceLength,
+                geometry: geometry
+            )
+        }
+
+        var totalMicroseconds = 0.0
+        for _ in 0..<iterations {
+            reset(recurrentState: recurrentState, convState: convState, output: output, sequenceLength: sequenceLength)
+            totalMicroseconds += try execute(
+                pipeline: pipeline,
+                inputs: inputs,
+                recurrentState: recurrentState,
+                convState: convState,
+                output: output,
+                sequenceLength: sequenceLength,
+                geometry: geometry
+            )
+        }
+
+        return SSMPhaseResultRow(
+            sequenceLength: sequenceLength,
+            phase: phase.name,
+            headCount: headCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            gridWidth: geometry.grid.width,
+            gridHeight: geometry.grid.height,
+            threadgroupWidth: geometry.threadgroup.width,
+            requestedThreadgroupWidth: phase.threadgroupWidth,
+            averageGpuMicroseconds: totalMicroseconds / Double(iterations),
+            fullBaseAverageGpuMicroseconds: fullBaseAverageGpuMicroseconds
+        )
+    }
+
+    private static func generatePhaseConvSiluKernel() -> String {
+        """
+        kernel void bench_ssm_phase_conv_silu_bf16_f32(
+            device const float* projectedQKV [[buffer(0)]],
+            device const float* projectedZ [[buffer(1)]],
+            device const float* projectedBeta [[buffer(2)]],
+            device const float* projectedAlpha [[buffer(3)]],
+            device const uint16_t* convWeight [[buffer(4)]],
+            device const float* normWeight [[buffer(5)]],
+            device const uint16_t* dtBias [[buffer(6)]],
+            device const float* aLog [[buffer(7)]],
+            device float* recurrentState [[buffer(8)]],
+            device uint16_t* convState [[buffer(9)]],
+            device float* output [[buffer(10)]],
+            constant uint& numHeads [[buffer(11)]],
+            constant uint& groupCount [[buffer(12)]],
+            constant uint& keyDimension [[buffer(13)]],
+            constant uint& valueDimension [[buffer(14)]],
+            constant uint& convKernelSize [[buffer(15)]],
+            constant uint& sequenceLength [[buffer(16)]],
+            constant uint& activationRowStride [[buffer(17)]],
+            device float* debugConvSilu [[buffer(18)]],
+            constant uint& debugConvRowStride [[buffer(19)]],
+            constant uint& debugConvEnabled [[buffer(20)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgSize [[threads_per_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]]
+        ) {
+            const uint dk = keyDimension;
+            const uint dv = valueDimension;
+            const uint safeGroupCount = max(groupCount, 1u);
+            const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
+            const uint keyGroupDim = safeGroupCount * dk;
+            const uint convDim = 2u * keyGroupDim + numHeads * dv;
+            const uint localDim = 2u * dk + headsPerGroup * dv;
+            const uint groupIndex = tgid;
+            if (groupIndex >= safeGroupCount) { return; }
+            const uint headStart = groupIndex * headsPerGroup;
+            const uint qBaseGlobal = groupIndex * dk;
+            const uint kBaseGlobal = keyGroupDim + groupIndex * dk;
+            const uint vBaseGlobal = 2u * keyGroupDim + headStart * dv;
+
+            for (uint pos = 0; pos < sequenceLength; ++pos) {
+                device const float* projectedQKVPos = projectedQKV + pos * activationRowStride;
+                device float* outputPos = output + pos * activationRowStride;
+                for (uint localCh = tid; localCh < localDim; localCh += tgSize) {
+                    uint globalCh;
+                    if (localCh < dk) {
+                        globalCh = qBaseGlobal + localCh;
+                    } else if (localCh < 2u * dk) {
+                        globalCh = kBaseGlobal + (localCh - dk);
+                    } else {
+                        globalCh = vBaseGlobal + (localCh - 2u * dk);
+                    }
+                    float sum = 0.0f;
+                    for (uint k = 0; k + 1 < convKernelSize; ++k) {
+                        float val = bf16_to_float(convState[(k + 1) * convDim + globalCh]);
+                        convState[k * convDim + globalCh] = float_to_bf16(val);
+                        sum += val * bf16_to_float(convWeight[globalCh * convKernelSize + k]);
+                    }
+                    float newVal = projectedQKVPos[globalCh];
+                    convState[(convKernelSize - 1) * convDim + globalCh] = float_to_bf16(newVal);
+                    sum += newVal * bf16_to_float(convWeight[globalCh * convKernelSize + convKernelSize - 1]);
+                    outputPos[globalCh] = sum * stable_sigmoid(sum);
+                }
+                if (pos + 1 < sequenceLength) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                }
+            }
+        }
+        """
+    }
+
+    private static func generatePhaseStateRecurrenceKernel() -> String {
+        """
+        kernel void bench_ssm_phase_state_recurrence_f32(
+            device const float* convSilu [[buffer(0)]],
+            device const float* projectedZ [[buffer(1)]],
+            device const float* projectedBeta [[buffer(2)]],
+            device const float* projectedAlpha [[buffer(3)]],
+            device const uint16_t* convWeight [[buffer(4)]],
+            device const float* normWeight [[buffer(5)]],
+            device const uint16_t* dtBias [[buffer(6)]],
+            device const float* aLog [[buffer(7)]],
+            device float* recurrentState [[buffer(8)]],
+            device uint16_t* convState [[buffer(9)]],
+            device float* output [[buffer(10)]],
+            constant uint& numHeads [[buffer(11)]],
+            constant uint& groupCount [[buffer(12)]],
+            constant uint& keyDimension [[buffer(13)]],
+            constant uint& valueDimension [[buffer(14)]],
+            constant uint& convKernelSize [[buffer(15)]],
+            constant uint& sequenceLength [[buffer(16)]],
+            constant uint& activationRowStride [[buffer(17)]],
+            device float* debugConvSilu [[buffer(18)]],
+            constant uint& debugConvRowStride [[buffer(19)]],
+            constant uint& debugConvEnabled [[buffer(20)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgSize [[threads_per_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]]
+        ) {
+            const uint dk = keyDimension;
+            const uint dv = valueDimension;
+            const uint safeGroupCount = max(groupCount, 1u);
+            const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
+            const uint keyGroupDim = safeGroupCount * dk;
+            const uint localDim = 2u * dk + headsPerGroup * dv;
+            const uint groupIndex = tgid;
+            if (groupIndex >= safeGroupCount) { return; }
+            const uint headStart = groupIndex * headsPerGroup;
+
+            threadgroup float convSiluCache[384];
+            threadgroup float qInvCache[1];
+            threadgroup float kInvCache[1];
+            threadgroup float kqSumCache[1];
+
+            for (uint pos = 0; pos < sequenceLength; ++pos) {
+                device const float* convSiluPos = convSilu + pos * activationRowStride;
+                device const float* betaPos = projectedBeta + pos * activationRowStride;
+                device const float* alphaPos = projectedAlpha + pos * activationRowStride;
+                device float* outputPos = output + pos * activationRowStride;
+
+                for (uint localCh = tid; localCh < localDim; localCh += tgSize) {
+                    uint globalCh;
+                    if (localCh < dk) {
+                        globalCh = groupIndex * dk + localCh;
+                    } else if (localCh < 2u * dk) {
+                        globalCh = keyGroupDim + groupIndex * dk + (localCh - dk);
+                    } else {
+                        globalCh = 2u * keyGroupDim + headStart * dv + (localCh - 2u * dk);
+                    }
+                    convSiluCache[localCh] = convSiluPos[globalCh];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+                const uint activeThreads = headsPerGroup * threadsPerHead;
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        float qNormSq = 0.0f;
+                        float kNormSq = 0.0f;
+                        float kqSum = 0.0f;
+                        for (uint j = 0; j < dk; ++j) {
+                            float q = convSiluCache[j];
+                            float k = convSiluCache[dk + j];
+                            qNormSq += q * q;
+                            kNormSq += k * k;
+                            kqSum += q * k;
+                        }
+                        qInvCache[0] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                        kInvCache[0] = rsqrt(kNormSq + 1e-6f);
+                        kqSumCache[0] = kqSum;
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < activeThreads) {
+                    const uint headIndex = headStart;
+                    const uint localTid = tid % threadsPerHead;
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    float alpha = alphaPos[headIndex];
+                    float betaInput = betaPos[headIndex];
+                    float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + bf16_to_float(dtBias[headIndex])));
+                    float beta = stable_sigmoid(betaInput);
+                    device float* state = recurrentState + headIndex * dk * dv;
+                    float qInv = qInvCache[0];
+                    float kInv = kInvCache[0];
+                    float kqSum = kqSumCache[0];
+                    for (uint d = dStart; d < dEnd; ++d) {
+                        float kvmemRaw = 0.0f;
+                        float sqSum = 0.0f;
+                        for (uint j = 0; j < dk; ++j) {
+                            float s = state[j * dv + d] * decay;
+                            kvmemRaw += s * convSiluCache[dk + j];
+                            sqSum += s * convSiluCache[j];
+                        }
+                        float delta = beta * (convSiluCache[2u * dk + d] - kvmemRaw * kInv);
+                        float kInvDelta = kInv * delta;
+                        float dot = (sqSum + kInvDelta * kqSum) * qInv;
+                        for (uint j = 0; j < dk; ++j) {
+                            state[j * dv + d] = state[j * dv + d] * decay + convSiluCache[dk + j] * kInvDelta;
+                        }
+                        outputPos[headIndex * dv + d] = dot;
+                    }
+                }
+                if (pos + 1 < sequenceLength) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                }
+            }
+        }
+        """
+    }
+
+    private static func generatePhaseRMSGateKernel() -> String {
+        """
+        kernel void bench_ssm_phase_rms_gate_f32(
+            device const float* dotInput [[buffer(0)]],
+            device const float* projectedZ [[buffer(1)]],
+            device const float* projectedBeta [[buffer(2)]],
+            device const float* projectedAlpha [[buffer(3)]],
+            device const uint16_t* convWeight [[buffer(4)]],
+            device const float* normWeight [[buffer(5)]],
+            device const uint16_t* dtBias [[buffer(6)]],
+            device const float* aLog [[buffer(7)]],
+            device float* recurrentState [[buffer(8)]],
+            device uint16_t* convState [[buffer(9)]],
+            device float* output [[buffer(10)]],
+            constant uint& numHeads [[buffer(11)]],
+            constant uint& groupCount [[buffer(12)]],
+            constant uint& keyDimension [[buffer(13)]],
+            constant uint& valueDimension [[buffer(14)]],
+            constant uint& convKernelSize [[buffer(15)]],
+            constant uint& sequenceLength [[buffer(16)]],
+            constant uint& activationRowStride [[buffer(17)]],
+            device float* debugConvSilu [[buffer(18)]],
+            constant uint& debugConvRowStride [[buffer(19)]],
+            constant uint& debugConvEnabled [[buffer(20)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgSize [[threads_per_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]]
+        ) {
+            const uint dv = valueDimension;
+            const uint safeGroupCount = max(groupCount, 1u);
+            const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
+            const uint groupIndex = tgid;
+            if (groupIndex >= safeGroupCount) { return; }
+            const uint headStart = groupIndex * headsPerGroup;
+            const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+            const uint activeThreads = headsPerGroup * threadsPerHead;
+            threadgroup float normPartials[384];
+            threadgroup float rmsScaleCache[1];
+
+            for (uint pos = 0; pos < sequenceLength; ++pos) {
+                device const float* dotPos = dotInput + pos * activationRowStride;
+                device const float* zPos = projectedZ + pos * activationRowStride;
+                device float* outputPos = output + pos * activationRowStride;
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    const uint headIndex = headStart;
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    float localNormSq = 0.0f;
+                    for (uint d = dStart; d < dEnd; ++d) {
+                        float value = dotPos[headIndex * dv + d];
+                        localNormSq += value * value;
+                    }
+                    normPartials[localTid] = localNormSq;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    if (localTid == 0) {
+                        float totalNormSq = 0.0f;
+                        for (uint t = 0; t < threadsPerHead; ++t) {
+                            totalNormSq += normPartials[t];
+                        }
+                        rmsScaleCache[0] = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < activeThreads) {
+                    const uint localTid = tid % threadsPerHead;
+                    const uint headIndex = headStart;
+                    const uint dChunk = dv / threadsPerHead;
+                    const uint dStart = localTid * dChunk;
+                    const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+                    float rmsScale = rmsScaleCache[0];
+                    for (uint d = dStart; d < dEnd; ++d) {
+                        float normed = dotPos[headIndex * dv + d] * rmsScale * normWeight[d];
+                        float z = zPos[headIndex * dv + d];
+                        outputPos[headIndex * dv + d] = normed * z * stable_sigmoid(z);
+                    }
+                }
+                if (pos + 1 < sequenceLength) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                }
+            }
+        }
+        """
     }
 
     private func makeInputs(sequenceLength: Int) throws -> SSMInputs {
