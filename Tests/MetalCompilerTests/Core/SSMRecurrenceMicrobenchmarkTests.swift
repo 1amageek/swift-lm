@@ -44,20 +44,37 @@ struct SSMRecurrenceMicrobenchmarkTests {
             }
         }
 
+        let summaryRows = summarize(rows: rows)
         let artifact = try writeCSV(rows: rows)
-        printReport(rows: rows, artifact: artifact)
+        let summaryArtifact = try writeSummaryCSV(rows: summaryRows)
+        printReport(rows: rows, summaryRows: summaryRows, artifact: artifact, summaryArtifact: summaryArtifact)
         #expect(rows.count == Self.sequenceLengths.count * variants.count)
+        #expect(summaryRows.count == Self.sequenceLengths.count)
     }
 
-    private func printReport(rows: [SSMResultRow], artifact: URL) {
+    private func printReport(
+        rows: [SSMResultRow],
+        summaryRows: [SSMSummaryRow],
+        artifact: URL,
+        summaryArtifact: URL
+    ) {
         print()
         print("=== BF16 SSM recurrence real-shape microbench ===")
         print("artifact: \(artifact.path)")
+        print("summary artifact: \(summaryArtifact.path)")
         print("seq  variant       avg_us  us/token  grid   tg")
         for row in rows.sorted(by: rowSort) {
-            let variant = row.variant.padding(toLength: 13, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 16, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 6, withPad: " ", startingAt: 0)
             print("  \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(grid) \(row.threadgroupWidth)")
+        }
+        print()
+        print("=== BF16 SSM recurrence promotion decisions ===")
+        print("seq  best             best_us  base             base_us  speedup  decision")
+        for row in summaryRows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
+            let bestVariant = row.bestVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
+            let baseVariant = row.bestBaseVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
+            print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(row.decision)")
         }
     }
 
@@ -104,6 +121,62 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
+    private func writeSummaryCSV(rows: [SSMSummaryRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-summary.csv")
+        var lines = [
+            [
+                "sequenceLength",
+                "bestVariant",
+                "bestThreadgroupWidth",
+                "bestAverageGpuMicroseconds",
+                "bestMicrosecondsPerToken",
+                "bestBaseVariant",
+                "bestBaseThreadgroupWidth",
+                "bestBaseAverageGpuMicroseconds",
+                "speedupVsBestBasePercent",
+                "decision",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
+            lines.append([
+                String(row.sequenceLength),
+                row.bestVariant,
+                String(row.bestThreadgroupWidth),
+                String(format: "%.3f", row.bestAverageGpuMicroseconds),
+                String(format: "%.6f", row.bestMicrosecondsPerToken),
+                row.bestBaseVariant,
+                String(row.bestBaseThreadgroupWidth),
+                String(format: "%.3f", row.bestBaseAverageGpuMicroseconds),
+                String(format: "%.3f", row.speedupVsBestBasePercent),
+                row.decision,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func summarize(rows: [SSMResultRow]) -> [SSMSummaryRow] {
+        Self.sequenceLengths.compactMap { sequenceLength in
+            let sequenceRows = rows.filter { $0.sequenceLength == sequenceLength }
+            let baseRows = sequenceRows.filter { $0.variant.hasPrefix("base_") }
+            guard let best = sequenceRows.min(by: averageSort),
+                  let bestBase = baseRows.min(by: averageSort) else {
+                return nil
+            }
+            let speedup = (bestBase.averageGpuMicroseconds - best.averageGpuMicroseconds)
+                / bestBase.averageGpuMicroseconds * 100.0
+            return SSMSummaryFactory.make(
+                sequenceLength: sequenceLength,
+                best: best,
+                bestBase: bestBase,
+                speedupVsBestBasePercent: speedup
+            )
+        }
+    }
+
     private func repositoryRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -115,6 +188,16 @@ struct SSMRecurrenceMicrobenchmarkTests {
     private func rowSort(_ lhs: SSMResultRow, _ rhs: SSMResultRow) -> Bool {
         if lhs.sequenceLength != rhs.sequenceLength {
             return lhs.sequenceLength < rhs.sequenceLength
+        }
+        if lhs.requestedThreadgroupWidth != rhs.requestedThreadgroupWidth {
+            return lhs.requestedThreadgroupWidth < rhs.requestedThreadgroupWidth
+        }
+        return lhs.variant < rhs.variant
+    }
+
+    private func averageSort(_ lhs: SSMResultRow, _ rhs: SSMResultRow) -> Bool {
+        if lhs.averageGpuMicroseconds != rhs.averageGpuMicroseconds {
+            return lhs.averageGpuMicroseconds < rhs.averageGpuMicroseconds
         }
         if lhs.requestedThreadgroupWidth != rhs.requestedThreadgroupWidth {
             return lhs.requestedThreadgroupWidth < rhs.requestedThreadgroupWidth
@@ -145,6 +228,54 @@ private struct SSMResultRow {
 
     var microsecondsPerToken: Double {
         averageGpuMicroseconds / Double(sequenceLength)
+    }
+}
+
+private struct SSMSummaryRow {
+    let sequenceLength: Int
+    let bestVariant: String
+    let bestThreadgroupWidth: Int
+    let bestAverageGpuMicroseconds: Double
+    let bestMicrosecondsPerToken: Double
+    let bestBaseVariant: String
+    let bestBaseThreadgroupWidth: Int
+    let bestBaseAverageGpuMicroseconds: Double
+    let speedupVsBestBasePercent: Double
+    let decision: String
+}
+
+private enum SSMSummaryFactory {
+    static func make(
+        sequenceLength: Int,
+        best: SSMResultRow,
+        bestBase: SSMResultRow,
+        speedupVsBestBasePercent: Double
+    ) -> SSMSummaryRow {
+        SSMSummaryRow(
+            sequenceLength: sequenceLength,
+            bestVariant: best.variant,
+            bestThreadgroupWidth: best.threadgroupWidth,
+            bestAverageGpuMicroseconds: best.averageGpuMicroseconds,
+            bestMicrosecondsPerToken: best.microsecondsPerToken,
+            bestBaseVariant: bestBase.variant,
+            bestBaseThreadgroupWidth: bestBase.threadgroupWidth,
+            bestBaseAverageGpuMicroseconds: bestBase.averageGpuMicroseconds,
+            speedupVsBestBasePercent: speedupVsBestBasePercent,
+            decision: decision(bestVariant: best.variant, speedupVsBestBasePercent: speedupVsBestBasePercent)
+        )
+    }
+
+    private static func decision(bestVariant: String, speedupVsBestBasePercent: Double) -> String {
+        guard speedupVsBestBasePercent >= 3.0 else {
+            return "keep-default"
+        }
+        if bestVariant.hasPrefix("shared_") {
+            return "candidate-shared-rms"
+        }
+        if bestVariant.hasPrefix("prewrite_") {
+            return "candidate-prewrite-decay"
+        }
+        return "keep-default"
     }
 }
 

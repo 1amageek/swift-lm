@@ -238,6 +238,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; route fires 18 `ssm_recurrence_seq_bf16_f32_partition_owned_partial` dispatches and removes `linear_attn.out_proj` GEMV, but regresses full-model prefill heavily |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window profile CSV now records recurrence/output threadgroup counts and flags fused recurrence partial-emission as output-row parallelism collapse |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1` | Pass; real Qwen recurrent-window artifact marks all fused partial-emission windows with `rowGridParallelismPreserved=false` and `fused-recurrence-serializes-output-row-projection-inside-sequence-loop` |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; isolated SSM microbench now writes both raw timing and per-sequence promotion-decision summary artifacts |
 
 ## Failed Experiments
 
@@ -1543,6 +1544,43 @@ Current decision: keep the width override as an opt-in diagnostic only. It is
 valuable for future sweeps because it proves narrower dispatch geometry is
 decode-equivalent, but the production route stays on the device-derived default
 width until a full-model profile shows a stable win.
+
+## SSM Recurrence Decision Summary Harness (2026-05-15)
+
+The SSM recurrence microbenchmark now emits two artifacts:
+
+| Artifact | Purpose |
+|---|---|
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence.csv` | Raw per-variant timing for each sequence length |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, speedup against best base, and promotion decision |
+
+This keeps the next SSM decision mechanical: a variant must beat the best base
+kernel for the relevant sequence lengths before it can become a runtime route
+candidate. A single favorable isolated sequence length is not sufficient for
+default promotion.
+
+```mermaid
+flowchart LR
+  A["SSM variant sweep"] --> B["raw CSV"]
+  A --> C["summary CSV"]
+  C --> D{"beats best base by >= 3%?"}
+  D -->|"yes"| E["candidate diagnostic"]
+  D -->|"no"| F["keep default"]
+  E --> G["full Qwen reference + profile required"]
+```
+
+Current local summary from the focused harness:
+
+| Sequence length | Best variant | Best base | Speedup vs best base | Decision |
+|---:|---|---|---:|---|
+| 16 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 64 | `shared_tg384` | `base_tg256` | 3.07% | candidate shared-RMS |
+| 128 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+
+Current decision: no runtime default changes. The harness shows that shared-RMS
+can win at seqLen 64 in isolation, but it does not beat the best base at seqLen
+128. Any route promotion still requires Qwen reference parity and a full-model
+profile win on the same path.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
