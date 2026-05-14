@@ -223,6 +223,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now labels dispatch-reducing fused-stage candidates and records current/target step counts |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 fused-stage candidates with estimated dispatch reduction 18 total |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; fused-stage admission now emits a typed safe execution plan only when the window reduces dispatch count and keeps unsafe row-grid fusion disallowed |
+| 2026-05-14 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic group-owned partial projection kernel writes the same partition partials and reduced output as the CPU reference without row-grid fan-out |
 
 ## Failed Experiments
 
@@ -1052,6 +1053,19 @@ This keeps the next kernel prototype behind an explicit admission contract. A
 window that has no bridge dispatch to remove is rejected even if it is otherwise
 shape-compatible, because it would add kernel risk without a dispatch-count
 benefit.
+
+M3D.8 adds the first kernel-level harness for that execution shape. The new
+synthetic `generateRecurrentBlockGroupOwnedPartialProjection` kernel dispatches
+only `group x sequence` threadgroups. Each group-owned threadgroup loops over
+the output rows internally and writes that group's partition partial rows before
+the existing `recurrent_block_partial_reduce_seq_f32` stage reduces across
+groups.
+
+This is intentionally not routed in production yet. It proves the memory layout
+and partial fan-in contract for the safe fused-stage shape, but the eventual
+runtime kernel still needs to combine the real SSM recurrence state update with
+this group-owned partial-row emission and then pass the Qwen schema v6 reference
+gates.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
