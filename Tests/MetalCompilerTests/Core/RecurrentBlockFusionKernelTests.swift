@@ -843,7 +843,9 @@ struct RecurrentBlockFusionKernelTests {
         }
 
         let artifact = try writeRowGridFanInRoundingCostCSV(rows: rows)
+        let promotionArtifact = try writeRowGridFanInRoutePromotionCSV(rows: rows)
         printRowGridFanInRoundingCostReport(rows: rows, artifact: artifact)
+        print("row-grid fan-in route promotion artifact: \(promotionArtifact.path)")
         #expect(rows.count == sequenceLengths.count * (variants.count + 1))
         #expect(rows.allSatisfy { $0.averageGpuMicroseconds.isFinite && $0.averageGpuMicroseconds > 0 })
     }
@@ -1168,6 +1170,78 @@ struct RecurrentBlockFusionKernelTests {
             ].joined(separator: ","))
         }
         try csv.joined(separator: "\n").write(to: artifact, atomically: true, encoding: .utf8)
+        return artifact
+    }
+
+    private func writeRowGridFanInRoutePromotionCSV(rows: [RowGridFanInRoundingCostRow]) throws -> URL {
+        let directory = URL(fileURLWithPath: ".test-artifacts/recurrent-block-fusion", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let artifact = directory.appendingPathComponent("row-grid-fan-in-route-promotions.csv")
+        let productionSequenceLengths = [64, 128]
+        let minimumSpeedupPercent = 5.0
+        let role = "linear_attn.out_proj"
+        let variant = "row_grid_fan_in"
+
+        var speedupPercents: [Double] = []
+        var failingSequenceLengths: [Int] = []
+        for sequenceLength in productionSequenceLengths {
+            guard let rowGrid = rows.first(where: {
+                $0.sequenceLength == sequenceLength && $0.variant == "decodeRoundedInput"
+            }), let gemv = rows.first(where: {
+                $0.sequenceLength == sequenceLength && $0.variant == "gemvSeqPreRoundedInput"
+            }) else {
+                failingSequenceLengths.append(sequenceLength)
+                continue
+            }
+            let speedup = (gemv.averageGpuMicroseconds - rowGrid.averageGpuMicroseconds)
+                / gemv.averageGpuMicroseconds * 100
+            speedupPercents.append(speedup)
+            if speedup < minimumSpeedupPercent {
+                failingSequenceLengths.append(sequenceLength)
+            }
+        }
+
+        let passingSequenceCount = productionSequenceLengths.count - failingSequenceLengths.count
+        let minimumObservedSpeedup = speedupPercents.min() ?? -.infinity
+        let thresholdShortfall = max(0, minimumSpeedupPercent - minimumObservedSpeedup)
+        let admission = failingSequenceLengths.isEmpty
+            ? "candidate-recurrent-block-row-grid-default-route"
+            : "reject-cross-sequence-threshold"
+        let readinessPrerequisite = failingSequenceLengths.isEmpty
+            ? "requires-full-profile-speed-gate"
+            : "microbench-rejected"
+
+        let csv = [
+            [
+                "role",
+                "variant",
+                "productionSequenceLengths",
+                "speedupPercents",
+                "passingSequenceCount",
+                "requiredSequenceCount",
+                "minimumSpeedupPercent",
+                "thresholdShortfallPercent",
+                "failingSequenceLengths",
+                "routePromotionAdmission",
+                "requiredProfileRouteGate",
+                "readinessPrerequisite",
+            ].joined(separator: ","),
+            [
+                role,
+                variant,
+                productionSequenceLengths.map(String.init).joined(separator: "|"),
+                speedupPercents.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+                "\(passingSequenceCount)",
+                "\(productionSequenceLengths.count)",
+                String(format: "%.3f", minimumSpeedupPercent),
+                String(format: "%.3f", thresholdShortfall),
+                failingSequenceLengths.map(String.init).joined(separator: "|"),
+                admission,
+                "experimental-route-observed",
+                readinessPrerequisite,
+            ].joined(separator: ","),
+        ].joined(separator: "\n") + "\n"
+        try csv.write(to: artifact, atomically: true, encoding: .utf8)
         return artifact
     }
 

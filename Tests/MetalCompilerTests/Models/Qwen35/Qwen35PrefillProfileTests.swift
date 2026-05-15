@@ -343,6 +343,14 @@ struct Qwen35PrefillProfileTests {
                     readinessPrerequisite: "microbench-rejected",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
+                RoutePromotionCandidate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    variant: "row_grid_fan_in",
+                    microbenchAdmission: "candidate-recurrent-block-row-grid-default-route",
+                    readinessPrerequisite: "requires-full-profile-speed-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
             ],
             profileGates: [
                 ProfileRouteGate(
@@ -370,6 +378,11 @@ struct Qwen35PrefillProfileTests {
                     role: "mlp.down_proj",
                     routeGate: "experimental-route-observed"
                 ),
+                ProfileRouteGate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    routeGate: "experimental-route-observed"
+                ),
             ]
         )
         let url = try writeRouteReadiness(rows: rows, directory: directory)
@@ -381,6 +394,7 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
         #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
         #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench-prerequisite"))
+        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,candidate-recurrent-block-row-grid-default-route,requires-full-profile-speed-gate,experimental-route-observed,experimental-route-observed,reject-full-profile-speed-gate-required"))
     }
 
     @Test("Route readiness can be reconstructed from artifact CSVs")
@@ -404,6 +418,12 @@ struct Qwen35PrefillProfileTests {
         self_attn.qkv,tile4,64|128,10.000|10.000,2,2,10.000,0.000,,candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate
         """.utf8).write(to: batchedArtifact, options: .atomic)
 
+        let recurrentArtifact = directory.appendingPathComponent("row-grid-fan-in-route-promotions.csv")
+        try Data("""
+        role,variant,productionSequenceLengths,speedupPercents,passingSequenceCount,requiredSequenceCount,minimumSpeedupPercent,thresholdShortfallPercent,failingSequenceLengths,routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite
+        linear_attn.out_proj,row_grid_fan_in,64|128,10.000|10.000,2,2,5.000,0.000,,candidate-recurrent-block-row-grid-default-route,experimental-route-observed,requires-full-profile-speed-gate
+        """.utf8).write(to: recurrentArtifact, options: .atomic)
+
         let routeGateArtifact = directory.appendingPathComponent("qwen35-prefill-route-gate.csv")
         try Data("""
         routeFamily,role,kernelName,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate
@@ -412,10 +432,15 @@ struct Qwen35PrefillProfileTests {
         single_projection,mlp.down_proj,gemv_seq_bf16_f32s_tile4,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
         batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s_tile2,64|128,1|1,200.000,baseline-route-observed|baseline-route-observed,,baseline-route-preserved
         batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s_tile4,64,1,100.000,experimental-route-observed,128,missing-production-sequence
+        recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,64|128,18|18,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
         """.utf8).write(to: routeGateArtifact, options: .atomic)
 
         let rows = routeReadinessRows(
-            candidates: try routePromotionCandidates(singleArtifact: singleArtifact, batchedArtifact: batchedArtifact),
+            candidates: try routePromotionCandidates(
+                singleArtifact: singleArtifact,
+                batchedArtifact: batchedArtifact,
+                recurrentArtifact: recurrentArtifact
+            ),
             profileGates: try profileRouteGates(artifact: routeGateArtifact)
         )
         let url = try writeRouteReadiness(rows: rows, directory: directory)
@@ -426,6 +451,7 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench-prerequisite"))
         #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
         #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
+        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,candidate-recurrent-block-row-grid-default-route,requires-full-profile-speed-gate,experimental-route-observed,experimental-route-observed,reject-full-profile-speed-gate-required"))
     }
 
     @Test("Opt-in current route readiness artifacts can be reconstructed")
@@ -444,16 +470,21 @@ struct Qwen35PrefillProfileTests {
             .appendingPathComponent("qwen35-bf16-single-sequence-gemv-route-promotions.csv")
         let batchedArtifact = microbenchDirectory
             .appendingPathComponent("qwen35-bf16-batched-sequence-gemv-route-promotions.csv")
+        let recurrentArtifact = root
+            .appendingPathComponent(".test-artifacts/recurrent-block-fusion", isDirectory: true)
+            .appendingPathComponent("row-grid-fan-in-route-promotions.csv")
         let routeGateArtifact = profileDirectory
             .appendingPathComponent("qwen35-prefill-route-gate.csv")
 
         try requireArtifact(singleArtifact)
         try requireArtifact(batchedArtifact)
+        try requireArtifact(recurrentArtifact)
         try requireArtifact(routeGateArtifact)
 
         let candidates = try routePromotionCandidates(
             singleArtifact: singleArtifact,
-            batchedArtifact: batchedArtifact
+            batchedArtifact: batchedArtifact,
+            recurrentArtifact: recurrentArtifact
         )
         try assertRoutePromotionRolesAreProfileAligned(candidates)
 
@@ -761,9 +792,23 @@ struct Qwen35PrefillProfileTests {
         return url
     }
 
-    private func routePromotionCandidates(singleArtifact: URL, batchedArtifact: URL) throws -> [RoutePromotionCandidate] {
-        try routePromotionCandidates(artifact: singleArtifact, routeFamily: "single_projection")
+    private func routePromotionCandidates(
+        singleArtifact: URL,
+        batchedArtifact: URL,
+        recurrentArtifact: URL? = nil
+    ) throws -> [RoutePromotionCandidate] {
+        let recurrentCandidates: [RoutePromotionCandidate]
+        if let recurrentArtifact {
+            recurrentCandidates = try routePromotionCandidates(
+                artifact: recurrentArtifact,
+                routeFamily: "recurrent_block_row_grid_fan_in"
+            )
+        } else {
+            recurrentCandidates = []
+        }
+        return try routePromotionCandidates(artifact: singleArtifact, routeFamily: "single_projection")
             + routePromotionCandidates(artifact: batchedArtifact, routeFamily: "batched_projection")
+            + recurrentCandidates
     }
 
     private func routePromotionCandidates(artifact: URL, routeFamily: String) throws -> [RoutePromotionCandidate] {
@@ -823,6 +868,9 @@ struct Qwen35PrefillProfileTests {
     ) -> String {
         guard microbenchAdmission.hasPrefix("candidate-") else {
             return "reject-microbench"
+        }
+        guard readinessPrerequisite != "requires-full-profile-speed-gate" else {
+            return "reject-full-profile-speed-gate-required"
         }
         guard readinessPrerequisite == "requires-full-profile-route-gate" else {
             return "reject-microbench-prerequisite"
@@ -1066,6 +1114,7 @@ struct Qwen35PrefillProfileTests {
         let allowedRolesByFamily: [String: Set<String>] = [
             "single_projection": ["linear_attn.out_proj", "self_attn.o_proj", "mlp.down_proj"],
             "batched_projection": ["linear_attn.in_proj", "mlp.gate_up", "self_attn.qkv"],
+            "recurrent_block_row_grid_fan_in": ["linear_attn.out_proj"],
         ]
 
         for candidate in candidates {
