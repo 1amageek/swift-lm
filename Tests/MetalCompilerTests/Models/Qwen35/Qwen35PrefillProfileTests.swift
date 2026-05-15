@@ -127,6 +127,69 @@ struct Qwen35PrefillProfileTests {
         #expect(!profilesByLength.isEmpty)
     }
 
+    @Test("Route manifest classifies projection routes")
+    func routeManifestClassifiesProjectionRoutes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-route-manifest-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let url = try writeRouteManifest(
+            profiles: [
+                syntheticProfileEntry(
+                    index: 0,
+                    kernelName: "batched_gemv4_seq_bf16_f32s",
+                    weightTensorName: [
+                        "model.layers.0.linear_attn.in_proj_q.weight",
+                        "model.layers.0.linear_attn.in_proj_k.weight",
+                        "model.layers.0.linear_attn.in_proj_v.weight",
+                    ].joined(separator: ";"),
+                    averageGpuMicroseconds: 100
+                ),
+                syntheticProfileEntry(
+                    index: 1,
+                    kernelName: "batched_gemv2_seq_bf16_f32s",
+                    weightTensorName: [
+                        "model.layers.0.mlp.gate_proj.weight",
+                        "model.layers.0.mlp.up_proj.weight",
+                    ].joined(separator: ";"),
+                    averageGpuMicroseconds: 200
+                ),
+                syntheticProfileEntry(
+                    index: 2,
+                    kernelName: "batched_gemv3_seq_bf16_f32s",
+                    weightTensorName: [
+                        "model.layers.0.self_attn.q_proj.weight",
+                        "model.layers.0.self_attn.k_proj.weight",
+                        "model.layers.0.self_attn.v_proj.weight",
+                    ].joined(separator: ";"),
+                    averageGpuMicroseconds: 300
+                ),
+                syntheticProfileEntry(
+                    index: 3,
+                    kernelName: "mlp_fused_swiglu_down_seq_bf16_f32s",
+                    weightTensorName: "model.layers.0.mlp.down_proj.weight",
+                    averageGpuMicroseconds: 400
+                ),
+                syntheticProfileEntry(
+                    index: 4,
+                    kernelName: "gemv_seq_bf16_f32s_rps2",
+                    weightTensorName: "model.layers.0.self_attn.o_proj.weight",
+                    averageGpuMicroseconds: 500
+                ),
+            ],
+            sequenceLength: 128,
+            directory: directory
+        )
+
+        let csv = try String(contentsOf: url, encoding: .utf8)
+        #expect(csv.contains("sequenceLength,routeFamily,role,kernelName,activeCount,totalGpuMicroseconds,averageGpuMicroseconds,routeObservation"))
+        #expect(csv.contains("128,batched_projection,linear_attn.in_proj,batched_gemv4_seq_bf16_f32s,1,100.000,100.000,baseline-route-observed"))
+        #expect(csv.contains("128,batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s,1,200.000,200.000,baseline-route-observed"))
+        #expect(csv.contains("128,batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s,1,300.000,300.000,baseline-route-observed"))
+        #expect(csv.contains("128,mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,400.000,400.000,default-runtime-gated-route"))
+        #expect(csv.contains("128,single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,500.000,500.000,experimental-route-observed"))
+    }
+
     // MARK: - Bundle resolution
 
     private func resolveBundlePath() throws -> String? {
@@ -364,6 +427,44 @@ struct Qwen35PrefillProfileTests {
             return "batched_projection"
         }
         return entry.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
+    }
+
+    private func syntheticProfileEntry(
+        index: Int,
+        kernelName: String,
+        weightTensorName: String,
+        averageGpuMicroseconds: Double
+    ) -> MetalPrefillProfile.Entry {
+        MetalPrefillProfile.Entry(
+            scope: "step",
+            index: index,
+            rangeStart: index,
+            rangeEnd: index + 1,
+            kernelName: kernelName,
+            category: "projection",
+            mode: "profile",
+            layerIndex: 0,
+            entryIndex: index,
+            weightTensorName: weightTensorName,
+            gridWidth: 1,
+            gridHeight: 1,
+            gridDepth: 1,
+            threadgroupWidth: 1,
+            threadgroupHeight: 1,
+            threadgroupDepth: 1,
+            threadgroupMemoryBytes: 0,
+            bufferBindingCount: 0,
+            inlineConstantBytes: 0,
+            uniqueBoundBufferBytes: 0,
+            estimatedReadBytes: 0,
+            estimatedWriteBytes: 0,
+            estimatedTotalBytes: 0,
+            estimatedDispatchCount: 1,
+            totalGpuMicroseconds: averageGpuMicroseconds,
+            averageGpuMicroseconds: averageGpuMicroseconds,
+            totalWallMicroseconds: averageGpuMicroseconds,
+            averageWallMicroseconds: averageGpuMicroseconds
+        )
     }
 
     private func printScalingReport(profilesByLength: [Int: [MetalPrefillProfile.Entry]], iterations: Int) {

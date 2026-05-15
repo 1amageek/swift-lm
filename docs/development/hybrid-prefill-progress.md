@@ -259,6 +259,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-manifest contract hard-checks batched role normalization, fused MLP runtime-gated labeling, and experimental single-GEMV route labeling |
 
 ## Failed Experiments
 
@@ -2131,3 +2132,13 @@ Current decision: use the route manifest as the full-model sanity check after
 each kernel-route experiment. A microbench candidate is not enough; the full
 profile must show that the intended route actually fired and that no unrelated
 projection family changed silently.
+
+The route manifest writer also has a lightweight synthetic contract test:
+
+| Contract case | Expected route manifest label |
+|---|---|
+| `batched_gemv4_seq_bf16_f32s` over `linear_attn.in_proj_*` | `batched_projection / linear_attn.in_proj / baseline-route-observed` |
+| `batched_gemv2_seq_bf16_f32s` over `mlp.gate_proj + mlp.up_proj` | `batched_projection / mlp.gate_up / baseline-route-observed` |
+| `batched_gemv3_seq_bf16_f32s` over `self_attn.q/k/v_proj` | `batched_projection / self_attn.qkv / baseline-route-observed` |
+| `mlp_fused_swiglu_down_seq_bf16_f32s` at seqLen 128 | `mlp_fused_down / mlp.down_proj / default-runtime-gated-route` |
+| `gemv_seq_bf16_f32s_rps2` | `single_projection / self_attn.o_proj / experimental-route-observed` |
