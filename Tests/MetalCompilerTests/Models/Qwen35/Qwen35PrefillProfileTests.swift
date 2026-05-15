@@ -408,6 +408,44 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
     }
 
+    @Test("Opt-in current route readiness artifacts can be reconstructed")
+    func currentRouteReadinessArtifactsCanBeReconstructedWhenRequested() throws {
+        guard shouldValidateCurrentRouteReadinessArtifacts() else {
+            print("Set SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 to validate current route-readiness artifacts.")
+            return
+        }
+
+        let root = repositoryRoot()
+        let microbenchDirectory = root
+            .appendingPathComponent(".test-artifacts/sequence-gemv-microbench", isDirectory: true)
+        let profileDirectory = root
+            .appendingPathComponent(".test-artifacts/prefill-profile", isDirectory: true)
+        let singleArtifact = microbenchDirectory
+            .appendingPathComponent("qwen35-bf16-single-sequence-gemv-route-promotions.csv")
+        let batchedArtifact = microbenchDirectory
+            .appendingPathComponent("qwen35-bf16-batched-sequence-gemv-route-promotions.csv")
+        let routeGateArtifact = profileDirectory
+            .appendingPathComponent("qwen35-prefill-route-gate.csv")
+
+        try requireArtifact(singleArtifact)
+        try requireArtifact(batchedArtifact)
+        try requireArtifact(routeGateArtifact)
+
+        let candidates = try routePromotionCandidates(
+            singleArtifact: singleArtifact,
+            batchedArtifact: batchedArtifact
+        )
+        try assertRoutePromotionRolesAreProfileAligned(candidates)
+
+        let rows = routeReadinessRows(
+            candidates: candidates,
+            profileGates: try profileRouteGates(artifact: routeGateArtifact)
+        )
+        let output = try writeRouteReadiness(rows: rows, directory: profileDirectory)
+        #expect(!rows.isEmpty)
+        print("route readiness artifact: \(output.path)")
+    }
+
     // MARK: - Bundle resolution
 
     private func resolveBundlePath() throws -> String? {
@@ -984,6 +1022,35 @@ struct Qwen35PrefillProfileTests {
         return !routeOverrideKeys.contains { environment[$0] != nil }
     }
 
+    private func shouldValidateCurrentRouteReadinessArtifacts() -> Bool {
+        let value = ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS"] ?? ""
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return !normalized.isEmpty && normalized != "0" && normalized != "false"
+    }
+
+    private func requireArtifact(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw RouteReadinessArtifactError.missingArtifact(url.path)
+        }
+    }
+
+    private func assertRoutePromotionRolesAreProfileAligned(_ candidates: [RoutePromotionCandidate]) throws {
+        let allowedRolesByFamily: [String: Set<String>] = [
+            "single_projection": ["linear_attn.out_proj", "self_attn.o_proj", "mlp.down_proj"],
+            "batched_projection": ["linear_attn.in_proj", "mlp.gate_up", "self_attn.qkv"],
+        ]
+
+        for candidate in candidates {
+            guard let allowedRoles = allowedRolesByFamily[candidate.routeFamily],
+                  allowedRoles.contains(candidate.role) else {
+                throw RouteReadinessArtifactError.profileUnalignedRole(
+                    routeFamily: candidate.routeFamily,
+                    role: candidate.role
+                )
+            }
+        }
+    }
+
     private func syntheticProfileEntry(
         index: Int,
         kernelName: String,
@@ -1075,13 +1142,17 @@ struct Qwen35PrefillProfileTests {
 }
 
 private enum RouteReadinessArtifactError: Error, CustomStringConvertible {
+    case missingArtifact(String)
     case emptyCSV(String)
     case rowWidthMismatch(path: String, expected: Int, actual: Int)
     case unclosedQuote(String)
     case missingColumn(path: String, column: String)
+    case profileUnalignedRole(routeFamily: String, role: String)
 
     var description: String {
         switch self {
+        case .missingArtifact(let path):
+            return "Required route-readiness artifact is missing: \(path)"
         case .emptyCSV(let path):
             return "CSV artifact is empty: \(path)"
         case .rowWidthMismatch(let path, let expected, let actual):
@@ -1090,6 +1161,8 @@ private enum RouteReadinessArtifactError: Error, CustomStringConvertible {
             return "CSV artifact has an unclosed quote: \(path)"
         case .missingColumn(let path, let column):
             return "CSV artifact \(path) is missing required column \(column)"
+        case .profileUnalignedRole(let routeFamily, let role):
+            return "Route-readiness artifact role \(routeFamily)/\(role) does not align with the full-profile route gate"
         }
     }
 }

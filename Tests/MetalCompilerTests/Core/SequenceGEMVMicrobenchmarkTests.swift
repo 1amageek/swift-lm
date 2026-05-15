@@ -205,7 +205,9 @@ struct SequenceGEMVMicrobenchmarkTests {
         #expect(row2?.requiredProfileRouteGate == "")
         #expect(row2?.readinessPrerequisite == "microbench-rejected")
 
-        let artifact = try writeSingleRoutePromotionCSV(rows: routeRows)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-single-route-promotion-test-\(UUID().uuidString)", isDirectory: true)
+        let artifact = try writeSingleRoutePromotionCSV(rows: routeRows, directory: directory)
         let csv = try String(contentsOf: artifact, encoding: .utf8)
         #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
         #expect(csv.contains("candidate-single-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
@@ -238,7 +240,9 @@ struct SequenceGEMVMicrobenchmarkTests {
         #expect(tile4?.requiredProfileRouteGate == "")
         #expect(tile4?.readinessPrerequisite == "microbench-rejected")
 
-        let artifact = try writeBatchedRoutePromotionCSV(rows: routeRows)
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-batched-route-promotion-test-\(UUID().uuidString)", isDirectory: true)
+        let artifact = try writeBatchedRoutePromotionCSV(rows: routeRows, directory: directory)
         let csv = try String(contentsOf: artifact, encoding: .utf8)
         #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
         #expect(csv.contains("candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
@@ -312,8 +316,11 @@ struct SequenceGEMVMicrobenchmarkTests {
         return url
     }
 
-    private func writeSingleRoutePromotionCSV(rows: [SingleGEMVRoutePromotionRow]) throws -> URL {
-        let directory = repositoryRoot()
+    private func writeSingleRoutePromotionCSV(
+        rows: [SingleGEMVRoutePromotionRow],
+        directory: URL? = nil
+    ) throws -> URL {
+        let directory = directory ?? repositoryRoot()
             .appendingPathComponent(".test-artifacts/sequence-gemv-microbench", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("qwen35-bf16-single-sequence-gemv-route-promotions.csv")
@@ -424,8 +431,11 @@ struct SequenceGEMVMicrobenchmarkTests {
         return url
     }
 
-    private func writeBatchedRoutePromotionCSV(rows: [BatchedGEMVRoutePromotionRow]) throws -> URL {
-        let directory = repositoryRoot()
+    private func writeBatchedRoutePromotionCSV(
+        rows: [BatchedGEMVRoutePromotionRow],
+        directory: URL? = nil
+    ) throws -> URL {
+        let directory = directory ?? repositoryRoot()
             .appendingPathComponent(".test-artifacts/sequence-gemv-microbench", isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("qwen35-bf16-batched-sequence-gemv-route-promotions.csv")
