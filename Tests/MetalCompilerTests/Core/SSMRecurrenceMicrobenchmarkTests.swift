@@ -399,6 +399,31 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(csv.contains("qkpar"))
     }
 
+    @Test("SSM state candidate feasibility artifact can be reconstructed when requested")
+    func ssmStateCandidateFeasibilityArtifactCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_STATE_FEASIBILITY_ARTIFACTS"] == "1" else {
+            return
+        }
+        let artifact = ssmMicrobenchmarkArtifactDirectory()
+            .appendingPathComponent("qwen35-bf16-ssm-state-candidate-feasibility.csv")
+        try requireArtifact(artifact)
+
+        let rows = try readStateCandidateFeasibilityCSV(artifact)
+        let expectedRows = SSMStateCandidateFeasibilityFactory.makeRows()
+        let rowsByShape = Dictionary(uniqueKeysWithValues: rows.map { ($0.shape, $0) })
+
+        #expect(rows.count == expectedRows.count)
+        for expected in expectedRows {
+            guard let actual = rowsByShape[expected.shape] else {
+                Issue.record("Missing feasibility row for \(expected.shape.rawValue)")
+                continue
+            }
+            #expect(actual.staticThreadgroupBytes == expected.staticThreadgroupBytes)
+            #expect(actual.coalescedValueLanesPerStateRow == expected.coalescedValueLanesPerStateRow)
+            #expect(actual.admission == expected.admission)
+        }
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -997,6 +1022,27 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 coalescedValueLanesPerStateRow: try integerCSVValue("coalescedValueLanesPerStateRow", in: row, artifact: url),
                 serialStateLanesPerThread: try integerCSVValue("serialStateLanesPerThread", in: row, artifact: url),
                 candidatePromotionAdmission: try requiredCSVValue("candidatePromotionAdmission", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func readStateCandidateFeasibilityCSV(_ url: URL) throws -> [SSMStateCandidateFeasibilityRow] {
+        try parseSimpleCSV(url).map { row in
+            let shapeName = try requiredCSVValue("shape", in: row, artifact: url)
+            guard let shape = SSMStateCandidateShape(rawValue: shapeName) else {
+                throw SSMArtifactError.invalidValue(url.path, "shape", shapeName)
+            }
+            return SSMStateCandidateFeasibilityRow(
+                shape: shape,
+                description: try requiredCSVValue("description", in: row, artifact: url),
+                threadgroupWidth: try integerCSVValue("threadgroupWidth", in: row, artifact: url),
+                activeThreadsPerThreadgroup: try integerCSVValue("activeThreadsPerThreadgroup", in: row, artifact: url),
+                valueLanesPerThread: try integerCSVValue("valueLanesPerThread", in: row, artifact: url),
+                coalescedValueLanesPerStateRow: try integerCSVValue("coalescedValueLanesPerStateRow", in: row, artifact: url),
+                serialStateLanesPerThread: try integerCSVValue("serialStateLanesPerThread", in: row, artifact: url),
+                estimatedStateTotalBytesPerToken: try integerCSVValue("estimatedStateTotalBytesPerToken", in: row, artifact: url),
+                staticThreadgroupBytes: try integerCSVValue("staticThreadgroupBytes", in: row, artifact: url),
+                threadgroupMemoryLimitBytes: try integerCSVValue("threadgroupMemoryLimitBytes", in: row, artifact: url)
             )
         }
     }
