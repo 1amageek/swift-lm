@@ -196,6 +196,9 @@ struct MetalPrefillExecutor: @unchecked Sendable {
             guard !range.isEmpty else { return }
             for currentStepIndex in range {
                 let currentStep = prefillPlan.steps[currentStepIndex]
+                guard currentStep.shouldExecute(sequenceLength: sequenceLength) else {
+                    continue
+                }
                 let currentProbes = probes.filter { ($0.stepIndex ?? currentStepIndex) == currentStepIndex }
                 if !currentProbes.isEmpty {
                     try MetalInferenceModel.encodePrefillProbes(

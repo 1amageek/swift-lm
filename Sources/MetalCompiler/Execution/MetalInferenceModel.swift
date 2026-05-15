@@ -1619,6 +1619,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
                 try probeSubmission.withCompute(ephemeralResidency: combinedLease) { encoder, argumentTable in
                     for currentStepIndex in 0...embeddingReplayEnd {
                         let currentStep = prefillPlan.steps[currentStepIndex]
+                        guard currentStep.shouldExecute(sequenceLength: tokens.count) else {
+                            continue
+                        }
                         let currentProbes = probes.filter { ($0.stepIndex ?? stepIndex) == currentStepIndex }
                         if !currentProbes.isEmpty {
                             try Self.encodePrefillProbes(
@@ -1679,6 +1682,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
         try probeSubmission.withCompute(ephemeralResidency: combinedLease) { encoder, argumentTable in
             for currentStepIndex in replayStartStepIndex...maximumStepIndex {
                 let currentStep = prefillPlan.steps[currentStepIndex]
+                guard currentStep.shouldExecute(sequenceLength: tokens.count) else {
+                    continue
+                }
                 let currentProbes = probes.filter { ($0.stepIndex ?? stepIndex) == currentStepIndex }
                 if !currentProbes.isEmpty {
                     try Self.encodePrefillProbes(
@@ -2148,6 +2154,9 @@ public struct MetalInferenceModel: @unchecked Sendable {
         runtimeConstantBuffer: MTLBuffer,
         sequenceLength: Int
     ) {
+        guard step.shouldExecute(sequenceLength: sequenceLength) else {
+            return
+        }
         switch step.mode {
         case .batch:
             step.bindings.bind(to: argumentTable)

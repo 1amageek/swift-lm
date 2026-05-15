@@ -87,17 +87,36 @@ struct MetalPrefillStepBuilder {
                 }
             }
             if let window = recurrentWindowsByRecurrenceIndex[entry.index],
-               let recurrentSteps = try planner.tryBuildRowGridRecurrentBlockFanInSteps(
-                   window: window,
-                   entriesByIndex: entriesByIndex
-               ) {
-                steps.append(contentsOf: recurrentSteps)
-                if let nextIndex = fusedEntries.firstIndex(where: { $0.index > window.outputProjectionEntryIndex }) {
-                    index = nextIndex
-                } else {
-                    index = fusedEntries.count
+               planner.rowGridRecurrentBlockFanInEnabled {
+                var rowGridPlanner = planner
+                if let recurrentSteps = try rowGridPlanner.tryBuildRowGridRecurrentBlockFanInSteps(
+                    window: window,
+                    entriesByIndex: entriesByIndex
+                ) {
+                    let threshold = planner.recurrentBlockRowGridFanInMinimumSequenceLength
+                    if threshold > 1 {
+                        var unfusedPlanner = planner
+                        let unfusedSteps = try unfusedPlanner.buildUnfusedRecurrentBlockSteps(
+                            window: window,
+                            entriesByIndex: entriesByIndex
+                        )
+                        steps.append(contentsOf: unfusedSteps.map {
+                            $0.withExecutionCondition(.sequenceLengthAtMost(threshold - 1))
+                        })
+                        steps.append(contentsOf: recurrentSteps.map {
+                            $0.withExecutionCondition(.sequenceLengthAtLeast(threshold))
+                        })
+                    } else {
+                        steps.append(contentsOf: recurrentSteps)
+                    }
+                    planner = rowGridPlanner
+                    if let nextIndex = fusedEntries.firstIndex(where: { $0.index > window.outputProjectionEntryIndex }) {
+                        index = nextIndex
+                    } else {
+                        index = fusedEntries.count
+                    }
+                    continue
                 }
-                continue
             }
             if let window = recurrentWindowsByRecurrenceIndex[entry.index],
                let recurrentSteps = try planner.tryBuildFusedRecurrentBlockPartialSteps(
@@ -326,17 +345,23 @@ struct MetalPrefillStepBuilder {
     ) -> [MetalPrefillStep] {
         var pendingReads = Set<BufferRegion>()
         var pendingWrites = Set<BufferRegion>()
+        var previousExecutionCondition: PrefillStepExecutionCondition?
         return steps.map { step in
             let accesses = resolveBufferRegions(for: step)
+            let executionConditionChanged = previousExecutionCondition.map {
+                $0 != step.executionCondition
+            } ?? false
             if step.mode == .lastToken {
                 pendingReads = accesses.reads
                 pendingWrites = accesses.writes
+                previousExecutionCondition = step.executionCondition
                 return step
             }
-            let requiresBarrier = accesses.requiresBarrier(
+            let requiresAccessBarrier = accesses.requiresBarrier(
                 after: pendingReads,
                 pendingWrites: pendingWrites
             )
+            let requiresBarrier = executionConditionChanged || requiresAccessBarrier
             let newBarrierPolicy: MetalBarrierPolicy
             if requiresBarrier {
                 let visibility: MTL4VisibilityOptions =
@@ -354,6 +379,7 @@ struct MetalPrefillStepBuilder {
                 pendingReads.formUnion(accesses.reads)
                 pendingWrites.formUnion(accesses.writes)
             }
+            previousExecutionCondition = step.executionCondition
 
             guard newBarrierPolicy != step.barrierPolicy else { return step }
 
@@ -611,6 +637,21 @@ private struct PrefillStepPlanner {
         return raw == "1" || raw.lowercased() == "true"
     }()
 
+    /// Minimum sequence length for the opt-in row-grid fan-in route.
+    ///
+    /// The full-tile row-grid kernel is promising for production-length Qwen
+    /// prompts but still regresses short prompts. Runtime admission keeps the
+    /// existing `round + gemv_seq` path for short sequences and routes only
+    /// longer sequences through row-grid fan-in when the experiment is enabled.
+    private static let recurrentBlockRowGridFanInMinimumSequenceLength: Int = {
+        guard let raw = ProcessInfo.processInfo.environment[
+            "SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN_MIN_SEQUENCE_LENGTH"
+        ], let value = Int(raw) else {
+            return 64
+        }
+        return max(value, 1)
+    }()
+
     private static func largestDivisor(of value: Int, notExceeding maximum: Int) -> Int {
         guard value > 0, maximum > 0 else { return 0 }
         for candidate in stride(from: min(value, maximum), through: 1, by: -1) {
@@ -646,6 +687,14 @@ private struct PrefillStepPlanner {
 
     var fusedMlpDownMinimumSequenceLength: Int {
         Self.fusedMlpDownMinimumSequenceLength
+    }
+
+    var rowGridRecurrentBlockFanInEnabled: Bool {
+        Self.bf16RecurrentBlockRowGridFanInEnabled
+    }
+
+    var recurrentBlockRowGridFanInMinimumSequenceLength: Int {
+        Self.recurrentBlockRowGridFanInMinimumSequenceLength
     }
 
     var bf16FusedMlpDownEnabled: Bool {
@@ -1703,6 +1752,38 @@ private struct PrefillStepPlanner {
             plan: plan
         )
         return recurrenceSteps + [outputStep]
+    }
+
+    mutating func buildUnfusedRecurrentBlockSteps(
+        window: RecurrentBlockFusionAdmissionWindow,
+        entriesByIndex: [Int: DispatchEntry]
+    ) throws -> [MetalPrefillStep] {
+        guard let recurrenceEntry = entriesByIndex[window.recurrenceEntryIndex],
+              let outputEntry = entriesByIndex[window.outputProjectionEntryIndex] else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Unfused recurrent block branch requires recurrence and output projection entries"
+            )
+        }
+        let bridgeEntries = window.bridgeEntryIndices
+            .filter { $0 > window.recurrenceEntryIndex }
+            .sorted()
+            .compactMap { entriesByIndex[$0] }
+        let expectedBridgeEntryCount = window.bridgeEntryIndices
+            .filter { $0 > window.recurrenceEntryIndex }
+            .count
+        guard bridgeEntries.count == expectedBridgeEntryCount else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Unfused recurrent block branch is missing bridge entries"
+            )
+        }
+
+        var steps: [MetalPrefillStep] = []
+        steps.append(contentsOf: try buildSteps(for: recurrenceEntry))
+        for bridgeEntry in bridgeEntries {
+            steps.append(contentsOf: try buildSteps(for: bridgeEntry))
+        }
+        steps.append(contentsOf: try buildSteps(for: outputEntry))
+        return steps
     }
 
     mutating func tryBuildFusedRecurrentBlockPartialSteps(
