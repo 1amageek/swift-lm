@@ -19,10 +19,7 @@ struct SequenceGEMVMicrobenchmarkTests {
         defer { gpuLock.release() }
 
         let harness = try MicrobenchmarkHarness(device: device)
-        let shapes = [
-            Shape(role: "attn_or_ssm.out_proj", inputDimension: 2048, outputDimension: 1024),
-            Shape(role: "mlp.down_proj", inputDimension: 3584, outputDimension: 1024),
-        ]
+        let shapes = Self.singleGEMVShapes()
         let variants = [
             Variant(name: "base", kernelName: "bench_gemv_seq_bf16_f32s", sequenceTile: 1, rowsPerSimdgroup: 1),
             Variant(name: "row2", kernelName: "bench_gemv_seq_bf16_f32s_rps2", sequenceTile: 1, rowsPerSimdgroup: 2),
@@ -52,6 +49,12 @@ struct SequenceGEMVMicrobenchmarkTests {
         printReport(rows: rows, routePromotionRows: routePromotionRows, artifact: artifact, routePromotionArtifact: routePromotionArtifact)
         #expect(rows.count == shapes.count * Self.sequenceLengths.count * variants.count)
         #expect(routePromotionRows.count == shapes.count * (variants.count - 1))
+    }
+
+    @Test("BF16 single sequence GEMV route roles match the full-profile route gate")
+    func bf16SingleSequenceGEMVRolesMatchFullProfileRouteGate() {
+        let roles = Set(Self.singleGEMVShapes().map(\.role))
+        #expect(roles == ["linear_attn.out_proj", "self_attn.o_proj", "mlp.down_proj"])
     }
 
     @Test("BF16 batched sequence GEMV real-shape microbench")
@@ -166,6 +169,14 @@ struct SequenceGEMVMicrobenchmarkTests {
         let artifact = try writeFusedRowsCSV(rows: rows)
         printFusedRowsReport(rows: rows, artifact: artifact)
         #expect(rows.count == Self.sequenceLengths.count * variants.count)
+    }
+
+    private static func singleGEMVShapes() -> [Shape] {
+        [
+            Shape(role: "linear_attn.out_proj", inputDimension: 2048, outputDimension: 1024),
+            Shape(role: "self_attn.o_proj", inputDimension: 2048, outputDimension: 1024),
+            Shape(role: "mlp.down_proj", inputDimension: 3584, outputDimension: 1024),
+        ]
     }
 
     @Test("BF16 single sequence GEMV route admissions require production sequence wins")

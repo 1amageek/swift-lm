@@ -267,6 +267,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` and `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` | Pass; route-promotion CSVs expose the required full-profile route gate and readiness prerequisite so microbench candidates cannot be mistaken for production-ready routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; route-readiness CSV now consumes the microbench `readinessPrerequisite` column and rejects candidate-shaped admissions unless they explicitly require the full-profile route gate |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCanBeReconstructedFromArtifactCSVs` with `ENABLE_METAL_PROBES=1` | Pass; lightweight checker reconstructs route readiness from route-promotion CSVs plus `qwen35-prefill-route-gate.csv` without depending on heavy profile test execution order |
+| 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRolesMatchFullProfileRouteGate` | Pass; single-GEMV microbench roles now match full-profile route gate roles instead of using the ambiguous `attn_or_ssm.out_proj` bucket |
 
 ## Failed Experiments
 
@@ -497,12 +498,14 @@ without post-processing the CSV artifact:
 output-projection shapes outside the full model and measures base/tile2/tile4
 sequence GEMV variants. It is an exploratory harness, not a release benchmark,
 because full-model correctness and end-to-end profile remain the routing gates.
+The artifact roles now match the full-profile route gate keys:
+`linear_attn.out_proj`, `self_attn.o_proj`, and `mlp.down_proj`.
 
 | Shape | SeqLen | Base | Tile2 | Tile4 | Local decision |
 |---|---:|---:|---:|---:|---|
-| `attn_or_ssm.out_proj` | 16 | 574.4 us | 652.1 us | 632.4 us | base |
-| `attn_or_ssm.out_proj` | 64 | 1551.6 us | 2209.6 us | 2278.0 us | base |
-| `attn_or_ssm.out_proj` | 128 | 2578.5 us | 2408.7 us | 3201.1 us | tile2 is interesting but not decisive |
+| `linear_attn.out_proj` / `self_attn.o_proj` historical grouped shape | 16 | 574.4 us | 652.1 us | 632.4 us | base |
+| `linear_attn.out_proj` / `self_attn.o_proj` historical grouped shape | 64 | 1551.6 us | 2209.6 us | 2278.0 us | base |
+| `linear_attn.out_proj` / `self_attn.o_proj` historical grouped shape | 128 | 2578.5 us | 2408.7 us | 3201.1 us | tile2 is interesting but not decisive |
 | `mlp.down_proj` | 16 | 1030.6 us | 1124.8 us | 1125.4 us | base |
 | `mlp.down_proj` | 64 | 2479.4 us | 2590.9 us | 2594.6 us | base |
 | `mlp.down_proj` | 128 | 3210.4 us | 2695.5 us | 2404.1 us | tile4 is interesting in isolation |
