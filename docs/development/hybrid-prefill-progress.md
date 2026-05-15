@@ -257,6 +257,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
+| 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 
 ## Failed Experiments
 
@@ -448,10 +449,15 @@ gate used by the SSM harness:
 |---|---|
 | `qwen35-bf16-single-sequence-gemv.csv` | Raw timing for base, row2, tile2, and tile4 by role and sequence length |
 | `qwen35-bf16-single-sequence-gemv-route-promotions.csv` | Per-role route admission across 64/128-token production lengths |
+| `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/tile2/tile4 by role and sequence length |
+| `qwen35-bf16-batched-sequence-gemv-route-promotions.csv` | Per-role route admission for batched tile2/tile4 across 64/128-token production lengths |
 
-Latest run: all single-GEMV variants remain non-default. Several variants win
-one length, but every `row2` / `tile2` / `tile4` candidate fails at least one of
-64 or 128 tokens and is recorded as `reject-cross-sequence-threshold`.
+Latest run: batched tile2/tile4 remains non-default; every batched role fails
+at least one production sequence length. The single-GEMV microbench can produce
+per-role candidates under favorable timing, but this is still only a
+microbench-level admission. Default routing still requires Qwen reference
+parity plus full prefill profile improvement for the same flag, because prior
+full-model tile2/row2 runs regressed or stayed within noise.
 
 The live profile test now also prints the BF16 single sequence GEMV role
 breakdown directly, so the dominant dependent projection can be identified
