@@ -204,6 +204,47 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(rows.allSatisfy { $0.candidateOutputChecksum.isFinite && $0.candidateOutputChecksum > 0 })
     }
 
+    @Test("SSM summary promotion admissions classify candidates")
+    func ssmSummaryPromotionAdmissionsClassifyCandidates() {
+        let base = makeSummaryFixture(sequenceLength: 128, variant: "base_tg384", averageGpuMicroseconds: 100.0)
+
+        let shared = SSMSummaryFactory.make(
+            sequenceLength: 128,
+            best: makeSummaryFixture(sequenceLength: 128, variant: "shared_tg384", averageGpuMicroseconds: 95.0),
+            bestBase: base,
+            speedupVsBestBasePercent: 5.0
+        )
+        #expect(shared.decision == "candidate-shared-rms")
+        #expect(shared.promotionAdmission == "candidate-shared-rms")
+
+        let shortQKParallel = SSMSummaryFactory.make(
+            sequenceLength: 16,
+            best: makeSummaryFixture(sequenceLength: 16, variant: "qkpar_tg384", averageGpuMicroseconds: 70.0),
+            bestBase: makeSummaryFixture(sequenceLength: 16, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+            speedupVsBestBasePercent: 30.0
+        )
+        #expect(shortQKParallel.decision == "keep-default")
+        #expect(shortQKParallel.promotionAdmission == "reject-short-sequence-only")
+
+        let noisyQKParallel = SSMSummaryFactory.make(
+            sequenceLength: 128,
+            best: makeSummaryFixture(sequenceLength: 128, variant: "qkpar_tg384", averageGpuMicroseconds: 98.0),
+            bestBase: base,
+            speedupVsBestBasePercent: 2.0
+        )
+        #expect(noisyQKParallel.decision == "keep-default")
+        #expect(noisyQKParallel.promotionAdmission == "reject-speedup-below-threshold")
+
+        let fastQKParallel = SSMSummaryFactory.make(
+            sequenceLength: 128,
+            best: makeSummaryFixture(sequenceLength: 128, variant: "qkpar_tg384", averageGpuMicroseconds: 90.0),
+            bestBase: base,
+            speedupVsBestBasePercent: 10.0
+        )
+        #expect(fastQKParallel.decision == "candidate-qkpar-full-kernel")
+        #expect(fastQKParallel.promotionAdmission == "candidate-qkpar-full-kernel")
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -222,12 +263,13 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
         print()
         print("=== BF16 SSM recurrence promotion decisions ===")
-        print("seq  best             best_us  state_mb/tok  base             base_us  speedup  decision")
+        print("seq  best             best_us  state_mb/tok  base             base_us  speedup  decision                     admission")
         for row in summaryRows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
             let bestVariant = row.bestVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
             let baseVariant = row.bestBaseVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
+            let decision = row.decision.padding(toLength: 28, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.bestEstimatedStateTotalBytesPerToken) / 1_048_576.0
-            print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(String(format: "%12.3f", stateMegabytes))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(row.decision)")
+            print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(String(format: "%12.3f", stateMegabytes))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(decision) \(row.promotionAdmission)")
         }
     }
 
@@ -301,6 +343,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "bestBaseEstimatedStateTotalBytesPerToken",
                 "speedupVsBestBasePercent",
                 "decision",
+                "promotionAdmission",
             ].joined(separator: ","),
         ]
         for row in rows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
@@ -317,6 +360,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.bestBaseEstimatedStateTotalBytesPerToken),
                 String(format: "%.3f", row.speedupVsBestBasePercent),
                 row.decision,
+                row.promotionAdmission,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -507,6 +551,27 @@ struct SSMRecurrenceMicrobenchmarkTests {
             return lhs.sampleIndex < rhs.sampleIndex
         }
         return lhs.candidatePhase < rhs.candidatePhase
+    }
+
+    private func makeSummaryFixture(
+        sequenceLength: Int,
+        variant: String,
+        averageGpuMicroseconds: Double
+    ) -> SSMResultRow {
+        SSMResultRow(
+            sequenceLength: sequenceLength,
+            variant: variant,
+            headCount: 16,
+            groupCount: 16,
+            keyDimension: 128,
+            valueDimension: 128,
+            convKernelSize: 4,
+            gridWidth: 16,
+            gridHeight: 1,
+            threadgroupWidth: 384,
+            requestedThreadgroupWidth: 384,
+            averageGpuMicroseconds: averageGpuMicroseconds
+        )
     }
 }
 
@@ -706,16 +771,25 @@ private struct SSMSummaryRow {
     let bestBaseEstimatedStateTotalBytesPerToken: Int
     let speedupVsBestBasePercent: Double
     let decision: String
+    let promotionAdmission: String
 }
 
 private enum SSMSummaryFactory {
+    private static let promotionSpeedupThresholdPercent = 3.0
+    private static let minimumPromotionSequenceLength = 64
+
     static func make(
         sequenceLength: Int,
         best: SSMResultRow,
         bestBase: SSMResultRow,
         speedupVsBestBasePercent: Double
     ) -> SSMSummaryRow {
-        SSMSummaryRow(
+        let admission = promotionAdmission(
+            sequenceLength: sequenceLength,
+            bestVariant: best.variant,
+            speedupVsBestBasePercent: speedupVsBestBasePercent
+        )
+        return SSMSummaryRow(
             sequenceLength: sequenceLength,
             bestVariant: best.variant,
             bestThreadgroupWidth: best.threadgroupWidth,
@@ -727,21 +801,33 @@ private enum SSMSummaryFactory {
             bestBaseAverageGpuMicroseconds: bestBase.averageGpuMicroseconds,
             bestBaseEstimatedStateTotalBytesPerToken: bestBase.estimatedStateTotalBytesPerToken,
             speedupVsBestBasePercent: speedupVsBestBasePercent,
-            decision: decision(bestVariant: best.variant, speedupVsBestBasePercent: speedupVsBestBasePercent)
+            decision: decision(promotionAdmission: admission),
+            promotionAdmission: admission
         )
     }
 
-    private static func decision(bestVariant: String, speedupVsBestBasePercent: Double) -> String {
-        guard speedupVsBestBasePercent >= 3.0 else {
-            return "keep-default"
-        }
+    private static func decision(promotionAdmission: String) -> String {
+        promotionAdmission.hasPrefix("candidate-") ? promotionAdmission : "keep-default"
+    }
+
+    private static func promotionAdmission(
+        sequenceLength: Int,
+        bestVariant: String,
+        speedupVsBestBasePercent: Double
+    ) -> String {
+        guard !bestVariant.hasPrefix("base_") else { return "baseline-best" }
+        guard sequenceLength >= minimumPromotionSequenceLength else { return "reject-short-sequence-only" }
+        guard speedupVsBestBasePercent >= promotionSpeedupThresholdPercent else { return "reject-speedup-below-threshold" }
         if bestVariant.hasPrefix("shared_") {
             return "candidate-shared-rms"
         }
         if bestVariant.hasPrefix("prewrite_") {
             return "candidate-prewrite-decay"
         }
-        return "keep-default"
+        if bestVariant.hasPrefix("qkpar_") {
+            return "candidate-qkpar-full-kernel"
+        }
+        return "reject-unknown-variant"
     }
 }
 

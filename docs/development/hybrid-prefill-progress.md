@@ -253,6 +253,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-only `state_recurrence_cache32` reduces modeled device state traffic to 2.0 MiB/token and matches CPU reference, but regresses badly because it collapses active value-lane parallelism from 128 to 32 |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; cache staging remains rejected after the 64-lane attempt exceeded the AGX 32 KiB threadgroup-memory limit and the runnable 32-lane probe stayed much slower than baseline |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase/stability CSV artifacts now emit promotion admission reasons so structurally bad state candidates are rejected before full-kernel routing work |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel summary CSV now emits per-sequence promotion admission reasons and has a synthetic contract test for short-sequence, noisy-speedup, and qkpar candidate classification |
 
 ## Failed Experiments
 
@@ -1786,6 +1787,22 @@ This keeps the next optimization loop bounded: a phase candidate can be timed
 for diagnostics, but it should not advance to route implementation unless it
 preserves the state-row lane contract or deliberately changes the algorithmic
 decomposition with a new reference-backed contract.
+
+The full-kernel summary artifact now applies the same idea at the route
+promotion layer:
+
+| Summary admission | Meaning |
+|---|---|
+| `baseline-best` | The existing base kernel is still the fastest measured row for that sequence length |
+| `reject-short-sequence-only` | The win appears only below the production promotion length |
+| `reject-speedup-below-threshold` | The measured win is below the 3% promotion threshold |
+| `candidate-shared-rms` | Shared-RMS variant is a per-sequence candidate |
+| `candidate-prewrite-decay` | Prewrite-decay variant is a per-sequence candidate |
+| `candidate-qkpar-full-kernel` | Q/K parallel-reduction variant is a per-sequence candidate |
+
+These are per-sequence admissions, not default-routing decisions by themselves.
+A production route still needs cross-sequence stability, Qwen reference parity,
+and full prefill profile improvement before default promotion.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
