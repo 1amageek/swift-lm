@@ -211,6 +211,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
 
         let artifact = try writePhaseStabilityCSV(rows: rows)
         printPhaseStabilityReport(rows: rows, artifact: artifact)
+        if let bridgeArtifact = try writePhaseFullBridgeCSVIfRoutePromotionArtifactExists(stabilityRows: rows) {
+            print("phase/full bridge artifact: \(bridgeArtifact.path)")
+        }
         #expect(rows.count == Self.stabilitySamples * candidatePhases.count)
         #expect(rows.allSatisfy { $0.candidateOutputChecksum.isFinite && $0.candidateOutputChecksum > 0 })
     }
@@ -282,6 +285,78 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(qkParallel?.routePromotionAdmission == "candidate-qkpar-default-route")
         #expect(qkParallel?.failingSequenceLengths == [])
         #expect(qkParallel?.thresholdShortfallPercent == 0.0)
+    }
+
+    @Test("SSM phase/full bridge blocks phase-only route promotion")
+    func ssmPhaseFullBridgeBlocksPhaseOnlyRoutePromotion() throws {
+        let stabilityRows = [
+            SSMPhaseStabilityRow(
+                sampleIndex: 0,
+                baseline: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence",
+                    averageGpuMicroseconds: 100.0
+                ),
+                candidate: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence_qkpar",
+                    averageGpuMicroseconds: 90.0
+                )
+            ),
+            SSMPhaseStabilityRow(
+                sampleIndex: 1,
+                baseline: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence",
+                    averageGpuMicroseconds: 100.0
+                ),
+                candidate: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence_qkpar",
+                    averageGpuMicroseconds: 95.0
+                )
+            ),
+        ]
+        let routeRows = [
+            SSMRoutePromotionRow(
+                candidate: .qkParallel,
+                productionSequenceLengths: [64, 128],
+                bestVariants: ["qkpar_tg128", "qkpar_tg384"],
+                speedupPercents: [-2.0, -1.0],
+                passingSequenceCount: 0,
+                requiredSequenceCount: 2,
+                failingSequenceLengths: [64, 128],
+                routePromotionAdmission: "reject-cross-sequence-threshold"
+            ),
+        ]
+
+        let bridgeRows = SSMPhaseFullBridgeFactory.make(stabilityRows: stabilityRows, routeRows: routeRows)
+        let qkParallel = bridgeRows.first { $0.candidate == .qkParallel }
+        #expect(qkParallel?.phaseWinCount == 2)
+        #expect(qkParallel?.phaseSampleCount == 2)
+        #expect(qkParallel?.phaseAdmission == "eligible-for-full-kernel-check")
+        #expect(qkParallel?.fullRouteAdmission == "reject-cross-sequence-threshold")
+        #expect(qkParallel?.bridgeAdmission == "reject-full-kernel-route")
+    }
+
+    @Test("SSM phase/full bridge artifacts can be reconstructed when requested")
+    func ssmPhaseFullBridgeArtifactsCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_RECURRENCE_BRIDGE_ARTIFACTS"] == "1" else {
+            return
+        }
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        let routePromotionArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-route-promotions.csv")
+        let phaseStabilityArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phase-stability.csv")
+        try requireArtifact(routePromotionArtifact)
+        try requireArtifact(phaseStabilityArtifact)
+
+        let routeRows = try readRoutePromotionCSV(routePromotionArtifact)
+        let stabilityRows = try readPhaseStabilityCSV(phaseStabilityArtifact)
+        let bridgeRows = SSMPhaseFullBridgeFactory.make(stabilityRows: stabilityRows, routeRows: routeRows)
+        let bridgeArtifact = try writePhaseFullBridgeCSV(rows: bridgeRows)
+        let csv = try String(contentsOf: bridgeArtifact, encoding: .utf8)
+        #expect(csv.contains("candidate,phaseSampleCount,phaseWinCount"))
+        #expect(csv.contains("qkpar"))
     }
 
     private func printReport(
@@ -510,8 +585,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
     }
 
     private func writePhaseStabilityCSV(rows: [SSMPhaseStabilityRow]) throws -> URL {
-        let directory = repositoryRoot()
-            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+        let directory = ssmMicrobenchmarkArtifactDirectory()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phase-stability.csv")
         var lines = [
@@ -550,6 +624,55 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.serialStateLanesPerThread),
                 row.candidatePromotionAdmission,
                 String(format: "%.6f", row.candidateOutputChecksum),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func writePhaseFullBridgeCSVIfRoutePromotionArtifactExists(stabilityRows: [SSMPhaseStabilityRow]) throws -> URL? {
+        let routePromotionArtifact = ssmMicrobenchmarkArtifactDirectory()
+            .appendingPathComponent("qwen35-bf16-ssm-recurrence-route-promotions.csv")
+        guard FileManager.default.fileExists(atPath: routePromotionArtifact.path) else {
+            return nil
+        }
+        let routeRows = try readRoutePromotionCSV(routePromotionArtifact)
+        let bridgeRows = SSMPhaseFullBridgeFactory.make(stabilityRows: stabilityRows, routeRows: routeRows)
+        return try writePhaseFullBridgeCSV(rows: bridgeRows)
+    }
+
+    private func writePhaseFullBridgeCSV(rows: [SSMPhaseFullBridgeRow]) throws -> URL {
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phase-full-bridge.csv")
+        var lines = [
+            [
+                "candidate",
+                "phaseSampleCount",
+                "phaseWinCount",
+                "phaseWinRate",
+                "minimumPhaseDeltaPercent",
+                "maximumPhaseDeltaPercent",
+                "phaseAdmission",
+                "fullRouteAdmission",
+                "fullRouteMinimumSpeedupPercent",
+                "fullRouteFailingSequenceLengths",
+                "bridgeAdmission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
+            lines.append([
+                row.candidate.rawValue,
+                String(row.phaseSampleCount),
+                String(row.phaseWinCount),
+                String(format: "%.6f", row.phaseWinRate),
+                String(format: "%.3f", row.minimumPhaseDeltaPercent),
+                String(format: "%.3f", row.maximumPhaseDeltaPercent),
+                row.phaseAdmission,
+                row.fullRouteAdmission,
+                String(format: "%.3f", row.fullRouteMinimumSpeedupPercent),
+                row.fullRouteFailingSequenceLengths.map(String.init).joined(separator: "|"),
+                row.bridgeAdmission,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -617,6 +740,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
             .deletingLastPathComponent()
     }
 
+    private func ssmMicrobenchmarkArtifactDirectory() -> URL {
+        repositoryRoot()
+            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+    }
+
     private func rowSort(_ lhs: SSMResultRow, _ rhs: SSMResultRow) -> Bool {
         if lhs.sequenceLength != rhs.sequenceLength {
             return lhs.sequenceLength < rhs.sequenceLength
@@ -670,6 +798,140 @@ struct SSMRecurrenceMicrobenchmarkTests {
             requestedThreadgroupWidth: 384,
             averageGpuMicroseconds: averageGpuMicroseconds
         )
+    }
+
+    private func makePhaseFixture(
+        sequenceLength: Int,
+        phase: String,
+        averageGpuMicroseconds: Double
+    ) -> SSMPhaseResultRow {
+        SSMPhaseResultRow(
+            sequenceLength: sequenceLength,
+            phase: phase,
+            headCount: 16,
+            keyDimension: 128,
+            valueDimension: 128,
+            gridWidth: 16,
+            gridHeight: 1,
+            threadgroupWidth: 384,
+            requestedThreadgroupWidth: 384,
+            averageGpuMicroseconds: averageGpuMicroseconds,
+            fullBaseAverageGpuMicroseconds: 1.0,
+            outputChecksum: 1.0
+        )
+    }
+
+    private func readRoutePromotionCSV(_ url: URL) throws -> [SSMRoutePromotionRow] {
+        try parseSimpleCSV(url).map { row in
+            let candidateName = try requiredCSVValue("candidate", in: row, artifact: url)
+            guard let candidate = SSMRoutePromotionCandidate(rawValue: candidateName) else {
+                throw SSMArtifactError.invalidValue(url.path, "candidate", candidateName)
+            }
+            return SSMRoutePromotionRow(
+                candidate: candidate,
+                productionSequenceLengths: try pipeSeparatedIntegers("productionSequenceLengths", in: row, artifact: url),
+                bestVariants: try requiredCSVValue("bestVariants", in: row, artifact: url).split(separator: "|").map(String.init),
+                speedupPercents: try pipeSeparatedDoubles("speedupPercents", in: row, artifact: url),
+                passingSequenceCount: try integerCSVValue("passingSequenceCount", in: row, artifact: url),
+                requiredSequenceCount: try integerCSVValue("requiredSequenceCount", in: row, artifact: url),
+                failingSequenceLengths: try pipeSeparatedIntegers("failingSequenceLengths", in: row, artifact: url),
+                routePromotionAdmission: try requiredCSVValue("routePromotionAdmission", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func readPhaseStabilityCSV(_ url: URL) throws -> [SSMPhaseStabilityRow] {
+        try parseSimpleCSV(url).map { row in
+            SSMPhaseStabilityRow(
+                sampleIndex: try integerCSVValue("sampleIndex", in: row, artifact: url),
+                sequenceLength: try integerCSVValue("sequenceLength", in: row, artifact: url),
+                candidatePhase: try requiredCSVValue("candidatePhase", in: row, artifact: url),
+                baselineAverageGpuMicroseconds: try doubleCSVValue("baselineAverageGpuMicroseconds", in: row, artifact: url),
+                candidateAverageGpuMicroseconds: try doubleCSVValue("candidateAverageGpuMicroseconds", in: row, artifact: url),
+                candidateOutputChecksum: try doubleCSVValue("candidateOutputChecksum", in: row, artifact: url),
+                activeThreadsPerThreadgroup: try integerCSVValue("activeThreadsPerThreadgroup", in: row, artifact: url),
+                valueLanesPerThread: try integerCSVValue("valueLanesPerThread", in: row, artifact: url),
+                laneParallelismPreserved: try boolCSVValue("laneParallelismPreserved", in: row, artifact: url),
+                stateInnerStrideElements: try integerCSVValue("stateInnerStrideElements", in: row, artifact: url),
+                coalescedValueLanesPerStateRow: try integerCSVValue("coalescedValueLanesPerStateRow", in: row, artifact: url),
+                serialStateLanesPerThread: try integerCSVValue("serialStateLanesPerThread", in: row, artifact: url),
+                candidatePromotionAdmission: try requiredCSVValue("candidatePromotionAdmission", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func parseSimpleCSV(_ url: URL) throws -> [[String: String]] {
+        let content = try String(contentsOf: url, encoding: .utf8)
+        let lines = content.split(whereSeparator: \.isNewline).map(String.init)
+        guard let header = lines.first else {
+            throw SSMArtifactError.emptyCSV(url.path)
+        }
+        let columns = header.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+        return try lines.dropFirst().map { line in
+            let values = line.split(separator: ",", omittingEmptySubsequences: false).map(String.init)
+            guard values.count == columns.count else {
+                throw SSMArtifactError.rowWidthMismatch(url.path, columns.count, values.count)
+            }
+            return Dictionary(uniqueKeysWithValues: zip(columns, values))
+        }
+    }
+
+    private func requiredCSVValue(_ key: String, in row: [String: String], artifact: URL) throws -> String {
+        guard let value = row[key] else {
+            throw SSMArtifactError.missingColumn(artifact.path, key)
+        }
+        return value
+    }
+
+    private func integerCSVValue(_ key: String, in row: [String: String], artifact: URL) throws -> Int {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        guard let intValue = Int(value) else {
+            throw SSMArtifactError.invalidValue(artifact.path, key, value)
+        }
+        return intValue
+    }
+
+    private func doubleCSVValue(_ key: String, in row: [String: String], artifact: URL) throws -> Double {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        guard let doubleValue = Double(value) else {
+            throw SSMArtifactError.invalidValue(artifact.path, key, value)
+        }
+        return doubleValue
+    }
+
+    private func boolCSVValue(_ key: String, in row: [String: String], artifact: URL) throws -> Bool {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        if value == "true" { return true }
+        if value == "false" { return false }
+        throw SSMArtifactError.invalidValue(artifact.path, key, value)
+    }
+
+    private func pipeSeparatedIntegers(_ key: String, in row: [String: String], artifact: URL) throws -> [Int] {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        if value.isEmpty { return [] }
+        return try value.split(separator: "|").map { item in
+            guard let intValue = Int(item) else {
+                throw SSMArtifactError.invalidValue(artifact.path, key, value)
+            }
+            return intValue
+        }
+    }
+
+    private func pipeSeparatedDoubles(_ key: String, in row: [String: String], artifact: URL) throws -> [Double] {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        if value.isEmpty { return [] }
+        return try value.split(separator: "|").map { item in
+            guard let doubleValue = Double(item) else {
+                throw SSMArtifactError.invalidValue(artifact.path, key, value)
+            }
+            return doubleValue
+        }
+    }
+
+    private func requireArtifact(_ url: URL) throws {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            throw SSMArtifactError.missingArtifact(url.path)
+        }
     }
 }
 
@@ -841,6 +1103,36 @@ private struct SSMPhaseStabilityRow {
         self.candidatePromotionAdmission = candidate.phasePromotionAdmission
     }
 
+    init(
+        sampleIndex: Int,
+        sequenceLength: Int,
+        candidatePhase: String,
+        baselineAverageGpuMicroseconds: Double,
+        candidateAverageGpuMicroseconds: Double,
+        candidateOutputChecksum: Double,
+        activeThreadsPerThreadgroup: Int,
+        valueLanesPerThread: Int,
+        laneParallelismPreserved: Bool,
+        stateInnerStrideElements: Int,
+        coalescedValueLanesPerStateRow: Int,
+        serialStateLanesPerThread: Int,
+        candidatePromotionAdmission: String
+    ) {
+        self.sampleIndex = sampleIndex
+        self.sequenceLength = sequenceLength
+        self.candidatePhase = candidatePhase
+        self.baselineAverageGpuMicroseconds = baselineAverageGpuMicroseconds
+        self.candidateAverageGpuMicroseconds = candidateAverageGpuMicroseconds
+        self.candidateOutputChecksum = candidateOutputChecksum
+        self.activeThreadsPerThreadgroup = activeThreadsPerThreadgroup
+        self.valueLanesPerThread = valueLanesPerThread
+        self.laneParallelismPreserved = laneParallelismPreserved
+        self.stateInnerStrideElements = stateInnerStrideElements
+        self.coalescedValueLanesPerStateRow = coalescedValueLanesPerStateRow
+        self.serialStateLanesPerThread = serialStateLanesPerThread
+        self.candidatePromotionAdmission = candidatePromotionAdmission
+    }
+
     var candidateDeltaPercent: Double {
         (candidateAverageGpuMicroseconds - baselineAverageGpuMicroseconds)
             / baselineAverageGpuMicroseconds * 100.0
@@ -848,6 +1140,92 @@ private struct SSMPhaseStabilityRow {
 
     var candidateWins: Bool {
         candidateAverageGpuMicroseconds < baselineAverageGpuMicroseconds
+    }
+}
+
+private struct SSMPhaseFullBridgeRow {
+    let candidate: SSMRoutePromotionCandidate
+    let phaseSampleCount: Int
+    let phaseWinCount: Int
+    let phaseWinRate: Double
+    let minimumPhaseDeltaPercent: Double
+    let maximumPhaseDeltaPercent: Double
+    let phaseAdmission: String
+    let fullRouteAdmission: String
+    let fullRouteMinimumSpeedupPercent: Double
+    let fullRouteFailingSequenceLengths: [Int]
+
+    var bridgeAdmission: String {
+        guard phaseAdmission == "eligible-for-full-kernel-check" else {
+            return "reject-phase-contract"
+        }
+        guard fullRouteAdmission.hasPrefix("candidate-") else {
+            return "reject-full-kernel-route"
+        }
+        return "candidate-production-route"
+    }
+}
+
+private enum SSMPhaseFullBridgeFactory {
+    static func make(
+        stabilityRows: [SSMPhaseStabilityRow],
+        routeRows: [SSMRoutePromotionRow]
+    ) -> [SSMPhaseFullBridgeRow] {
+        routeRows.map { routeRow in
+            let rows = stabilityRows.filter { $0.candidatePhase == candidatePhaseName(routeRow.candidate) }
+            let phaseWinCount = rows.filter(\.candidateWins).count
+            let sampleCount = rows.count
+            let deltas = rows.map(\.candidateDeltaPercent)
+            let phaseAdmission = rows.allSatisfy { $0.candidatePromotionAdmission == "eligible-for-full-kernel-check" } && !rows.isEmpty
+                ? "eligible-for-full-kernel-check"
+                : "reject-phase-contract"
+            return SSMPhaseFullBridgeRow(
+                candidate: routeRow.candidate,
+                phaseSampleCount: sampleCount,
+                phaseWinCount: phaseWinCount,
+                phaseWinRate: sampleCount == 0 ? 0.0 : Double(phaseWinCount) / Double(sampleCount),
+                minimumPhaseDeltaPercent: deltas.min() ?? .nan,
+                maximumPhaseDeltaPercent: deltas.max() ?? .nan,
+                phaseAdmission: phaseAdmission,
+                fullRouteAdmission: routeRow.routePromotionAdmission,
+                fullRouteMinimumSpeedupPercent: routeRow.minimumSpeedupPercent,
+                fullRouteFailingSequenceLengths: routeRow.failingSequenceLengths
+            )
+        }
+    }
+
+    private static func candidatePhaseName(_ candidate: SSMRoutePromotionCandidate) -> String {
+        switch candidate {
+        case .prewriteDecay:
+            return "state_recurrence_prewrite_decay"
+        case .qkParallel:
+            return "state_recurrence_qkpar"
+        case .sharedRMS:
+            return "state_recurrence_shared_rms"
+        }
+    }
+}
+
+private enum SSMArtifactError: Error, CustomStringConvertible {
+    case emptyCSV(String)
+    case rowWidthMismatch(String, Int, Int)
+    case missingColumn(String, String)
+    case invalidValue(String, String, String)
+    case missingArtifact(String)
+
+    var description: String {
+        switch self {
+        case .emptyCSV(let path):
+            return "CSV artifact is empty: \(path)"
+        case .rowWidthMismatch(let path, let expected, let actual):
+            return "CSV row width mismatch in \(path): expected \(expected), got \(actual)"
+        case .missingColumn(let path, let column):
+            return "CSV artifact \(path) is missing required column \(column)"
+        case .invalidValue(let path, let column, let value):
+            return "CSV artifact \(path) has invalid value \(value) in column \(column)"
+        case .missingArtifact(let path):
+            return "Missing required SSM artifact: \(path)"
+        }
     }
 }
 

@@ -244,7 +244,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; register-block `state_recurrence_d2` phase candidate is CPU-reference equivalent but slower than the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; `state_recurrence_qkpar` preserves active value-lane parallelism and matches the CPU reference, but does not beat the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase CSV now records state-loop stride, coalesced value lanes, and serial value lanes per thread for recurrence candidates |
-| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase stability CSV shows `qkpar` wins 3/3 at seqLen 128 while `d2` loses 3/3 |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase stability CSV records repeated seqLen 128 state-candidate timing and keeps `qkpar` as a full-kernel-check candidate, not a route candidate |
 | 2026-05-15 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; opt-in `ssm_recurrence_seq_bf16_f32_qkpar` full sequence kernel matches repeated decode recurrence for output, recurrent state, and conv state |
 | 2026-05-15 | `swift test --filter MetalSourceGeneratorTests` | Pass; SSM sequence kernel naming and generated sources remain valid after adding the q/k parallel-reduction variant |
 | 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; opt-in q/k parallel-reduction SSM route keeps schema v6 block boundaries, final hidden/logits, state/KV, and decode0 gates green |
@@ -256,6 +256,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel summary CSV now emits per-sequence promotion admission reasons and has a synthetic contract test for short-sequence, noisy-speedup, and qkpar candidate classification |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
+| 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmPhaseFullBridgeBlocksPhaseOnlyRoutePromotion` and `SWIFTLM_VALIDATE_SSM_RECURRENCE_BRIDGE_ARTIFACTS=1 .../ssmPhaseFullBridgeArtifactsCanBeReconstructedWhenRequested` | Pass; phase/full bridge artifact joins phase stability with full-kernel route promotion so phase-only wins cannot be promoted |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
@@ -1899,18 +1900,26 @@ the same process:
 
 | Sample | Baseline state phase | `d2` delta | `qkpar` delta | `cache32` delta |
 |---:|---:|---:|---:|---:|
-| 0 | 4030.8 us | +27.01% | -24.86% | +132.82% |
-| 1 | 2832.7 us | +65.45% | +4.92% | +244.97% |
-| 2 | 2794.9 us | +72.34% | +17.65% | +244.42% |
+| 0 | 3486.7 us | +40.63% | -15.74% | +185.71% |
+| 1 | 2837.3 us | +65.57% | +2.31% | +236.71% |
+| 2 | 2808.9 us | +67.62% | +1.13% | +232.82% |
 
 Current decision: `d2` remains rejected. `qkpar` has completed the sequence
 kernel experiment loop: the full sequence kernel is decode-equivalent, the
 Qwen schema v6 reference gate passes, and the route fires under
 `SWIFTLM_PREFILL_SSM_QKPAR=1`. It is still not a production route because the
 same-build Qwen profile regressed and the full-kernel microbench does not show
-a stable best-base win. The likely lesson is that the phase-level q/k scalar
-setup win is smaller than the extra full-kernel barrier and threadgroup-memory
-traffic once the surrounding sequence recurrence loop is included.
+a stable best-base win. The latest bridge artifact records this explicitly:
+
+| Candidate | Phase wins | Phase admission | Full route admission | Bridge admission |
+|---|---:|---|---|---|
+| `prewrite_decay` | 0/0 | `reject-phase-contract` | `reject-cross-sequence-threshold` | `reject-phase-contract` |
+| `qkpar` | 1/3 | `eligible-for-full-kernel-check` | `reject-cross-sequence-threshold` | `reject-full-kernel-route` |
+| `shared_rms` | 0/0 | `reject-phase-contract` | `reject-cross-sequence-threshold` | `reject-phase-contract` |
+
+The lesson is that phase-level q/k scalar setup wins are not sufficient. A
+candidate must survive the full sequence kernel where barriers, threadgroup
+memory, and the surrounding recurrence loop are included.
 
 The third probe, `state_recurrence_cache32`, tests the most direct traffic
 reduction idea: cache `state_before * decay` in threadgroup memory so pass 2 can
@@ -1991,6 +2000,16 @@ The route-promotion CSV includes these diagnostic columns:
 | `thresholdShortfallPercent` | How far the worst sequence length is below the 3% threshold |
 | `failingSequenceLengths` | Production sequence lengths that prevent route promotion |
 | `routePromotionAdmission` | Final per-family route admission or rejection reason |
+
+The phase/full bridge CSV adds the missing join between isolated phase timing
+and full-kernel route evidence:
+
+| CSV column | Meaning |
+|---|---|
+| `phaseWinCount` / `phaseSampleCount` | How often the isolated phase beat its baseline |
+| `phaseAdmission` | Whether the phase contract is structurally eligible |
+| `fullRouteAdmission` | The route-promotion decision from the full-kernel microbench |
+| `bridgeAdmission` | Final bridge decision; phase-only wins become `reject-full-kernel-route` |
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
