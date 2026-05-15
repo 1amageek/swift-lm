@@ -602,13 +602,14 @@ extension MetalSourceGenerator {
         name: String,
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat,
-        tileElements: Int = 256
+        tileElements: Int = 256,
+        roundInputForDecodeEquivalentStorage: Bool = true
     ) -> String {
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
         let loadInput = { (expr: String) in
-            bufferPrecision.isPrefillSequencePrecision
+            roundInputForDecodeEquivalentStorage && bufferPrecision.isPrefillSequencePrecision
                 ? MetalSourceGenerator.sequenceStorageValue("float(\(expr))", weightFormat: weightFormat)
                 : "float(\(expr))"
         }
