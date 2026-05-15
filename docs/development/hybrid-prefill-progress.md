@@ -264,6 +264,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeGateSummarizesProductionSequenceRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-gate contract verifies 64/128 cross-sequence route summaries classify baseline, default runtime-gated, and experimental routes distinctly |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes `qwen35-prefill-route-gate.csv`, showing `mlp_fused_down` active at production lengths and all remaining projection routes preserved as baseline |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; synthetic readiness contract requires both a microbench candidate admission and the expected full-profile route gate before a projection route can be treated as production-ready |
+| 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` and `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` | Pass; route-promotion CSVs expose the required full-profile route gate and readiness prerequisite so microbench candidates cannot be mistaken for production-ready routes |
 
 ## Failed Experiments
 
@@ -457,6 +458,19 @@ gate used by the SSM harness:
 | `qwen35-bf16-single-sequence-gemv-route-promotions.csv` | Per-role route admission across 64/128-token production lengths |
 | `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/tile2/tile4 by role and sequence length |
 | `qwen35-bf16-batched-sequence-gemv-route-promotions.csv` | Per-role route admission for batched tile2/tile4 across 64/128-token production lengths |
+
+The route-promotion CSVs also publish two readiness columns that connect the
+isolated microbench decision to the full Qwen profile gate:
+
+| Column | Meaning |
+|---|---|
+| `requiredProfileRouteGate` | Full-profile route gate that must be observed before the microbench candidate can move to route-default discussion. Current candidate rows require `experimental-route-observed`. |
+| `readinessPrerequisite` | `requires-full-profile-route-gate` for microbench candidates and `microbench-rejected` for rejected rows. |
+
+This makes the relationship between the microbench artifacts and
+`qwen35-prefill-route-gate.csv` machine-readable. A candidate row in the
+microbench CSV is only an invitation to run the full-profile route gate; it is
+not production-ready by itself.
 
 Latest run: batched tile2/tile4 remains non-default; every batched role fails
 at least one production sequence length. The single-GEMV microbench can produce
@@ -2204,6 +2218,7 @@ flowchart LR
 | Readiness input | Required value |
 |---|---|
 | `microbenchAdmission` | Must start with `candidate-` |
+| `requiredProfileRouteGate` | Published by the microbench route-promotion CSV for every candidate route |
 | `observedProfileRouteGate` | Must equal the route's required profile gate |
 | Missing profile route | Reject as `reject-missing-full-profile-route` |
 | Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |

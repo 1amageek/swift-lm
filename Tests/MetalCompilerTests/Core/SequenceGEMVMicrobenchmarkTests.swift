@@ -169,7 +169,7 @@ struct SequenceGEMVMicrobenchmarkTests {
     }
 
     @Test("BF16 single sequence GEMV route admissions require production sequence wins")
-    func bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins() {
+    func bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins() throws {
         let rows = [
             makeResultFixture(role: "dependent", sequenceLength: 16, variant: "base", averageGpuMicroseconds: 100.0),
             makeResultFixture(role: "dependent", sequenceLength: 16, variant: "tile2", averageGpuMicroseconds: 50.0),
@@ -186,13 +186,23 @@ struct SequenceGEMVMicrobenchmarkTests {
         let row2 = routeRows.first { $0.variant == "row2" }
         #expect(tile2?.routePromotionAdmission == "candidate-single-gemv-default-route")
         #expect(tile2?.failingSequenceLengths == [])
+        #expect(tile2?.requiredProfileRouteGate == "experimental-route-observed")
+        #expect(tile2?.readinessPrerequisite == "requires-full-profile-route-gate")
         #expect(row2?.routePromotionAdmission == "reject-cross-sequence-threshold")
         #expect(row2?.failingSequenceLengths == [128])
         #expect(row2?.thresholdShortfallPercent == 2.0)
+        #expect(row2?.requiredProfileRouteGate == "")
+        #expect(row2?.readinessPrerequisite == "microbench-rejected")
+
+        let artifact = try writeSingleRoutePromotionCSV(rows: routeRows)
+        let csv = try String(contentsOf: artifact, encoding: .utf8)
+        #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
+        #expect(csv.contains("candidate-single-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
+        #expect(csv.contains("reject-cross-sequence-threshold,,microbench-rejected"))
     }
 
     @Test("BF16 batched sequence GEMV route admissions require production sequence wins")
-    func bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins() {
+    func bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins() throws {
         let rows = [
             makeBatchedResultFixture(role: "batched", sequenceLength: 16, variant: "base", averageGpuMicroseconds: 100.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 16, variant: "tile2", averageGpuMicroseconds: 50.0),
@@ -209,9 +219,19 @@ struct SequenceGEMVMicrobenchmarkTests {
         let tile4 = routeRows.first { $0.variant == "tile4" }
         #expect(tile2?.routePromotionAdmission == "candidate-batched-gemv-default-route")
         #expect(tile2?.failingSequenceLengths == [])
+        #expect(tile2?.requiredProfileRouteGate == "experimental-route-observed")
+        #expect(tile2?.readinessPrerequisite == "requires-full-profile-route-gate")
         #expect(tile4?.routePromotionAdmission == "reject-cross-sequence-threshold")
         #expect(tile4?.failingSequenceLengths == [128])
         #expect(tile4?.thresholdShortfallPercent == 2.0)
+        #expect(tile4?.requiredProfileRouteGate == "")
+        #expect(tile4?.readinessPrerequisite == "microbench-rejected")
+
+        let artifact = try writeBatchedRoutePromotionCSV(rows: routeRows)
+        let csv = try String(contentsOf: artifact, encoding: .utf8)
+        #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
+        #expect(csv.contains("candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
+        #expect(csv.contains("reject-cross-sequence-threshold,,microbench-rejected"))
     }
 
     private func printReport(
@@ -298,6 +318,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 "thresholdShortfallPercent",
                 "failingSequenceLengths",
                 "routePromotionAdmission",
+                "requiredProfileRouteGate",
+                "readinessPrerequisite",
             ].joined(separator: ","),
         ]
         for row in rows.sorted(by: singleRoutePromotionSort) {
@@ -312,6 +334,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 String(format: "%.3f", row.thresholdShortfallPercent),
                 row.failingSequenceLengths.map(String.init).joined(separator: "|"),
                 row.routePromotionAdmission,
+                row.requiredProfileRouteGate,
+                row.readinessPrerequisite,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -406,6 +430,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 "thresholdShortfallPercent",
                 "failingSequenceLengths",
                 "routePromotionAdmission",
+                "requiredProfileRouteGate",
+                "readinessPrerequisite",
             ].joined(separator: ","),
         ]
         for row in rows.sorted(by: batchedRoutePromotionSort) {
@@ -420,6 +446,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 String(format: "%.3f", row.thresholdShortfallPercent),
                 row.failingSequenceLengths.map(String.init).joined(separator: "|"),
                 row.routePromotionAdmission,
+                row.requiredProfileRouteGate,
+                row.readinessPrerequisite,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -687,6 +715,16 @@ private struct SingleGEMVRoutePromotionRow {
         guard minimumSpeedupPercent.isFinite else { return .infinity }
         return max(0.0, SingleGEMVRoutePromotionFactory.promotionSpeedupThresholdPercent - minimumSpeedupPercent)
     }
+
+    var requiredProfileRouteGate: String {
+        routePromotionAdmission.hasPrefix("candidate-") ? "experimental-route-observed" : ""
+    }
+
+    var readinessPrerequisite: String {
+        routePromotionAdmission.hasPrefix("candidate-")
+            ? "requires-full-profile-route-gate"
+            : "microbench-rejected"
+    }
 }
 
 private enum SingleGEMVRoutePromotionFactory {
@@ -777,6 +815,16 @@ private struct BatchedGEMVRoutePromotionRow {
     var thresholdShortfallPercent: Double {
         guard minimumSpeedupPercent.isFinite else { return .infinity }
         return max(0.0, BatchedGEMVRoutePromotionFactory.promotionSpeedupThresholdPercent - minimumSpeedupPercent)
+    }
+
+    var requiredProfileRouteGate: String {
+        routePromotionAdmission.hasPrefix("candidate-") ? "experimental-route-observed" : ""
+    }
+
+    var readinessPrerequisite: String {
+        routePromotionAdmission.hasPrefix("candidate-")
+            ? "requires-full-profile-route-gate"
+            : "microbench-rejected"
     }
 }
 
