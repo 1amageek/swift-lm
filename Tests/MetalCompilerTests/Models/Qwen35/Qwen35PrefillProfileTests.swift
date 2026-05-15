@@ -208,6 +208,12 @@ struct Qwen35PrefillProfileTests {
                     weightTensorName: "model.layers.0.self_attn.o_proj.weight",
                     averageGpuMicroseconds: 500
                 ),
+                syntheticProfileEntry(
+                    index: 5,
+                    kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                    weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                    averageGpuMicroseconds: 600
+                ),
             ],
             sequenceLength: 128,
             directory: directory
@@ -220,6 +226,7 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("128,batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s,1,300.000,300.000,baseline-route-observed"))
         #expect(csv.contains("128,mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,400.000,400.000,default-runtime-gated-route"))
         #expect(csv.contains("128,single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,500.000,500.000,experimental-route-observed"))
+        #expect(csv.contains("128,recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,600.000,600.000,experimental-route-observed"))
     }
 
     @Test("Route gate summarizes production sequence routes")
@@ -249,6 +256,12 @@ struct Qwen35PrefillProfileTests {
                         weightTensorName: "model.layers.0.self_attn.o_proj.weight",
                         averageGpuMicroseconds: 50
                     ),
+                    syntheticProfileEntry(
+                        index: 5,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 600
+                    ),
                 ],
                 128: [
                     syntheticProfileEntry(
@@ -263,6 +276,12 @@ struct Qwen35PrefillProfileTests {
                         weightTensorName: "model.layers.0.self_attn.o_proj.weight",
                         averageGpuMicroseconds: 400
                     ),
+                    syntheticProfileEntry(
+                        index: 6,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 700
+                    ),
                 ],
             ],
             directory: directory
@@ -273,6 +292,7 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,,default-runtime-gated-route-active"))
         #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,64,1,200.000,baseline-route-observed,128,missing-production-sequence"))
         #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
+        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,64|128,1|1,1300.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
     }
 
     @Test("Route readiness combines microbench and full profile gates")
@@ -823,11 +843,15 @@ struct Qwen35PrefillProfileTests {
         entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
             || entry.kernelName.hasPrefix("batched_gemv")
             || entry.kernelName.hasPrefix("mlp_fused_swiglu_down")
+            || entry.kernelName.hasPrefix("recurrent_block_row_grid_fan_in")
     }
 
     private func projectionRouteFamily(_ kernelName: String) -> String {
         if kernelName.hasPrefix("mlp_fused_swiglu_down") {
             return "mlp_fused_down"
+        }
+        if kernelName.hasPrefix("recurrent_block_row_grid_fan_in") {
+            return "recurrent_block_row_grid_fan_in"
         }
         if kernelName.hasPrefix("batched_gemv") {
             return "batched_projection"
@@ -840,6 +864,9 @@ struct Qwen35PrefillProfileTests {
 
     private func routeObservation(kernelName: String, sequenceLength: Int) -> String {
         if kernelName.hasSuffix("_tile2") || kernelName.hasSuffix("_tile4") || kernelName.hasSuffix("_rps2") {
+            return "experimental-route-observed"
+        }
+        if kernelName.hasPrefix("recurrent_block_row_grid_fan_in") {
             return "experimental-route-observed"
         }
         if kernelName.hasPrefix("mlp_fused_swiglu_down") {

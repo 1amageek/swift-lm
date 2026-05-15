@@ -286,6 +286,7 @@ flowchart TD
 | 2026-05-16 | `Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1` | Pass; same-build profile changed default 46.270/164.823/325.682 ms to row-grid 56.829/163.170/322.151 ms for seqLen 16/64/128, so the route is still opt-in pending runtime gating/repeated evidence |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass after adding runtime admission at seqLen >= 64 and making debug/probe executors honor `PrefillStepExecutionCondition`; short prompts now observe the same unfused path as production while long prompts can exercise row-grid fan-in |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; runtime-gated row-grid keeps seqLen 16 on the 293-step unfused path and routes seqLen 64/128 through 18 row-grid fan-in dispatches |
+| 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` and `.../routeGateSummarizesProductionSequenceRoutes` | Pass; route manifest/gate now classify `recurrent_block_row_grid_fan_in_seq_bf16_f32` as the experimental `linear_attn.out_proj` fan-in route instead of only showing the replaced GEMV as missing |
 
 ## Failed Experiments
 
