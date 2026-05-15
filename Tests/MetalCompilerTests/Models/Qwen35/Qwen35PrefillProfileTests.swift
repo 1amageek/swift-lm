@@ -461,6 +461,52 @@ struct Qwen35PrefillProfileTests {
         #expect(missingCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64,100.000,90.000,10.000,1,2,5.000,0.000,128,missing-production-sequence"))
     }
 
+    @Test("Full-profile speed gate can be reconstructed from profile CSV artifacts")
+    func fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-full-profile-speed-artifact-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let baseline64 = try writeSyntheticProfileCSV(
+            directory: directory,
+            filename: "baseline-seq64.csv",
+            averageGpuMicroseconds: [100, 200]
+        )
+        let baseline128 = try writeSyntheticProfileCSV(
+            directory: directory,
+            filename: "baseline-seq128.csv",
+            averageGpuMicroseconds: [400]
+        )
+        let experimental64 = try writeSyntheticProfileCSV(
+            directory: directory,
+            filename: "experimental-seq64.csv",
+            averageGpuMicroseconds: [250]
+        )
+        let experimental128 = try writeSyntheticProfileCSV(
+            directory: directory,
+            filename: "experimental-seq128.csv",
+            averageGpuMicroseconds: [350]
+        )
+
+        let speedGateURL = try writeFullProfileSpeedGate(
+            baselineProfileArtifactsByLength: [
+                64: baseline64,
+                128: baseline128,
+            ],
+            experimentalProfileArtifactsByLength: [
+                64: experimental64,
+                128: experimental128,
+            ],
+            routeFamily: "recurrent_block_row_grid_fan_in",
+            role: "linear_attn.out_proj",
+            variant: "row_grid_fan_in",
+            minimumSpeedupPercent: 5,
+            directory: directory
+        )
+        let speedGateCSV = try String(contentsOf: speedGateURL, encoding: .utf8)
+        #expect(speedGateCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64|128,300.000|400.000,250.000|350.000,16.667|12.500,2,2,5.000,0.000,,full-profile-speedup-observed"))
+    }
+
     @Test("Route readiness combines microbench and full profile gates")
     func routeReadinessCombinesMicrobenchAndFullProfileGates() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -648,6 +694,8 @@ struct Qwen35PrefillProfileTests {
             .appendingPathComponent("row-grid-fan-in-route-promotions.csv")
         let routeGateArtifact = profileDirectory
             .appendingPathComponent("qwen35-prefill-route-gate.csv")
+        let speedGateArtifact = profileDirectory
+            .appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
 
         try requireArtifact(singleArtifact)
         try requireArtifact(batchedArtifact)
@@ -663,7 +711,10 @@ struct Qwen35PrefillProfileTests {
 
         let rows = routeReadinessRows(
             candidates: candidates,
-            profileGates: try profileRouteGates(artifact: routeGateArtifact)
+            profileGates: try profileRouteGates(artifact: routeGateArtifact),
+            profileSpeedGates: FileManager.default.fileExists(atPath: speedGateArtifact.path)
+                ? try profileSpeedGates(artifact: speedGateArtifact)
+                : []
         )
         let output = try writeRouteReadiness(rows: rows, directory: profileDirectory)
         #expect(!rows.isEmpty)
@@ -944,6 +995,46 @@ struct Qwen35PrefillProfileTests {
         minimumSpeedupPercent: Double,
         directory: URL
     ) throws -> URL {
+        try writeFullProfileSpeedGate(
+            baselineTotalsByLength: baselineProfilesByLength.mapValues(profileTotalGpuMicroseconds),
+            experimentalTotalsByLength: experimentalProfilesByLength.mapValues(profileTotalGpuMicroseconds),
+            routeFamily: routeFamily,
+            role: role,
+            variant: variant,
+            minimumSpeedupPercent: minimumSpeedupPercent,
+            directory: directory
+        )
+    }
+
+    private func writeFullProfileSpeedGate(
+        baselineProfileArtifactsByLength: [Int: URL],
+        experimentalProfileArtifactsByLength: [Int: URL],
+        routeFamily: String,
+        role: String,
+        variant: String,
+        minimumSpeedupPercent: Double,
+        directory: URL
+    ) throws -> URL {
+        try writeFullProfileSpeedGate(
+            baselineTotalsByLength: profileTotalsByLength(baselineProfileArtifactsByLength),
+            experimentalTotalsByLength: profileTotalsByLength(experimentalProfileArtifactsByLength),
+            routeFamily: routeFamily,
+            role: role,
+            variant: variant,
+            minimumSpeedupPercent: minimumSpeedupPercent,
+            directory: directory
+        )
+    }
+
+    private func writeFullProfileSpeedGate(
+        baselineTotalsByLength: [Int: Double],
+        experimentalTotalsByLength: [Int: Double],
+        routeFamily: String,
+        role: String,
+        variant: String,
+        minimumSpeedupPercent: Double,
+        directory: URL
+    ) throws -> URL {
         let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= 64 }
         let url = directory.appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
 
@@ -957,13 +1048,11 @@ struct Qwen35PrefillProfileTests {
         var missingSequenceLengths: [Int] = []
 
         for sequenceLength in productionSequenceLengths {
-            guard let baselineProfiles = baselineProfilesByLength[sequenceLength],
-                  let experimentalProfiles = experimentalProfilesByLength[sequenceLength] else {
+            guard let baselineTotal = baselineTotalsByLength[sequenceLength],
+                  let experimentalTotal = experimentalTotalsByLength[sequenceLength] else {
                 missingSequenceLengths.append(sequenceLength)
                 continue
             }
-            let baselineTotal = profileTotalGpuMicroseconds(baselineProfiles)
-            let experimentalTotal = profileTotalGpuMicroseconds(experimentalProfiles)
             let speedupPercent = baselineTotal > 0
                 ? (baselineTotal - experimentalTotal) / baselineTotal * 100.0
                 : 0.0
@@ -1031,6 +1120,28 @@ struct Qwen35PrefillProfileTests {
 
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
         return url
+    }
+
+    private func profileTotalsByLength(_ artifactsByLength: [Int: URL]) throws -> [Int: Double] {
+        var totals: [Int: Double] = [:]
+        for (sequenceLength, artifact) in artifactsByLength {
+            totals[sequenceLength] = try profileTotalGpuMicroseconds(artifact: artifact)
+        }
+        return totals
+    }
+
+    private func profileTotalGpuMicroseconds(artifact: URL) throws -> Double {
+        try parseCSV(artifact).reduce(0.0) { total, row in
+            let value = try requiredCSVValue("averageGpuMicroseconds", in: row, artifact: artifact)
+            guard let microseconds = Double(value) else {
+                throw RouteReadinessArtifactError.invalidNumericValue(
+                    path: artifact.path,
+                    column: "averageGpuMicroseconds",
+                    value: value
+                )
+            }
+            return total + microseconds
+        }
     }
 
     private func profileTotalGpuMicroseconds(_ profiles: [MetalPrefillProfile.Entry]) -> Double {
@@ -1469,6 +1580,18 @@ struct Qwen35PrefillProfileTests {
         )
     }
 
+    private func writeSyntheticProfileCSV(
+        directory: URL,
+        filename: String,
+        averageGpuMicroseconds: [Double]
+    ) throws -> URL {
+        let url = directory.appendingPathComponent(filename)
+        let lines = ["averageGpuMicroseconds"]
+            + averageGpuMicroseconds.map { String(format: "%.3f", $0) }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func printScalingReport(profilesByLength: [Int: [MetalPrefillProfile.Entry]], iterations: Int) {
         print()
         print("=== Per-kernel scaling (seqLen 16 → 128) ===")
@@ -1527,6 +1650,7 @@ private enum RouteReadinessArtifactError: Error, CustomStringConvertible {
     case rowWidthMismatch(path: String, expected: Int, actual: Int)
     case unclosedQuote(String)
     case missingColumn(path: String, column: String)
+    case invalidNumericValue(path: String, column: String, value: String)
     case profileUnalignedRole(routeFamily: String, role: String)
 
     var description: String {
@@ -1541,6 +1665,8 @@ private enum RouteReadinessArtifactError: Error, CustomStringConvertible {
             return "CSV artifact has an unclosed quote: \(path)"
         case .missingColumn(let path, let column):
             return "CSV artifact \(path) is missing required column \(column)"
+        case .invalidNumericValue(let path, let column, let value):
+            return "CSV artifact \(path) has invalid numeric value \(value) in column \(column)"
         case .profileUnalignedRole(let routeFamily, let role):
             return "Route-readiness artifact role \(routeFamily)/\(role) does not align with the full-profile route gate"
         }
