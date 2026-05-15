@@ -256,6 +256,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel summary CSV now emits per-sequence promotion admission reasons and has a synthetic contract test for short-sequence, noisy-speedup, and qkpar candidate classification |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
+| 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 
 ## Failed Experiments
 
@@ -439,6 +440,18 @@ The next acceptable projection candidate should either improve the standalone
 single sequence GEMV dataflow without changing producer ownership, or introduce
 a new producer/projection fusion shape that keeps producer work materialized
 once and preserves output-row parallelism.
+
+The single sequence GEMV microbenchmark now applies the same production-length
+gate used by the SSM harness:
+
+| Artifact | Purpose |
+|---|---|
+| `qwen35-bf16-single-sequence-gemv.csv` | Raw timing for base, row2, tile2, and tile4 by role and sequence length |
+| `qwen35-bf16-single-sequence-gemv-route-promotions.csv` | Per-role route admission across 64/128-token production lengths |
+
+Latest run: all single-GEMV variants remain non-default. Several variants win
+one length, but every `row2` / `tile2` / `tile4` candidate fails at least one of
+64 or 128 tokens and is recorded as `reject-cross-sequence-threshold`.
 
 The live profile test now also prints the BF16 single sequence GEMV role
 breakdown directly, so the dominant dependent projection can be identified

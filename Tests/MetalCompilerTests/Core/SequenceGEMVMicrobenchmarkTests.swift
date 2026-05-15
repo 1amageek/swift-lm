@@ -46,9 +46,12 @@ struct SequenceGEMVMicrobenchmarkTests {
             }
         }
 
+        let routePromotionRows = summarizeSingleRoutePromotions(rows: rows)
         let artifact = try writeCSV(rows: rows)
-        printReport(rows: rows, artifact: artifact)
+        let routePromotionArtifact = try writeSingleRoutePromotionCSV(rows: routePromotionRows)
+        printReport(rows: rows, routePromotionRows: routePromotionRows, artifact: artifact, routePromotionArtifact: routePromotionArtifact)
         #expect(rows.count == shapes.count * Self.sequenceLengths.count * variants.count)
+        #expect(routePromotionRows.count == shapes.count * (variants.count - 1))
     }
 
     @Test("BF16 batched sequence GEMV real-shape microbench")
@@ -162,16 +165,54 @@ struct SequenceGEMVMicrobenchmarkTests {
         #expect(rows.count == Self.sequenceLengths.count * variants.count)
     }
 
-    private func printReport(rows: [ResultRow], artifact: URL) {
+    @Test("BF16 single sequence GEMV route admissions require production sequence wins")
+    func bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins() {
+        let rows = [
+            makeResultFixture(role: "dependent", sequenceLength: 16, variant: "base", averageGpuMicroseconds: 100.0),
+            makeResultFixture(role: "dependent", sequenceLength: 16, variant: "tile2", averageGpuMicroseconds: 50.0),
+            makeResultFixture(role: "dependent", sequenceLength: 64, variant: "base", averageGpuMicroseconds: 100.0),
+            makeResultFixture(role: "dependent", sequenceLength: 64, variant: "tile2", averageGpuMicroseconds: 90.0),
+            makeResultFixture(role: "dependent", sequenceLength: 64, variant: "row2", averageGpuMicroseconds: 90.0),
+            makeResultFixture(role: "dependent", sequenceLength: 128, variant: "base", averageGpuMicroseconds: 100.0),
+            makeResultFixture(role: "dependent", sequenceLength: 128, variant: "tile2", averageGpuMicroseconds: 90.0),
+            makeResultFixture(role: "dependent", sequenceLength: 128, variant: "row2", averageGpuMicroseconds: 99.0),
+        ]
+
+        let routeRows = summarizeSingleRoutePromotions(rows: rows)
+        let tile2 = routeRows.first { $0.variant == "tile2" }
+        let row2 = routeRows.first { $0.variant == "row2" }
+        #expect(tile2?.routePromotionAdmission == "candidate-single-gemv-default-route")
+        #expect(tile2?.failingSequenceLengths == [])
+        #expect(row2?.routePromotionAdmission == "reject-cross-sequence-threshold")
+        #expect(row2?.failingSequenceLengths == [128])
+        #expect(row2?.thresholdShortfallPercent == 2.0)
+    }
+
+    private func printReport(
+        rows: [ResultRow],
+        routePromotionRows: [SingleGEMVRoutePromotionRow],
+        artifact: URL,
+        routePromotionArtifact: URL
+    ) {
         print()
         print("=== BF16 single sequence GEMV real-shape microbench ===")
         print("artifact: \(artifact.path)")
+        print("route promotion artifact: \(routePromotionArtifact.path)")
         print("role                    seq  variant  avg_us  us/output  grid      tg")
         for row in rows.sorted(by: rowSort) {
             let role = row.role.padding(toLength: 23, withPad: " ", startingAt: 0)
             let variant = row.variant.padding(toLength: 7, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 9, withPad: " ", startingAt: 0)
             print("  \(role) \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.4f", row.microsecondsPerOutput))  \(grid) \(row.threadgroupWidth)")
+        }
+        print()
+        print("=== BF16 single sequence GEMV route promotion admissions ===")
+        print("role                    variant  pass/required  min_speedup  shortfall  failing_seq  admission")
+        for row in routePromotionRows.sorted(by: singleRoutePromotionSort) {
+            let role = row.role.padding(toLength: 23, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 7, withPad: " ", startingAt: 0)
+            let failingSequences = row.failingSequenceLengths.map(String.init).joined(separator: "|")
+            print("  \(role) \(variant)  \(row.passingSequenceCount)/\(row.requiredSequenceCount)          \(String(format: "%7.2f", row.minimumSpeedupPercent))%  \(String(format: "%8.2f", row.thresholdShortfallPercent))%  \(failingSequences.padding(toLength: 11, withPad: " ", startingAt: 0))  \(row.routePromotionAdmission)")
         }
     }
 
@@ -208,6 +249,43 @@ struct SequenceGEMVMicrobenchmarkTests {
                 String(row.threadgroupWidth),
                 String(format: "%.3f", row.averageGpuMicroseconds),
                 String(format: "%.6f", row.microsecondsPerOutput),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func writeSingleRoutePromotionCSV(rows: [SingleGEMVRoutePromotionRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/sequence-gemv-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-single-sequence-gemv-route-promotions.csv")
+        var lines = [
+            [
+                "role",
+                "variant",
+                "productionSequenceLengths",
+                "speedupPercents",
+                "passingSequenceCount",
+                "requiredSequenceCount",
+                "minimumSpeedupPercent",
+                "thresholdShortfallPercent",
+                "failingSequenceLengths",
+                "routePromotionAdmission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: singleRoutePromotionSort) {
+            lines.append([
+                row.role,
+                row.variant,
+                row.productionSequenceLengths.map(String.init).joined(separator: "|"),
+                row.speedupPercents.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+                String(row.passingSequenceCount),
+                String(row.requiredSequenceCount),
+                String(format: "%.3f", row.minimumSpeedupPercent),
+                String(format: "%.3f", row.thresholdShortfallPercent),
+                row.failingSequenceLengths.map(String.init).joined(separator: "|"),
+                row.routePromotionAdmission,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -354,6 +432,52 @@ struct SequenceGEMVMicrobenchmarkTests {
         }
         return lhs.rowsPerSimdgroup < rhs.rowsPerSimdgroup
     }
+
+    private func singleRoutePromotionSort(
+        _ lhs: SingleGEMVRoutePromotionRow,
+        _ rhs: SingleGEMVRoutePromotionRow
+    ) -> Bool {
+        if lhs.role != rhs.role { return lhs.role < rhs.role }
+        return lhs.variant < rhs.variant
+    }
+
+    private func summarizeSingleRoutePromotions(rows: [ResultRow]) -> [SingleGEMVRoutePromotionRow] {
+        let productionSequenceLengths = Self.sequenceLengths.filter {
+            $0 >= SingleGEMVRoutePromotionFactory.minimumPromotionSequenceLength
+        }
+        let roles = Array(Set(rows.map(\.role))).sorted()
+        let variants = Array(Set(rows.map(\.variant))).filter { $0 != "base" }.sorted()
+        return roles.flatMap { role in
+            variants.map { variant in
+                SingleGEMVRoutePromotionFactory.make(
+                    role: role,
+                    variant: variant,
+                    productionSequenceLengths: productionSequenceLengths,
+                    rows: rows
+                )
+            }
+        }
+    }
+
+    private func makeResultFixture(
+        role: String,
+        sequenceLength: Int,
+        variant: String,
+        averageGpuMicroseconds: Double
+    ) -> ResultRow {
+        ResultRow(
+            role: role,
+            inputDimension: 2048,
+            outputDimension: 1024,
+            sequenceLength: sequenceLength,
+            variant: variant,
+            sequenceTile: variant == "base" ? 1 : 2,
+            gridWidth: 1024,
+            gridHeight: sequenceLength,
+            threadgroupWidth: 64,
+            averageGpuMicroseconds: averageGpuMicroseconds
+        )
+    }
 }
 
 private struct Shape {
@@ -417,6 +541,75 @@ private struct ResultRow {
 
     var microsecondsPerOutput: Double {
         averageGpuMicroseconds / Double(sequenceLength * outputDimension)
+    }
+}
+
+private struct SingleGEMVRoutePromotionRow {
+    let role: String
+    let variant: String
+    let productionSequenceLengths: [Int]
+    let speedupPercents: [Double]
+    let passingSequenceCount: Int
+    let requiredSequenceCount: Int
+    let failingSequenceLengths: [Int]
+    let routePromotionAdmission: String
+
+    var minimumSpeedupPercent: Double {
+        speedupPercents.min() ?? .nan
+    }
+
+    var thresholdShortfallPercent: Double {
+        guard minimumSpeedupPercent.isFinite else { return .infinity }
+        return max(0.0, SingleGEMVRoutePromotionFactory.promotionSpeedupThresholdPercent - minimumSpeedupPercent)
+    }
+}
+
+private enum SingleGEMVRoutePromotionFactory {
+    static let promotionSpeedupThresholdPercent = 3.0
+    static let minimumPromotionSequenceLength = 64
+
+    static func make(
+        role: String,
+        variant: String,
+        productionSequenceLengths: [Int],
+        rows: [ResultRow]
+    ) -> SingleGEMVRoutePromotionRow {
+        var speedupPercents: [Double] = []
+
+        for sequenceLength in productionSequenceLengths {
+            let base = rows.first {
+                $0.role == role && $0.sequenceLength == sequenceLength && $0.variant == "base"
+            }
+            let candidate = rows.first {
+                $0.role == role && $0.sequenceLength == sequenceLength && $0.variant == variant
+            }
+            guard let base, let candidate else {
+                speedupPercents.append(-Double.infinity)
+                continue
+            }
+            let speedup = (base.averageGpuMicroseconds - candidate.averageGpuMicroseconds)
+                / base.averageGpuMicroseconds * 100.0
+            speedupPercents.append(speedup)
+        }
+
+        let passingCount = speedupPercents.filter { $0 >= promotionSpeedupThresholdPercent }.count
+        let failingSequenceLengths = zip(productionSequenceLengths, speedupPercents).compactMap { sequenceLength, speedup in
+            speedup >= promotionSpeedupThresholdPercent ? nil : sequenceLength
+        }
+        let admission = passingCount == productionSequenceLengths.count
+            ? "candidate-single-gemv-default-route"
+            : "reject-cross-sequence-threshold"
+
+        return SingleGEMVRoutePromotionRow(
+            role: role,
+            variant: variant,
+            productionSequenceLengths: productionSequenceLengths,
+            speedupPercents: speedupPercents,
+            passingSequenceCount: passingCount,
+            requiredSequenceCount: productionSequenceLengths.count,
+            failingSequenceLengths: failingSequenceLengths,
+            routePromotionAdmission: admission
+        )
     }
 }
 
