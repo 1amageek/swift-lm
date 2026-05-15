@@ -116,9 +116,12 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
 
         let artifact = try writePhaseCSV(rows: rows)
-        printPhaseReport(rows: rows, artifact: artifact)
+        let feasibilityRows = SSMStateCandidateFeasibilityFactory.makeRows()
+        let feasibilityArtifact = try writeStateCandidateFeasibilityCSV(rows: feasibilityRows)
+        printPhaseReport(rows: rows, artifact: artifact, feasibilityArtifact: feasibilityArtifact)
         #expect(rows.count == Self.sequenceLengths.count * phases.count)
         #expect(rows.allSatisfy { $0.outputChecksum.isFinite && $0.outputChecksum > 0 })
+        #expect(feasibilityRows.count == SSMStateCandidateShape.allCases.count)
         #expect(rows.filter { $0.phase == "state_recurrence_cache32" }.allSatisfy {
             $0.phasePromotionAdmission == "reject-lane-parallelism-lost"
         })
@@ -220,6 +223,19 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
         #expect(rows.count == Self.stabilitySamples * candidatePhases.count)
         #expect(rows.allSatisfy { $0.candidateOutputChecksum.isFinite && $0.candidateOutputChecksum > 0 })
+    }
+
+    @Test("SSM state candidate feasibility rejects unsafe shapes before timing")
+    func ssmStateCandidateFeasibilityRejectsUnsafeShapesBeforeTiming() {
+        let rows = SSMStateCandidateFeasibilityFactory.makeRows()
+        let byShape = Dictionary(uniqueKeysWithValues: rows.map { ($0.shape, $0) })
+
+        #expect(byShape[.baseline]?.admission == "baseline")
+        #expect(byShape[.qkParallel]?.admission == "eligible-for-full-kernel-check")
+        #expect(byShape[.registerBlockD2]?.admission == "reject-serial-value-lanes")
+        #expect(byShape[.cache32]?.admission == "reject-lane-parallelism-lost")
+        #expect(byShape[.cache64]?.admission == "reject-threadgroup-memory-limit")
+        #expect(byShape[.cache64]?.staticThreadgroupBytes == 34_316)
     }
 
     @Test("SSM summary promotion admissions classify candidates")
@@ -743,10 +759,53 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
-    private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL) {
+    private func writeStateCandidateFeasibilityCSV(rows: [SSMStateCandidateFeasibilityRow]) throws -> URL {
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-state-candidate-feasibility.csv")
+        var lines = [
+            [
+                "shape",
+                "description",
+                "threadgroupWidth",
+                "activeThreadsPerThreadgroup",
+                "valueLanesPerThread",
+                "coalescedValueLanesPerStateRow",
+                "serialStateLanesPerThread",
+                "estimatedStateTotalBytesPerToken",
+                "staticThreadgroupBytes",
+                "threadgroupMemoryLimitBytes",
+                "laneParallelismPreserved",
+                "threadgroupMemoryFits",
+                "admission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.shape.rawValue < $1.shape.rawValue }) {
+            lines.append([
+                row.shape.rawValue,
+                row.description,
+                String(row.threadgroupWidth),
+                String(row.activeThreadsPerThreadgroup),
+                String(row.valueLanesPerThread),
+                String(row.coalescedValueLanesPerStateRow),
+                String(row.serialStateLanesPerThread),
+                String(row.estimatedStateTotalBytesPerToken),
+                String(row.staticThreadgroupBytes),
+                String(row.threadgroupMemoryLimitBytes),
+                String(row.laneParallelismPreserved),
+                String(row.threadgroupMemoryFits),
+                row.admission,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL, feasibilityArtifact: URL) {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
         print("artifact: \(artifact.path)")
+        print("state candidate feasibility artifact: \(feasibilityArtifact.path)")
         print("seq  phase                      avg_us  us/token  full_%  active  lanes  stride  coalesced  state_mb/tok")
         for row in rows.sorted(by: phaseRowSort) {
             let phase = row.phase.padding(toLength: 25, withPad: " ", startingAt: 0)
@@ -1151,6 +1210,143 @@ private struct SSMPhaseResultRow {
             return 32
         }
         return nil
+    }
+}
+
+private enum SSMStateCandidateShape: String, CaseIterable {
+    case baseline = "baseline"
+    case registerBlockD2 = "register_block_d2"
+    case qkParallel = "qk_parallel"
+    case cache32 = "cache32"
+    case cache64 = "cache64"
+
+    var description: String {
+        switch self {
+        case .baseline:
+            return "current decode-equivalent state recurrence"
+        case .registerBlockD2:
+            return "two value lanes per active thread"
+        case .qkParallel:
+            return "parallel q/k scalar setup with preserved value lanes"
+        case .cache32:
+            return "32-lane decayed-state cache tile"
+        case .cache64:
+            return "64-lane decayed-state cache tile"
+        }
+    }
+
+    var valueLanesPerThread: Int {
+        self == .registerBlockD2 ? 2 : 1
+    }
+
+    var stateCacheTileWidth: Int? {
+        switch self {
+        case .cache32:
+            return 32
+        case .cache64:
+            return 64
+        case .baseline, .registerBlockD2, .qkParallel:
+            return nil
+        }
+    }
+
+    var usesParallelQKReduction: Bool {
+        self == .qkParallel
+    }
+}
+
+private struct SSMStateCandidateFeasibilityRow {
+    let shape: SSMStateCandidateShape
+    let description: String
+    let threadgroupWidth: Int
+    let activeThreadsPerThreadgroup: Int
+    let valueLanesPerThread: Int
+    let coalescedValueLanesPerStateRow: Int
+    let serialStateLanesPerThread: Int
+    let estimatedStateTotalBytesPerToken: Int
+    let staticThreadgroupBytes: Int
+    let threadgroupMemoryLimitBytes: Int
+
+    var laneParallelismPreserved: Bool {
+        valueLanesPerThread == 1 && coalescedValueLanesPerStateRow == SSMStateCandidateFeasibilityFactory.valueDimension
+    }
+
+    var threadgroupMemoryFits: Bool {
+        staticThreadgroupBytes <= threadgroupMemoryLimitBytes
+    }
+
+    var admission: String {
+        if shape == .baseline {
+            return "baseline"
+        }
+        if !threadgroupMemoryFits {
+            return "reject-threadgroup-memory-limit"
+        }
+        if coalescedValueLanesPerStateRow < SSMStateCandidateFeasibilityFactory.valueDimension {
+            return "reject-lane-parallelism-lost"
+        }
+        if valueLanesPerThread != 1 {
+            return "reject-serial-value-lanes"
+        }
+        return "eligible-for-full-kernel-check"
+    }
+}
+
+private enum SSMStateCandidateFeasibilityFactory {
+    static let headCount = 16
+    static let keyDimension = 128
+    static let valueDimension = 128
+    static let threadgroupWidth = 384
+    static let threadgroupMemoryLimitBytes = 32_768
+
+    static func makeRows() -> [SSMStateCandidateFeasibilityRow] {
+        SSMStateCandidateShape.allCases.map(makeRow)
+    }
+
+    private static func makeRow(shape: SSMStateCandidateShape) -> SSMStateCandidateFeasibilityRow {
+        let activeThreads = activeThreadsPerThreadgroup(shape: shape)
+        let coalescedValueLanes = activeThreads * shape.valueLanesPerThread
+        return SSMStateCandidateFeasibilityRow(
+            shape: shape,
+            description: shape.description,
+            threadgroupWidth: threadgroupWidth,
+            activeThreadsPerThreadgroup: activeThreads,
+            valueLanesPerThread: shape.valueLanesPerThread,
+            coalescedValueLanesPerStateRow: coalescedValueLanes,
+            serialStateLanesPerThread: serialStateLanesPerThread(shape: shape),
+            estimatedStateTotalBytesPerToken: estimatedStateTotalBytesPerToken(shape: shape),
+            staticThreadgroupBytes: staticThreadgroupBytes(shape: shape),
+            threadgroupMemoryLimitBytes: threadgroupMemoryLimitBytes
+        )
+    }
+
+    private static func activeThreadsPerThreadgroup(shape: SSMStateCandidateShape) -> Int {
+        if let cacheTileWidth = shape.stateCacheTileWidth {
+            return min(threadgroupWidth, cacheTileWidth)
+        }
+        let valueThreadCount = (valueDimension + shape.valueLanesPerThread - 1) / shape.valueLanesPerThread
+        return min(threadgroupWidth, valueThreadCount)
+    }
+
+    private static func serialStateLanesPerThread(shape: SSMStateCandidateShape) -> Int {
+        if let cacheTileWidth = shape.stateCacheTileWidth {
+            return (valueDimension + cacheTileWidth - 1) / cacheTileWidth
+        }
+        return shape.valueLanesPerThread
+    }
+
+    private static func estimatedStateTotalBytesPerToken(shape: SSMStateCandidateShape) -> Int {
+        let devicePasses = shape.stateCacheTileWidth == nil ? 3 : 2
+        return headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride * devicePasses
+    }
+
+    private static func staticThreadgroupBytes(shape: SSMStateCandidateShape) -> Int {
+        let floatBytes = MemoryLayout<Float>.stride
+        let convSiluCacheBytes = threadgroupWidth * floatBytes
+        let scalarCacheBytes = 3 * floatBytes
+        let qkPartialBytes = shape.usesParallelQKReduction ? 3 * keyDimension * floatBytes : 0
+        let decayedStateCacheBytes = (shape.stateCacheTileWidth ?? 0) * keyDimension * floatBytes
+        return convSiluCacheBytes + scalarCacheBytes + qkPartialBytes + decayedStateCacheBytes
     }
 }
 

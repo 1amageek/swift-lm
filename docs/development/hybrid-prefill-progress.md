@@ -258,6 +258,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
 | 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmPhaseFullBridgeBlocksPhaseOnlyRoutePromotion` and `SWIFTLM_VALIDATE_SSM_RECURRENCE_BRIDGE_ARTIFACTS=1 .../ssmPhaseFullBridgeArtifactsCanBeReconstructedWhenRequested` | Pass; phase/full bridge artifact joins phase stability with full-kernel route promotion so phase-only wins cannot be promoted |
 | 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmThreadgroupPolicyAdmissionsClassifyCandidates` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrenceRealShapeMicrobench` | Pass; SSM threadgroup policy artifact rejects current fixed/adaptive routes, while the synthetic contract covers the policy-only candidate classification |
+| 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmStateCandidateFeasibilityRejectsUnsafeShapesBeforeTiming` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrencePhaseIsolationMicrobench` | Pass; SSM state-candidate feasibility artifact rejects serial-lane, lane-parallelism-losing, and threadgroup-memory-over-limit shapes before timing or routing |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
@@ -1729,7 +1730,9 @@ width until a full-model profile shows a stable win.
 
 ## SSM Recurrence Decision Summary Harness (2026-05-15)
 
-The SSM recurrence microbenchmark now emits five artifacts:
+The SSM recurrence microbenchmark now emits six primary artifacts, plus one
+optional phase/full bridge artifact when the route-promotion artifact is
+present:
 
 | Artifact | Purpose |
 |---|---|
@@ -1738,6 +1741,8 @@ The SSM recurrence microbenchmark now emits five artifacts:
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, active-thread shape, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-stability.csv` | Repeated 128-token phase candidate samples compared against the baseline state phase in the same test process |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-threadgroup-policies.csv` | Fixed 128/256 and adaptive best-base threadgroup policy comparison against default 384 for production sequence lengths |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-feasibility.csv` | Static feasibility check for state-recurrence candidate shapes before timing or route implementation |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-full-bridge.csv` | Optional join between phase stability and full-kernel route promotion, emitted only when both inputs exist |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1817,9 +1822,9 @@ Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 3.16% | 75.23% | 23.22% | state recurrence dominates |
-| 64 | 2.68% | 90.49% | 22.98% | state recurrence dominates |
-| 128 | 2.64% | 85.24% | 23.15% | state recurrence dominates |
+| 16 | 1.31% | 32.81% | 5.78% | state recurrence is still the largest isolated phase |
+| 64 | 1.88% | 56.62% | 10.79% | state recurrence is still the largest isolated phase |
+| 128 | 2.60% | 106.65% | 22.84% | state recurrence dominates, with phase timing not additive |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
@@ -1969,6 +1974,17 @@ reasons:
 | `state_recurrence_qkpar` | `eligible-for-full-kernel-check` |
 | `state_recurrence_d2` | `reject-serial-value-lanes` |
 | `state_recurrence_cache32` | `reject-lane-parallelism-lost` |
+
+The feasibility artifact adds a static preflight gate before a candidate is
+compiled or timed:
+
+| Shape | Static bytes | Lane contract | Admission |
+|---|---:|---|---|
+| `baseline` | 1,548 | preserved | `baseline` |
+| `qk_parallel` | 3,084 | preserved | `eligible-for-full-kernel-check` |
+| `register_block_d2` | 1,548 | serial value lanes | `reject-serial-value-lanes` |
+| `cache32` | 17,932 | 32/128 lanes | `reject-lane-parallelism-lost` |
+| `cache64` | 34,316 | 64/128 lanes and exceeds 32 KiB | `reject-threadgroup-memory-limit` |
 
 This keeps the next optimization loop bounded: a phase candidate can be timed
 for diagnostics, but it should not advance to route implementation unless it
