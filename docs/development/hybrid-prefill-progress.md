@@ -260,6 +260,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-manifest contract hard-checks batched role normalization, fused MLP runtime-gated labeling, and experimental single-GEMV route labeling |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default-environment full profile now hard-checks active route shape: seqLen 16 keeps unfused `mlp.down_proj`, seqLen 64/128 use fused MLP, and remaining single projections stay limited to `linear_attn.out_proj` plus `self_attn.o_proj` |
 
 ## Failed Experiments
 
@@ -2132,6 +2133,12 @@ Current decision: use the route manifest as the full-model sanity check after
 each kernel-route experiment. A microbench candidate is not enough; the full
 profile must show that the intended route actually fired and that no unrelated
 projection family changed silently.
+
+In the default environment, `Qwen35PrefillProfileTests` now hard-checks this
+active route shape directly from the profile entries. The assertion is skipped
+only when explicit route override environment variables are present, so the same
+suite can still be used for opt-in experiments without weakening the default
+production route gate.
 
 The route manifest writer also has a lightweight synthetic contract test:
 

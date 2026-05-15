@@ -102,6 +102,7 @@ struct Qwen35PrefillProfileTests {
             )
             let profiles = profile.entries
             profilesByLength[seqLen] = profiles
+            assertDefaultProjectionRoutes(profiles: profiles, sequenceLength: seqLen)
             printCategoryBreakdown(profiles: profiles, iterations: Self.iterations, seqLen: seqLen)
             if seqLen == 128 {
                 printSingleProjectionRoleBreakdown(profiles: profiles)
@@ -427,6 +428,50 @@ struct Qwen35PrefillProfileTests {
             return "batched_projection"
         }
         return entry.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
+    }
+
+    private func assertDefaultProjectionRoutes(profiles: [MetalPrefillProfile.Entry], sequenceLength: Int) {
+        guard shouldAssertDefaultProjectionRoutes() else { return }
+
+        var counts: [String: Int] = [:]
+        for profile in profiles where isProjectionRouteManifestEntry(profile) {
+            let key = "\(projectionRouteFamily(profile.kernelName))/\(projectionManifestRole(profile))"
+            counts[key, default: 0] += 1
+        }
+
+        #expect(counts["batched_projection/linear_attn.in_proj"] == 18)
+        #expect(counts["batched_projection/mlp.gate_up"] == 24)
+        #expect(counts["batched_projection/self_attn.qkv"] == 6)
+        #expect(counts["single_projection/linear_attn.out_proj"] == 18)
+        #expect(counts["single_projection/self_attn.o_proj"] == 6)
+
+        if sequenceLength >= 64 {
+            #expect(counts["mlp_fused_down/mlp.down_proj"] == 24)
+            #expect(counts["single_projection/mlp.down_proj"] == nil)
+        } else {
+            #expect(counts["mlp_fused_down/mlp.down_proj"] == nil)
+            #expect(counts["single_projection/mlp.down_proj"] == 24)
+        }
+    }
+
+    private func shouldAssertDefaultProjectionRoutes() -> Bool {
+        let environment = ProcessInfo.processInfo.environment
+        let routeOverrideKeys = [
+            "SWIFTLM_PREFILL_BF16_SINGLE_TILE2",
+            "SWIFTLM_PREFILL_BF16_SINGLE_RPS2",
+            "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN",
+            "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS",
+            "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP",
+            "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_MIN_SEQUENCE_LENGTH",
+            "SWIFTLM_PREFILL_BF16_FUSED_ATTENTION_O",
+            "SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL",
+            "SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL",
+            "SWIFTLM_PREFILL_SSM_SHARED_RMS",
+            "SWIFTLM_PREFILL_SSM_PREWRITE_DECAY",
+            "SWIFTLM_PREFILL_SSM_QKPAR",
+            "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH",
+        ]
+        return !routeOverrideKeys.contains { environment[$0] != nil }
     }
 
     private func syntheticProfileEntry(
