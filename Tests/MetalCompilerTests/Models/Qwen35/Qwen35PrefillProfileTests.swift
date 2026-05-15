@@ -303,6 +303,164 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,64|128,1|1,1300.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
     }
 
+    @Test("Full-profile speed gate requires production sequence speedup")
+    func fullProfileSpeedGateRequiresProductionSequenceSpeedup() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-full-profile-speed-gate-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let speedupURL = try writeFullProfileSpeedGate(
+            baselineProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "ssm_recurrence_seq_bf16_f32",
+                        weightTensorName: "",
+                        averageGpuMicroseconds: 200
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 2,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 400
+                    ),
+                ],
+            ],
+            experimentalProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 250
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 350
+                    ),
+                ],
+            ],
+            routeFamily: "recurrent_block_row_grid_fan_in",
+            role: "linear_attn.out_proj",
+            variant: "row_grid_fan_in",
+            minimumSpeedupPercent: 5,
+            directory: directory
+        )
+        let speedupCSV = try String(contentsOf: speedupURL, encoding: .utf8)
+
+        #expect(speedupCSV.contains("routeFamily,role,variant,productionSequenceLengths,baselineTotalGpuMicroseconds,experimentalTotalGpuMicroseconds,speedupPercents,passingSequenceCount,requiredSequenceCount,minimumSpeedupPercent,thresholdShortfallPercent,failingSequenceLengths,profileSpeedGate"))
+        #expect(speedupCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64|128,300.000|400.000,250.000|350.000,16.667|12.500,2,2,5.000,0.000,,full-profile-speedup-observed"))
+        let rows = routeReadinessRows(
+            candidates: [
+                RoutePromotionCandidate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    variant: "row_grid_fan_in",
+                    microbenchAdmission: "candidate-recurrent-block-row-grid-default-route",
+                    readinessPrerequisite: "requires-full-profile-speed-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+            ],
+            profileGates: [
+                ProfileRouteGate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    routeGate: "experimental-route-observed"
+                ),
+            ],
+            profileSpeedGates: try profileSpeedGates(artifact: speedupURL)
+        )
+        #expect(rows.first?.routeReadiness == "candidate-production-route")
+
+        let regressionURL = try writeFullProfileSpeedGate(
+            baselineProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                ],
+            ],
+            experimentalProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 96
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 101
+                    ),
+                ],
+            ],
+            routeFamily: "recurrent_block_row_grid_fan_in",
+            role: "linear_attn.out_proj",
+            variant: "row_grid_fan_in",
+            minimumSpeedupPercent: 5,
+            directory: directory
+        )
+        let regressionCSV = try String(contentsOf: regressionURL, encoding: .utf8)
+        #expect(regressionCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64|128,100.000|100.000,96.000|101.000,4.000|-1.000,0,2,5.000,6.000,64|128,full-profile-regression-observed"))
+
+        let missingURL = try writeFullProfileSpeedGate(
+            baselineProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                ],
+            ],
+            experimentalProfilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "recurrent_block_row_grid_fan_in_seq_bf16_f32",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 90
+                    ),
+                ],
+            ],
+            routeFamily: "recurrent_block_row_grid_fan_in",
+            role: "linear_attn.out_proj",
+            variant: "row_grid_fan_in",
+            minimumSpeedupPercent: 5,
+            directory: directory
+        )
+        let missingCSV = try String(contentsOf: missingURL, encoding: .utf8)
+        #expect(missingCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64,100.000,90.000,10.000,1,2,5.000,0.000,128,missing-production-sequence"))
+    }
+
     @Test("Route readiness combines microbench and full profile gates")
     func routeReadinessCombinesMicrobenchAndFullProfileGates() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -775,6 +933,108 @@ struct Qwen35PrefillProfileTests {
 
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
         return url
+    }
+
+    private func writeFullProfileSpeedGate(
+        baselineProfilesByLength: [Int: [MetalPrefillProfile.Entry]],
+        experimentalProfilesByLength: [Int: [MetalPrefillProfile.Entry]],
+        routeFamily: String,
+        role: String,
+        variant: String,
+        minimumSpeedupPercent: Double,
+        directory: URL
+    ) throws -> URL {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= 64 }
+        let url = directory.appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
+
+        var observedSequenceLengths: [Int] = []
+        var baselineTotals: [Double] = []
+        var experimentalTotals: [Double] = []
+        var speedupPercents: [Double] = []
+        var passingSequenceCount = 0
+        var thresholdShortfallPercent = 0.0
+        var failingSequenceLengths: [Int] = []
+        var missingSequenceLengths: [Int] = []
+
+        for sequenceLength in productionSequenceLengths {
+            guard let baselineProfiles = baselineProfilesByLength[sequenceLength],
+                  let experimentalProfiles = experimentalProfilesByLength[sequenceLength] else {
+                missingSequenceLengths.append(sequenceLength)
+                continue
+            }
+            let baselineTotal = profileTotalGpuMicroseconds(baselineProfiles)
+            let experimentalTotal = profileTotalGpuMicroseconds(experimentalProfiles)
+            let speedupPercent = baselineTotal > 0
+                ? (baselineTotal - experimentalTotal) / baselineTotal * 100.0
+                : 0.0
+            observedSequenceLengths.append(sequenceLength)
+            baselineTotals.append(baselineTotal)
+            experimentalTotals.append(experimentalTotal)
+            speedupPercents.append(speedupPercent)
+            if speedupPercent >= minimumSpeedupPercent {
+                passingSequenceCount += 1
+            } else {
+                failingSequenceLengths.append(sequenceLength)
+                thresholdShortfallPercent = max(
+                    thresholdShortfallPercent,
+                    minimumSpeedupPercent - speedupPercent
+                )
+            }
+        }
+
+        let profileSpeedGate: String
+        if !missingSequenceLengths.isEmpty {
+            profileSpeedGate = "missing-production-sequence"
+        } else if passingSequenceCount == productionSequenceLengths.count {
+            profileSpeedGate = "full-profile-speedup-observed"
+        } else {
+            profileSpeedGate = "full-profile-regression-observed"
+        }
+
+        var allFailingSequenceLengths = failingSequenceLengths
+        allFailingSequenceLengths.append(contentsOf: missingSequenceLengths)
+
+        let headerFields = [
+            "routeFamily",
+            "role",
+            "variant",
+            "productionSequenceLengths",
+            "baselineTotalGpuMicroseconds",
+            "experimentalTotalGpuMicroseconds",
+            "speedupPercents",
+            "passingSequenceCount",
+            "requiredSequenceCount",
+            "minimumSpeedupPercent",
+            "thresholdShortfallPercent",
+            "failingSequenceLengths",
+            "profileSpeedGate",
+        ]
+        let rowFields = [
+            csvEscape(routeFamily),
+            csvEscape(role),
+            csvEscape(variant),
+            observedSequenceLengths.map(String.init).joined(separator: "|"),
+            baselineTotals.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+            experimentalTotals.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+            speedupPercents.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+            String(passingSequenceCount),
+            String(productionSequenceLengths.count),
+            String(format: "%.3f", minimumSpeedupPercent),
+            String(format: "%.3f", max(0.0, thresholdShortfallPercent)),
+            allFailingSequenceLengths.map(String.init).joined(separator: "|"),
+            profileSpeedGate,
+        ]
+        let lines = [
+            headerFields.joined(separator: ","),
+            rowFields.joined(separator: ","),
+        ]
+
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func profileTotalGpuMicroseconds(_ profiles: [MetalPrefillProfile.Entry]) -> Double {
+        profiles.reduce(0.0) { $0 + $1.averageGpuMicroseconds }
     }
 
     private func writeRouteReadiness(rows: [RouteReadinessRow], directory: URL) throws -> URL {

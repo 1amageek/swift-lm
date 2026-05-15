@@ -289,6 +289,7 @@ flowchart TD
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` and `.../routeGateSummarizesProductionSequenceRoutes` | Pass; route manifest/gate now classify `recurrent_block_row_grid_fan_in_seq_bf16_f32` as the experimental `linear_attn.out_proj` fan-in route instead of only showing the replaced GEMV as missing |
 | 2026-05-16 | `swift test --filter RecurrentBlockFusionKernelTests/rowGridFanInInlineRoundingCostProbe` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; recurrent-block row-grid now writes a route-promotion CSV consumed by route-readiness reconstruction. Current artifact rejects default promotion because seqLen 64 missed the microbench threshold even though the full-profile route gate observed the experimental route |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` and `.../routeReadinessCanBeReconstructedFromArtifactCSVs` | Pass; route-readiness schema now has an `observedProfileSpeedGate` column, so future default promotion can require both route observation and an explicit full-profile speedup artifact instead of treating route presence as speed evidence |
+| 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; full-profile speed gate CSV generation now distinguishes `full-profile-speedup-observed`, `full-profile-regression-observed`, and `missing-production-sequence`, and route readiness only promotes recurrent row-grid routes when the generated speed gate is positive |
 
 ## Failed Experiments
 
@@ -2309,11 +2310,35 @@ flowchart LR
 | Missing profile route | Reject as `reject-missing-full-profile-route` |
 | Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |
 | Baseline preserved when an experimental route was required | Reject as `reject-full-profile-route-not-observed` |
+| `requires-full-profile-speed-gate` prerequisite | Requires `observedProfileSpeedGate == full-profile-speedup-observed` |
+| Missing full-profile speed artifact | Reject as `reject-missing-full-profile-speed-gate` |
+| Full-profile regression or threshold miss | Reject as `reject-full-profile-speed-gate-not-observed` |
 
 Current decision: future projection experiments must pass this readiness layer
 before moving to route-default discussion. A microbench win alone does not
 authorize routing; the full profile must show the intended route actually
 executed across the production sequence lengths.
+
+Recurrent block routes have a stricter contract than projection route
+experiments. Row-grid fan-in can change the block schedule and cross-group
+fan-in, so route observation alone is not enough. It must also publish a
+full-profile speed gate generated from baseline and experimental profile totals:
+
+```mermaid
+flowchart LR
+  A["baseline full profile 64/128"] --> C["full-profile speed gate"]
+  B["experimental full profile 64/128"] --> C
+  C --> D{"all production lengths faster?"}
+  D -->|"yes"| E["full-profile-speedup-observed"]
+  D -->|"no"| F["full-profile-regression-observed"]
+  D -->|"missing length"| G["missing-production-sequence"]
+```
+
+The current contract compares total GPU microseconds for the full prefill plan
+at production sequence lengths `64` and `128`. A route can only become a
+production candidate when every production length meets the configured speedup
+threshold. This prevents a route from being promoted because a narrow kernel or
+microbench improved while the full Qwen profile regressed.
 
 The readiness layer is now reconstructable from artifact CSVs:
 
@@ -2322,7 +2347,8 @@ flowchart LR
   A["single GEMV route-promotion CSV"] --> C["artifact readiness checker"]
   B["batched GEMV route-promotion CSV"] --> C
   D["qwen35-prefill-route-gate.csv"] --> C
-  C --> E["qwen35-prefill-route-readiness.csv"]
+  E["qwen35-prefill-full-profile-speed-gate.csv"] --> C
+  C --> F["qwen35-prefill-route-readiness.csv"]
 ```
 
 This is intentionally a lightweight parser contract. It proves the release
