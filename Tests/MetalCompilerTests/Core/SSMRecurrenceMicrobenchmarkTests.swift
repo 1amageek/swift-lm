@@ -271,7 +271,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
         ]
         let routeRows = summarizeRoutePromotions(rows: rows)
         let shared = routeRows.first { $0.candidate == .sharedRMS }
+        let prewrite = routeRows.first { $0.candidate == .prewriteDecay }
         let qkParallel = routeRows.first { $0.candidate == .qkParallel }
+        #expect(prewrite?.routePromotionAdmission == "reject-cross-sequence-threshold")
+        #expect(prewrite?.failingSequenceLengths == [64, 128])
+        #expect(prewrite?.thresholdShortfallPercent.isInfinite == true)
         #expect(shared?.routePromotionAdmission == "reject-cross-sequence-threshold")
         #expect(shared?.failingSequenceLengths == [128])
         #expect(shared?.thresholdShortfallPercent == 2.0)
