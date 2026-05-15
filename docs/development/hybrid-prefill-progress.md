@@ -249,6 +249,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter MetalSourceGeneratorTests` | Pass; SSM sequence kernel naming and generated sources remain valid after adding the q/k parallel-reduction variant |
 | 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; opt-in q/k parallel-reduction SSM route keeps schema v6 block boundaries, final hidden/logits, state/KV, and decode0 gates green |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; route fires for all 18 SSM recurrence dispatches, but same-build Qwen profile is slower, so default routing remains unchanged |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel SSM sweep now includes `qkpar_tg{128,256,384}` next to base/shared/prewrite variants so phase wins can be checked against full sequence-kernel behavior |
 
 ## Failed Experiments
 
@@ -1587,9 +1588,9 @@ Current local summary from the focused harness:
 
 | Sequence length | Best variant | Best base | Speedup vs best base | Decision |
 |---:|---|---|---:|---|
-| 16 | `prewrite_tg128` | `base_tg384` | 9.60% | candidate prewrite-decay |
-| 64 | `base_tg384` | `base_tg384` | 0.00% | keep default |
-| 128 | `shared_tg384` | `base_tg384` | 0.37% | keep default |
+| 16 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 64 | `shared_tg384` | `base_tg128` | 12.15% | candidate shared-RMS diagnostic |
+| 128 | `base_tg384` | `base_tg384` | 0.00% | keep default |
 
 Current decision: no runtime default changes. The best isolated variant moves
 with run-to-run variance and sequence length, while the longest measured
@@ -1631,9 +1632,9 @@ Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 3.13% | 75.01% | 22.40% | state recurrence dominates |
-| 64 | 2.69% | 75.55% | 25.19% | state recurrence dominates |
-| 128 | 1.99% | 58.10% | 17.80% | state recurrence dominates, with noisy full-base denominator |
+| 16 | 3.15% | 75.52% | 23.22% | state recurrence dominates |
+| 64 | 2.71% | 87.19% | 29.05% | state recurrence dominates |
+| 128 | 1.58% | 53.96% | 14.74% | state recurrence dominates, with noisy full-base denominator |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
@@ -1720,24 +1721,27 @@ partials and barrier do not pay for themselves:
 
 | Sequence length | Baseline state phase | `qkpar` state phase | Active lanes | Decision |
 |---:|---:|---:|---:|---|
-| 16 | 366.1 us | 368.7 us | 128 -> 128 | reject/noise |
-| 64 | 1413.4 us | 1450.8 us | 128 -> 128 | reject |
-| 128 | 2811.8 us | 2822.0 us | 128 -> 128 | reject/noise |
+| 16 | 369.1 us | 375.2 us | 128 -> 128 | reject/noise |
+| 64 | 1640.1 us | 1922.8 us | 128 -> 128 | reject |
+| 128 | 3322.1 us | 2800.5 us | 128 -> 128 | phase-only candidate |
 
 The stability harness then measures 128-token state candidates repeatedly in
 the same process:
 
 | Sample | Baseline state phase | `d2` delta | `qkpar` delta |
 |---:|---:|---:|---:|
-| 0 | 3629.4 us | +35.03% | -11.93% |
-| 1 | 3991.7 us | +62.00% | -11.68% |
-| 2 | 3472.9 us | +51.12% | -14.96% |
+| 0 | 3714.3 us | +40.74% | -13.13% |
+| 1 | 4315.3 us | +55.55% | -20.96% |
+| 2 | 3805.3 us | +83.18% | -27.26% |
 
-Current decision: `d2` remains rejected. `qkpar` is promoted from unstable
-diagnostic to the next sequence-kernel experiment candidate, but it is still
-not a production route. The required next gates are sequence recurrence
-equivalence, Qwen reference comparison, and full Qwen profile with the same
-kernel shape.
+Current decision: `d2` remains rejected. `qkpar` has completed the sequence
+kernel experiment loop: the full sequence kernel is decode-equivalent, the
+Qwen schema v6 reference gate passes, and the route fires under
+`SWIFTLM_PREFILL_SSM_QKPAR=1`. It is still not a production route because the
+same-build Qwen profile regressed and the full-kernel microbench does not show
+a stable best-base win. The likely lesson is that the phase-level q/k scalar
+setup win is smaller than the extra full-kernel barrier and threadgroup-memory
+traffic once the surrounding sequence recurrence loop is included.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

@@ -31,6 +31,9 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMVariant(name: "prewrite_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 128),
             SSMVariant(name: "prewrite_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 256),
             SSMVariant(name: "prewrite_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay", threadgroupWidth: 384),
+            SSMVariant(name: "qkpar_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 128),
+            SSMVariant(name: "qkpar_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 256),
+            SSMVariant(name: "qkpar_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 384),
         ]
 
         var rows: [SSMResultRow] = []
@@ -753,6 +756,18 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 valueHeadDimension: 128,
                 prewriteDecayedState: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_qkpar",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                parallelQKReduction: true
+            ),
             Self.generatePhaseConvSiluKernel(),
             Self.generatePhaseStateRecurrenceKernel(),
             Self.generatePhaseStateRecurrenceKernel(
@@ -772,6 +787,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_recurrence_seq_bf16_f32",
             "bench_ssm_recurrence_seq_bf16_f32_shared_rms",
             "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
+            "bench_ssm_recurrence_seq_bf16_f32_qkpar",
             "bench_ssm_phase_conv_silu_bf16_f32",
             "bench_ssm_phase_state_recurrence_f32",
             "bench_ssm_phase_state_recurrence_d2_f32",
