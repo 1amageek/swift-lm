@@ -208,6 +208,14 @@ enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
 enum RecurrentBlockFusionFusedStageExecutionShape: String, Sendable, Equatable {
     case groupOwnedStateUpdateThenPartialRows = "group-owned-state-update-then-partial-rows"
     case partialPartitionOwnedStateUpdatesThenPartialRows = "partial-partition-owned-state-updates-then-partial-rows"
+
+    var preservesOutputRowGridParallelism: Bool {
+        switch self {
+        case .groupOwnedStateUpdateThenPartialRows,
+             .partialPartitionOwnedStateUpdatesThenPartialRows:
+            return false
+        }
+    }
 }
 
 struct RecurrentBlockFusionFusedStagePlan: Sendable, Equatable {
@@ -243,6 +251,18 @@ enum RecurrentBlockFusionFusedStageRejection: Sendable, Equatable {
 enum RecurrentBlockFusionFusedStageDecision: Sendable, Equatable {
     case candidate(RecurrentBlockFusionFusedStagePlan)
     case rejected([RecurrentBlockFusionFusedStageRejection])
+}
+
+enum RecurrentBlockFusionDefaultPromotionRejection: Sendable, Equatable {
+    case outputRowGridParallelismNotPreserved(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
+    case unsafeRowGridFusionAllowed
+    case nonPositiveDispatchReduction(estimatedDispatchReduction: Int)
+    case numericalContractNotReferenceGated(RecurrentBlockFusionNumericalContract)
+}
+
+enum RecurrentBlockFusionDefaultPromotionDecision: Sendable, Equatable {
+    case eligible
+    case rejected([RecurrentBlockFusionDefaultPromotionRejection])
 }
 
 enum RecurrentBlockFusionPrototypePlanner {
@@ -491,6 +511,29 @@ enum RecurrentBlockFusionPrototypePlanner {
             unsafeRowGridFusionAllowed: false,
             numericalContract: .referenceGated
         ))
+    }
+
+    static func defaultPromotionDecision(
+        for plan: RecurrentBlockFusionFusedStagePlan
+    ) -> RecurrentBlockFusionDefaultPromotionDecision {
+        var rejections: [RecurrentBlockFusionDefaultPromotionRejection] = []
+
+        if !plan.executionShape.preservesOutputRowGridParallelism {
+            rejections.append(.outputRowGridParallelismNotPreserved(executionShape: plan.executionShape))
+        }
+        if plan.unsafeRowGridFusionAllowed {
+            rejections.append(.unsafeRowGridFusionAllowed)
+        }
+        if plan.estimatedDispatchReduction <= 0 {
+            rejections.append(.nonPositiveDispatchReduction(
+                estimatedDispatchReduction: plan.estimatedDispatchReduction
+            ))
+        }
+        if plan.numericalContract != .referenceGated {
+            rejections.append(.numericalContractNotReferenceGated(plan.numericalContract))
+        }
+
+        return rejections.isEmpty ? .eligible : .rejected(rejections)
     }
 }
 

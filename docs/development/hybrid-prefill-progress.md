@@ -270,6 +270,10 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRolesMatchFullProfileRouteGate` | Pass; single-GEMV microbench roles now match full-profile route gate roles instead of using the ambiguous `attn_or_ssm.out_proj` bucket |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; synthetic route-admission contract tests now write fixture CSVs to temporary directories instead of overwriting production `.test-artifacts` |
 | 2026-05-15 | `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass after regenerating microbench artifacts; opt-in hard gate reconstructs route readiness from current `.test-artifacts` and rejects stale aggregate roles such as `dependent` / `batched` buckets |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests/defaultPromotionRejectsFusedStagePlansThatSerializeOutputRows` | Pass; correctness-green fused recurrent partial-emission plans are explicitly rejected for default promotion until they preserve output row-grid parallelism |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; full recurrent-window planner/profile contract remains green after adding the default-promotion gate |
+| 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; opt-in fused recurrent route remains schema v6 reference-equivalent after preserving F32 partial scratch storage |
+| 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests` | Pass; storage-round dispatches dropped from the opt-in fused route, but seqLen 128 still regressed to 966.593 ms because the partition-owned recurrent partial kernel dominates at 737.264 ms |
 
 ## Failed Experiments
 
@@ -290,6 +294,7 @@ flowchart TD
 | Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
+| Preserving F32 partial scratch storage in the opt-in fused route | Correctness still passed and storage-round dispatches were reduced, but Qwen seqLen 16/64/128 still measured 126.712/482.701/966.593 ms; fused SSM remained dominant at 93.860/366.404/737.264 ms | Keep the cleanup because it removes unnecessary experimental-route dispatches, but do not treat it as a speed path. The required fix is preserving row-grid projection parallelism, not rounding cleanup |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
 | Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 330.5%/217.4%/263.9% of baseline state-phase time for seqLen 16/64/128 in the latest run | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
 | Phase-only `state_recurrence_cache64` attempt | Pipeline creation failed before timing because the static threadgroup allocation was 34,316 bytes, above the 32,768-byte AGX threadgroup-memory limit | Rejected and not kept as a runnable harness variant |
@@ -310,6 +315,7 @@ flowchart TD
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
 | Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
 | Next recurrent-block optimization unit | Redesign the partition-owned fused kernel to avoid recomputing/re-reading the full partial projection per partition. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
+| Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups |
 
 ## Opt-in Fused Recurrent Partial-Emission Status
 
@@ -331,11 +337,18 @@ flowchart LR
 | Admission contract | Pass | `RecurrentBlockFusionWindowTests` counts the implicit storage-round bridge |
 | Qwen reference correctness | Pass | schema v6 boundary, partial fan-in readback, final hidden/logits, state/KV, decode0 |
 | Route activation | Pass | profile shows 18 `ssm_recurrence_seq_bf16_f32_partition_owned_partial` dispatches |
-| Performance | Fail | seqLen 128 grows from the production-profile 314.525 ms to 955.549 ms |
+| Performance | Fail | seqLen 128 grows from the production-profile 314.525 ms to 966.593 ms in the latest opt-in fused-route profile |
 
 The route remains useful because it proves that the reference harness can catch
 cross-group fan-in and partial scratch layout errors on the fused execution
 shape. It is not eligible for default routing.
+
+After preserving F32 partial scratch storage, the opt-in route still fails the
+speed gate: seqLen 128 measured 966.593 ms, with
+`ssm_recurrence_seq_bf16_f32_partition_owned_partial` alone accounting for
+737.264 ms. This confirms the primary issue is not the storage-round bridge;
+it is the loss of output row-grid parallelism inside the partition-owned
+recurrence kernel.
 
 The profile harness now exposes the failure mode directly:
 

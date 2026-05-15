@@ -268,6 +268,51 @@ struct RecurrentBlockFusionWindowTests {
         )))
     }
 
+    @Test("Default promotion rejects fused-stage plans that serialize output rows")
+    func defaultPromotionRejectsFusedStagePlansThatSerializeOutputRows() throws {
+        let groupOwnedPlan = RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 8,
+            partitionCount: 4,
+            recurrentGroupsPerPartition: 1,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .groupOwnedStateUpdateThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )
+        let partitionOwnedPlan = RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 8,
+            partitionCount: 4,
+            recurrentGroupsPerPartition: 2,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .partialPartitionOwnedStateUpdatesThenPartialRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )
+
+        #expect(RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision(
+            for: groupOwnedPlan
+        ) == .rejected([
+            .outputRowGridParallelismNotPreserved(executionShape: .groupOwnedStateUpdateThenPartialRows),
+        ]))
+        #expect(RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision(
+            for: partitionOwnedPlan
+        ) == .rejected([
+            .outputRowGridParallelismNotPreserved(executionShape: .partialPartitionOwnedStateUpdatesThenPartialRows),
+        ]))
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [

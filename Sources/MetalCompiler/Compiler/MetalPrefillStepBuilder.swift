@@ -256,6 +256,13 @@ struct MetalPrefillStepBuilder {
             && kernelName.contains("_seq_") {
             return true
         }
+        if kernelName.hasPrefix("recurrent_block_partial_projection") {
+            return true
+        }
+        if kernelName.hasPrefix("ssm_recurrence_seq_")
+            && kernelName.hasSuffix("_partial") {
+            return true
+        }
         if kernelName.hasPrefix("synthesized_") {
             return true
         }
