@@ -409,6 +409,37 @@ Single output projections remain because their input is intermediate-only.
 The next prefill speed lever is therefore **per-token amortization inside the
 single-projection kernel** (M2 territory), not additional batching.
 
+### Mainline after SSM route-gate closure (2026-05-15)
+
+The SSM path now has phase, full-kernel, and route-promotion gates. All current
+SSM variants (`shared_rms`, `prewrite_decay`, `qkpar`, `cache32`) either fail
+the cross-sequence route gate or the structural lane-preservation gate. The
+next production-speed effort should therefore return to projection kernels.
+
+```mermaid
+flowchart TD
+  A["Qwen prefill profile"] --> B["projection ~76%"]
+  A --> C["SSM recurrence ~22%"]
+  C --> D["route gate rejects current SSM candidates"]
+  B --> E["projection mainline remains active"]
+  E --> F["improve active single-output projections"]
+  E --> G["improve batched in-projection throughput"]
+```
+
+Current active projection work must respect the failed-fusion lessons:
+
+| Rule | Reason |
+|---|---|
+| Do not recompute the producer per output-row group | Fused SwiGLU/down rows=2 and fused attention output regressed by recomputing producer tiles |
+| Do not serialize output-row projection inside recurrent ownership | Fused recurrent partial-emission preserved correctness but collapsed row parallelism |
+| Do not promote a one-sequence win | Route-promotion CSV now requires 64/128-token evidence |
+| Keep reference gates before profile gates | Qwen schema v6 and prompt-ingestion trace gates remain mandatory |
+
+The next acceptable projection candidate should either improve the standalone
+single sequence GEMV dataflow without changing producer ownership, or introduce
+a new producer/projection fusion shape that keeps producer work materialized
+once and preserves output-row parallelism.
+
 The live profile test now also prints the BF16 single sequence GEMV role
 breakdown directly, so the dominant dependent projection can be identified
 without post-processing the CSV artifact:
