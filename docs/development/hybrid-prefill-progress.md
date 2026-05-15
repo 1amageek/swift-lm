@@ -261,6 +261,8 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-manifest contract hard-checks batched role normalization, fused MLP runtime-gated labeling, and experimental single-GEMV route labeling |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default-environment full profile now hard-checks active route shape: seqLen 16 keeps unfused `mlp.down_proj`, seqLen 64/128 use fused MLP, and remaining single projections stay limited to `linear_attn.out_proj` plus `self_attn.o_proj` |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeGateSummarizesProductionSequenceRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-gate contract verifies 64/128 cross-sequence route summaries classify baseline, default runtime-gated, and experimental routes distinctly |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes `qwen35-prefill-route-gate.csv`, showing `mlp_fused_down` active at production lengths and all remaining projection routes preserved as baseline |
 
 ## Failed Experiments
 
@@ -2099,9 +2101,16 @@ length:
 .test-artifacts/prefill-profile/qwen35-prefill-route-manifest-seq128.csv
 ```
 
+It also emits one cross-sequence route gate over production lengths:
+
+```text
+.test-artifacts/prefill-profile/qwen35-prefill-route-gate.csv
+```
+
 This artifact answers a different question from the isolated microbench route
 promotion CSVs: it records which projection route actually executed in the
-full model for that sequence length.
+full model for that sequence length and whether the 64/128-token production
+route shape is still baseline, default runtime-gated, or experimental.
 
 ```mermaid
 flowchart LR
@@ -2121,6 +2130,15 @@ flowchart LR
 | `totalGpuMicroseconds` / `averageGpuMicroseconds` | Aggregated profile timing for the active route group |
 | `routeObservation` | Whether the route is baseline, experimental, or the default runtime-gated fused MLP path |
 
+The cross-sequence route gate adds these fields:
+
+| CSV column | Purpose |
+|---|---|
+| `productionSequenceLengths` | Production sequence lengths covered by the route group, currently `64|128` |
+| `activeCounts` | Active dispatch counts per production sequence length |
+| `routeObservations` | Per-length route labels from the route manifest |
+| `routeGate` | Cross-sequence classification: `baseline-route-preserved`, `default-runtime-gated-route-active`, `experimental-route-observed`, or `mixed-route-observed` |
+
 The current default profile confirms the production routing shape:
 
 | Sequence length | Fused MLP route | Remaining single projections | Batched projections |
@@ -2133,6 +2151,17 @@ Current decision: use the route manifest as the full-model sanity check after
 each kernel-route experiment. A microbench candidate is not enough; the full
 profile must show that the intended route actually fired and that no unrelated
 projection family changed silently.
+
+The current route gate over seqLen 64/128 reports:
+
+| Route family / role | Gate |
+|---|---|
+| `mlp_fused_down / mlp.down_proj` | `default-runtime-gated-route-active` |
+| `batched_projection / linear_attn.in_proj` | `baseline-route-preserved` |
+| `batched_projection / mlp.gate_up` | `baseline-route-preserved` |
+| `batched_projection / self_attn.qkv` | `baseline-route-preserved` |
+| `single_projection / linear_attn.out_proj` | `baseline-route-preserved` |
+| `single_projection / self_attn.o_proj` | `baseline-route-preserved` |
 
 In the default environment, `Qwen35PrefillProfileTests` now hard-checks this
 active route shape directly from the profile entries. The assertion is skipped
@@ -2149,3 +2178,7 @@ The route manifest writer also has a lightweight synthetic contract test:
 | `batched_gemv3_seq_bf16_f32s` over `self_attn.q/k/v_proj` | `batched_projection / self_attn.qkv / baseline-route-observed` |
 | `mlp_fused_swiglu_down_seq_bf16_f32s` at seqLen 128 | `mlp_fused_down / mlp.down_proj / default-runtime-gated-route` |
 | `gemv_seq_bf16_f32s_rps2` | `single_projection / self_attn.o_proj / experimental-route-observed` |
+
+The route gate has a separate synthetic contract that verifies a production
+length group with an experimental kernel is classified as
+`experimental-route-observed` instead of being mistaken for a default route.

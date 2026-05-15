@@ -124,6 +124,11 @@ struct Qwen35PrefillProfileTests {
 
         // Scaling report: for each step, show time at 16 / 64 / 128 and ratio 128/16
         printScalingReport(profilesByLength: profilesByLength, iterations: Self.iterations)
+        let routeGateArtifact = try writeRouteGate(
+            profilesByLength: profilesByLength,
+            directory: artifactDirectory
+        )
+        print("route gate: \(routeGateArtifact.path)")
 
         #expect(!profilesByLength.isEmpty)
     }
@@ -189,6 +194,53 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("128,batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s,1,300.000,300.000,baseline-route-observed"))
         #expect(csv.contains("128,mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,400.000,400.000,default-runtime-gated-route"))
         #expect(csv.contains("128,single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,500.000,500.000,experimental-route-observed"))
+    }
+
+    @Test("Route gate summarizes production sequence routes")
+    func routeGateSummarizesProductionSequenceRoutes() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-route-gate-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let url = try writeRouteGate(
+            profilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "mlp_fused_swiglu_down_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.down_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 200
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 2,
+                        kernelName: "mlp_fused_swiglu_down_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.down_proj.weight",
+                        averageGpuMicroseconds: 300
+                    ),
+                    syntheticProfileEntry(
+                        index: 3,
+                        kernelName: "gemv_seq_bf16_f32s_rps2",
+                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        averageGpuMicroseconds: 400
+                    ),
+                ],
+            ],
+            directory: directory
+        )
+
+        let csv = try String(contentsOf: url, encoding: .utf8)
+        #expect(csv.contains("routeFamily,role,kernelName,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,routeGate"))
+        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,default-runtime-gated-route-active"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,64,1,200.000,baseline-route-observed,baseline-route-preserved"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s_rps2,128,1,400.000,experimental-route-observed,experimental-route-observed"))
     }
 
     // MARK: - Bundle resolution
@@ -375,6 +427,78 @@ struct Qwen35PrefillProfileTests {
         return url
     }
 
+    private func writeRouteGate(
+        profilesByLength: [Int: [MetalPrefillProfile.Entry]],
+        directory: URL
+    ) throws -> URL {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= 64 }
+        let url = directory.appendingPathComponent("qwen35-prefill-route-gate.csv")
+
+        struct Aggregate {
+            var sequenceLengths: [Int] = []
+            var activeCounts: [Int] = []
+            var totalGpuMicroseconds: Double = 0
+            var routeObservations: [String] = []
+        }
+
+        var groups: [String: Aggregate] = [:]
+        for sequenceLength in productionSequenceLengths {
+            guard let profiles = profilesByLength[sequenceLength] else { continue }
+            var sequenceGroups: [String: (count: Int, totalGpuMicroseconds: Double, routeObservation: String)] = [:]
+            for profile in profiles where isProjectionRouteManifestEntry(profile) {
+                let routeFamily = projectionRouteFamily(profile.kernelName)
+                let role = projectionManifestRole(profile)
+                let key = [routeFamily, role, profile.kernelName].joined(separator: "\u{1F}")
+                let observation = routeObservation(kernelName: profile.kernelName, sequenceLength: sequenceLength)
+                var sequenceAggregate = sequenceGroups[key] ?? (count: 0, totalGpuMicroseconds: 0, routeObservation: observation)
+                sequenceAggregate.count += 1
+                sequenceAggregate.totalGpuMicroseconds += profile.averageGpuMicroseconds
+                sequenceAggregate.routeObservation = observation
+                sequenceGroups[key] = sequenceAggregate
+            }
+            for (key, sequenceAggregate) in sequenceGroups {
+                var aggregate = groups[key] ?? Aggregate()
+                aggregate.sequenceLengths.append(sequenceLength)
+                aggregate.activeCounts.append(sequenceAggregate.count)
+                aggregate.totalGpuMicroseconds += sequenceAggregate.totalGpuMicroseconds
+                aggregate.routeObservations.append(sequenceAggregate.routeObservation)
+                groups[key] = aggregate
+            }
+        }
+
+        var lines = [
+            [
+                "routeFamily",
+                "role",
+                "kernelName",
+                "productionSequenceLengths",
+                "activeCounts",
+                "totalGpuMicroseconds",
+                "routeObservations",
+                "routeGate",
+            ].joined(separator: ","),
+        ]
+        for (key, aggregate) in groups.sorted(by: { $0.key < $1.key }) {
+            let parts = key.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
+            let routeFamily = parts[0]
+            let role = parts[1]
+            let kernelName = parts[2]
+            lines.append([
+                routeFamily,
+                csvEscape(role),
+                csvEscape(kernelName),
+                aggregate.sequenceLengths.map(String.init).joined(separator: "|"),
+                aggregate.activeCounts.map(String.init).joined(separator: "|"),
+                String(format: "%.3f", aggregate.totalGpuMicroseconds),
+                aggregate.routeObservations.joined(separator: "|"),
+                routeGate(routeFamily: routeFamily, routeObservations: aggregate.routeObservations),
+            ].joined(separator: ","))
+        }
+
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func isProjectionRouteManifestEntry(_ entry: MetalPrefillProfile.Entry) -> Bool {
         entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
             || entry.kernelName.hasPrefix("batched_gemv")
@@ -402,6 +526,20 @@ struct Qwen35PrefillProfileTests {
             return sequenceLength >= 64 ? "default-runtime-gated-route" : "unexpected-short-sequence-route"
         }
         return "baseline-route-observed"
+    }
+
+    private func routeGate(routeFamily: String, routeObservations: [String]) -> String {
+        if routeObservations.contains("experimental-route-observed") {
+            return "experimental-route-observed"
+        }
+        if routeFamily == "mlp_fused_down",
+           routeObservations.allSatisfy({ $0 == "default-runtime-gated-route" }) {
+            return "default-runtime-gated-route-active"
+        }
+        if routeObservations.allSatisfy({ $0 == "baseline-route-observed" }) {
+            return "baseline-route-preserved"
+        }
+        return "mixed-route-observed"
     }
 
     private func csvEscape(_ value: String) -> String {
