@@ -252,6 +252,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel SSM sweep now includes `qkpar_tg{128,256,384}` next to base/shared/prewrite variants so phase wins can be checked against full sequence-kernel behavior |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-only `state_recurrence_cache32` reduces modeled device state traffic to 2.0 MiB/token and matches CPU reference, but regresses badly because it collapses active value-lane parallelism from 128 to 32 |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; cache staging remains rejected after the 64-lane attempt exceeded the AGX 32 KiB threadgroup-memory limit and the runnable 32-lane probe stayed much slower than baseline |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase/stability CSV artifacts now emit promotion admission reasons so structurally bad state candidates are rejected before full-kernel routing work |
 
 ## Failed Experiments
 
@@ -1770,6 +1771,21 @@ Metal because the static threadgroup allocation reached 34,316 bytes on a
 coalesced state-row access pattern without staging a full state tile in
 threadgroup memory, or use a different algorithmic decomposition that does not
 serialize value lanes inside one recurrent owner.
+
+The phase and stability artifacts now include explicit promotion-admission
+reasons:
+
+| Candidate shape | Harness admission |
+|---|---|
+| Baseline state recurrence | `baseline` |
+| `state_recurrence_qkpar` | `eligible-for-full-kernel-check` |
+| `state_recurrence_d2` | `reject-serial-value-lanes` |
+| `state_recurrence_cache32` | `reject-lane-parallelism-lost` |
+
+This keeps the next optimization loop bounded: a phase candidate can be timed
+for diagnostics, but it should not advance to route implementation unless it
+preserves the state-row lane contract or deliberately changes the algorithmic
+decomposition with a new reference-backed contract.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

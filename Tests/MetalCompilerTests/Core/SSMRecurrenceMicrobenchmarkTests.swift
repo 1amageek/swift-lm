@@ -104,6 +104,15 @@ struct SSMRecurrenceMicrobenchmarkTests {
         printPhaseReport(rows: rows, artifact: artifact)
         #expect(rows.count == Self.sequenceLengths.count * phases.count)
         #expect(rows.allSatisfy { $0.outputChecksum.isFinite && $0.outputChecksum > 0 })
+        #expect(rows.filter { $0.phase == "state_recurrence_cache32" }.allSatisfy {
+            $0.phasePromotionAdmission == "reject-lane-parallelism-lost"
+        })
+        #expect(rows.filter { $0.phase == "state_recurrence_d2" }.allSatisfy {
+            $0.phasePromotionAdmission == "reject-serial-value-lanes"
+        })
+        #expect(rows.filter { $0.phase == "state_recurrence_qkpar" }.allSatisfy {
+            $0.phasePromotionAdmission == "eligible-for-full-kernel-check"
+        })
     }
 
     @Test("BF16 SSM state recurrence phase matches CPU reference")
@@ -338,6 +347,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "coalescedValueLanesPerStateRow",
                 "serialStateLanesPerThread",
                 "estimatedStateTotalBytesPerToken",
+                "phasePromotionAdmission",
                 "outputChecksum",
             ].joined(separator: ","),
         ]
@@ -360,6 +370,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.coalescedValueLanesPerStateRow),
                 String(row.serialStateLanesPerThread),
                 String(row.estimatedStateTotalBytesPerToken),
+                row.phasePromotionAdmission,
                 String(format: "%.6f", row.outputChecksum),
             ].joined(separator: ","))
         }
@@ -387,6 +398,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "stateInnerStrideElements",
                 "coalescedValueLanesPerStateRow",
                 "serialStateLanesPerThread",
+                "candidatePromotionAdmission",
                 "candidateOutputChecksum",
             ].joined(separator: ","),
         ]
@@ -405,6 +417,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.stateInnerStrideElements),
                 String(row.coalescedValueLanesPerStateRow),
                 String(row.serialStateLanesPerThread),
+                row.candidatePromotionAdmission,
                 String(format: "%.6f", row.candidateOutputChecksum),
             ].joined(separator: ","))
         }
@@ -610,6 +623,22 @@ private struct SSMPhaseResultRow {
         return phase.hasPrefix("state_recurrence") ? valueLanesPerThread : 0
     }
 
+    var phasePromotionAdmission: String {
+        guard phase.hasPrefix("state_recurrence") else {
+            return "not-state-recurrence"
+        }
+        if phase == "state_recurrence" {
+            return "baseline"
+        }
+        if coalescedValueLanesPerStateRow < valueDimension {
+            return "reject-lane-parallelism-lost"
+        }
+        if valueLanesPerThread != 1 {
+            return "reject-serial-value-lanes"
+        }
+        return "eligible-for-full-kernel-check"
+    }
+
     private var stateCacheTileWidth: Int? {
         if phase == "state_recurrence_cache32" {
             return 32
@@ -631,6 +660,7 @@ private struct SSMPhaseStabilityRow {
     let stateInnerStrideElements: Int
     let coalescedValueLanesPerStateRow: Int
     let serialStateLanesPerThread: Int
+    let candidatePromotionAdmission: String
 
     init(sampleIndex: Int, baseline: SSMPhaseResultRow, candidate: SSMPhaseResultRow) {
         self.sampleIndex = sampleIndex
@@ -645,6 +675,7 @@ private struct SSMPhaseStabilityRow {
         self.stateInnerStrideElements = candidate.stateInnerStrideElements
         self.coalescedValueLanesPerStateRow = candidate.coalescedValueLanesPerStateRow
         self.serialStateLanesPerThread = candidate.serialStateLanesPerThread
+        self.candidatePromotionAdmission = candidate.phasePromotionAdmission
     }
 
     var candidateDeltaPercent: Double {
