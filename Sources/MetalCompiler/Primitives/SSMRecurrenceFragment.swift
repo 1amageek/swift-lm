@@ -103,6 +103,13 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_prewrite_decay"
     }
 
+    static func qkParallelSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_qkpar"
+    }
+
     static func groupOwnedPartialProjectionSequenceKernelName(
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat
@@ -123,6 +130,10 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
 
     static var isPrewriteDecayPrefillEnabled: Bool {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PREWRITE_DECAY"] == "1"
+    }
+
+    static var isQKParallelPrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_QKPAR"] == "1"
     }
 
     static var isConvDebugPrefillEnabled: Bool {
@@ -256,13 +267,30 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             * MemoryLayout<Float16>.size
         let sharedRMSPrefillEnabled = Self.isSharedRMSPrefillEnabled
         let prewriteDecayPrefillEnabled = Self.isPrewriteDecayPrefillEnabled
-        if sharedRMSPrefillEnabled && prewriteDecayPrefillEnabled {
+        let qkParallelPrefillEnabled = Self.isQKParallelPrefillEnabled
+        let enabledVariantCount = [sharedRMSPrefillEnabled, prewriteDecayPrefillEnabled, qkParallelPrefillEnabled]
+            .filter { $0 }
+            .count
+        if enabledVariantCount > 1 {
             throw MetalCompilerError.deviceSetupFailed(
-                "SWIFTLM_PREFILL_SSM_SHARED_RMS and SWIFTLM_PREFILL_SSM_PREWRITE_DECAY cannot be enabled together"
+                "SWIFTLM_PREFILL_SSM_SHARED_RMS, SWIFTLM_PREFILL_SSM_PREWRITE_DECAY, and SWIFTLM_PREFILL_SSM_QKPAR are mutually exclusive"
             )
+        }
+        if qkParallelPrefillEnabled {
+            guard context.kernelContext.bufferPrecision == .float32,
+                  context.kernelContext.weightFormat == .bfloat16 else {
+                throw MetalCompilerError.deviceSetupFailed(
+                    "SWIFTLM_PREFILL_SSM_QKPAR currently supports only BF16 weights with F32 sequence buffers"
+                )
+            }
         }
         let kernelName = if prewriteDecayPrefillEnabled {
             Self.prewriteDecaySequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        } else if qkParallelPrefillEnabled {
+            Self.qkParallelSequenceKernelName(
                 bufferPrecision: context.kernelContext.bufferPrecision,
                 weightFormat: context.kernelContext.weightFormat
             )

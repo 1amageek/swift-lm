@@ -551,7 +551,8 @@ public static func generateSSMRecurrenceSequence(
     shareRMSScale: Bool = false,
     prewriteDecayedState: Bool = false,
     emitsGroupOwnedPartialProjection: Bool = false,
-    emitsPartitionOwnedPartialProjection: Bool = false
+    emitsPartitionOwnedPartialProjection: Bool = false,
+    parallelQKReduction: Bool = false
 ) -> String {
     precondition(
         !(emitsGroupOwnedPartialProjection && emitsPartitionOwnedPartialProjection),
@@ -573,6 +574,14 @@ public static func generateSSMRecurrenceSequence(
     let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
     let rmsScaleCacheDeclaration = shareRMSScale
         ? "\n        threadgroup float rmsScaleCache[\(headsPerGroup)];"
+        : ""
+    let qkPartialCacheDeclaration = parallelQKReduction
+        ? """
+
+        threadgroup float qNormSqPartials[\(headsPerGroup * keyHeadDimension)];
+        threadgroup float kNormSqPartials[\(headsPerGroup * keyHeadDimension)];
+        threadgroup float kqSumPartials[\(headsPerGroup * keyHeadDimension)];
+        """
         : ""
     let rmsPhase = shareRMSScale
         ? """
@@ -692,6 +701,67 @@ public static func generateSSMRecurrenceSequence(
             }
         """
         : ""
+    let qkReductionPhase = parallelQKReduction
+        ? """
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint localTid = tid % threadsPerHead;
+                        const uint qBase = 0u;
+                        const uint kBase = dk;
+                        for (uint j = localTid; j < dk; j += threadsPerHead) {
+                            float q = convSiluCache[qBase + j];
+                            float k = convSiluCache[kBase + j];
+                            const uint partialIndex = localHead * dk + j;
+                            qNormSqPartials[partialIndex] = q * q;
+                            kNormSqPartials[partialIndex] = k * k;
+                            kqSumPartials[partialIndex] = q * k;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint localTid = tid % threadsPerHead;
+                        if (localTid == 0) {
+                            float qNormSq = 0.0f;
+                            float kNormSq = 0.0f;
+                            float kqSum = 0.0f;
+                            for (uint j = 0; j < dk; ++j) {
+                                const uint partialIndex = localHead * dk + j;
+                                qNormSq += qNormSqPartials[partialIndex];
+                                kNormSq += kNormSqPartials[partialIndex];
+                                kqSum += kqSumPartials[partialIndex];
+                            }
+                            qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                            kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
+                            kqSumCache[localHead] = kqSum;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+        : """
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint localTid = tid % threadsPerHead;
+                        if (localTid == 0) {
+                            const uint qBase = 0u;
+                            const uint kBase = dk;
+                            float qNormSq = 0.0f;
+                            float kNormSq = 0.0f;
+                            float kqSum = 0.0f;
+                            for (uint j = 0; j < dk; ++j) {
+                                float q = convSiluCache[qBase + j];
+                                float k = convSiluCache[kBase + j];
+                                qNormSq += q * q;
+                                kNormSq += k * k;
+                                kqSum += q * k;
+                            }
+                            qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                            kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
+                            kqSumCache[localHead] = kqSum;
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
 
     return """
     kernel void \(name)(
@@ -755,7 +825,7 @@ public static func generateSSMRecurrenceSequence(
         threadgroup float normPartials[\(maxThreadgroupSize)];
         threadgroup float qInvCache[\(headsPerGroup)];
         threadgroup float kInvCache[\(headsPerGroup)];
-        threadgroup float kqSumCache[\(headsPerGroup)];\(rmsScaleCacheDeclaration)
+        threadgroup float kqSumCache[\(headsPerGroup)];\(rmsScaleCacheDeclaration)\(qkPartialCacheDeclaration)
 
         for (uint pos = 0; pos < sequenceLength; ++pos) {
             device const \(bt)* projectedQKVPos = projectedQKV + pos * activationRowStride;
@@ -807,28 +877,7 @@ public static func generateSSMRecurrenceSequence(
                 {
                     const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
                     const uint activeThreads = headsPerGroup * threadsPerHead;
-                    if (tid < activeThreads) {
-                        const uint localHead = tid / threadsPerHead;
-                        const uint localTid = tid % threadsPerHead;
-                        if (localTid == 0) {
-                            const uint qBase = 0u;
-                            const uint kBase = dk;
-                            float qNormSq = 0.0f;
-                            float kNormSq = 0.0f;
-                            float kqSum = 0.0f;
-                            for (uint j = 0; j < dk; ++j) {
-                                float q = convSiluCache[qBase + j];
-                                float k = convSiluCache[kBase + j];
-                                qNormSq += q * q;
-                                kNormSq += k * k;
-                                kqSum += q * k;
-                            }
-                            qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
-                            kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
-                            kqSumCache[localHead] = kqSum;
-                        }
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    \(qkReductionPhase)
 
                     if (tid < activeThreads) {
                         const uint localHead = tid / threadsPerHead;

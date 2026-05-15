@@ -245,6 +245,10 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; `state_recurrence_qkpar` preserves active value-lane parallelism and matches the CPU reference, but does not beat the baseline state phase |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase CSV now records state-loop stride, coalesced value lanes, and serial value lanes per thread for recurrence candidates |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase stability CSV shows `qkpar` wins 3/3 at seqLen 128 while `d2` loses 3/3 |
+| 2026-05-15 | `swift test --filter SSMRecurrenceSequenceEquivalenceTests` | Pass; opt-in `ssm_recurrence_seq_bf16_f32_qkpar` full sequence kernel matches repeated decode recurrence for output, recurrent state, and conv state |
+| 2026-05-15 | `swift test --filter MetalSourceGeneratorTests` | Pass; SSM sequence kernel naming and generated sources remain valid after adding the q/k parallel-reduction variant |
+| 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; opt-in q/k parallel-reduction SSM route keeps schema v6 block boundaries, final hidden/logits, state/KV, and decode0 gates green |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; route fires for all 18 SSM recurrence dispatches, but same-build Qwen profile is slower, so default routing remains unchanged |
 
 ## Failed Experiments
 
@@ -265,6 +269,7 @@ flowchart TD
 | Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
+| Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
 
 ## Open Decisions
 
@@ -278,6 +283,7 @@ flowchart TD
 | Whether fused SwiGLU + down should default | Yes, narrowly: rows=8 is default only for stateful hybrid BF16 sequence prefill with runtime admission at seqLen >= 64; `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` disables it |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
+| Whether q/k parallel-reduction SSM recurrence should default | No; correctness is green, but the full Qwen profile regresses despite isolated phase stability wins |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
 | Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
 | Next recurrent-block optimization unit | Redesign the partition-owned fused kernel to avoid recomputing/re-reading the full partial projection per partition. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
@@ -319,24 +325,24 @@ The profile harness now exposes the failure mode directly:
 
 ## Current Production Prefill Profile
 
-Latest focused Qwen profile (2026-05-14), with production planner using
+Latest focused Qwen profile (2026-05-15), with production planner using
 runtime-gated BF16 fused SwiGLU+down for stateful hybrid sequence prefill:
 
 | Sequence length | Total prefill time | Steps | Pass count |
 |---:|---:|---:|---:|
-| 16 | 56.241 ms | 293 | 1 |
-| 64 | 159.820 ms | 269 | 1 |
-| 128 | 314.525 ms | 269 | 1 |
+| 16 | 44.713 ms | 293 | 1 |
+| 64 | 159.880 ms | 269 | 1 |
+| 128 | 315.780 ms | 269 | 1 |
 
 Category share at seqLen=128:
 
 | Category | Steps | Time | Share |
 |---|---:|---:|---:|
-| `projection` | 97 | 240.207 ms | 76.4% |
-| `ssm_recurrence` | 18 | 68.589 ms | 21.8% |
-| `attention` | 6 | 3.837 ms | 1.2% |
-| `other` | 129 | 1.748 ms | 0.6% |
-| remaining | 19 | 0.143 ms | 0.0% |
+| `projection` | 97 | 241.172 ms | 76.4% |
+| `ssm_recurrence` | 18 | 68.811 ms | 21.8% |
+| `attention` | 6 | 3.860 ms | 1.2% |
+| `other` | 129 | 1.791 ms | 0.6% |
+| remaining | 19 | 0.146 ms | 0.0% |
 
 Kernel families confirmed in the plan:
 

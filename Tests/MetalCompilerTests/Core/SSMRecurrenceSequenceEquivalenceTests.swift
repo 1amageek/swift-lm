@@ -26,6 +26,7 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let sequenceKernelName = "ssm_recurrence_bf16_sequence_equivalence"
         let sharedRMSSequenceKernelName = "ssm_recurrence_bf16_sequence_shared_rms_equivalence"
         let prewriteDecaySequenceKernelName = "ssm_recurrence_bf16_sequence_prewrite_decay_equivalence"
+        let qkParallelSequenceKernelName = "ssm_recurrence_bf16_sequence_qkpar_equivalence"
         let source = [
             MetalSourceGenerator.commonHeader,
             MetalSourceGenerator.generateSSMWeightIndependentHelpers(),
@@ -76,12 +77,25 @@ struct SSMRecurrenceSequenceEquivalenceTests {
                 valueHeadDimension: valueDimension,
                 prewriteDecayedState: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: qkParallelSequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                parallelQKReduction: true
+            ),
         ].joined(separator: "\n")
         let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
         let decodePipeline = try harness.pipeline(named: decodeKernelName)
         let sequencePipeline = try harness.pipeline(named: sequenceKernelName)
         let sharedRMSSequencePipeline = try harness.pipeline(named: sharedRMSSequenceKernelName)
         let prewriteDecaySequencePipeline = try harness.pipeline(named: prewriteDecaySequenceKernelName)
+        let qkParallelSequencePipeline = try harness.pipeline(named: qkParallelSequenceKernelName)
 
         let projectedQKV = roundedBFloat16Values(
             count: sequenceLength * convDimension,
@@ -200,6 +214,26 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             convDimension: convDimension,
             outputDimension: outputDimension
         )
+        let qkParallelSequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: qkParallelSequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: outputDimension
+        )
 
         let outputMismatch = harness.firstMismatch(
             expected: decode.output,
@@ -266,6 +300,28 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         #expect(
             decode.convStateBits == prewriteDecaySequence.convStateBits,
             "Prewrite-decay SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(prewriteDecaySequence.convStateBits)"
+        )
+        let qkParallelOutputMismatch = harness.firstMismatch(
+            expected: decode.output,
+            actual: qkParallelSequence.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            qkParallelOutputMismatch == nil,
+            "QK-parallel SSM output drifted: \(String(describing: qkParallelOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: qkParallelSequence.output))"
+        )
+        let qkParallelRecurrentMismatch = harness.firstMismatch(
+            expected: decode.recurrentState,
+            actual: qkParallelSequence.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            qkParallelRecurrentMismatch == nil,
+            "QK-parallel SSM recurrent state drifted: \(String(describing: qkParallelRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: qkParallelSequence.recurrentState))"
+        )
+        #expect(
+            decode.convStateBits == qkParallelSequence.convStateBits,
+            "QK-parallel SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(qkParallelSequence.convStateBits)"
         )
 
         for threadgroupWidth in [128, 256] {

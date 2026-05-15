@@ -481,6 +481,27 @@ struct MetalKernelSourceCatalog {
                                     shareRMSScale: true))
                             }
                         }
+                        if SSMRecurrenceFragment.isQKParallelPrefillEnabled,
+                           bufferPrecision == .float32,
+                           weightFormat == .bfloat16 {
+                            let qkParallelSequenceKernelName = SSMRecurrenceFragment.qkParallelSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(qkParallelSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: qkParallelSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    parallelQKReduction: true))
+                            }
+                        }
                         if SSMRecurrenceFragment.isPrewriteDecayPrefillEnabled {
                             let prewriteDecaySequenceKernelName = SSMRecurrenceFragment.prewriteDecaySequenceKernelName(
                                 bufferPrecision: bufferPrecision,
