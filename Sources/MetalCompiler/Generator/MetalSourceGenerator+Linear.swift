@@ -598,6 +598,78 @@ extension MetalSourceGenerator {
         """
     }
 
+    public static func generateRecurrentBlockRowGridFanInProjection(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        tileElements: Int = 256
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input                    [[buffer(0)]],
+            device const \(wt)* weight                   [[buffer(1)]],
+            device \(bt)* output                         [[buffer(2)]],
+            constant uint& partitionInputDimension       [[buffer(3)]],
+            constant uint& outputDimension               [[buffer(4)]],
+            constant uint& groupCount                    [[buffer(5)]],
+            constant uint& sequenceLength                [[buffer(6)]],
+            constant uint& inputRowStride                [[buffer(7)]],
+            constant uint& outputRowStride               [[buffer(8)]],
+            uint2 gid                                    [[threadgroup_position_in_grid]],
+            uint tid                                     [[thread_index_in_threadgroup]],
+            uint tiisg                                   [[thread_index_in_simdgroup]],
+            uint sgitg                                   [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup                  [[threads_per_threadgroup]]
+        ) {
+            const uint tileElements = \(tileElements);
+            const uint row = gid.x * max(1u, threadsPerThreadgroup.x / SIMD_WIDTH) + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength) {
+                return;
+            }
+
+            const uint inputDimension = groupCount * partitionInputDimension;
+            const bool activeRow = row < outputDimension;
+            threadgroup \(bt) inputTile[tileElements];
+            float sum = 0.0f;
+
+            for (uint group = 0; group < groupCount; ++group) {
+                const uint groupInputBase = group * partitionInputDimension;
+                device const \(bt)* inputRow = input + seqPos * inputRowStride + groupInputBase;
+                for (uint base = 0; base < partitionInputDimension; base += tileElements) {
+                    for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
+                        const uint inputIndex = base + j;
+                        inputTile[j] = inputIndex < partitionInputDimension
+                            ? inputRow[inputIndex]
+                            : \(bt)(0.0f);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    const uint tileCount = min(tileElements, partitionInputDimension - base);
+                    if (activeRow) {
+                        device const \(wt)* weightRow = weight + row * inputDimension + groupInputBase;
+                        for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                            sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                        }
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+
+            if (activeRow) {
+                sum = simd_sum(sum);
+                if (tiisg == 0) {
+                    output[seqPos * outputRowStride + row] = \(bt)(sum);
+                }
+            }
+        }
+        """
+    }
+
     /// Generate a sequence GEMV kernel that covers multiple tokens per threadgroup.
     ///
     /// Each SIMD group still owns one output row and one token, preserving the

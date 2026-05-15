@@ -427,6 +427,118 @@ struct RecurrentBlockFusionKernelTests {
         }
     }
 
+    @Test("Row-grid fan-in projection matches CPU reference")
+    func rowGridFanInProjectionMatchesCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let kernelName = "test_recurrent_block_row_grid_fan_in_projection"
+        let source = [
+            MetalSourceGenerator.commonHeader,
+            MetalSourceGenerator.generateRecurrentBlockRowGridFanInProjection(
+                name: kernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                tileElements: 4
+            ),
+        ].joined(separator: "\n")
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let function = try #require(library.makeFunction(name: kernelName))
+        let pipeline = try device.makeComputePipelineState(function: function)
+        let commandQueue = try #require(device.makeCommandQueue())
+
+        let groupCount = 4
+        let partitionInputDimension = 5
+        let inputDimension = groupCount * partitionInputDimension
+        let outputDimension = 9
+        let sequenceLength = 3
+        let inputRowStride = 23
+        let outputRowStride = 12
+
+        var input = [Float](repeating: -333.0, count: sequenceLength * inputRowStride)
+        for seq in 0..<sequenceLength {
+            for column in 0..<inputDimension {
+                input[seq * inputRowStride + column] = Float((seq + 3) * 13 + column * 7 - 23) * 0.03125
+            }
+        }
+        let weights = (0..<(outputDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 13) % 37 - 18) * 0.015625)
+        }
+        let output = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
+        let expected = expectedPartialProjectionAndReduce(
+            input: input,
+            weights: weights,
+            groupCount: groupCount,
+            partitionInputDimension: partitionInputDimension,
+            outputDimension: outputDimension,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            outputRowStride: outputRowStride,
+            sentinel: -999.0
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weights,
+            length: weights.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: output,
+            length: output.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+
+        let commandBuffer = try #require(commandQueue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        encoder.setBytes([UInt32(partitionInputDimension)], length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes([UInt32(groupCount)], length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes([UInt32(outputRowStride)], length: MemoryLayout<UInt32>.stride, index: 8)
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let rowsPerThreadgroup = 2
+        encoder.dispatchThreadgroups(
+            MTLSize(
+                width: (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+                height: sequenceLength,
+                depth: 1
+            ),
+            threadsPerThreadgroup: MTLSize(width: simdWidth * rowsPerThreadgroup, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        #expect(commandBuffer.error == nil)
+        let pointer = outputBuffer.contents().assumingMemoryBound(to: Float.self)
+        let actual = (0..<output.count).map { pointer[$0] }
+        let maxError = zip(expected, actual).reduce(Float.zero) { current, pair in
+            max(current, abs(pair.0 - pair.1))
+        }
+        #expect(maxError <= 0.000_01, "row-grid fan-in projection maxError=\(maxError)")
+        for seq in 0..<sequenceLength {
+            for row in outputDimension..<outputRowStride {
+                #expect(actual[seq * outputRowStride + row] == -999.0)
+            }
+        }
+    }
+
     private func expectedPartialReduce(
         partial: [Float],
         groupCount: Int,

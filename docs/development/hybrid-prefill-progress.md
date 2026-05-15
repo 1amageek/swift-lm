@@ -276,6 +276,7 @@ flowchart TD
 | 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests` | Pass; storage-round dispatches dropped from the opt-in fused route, but seqLen 128 still regressed to 966.593 ms because the partition-owned recurrent partial kernel dominates at 737.264 ms |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes machine-readable `defaultPromotionAdmission` and `defaultPromotionRejections` columns |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; planner now separates implemented-but-row-serial fused-stage shapes from the future row-grid-preserving target shape, and default promotion rejects the target until a real route exists |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic row-grid fan-in projection kernel matches the CPU cross-group reference without writing partition partial scratch |
 
 ## Failed Experiments
 
@@ -359,6 +360,7 @@ The profile harness now exposes the failure mode directly:
 | `recurrenceThreadgroupCount` | Number of threadgroups used by the recurrence-stage entry |
 | `outputProjectionThreadgroupCount` | Number of threadgroups used by the output-projection/reduce entries |
 | `rowGridParallelismPreserved` | `false` when a fused recurrence partial-emission kernel serializes output-row projection inside the sequence loop |
+| `parallelismRisk` | Machine-readable reason that must be cleared before default routing |
 | `defaultPromotionAdmission` / `defaultPromotionRejections` | Machine-readable promotion gate result for the active window shape |
 
 The planner now names the next acceptable recurrent-block target separately from
@@ -374,9 +376,13 @@ This prevents the next optimization from being framed as "make the current
 partial-emission route faster." The required route shape is different: state
 update ownership must stay well-defined, while output projection fan-in must
 recover row-grid parallelism.
-| `parallelismRisk` | Machine-readable reason that must be cleared before default routing |
-| `defaultPromotionAdmission` | `reject`, `requires-prototype-planner-admission`, or `not-a-fused-stage` |
-| `defaultPromotionRejections` | Machine-readable blocker list for current fused routes |
+
+The first harness for that target is now a synthetic row-grid fan-in projection
+kernel. It dispatches over `output row x sequence`, loops over recurrent
+partitions inside each row owner, and writes the reduced hidden output directly.
+It intentionally does not route in production yet; its job is to fix the Metal
+math/layout contract that the real `state-update-then-row-grid-fan-in-rows`
+route must preserve.
 
 ## Current Production Prefill Profile
 
