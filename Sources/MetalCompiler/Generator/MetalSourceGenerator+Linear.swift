@@ -642,28 +642,25 @@ extension MetalSourceGenerator {
             const bool activeRow = row < outputDimension;
             threadgroup \(bt) inputTile[tileElements];
             float sum = 0.0f;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
 
-            for (uint group = 0; group < groupCount; ++group) {
-                const uint groupInputBase = group * partitionInputDimension;
-                device const \(bt)* inputRow = input + seqPos * inputRowStride + groupInputBase;
-                for (uint base = 0; base < partitionInputDimension; base += tileElements) {
-                    for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
-                        const uint inputIndex = base + j;
-                        inputTile[j] = inputIndex < partitionInputDimension
-                            ? \(bt)(\(loadInput("inputRow[inputIndex]")))
-                            : \(bt)(0.0f);
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-                    const uint tileCount = min(tileElements, partitionInputDimension - base);
-                    if (activeRow) {
-                        device const \(wt)* weightRow = weight + row * inputDimension + groupInputBase;
-                        for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
-                            sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
-                        }
-                    }
-                    threadgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint base = 0; base < inputDimension; base += tileElements) {
+                for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
+                    const uint inputIndex = base + j;
+                    inputTile[j] = inputIndex < inputDimension
+                        ? \(bt)(\(loadInput("inputRow[inputIndex]")))
+                        : \(bt)(0.0f);
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint tileCount = min(tileElements, inputDimension - base);
+                if (activeRow) {
+                    device const \(wt)* weightRow = weight + row * inputDimension;
+                    for (uint j = tiisg; j < tileCount; j += SIMD_WIDTH) {
+                        sum += \(readWeight("weightRow[base + j]")) * float(inputTile[j]);
+                    }
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
             }
 
             if (activeRow) {

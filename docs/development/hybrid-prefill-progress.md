@@ -281,6 +281,9 @@ flowchart TD
 | 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests` | Pass; route fires 18 `recurrent_block_row_grid_fan_in_seq_bf16_f32` dispatches and removes 18 `linear_attn.out_proj` GEMVs plus 18 round bridges, but seqLen 128 still regresses to 332.700 ms |
 | 2026-05-16 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; row-grid fan-in harness now validates both decode-rounded and raw-input diagnostic contracts, and writes `row-grid-fan-in-rounding-cost.csv` |
 | 2026-05-16 | `swift test --filter RecurrentBlockFusionKernelTests/rowGridFanInInlineRoundingCostProbe` | Pass; same-shape microbench shows `gemv_seq` over pre-rounded input is about 2x faster than the decode-rounded row-grid fan-in kernel for seqLen 16/64/128, so dispatch fusion alone is not enough |
+| 2026-05-16 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass after changing row-grid fan-in to stage the full recurrent output tile instead of reloading per recurrent group; synthetic row-grid now beats same-shape pre-rounded `gemv_seq` in the latest probe |
+| 2026-05-16 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; full-tile row-grid fan-in remains schema v6 reference-equivalent |
+| 2026-05-16 | `Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1` | Pass; same-build profile changed default 46.270/164.823/325.682 ms to row-grid 56.829/163.170/322.151 ms for seqLen 16/64/128, so the route is still opt-in pending runtime gating/repeated evidence |
 
 ## Failed Experiments
 
@@ -303,7 +306,7 @@ flowchart TD
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
 | Preserving F32 partial scratch storage in the opt-in fused route | Correctness still passed and storage-round dispatches were reduced, but Qwen seqLen 16/64/128 still measured 126.712/482.701/966.593 ms; fused SSM remained dominant at 93.860/366.404/737.264 ms | Keep the cleanup because it removes unnecessary experimental-route dispatches, but do not treat it as a speed path. The required fix is preserving row-grid projection parallelism, not rounding cleanup |
 | Opt-in row-grid recurrent fan-in route | Correctness passed and dispatch count dropped at seqLen 128, but Qwen seqLen 16/64/128 profile measured 46.748/168.406/332.700 ms, slower than the current default production route | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1`; do not default. The row-grid projection itself costs 29.038 ms at seqLen 128, more than the removed out-proj GEMVs and round bridges save |
-| Row-grid fan-in inline-rounding removal diagnostic | Correctness passed for a raw-input diagnostic kernel, but the same-shape probe still showed the pre-rounded `gemv_seq` baseline about 2x faster than decode-rounded row-grid fan-in | Do not spend the next step only on removing inline rounding. The dominant issue is the row-grid kernel dataflow/scheduling versus the existing sequence GEMV path |
+| Initial row-grid fan-in group-loop dataflow | Correctness passed, but the same-shape probe showed pre-rounded `gemv_seq` about 2x faster than decode-rounded row-grid fan-in because the kernel reloaded and synchronized each recurrent group separately | Fixed by staging the full recurrent output tile once per row/token owner. Keep the lesson: dispatch fusion must preserve input-tile reuse, not only row-grid ownership |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
 | Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 330.5%/217.4%/263.9% of baseline state-phase time for seqLen 16/64/128 in the latest run | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
 | Phase-only `state_recurrence_cache64` attempt | Pipeline creation failed before timing because the static threadgroup allocation was 34,316 bytes, above the 32,768-byte AGX threadgroup-memory limit | Rejected and not kept as a runnable harness variant |
@@ -390,19 +393,31 @@ inside the kernel, and writes the reduced hidden output directly. It removes
 the separate storage-round bridge, but the latest Qwen profile is still slower
 than default, so the route remains experimental.
 
-The 2026-05-16 synthetic probe isolates the next blocker:
+The first 2026-05-16 synthetic probe isolated the blocker: the row-grid kernel
+loaded each recurrent group separately and paid extra barriers. The full-tile
+row-grid rewrite fixes that shape by staging the whole recurrent output tile
+once and reducing across all groups in the same row owner.
 
 | Variant | Contract | seqLen 16 relative | seqLen 64 relative | seqLen 128 relative |
 |---|---|---:|---:|---:|
 | `gemvSeqPreRoundedInput` | default-style sequence GEMV after one storage-round bridge | 1.00x | 1.00x | 1.00x |
-| `decodeRoundedInput` | row-grid fan-in with inline decode-equivalent input rounding | 1.97x | 2.04x | 2.02x |
-| `rawInputDiagnostic` | row-grid fan-in without inline input rounding, diagnostic only | 2.41x | 2.79x | 2.34x |
+| `decodeRoundedInput` | full-tile row-grid fan-in with inline decode-equivalent input rounding | 0.91x | 0.81x | 0.78x |
+| `rawInputDiagnostic` | full-tile row-grid fan-in without inline input rounding, diagnostic only | 0.88x | 0.79x | 0.32x |
 
-This means the slower route is not fixed by just moving or deleting the inline
-rounding. A production candidate must beat `gemv_seq_bf16_f32s` with
-pre-rounded input on the same shape before it is worth another full Qwen route
-profile. The next row-grid design should therefore change data reuse or work
-ownership inside the kernel, not only remove a dispatch boundary.
+The same-build Qwen profile is now directionally better at production lengths
+but still not defaultable:
+
+| Route | seqLen 16 | seqLen 64 | seqLen 128 | Decision |
+|---|---:|---:|---:|---|
+| default | 46.270 ms | 164.823 ms | 325.682 ms | current production path |
+| full-tile row-grid fan-in opt-in | 56.829 ms | 163.170 ms | 322.151 ms | keep opt-in; needs runtime gating and repeated evidence |
+
+The next route step is not another grouped fan-in kernel. It is either:
+
+1. add deterministic runtime admission so row-grid only executes at sequence
+   lengths where it wins, then run repeated same-build profiles; or
+2. continue improving the full-tile row-grid kernel until the production-length
+   win is large enough to clear the route-promotion threshold.
 
 ## Current Production Prefill Profile
 
