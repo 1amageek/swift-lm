@@ -250,6 +250,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; opt-in q/k parallel-reduction SSM route keeps schema v6 block boundaries, final hidden/logits, state/KV, and decode0 gates green |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; route fires for all 18 SSM recurrence dispatches, but same-build Qwen profile is slower, so default routing remains unchanged |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel SSM sweep now includes `qkpar_tg{128,256,384}` next to base/shared/prewrite variants so phase wins can be checked against full sequence-kernel behavior |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-only `state_recurrence_cache32` reduces modeled device state traffic to 2.0 MiB/token and matches CPU reference, but regresses badly because it collapses active value-lane parallelism from 128 to 32 |
 
 ## Failed Experiments
 
@@ -271,6 +272,7 @@ flowchart TD
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
+| Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 249.85%/263.62%/245.32% of full-base time for seqLen 16/64/128 | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
 
 ## Open Decisions
 
@@ -1589,8 +1591,8 @@ Current local summary from the focused harness:
 | Sequence length | Best variant | Best base | Speedup vs best base | Decision |
 |---:|---|---|---:|---|
 | 16 | `base_tg384` | `base_tg384` | 0.00% | keep default |
-| 64 | `shared_tg384` | `base_tg128` | 12.15% | candidate shared-RMS diagnostic |
-| 128 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 64 | `shared_tg256` | `base_tg384` | 0.88% | keep default |
+| 128 | `shared_tg384` | `base_tg384` | 0.44% | keep default |
 
 Current decision: no runtime default changes. The best isolated variant moves
 with run-to-run variance and sequence length, while the longest measured
@@ -1632,9 +1634,9 @@ Current local phase-isolation result:
 
 | Sequence length | Conv+SiLU | State recurrence | RMS/gate | Read |
 |---:|---:|---:|---:|---|
-| 16 | 3.15% | 75.52% | 23.22% | state recurrence dominates |
-| 64 | 2.71% | 87.19% | 29.05% | state recurrence dominates |
-| 128 | 1.58% | 53.96% | 14.74% | state recurrence dominates, with noisy full-base denominator |
+| 16 | 3.16% | 75.23% | 23.22% | state recurrence dominates |
+| 64 | 2.68% | 90.49% | 22.98% | state recurrence dominates |
+| 128 | 2.64% | 85.24% | 23.15% | state recurrence dominates |
 
 Current decision: the next serious SSM speed project should target the state
 recurrence phase first. Conv+SiLU is too small to justify more routing
@@ -1673,6 +1675,7 @@ Safe next candidates:
 | register-block multiple `d` lanes per thread | reuses `q/k` and scalar `decay/beta/qInv/kInv/kqSum` across adjacent value lanes | state phase CPU reference, sequence equivalence, Qwen reference, full profile |
 | split state load and final write into vectorized contiguous chunks | improves memory coalescing without changing math | state phase CPU reference and sequence equivalence |
 | cache `q/k` scalar reductions per head once per position | already partly done; further changes must avoid extra barriers | state phase CPU reference |
+| cache decayed state without reducing value-lane parallelism | could remove the second device read only if it preserves 128 active lanes and stays within threadgroup memory | state phase CPU reference, occupancy check, full sequence equivalence |
 
 Unsafe until separately proven:
 
@@ -1681,6 +1684,7 @@ Unsafe until separately proven:
 | cross-position parallel scan | recurrence state is sequential; numerical and state order contract changes |
 | fusing output projection inside recurrence owner | collapses output-row fan-out and already regressed heavily |
 | prewriting decayed state as default | adds a second state write pass and only wins in noisy isolated cases |
+| small value-tile state cache | reduces modeled device reads but serializes value lanes; `cache32` already regressed badly |
 
 The first register-block probe, `state_recurrence_d2`, is intentionally kept as
 a phase-only candidate. It processes two adjacent value lanes per active
@@ -1742,6 +1746,25 @@ same-build Qwen profile regressed and the full-kernel microbench does not show
 a stable best-base win. The likely lesson is that the phase-level q/k scalar
 setup win is smaller than the extra full-kernel barrier and threadgroup-memory
 traffic once the surrounding sequence recurrence loop is included.
+
+The third probe, `state_recurrence_cache32`, tests the most direct traffic
+reduction idea: cache `state_before * decay` in threadgroup memory so pass 2 can
+write `state_after` without rereading device state. It is CPU-reference
+equivalent, but it processes only 32 value lanes per tile and repeats four
+tiles per head. That drops the modeled device state traffic from 3.0 MiB/token
+to 2.0 MiB/token, but the lost lane parallelism dominates:
+
+| Sequence length | Baseline state phase | `cache32` state phase | Modeled device traffic | Active lanes | Decision |
+|---:|---:|---:|---:|---:|---|
+| 16 | 367.2 us | 1219.5 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+| 64 | 1723.0 us | 5019.6 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+| 128 | 3178.0 us | 9146.9 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+
+Current decision: state traffic reduction is still the right target, but
+`cache32` proves that trading away value-lane parallelism is the wrong shape.
+The next state candidate must preserve the 128-lane coalesced state-row access
+pattern, or use a different algorithmic decomposition that does not serialize
+value lanes inside one recurrent owner.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
