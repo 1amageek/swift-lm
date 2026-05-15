@@ -292,6 +292,7 @@ flowchart TD
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; full-profile speed gate CSV generation now distinguishes `full-profile-speedup-observed`, `full-profile-regression-observed`, and `missing-production-sequence`, and route readiness only promotes recurrent row-grid routes when the generated speed gate is positive |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
 | 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
+| 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
 
 ## Failed Experiments
 
@@ -2362,15 +2363,29 @@ The readiness layer is now reconstructable from artifact CSVs:
 flowchart LR
   A["single GEMV route-promotion CSV"] --> C["artifact readiness checker"]
   B["batched GEMV route-promotion CSV"] --> C
-  D["qwen35-prefill-route-gate.csv"] --> C
-  E["qwen35-prefill-full-profile-speed-gate.csv"] --> C
-  C --> F["qwen35-prefill-route-readiness.csv"]
+  D["SSM recurrence route-promotion CSV"] --> C
+  E["qwen35-prefill-route-gate.csv"] --> C
+  F["qwen35-prefill-full-profile-speed-gate.csv"] --> C
+  C --> G["qwen35-prefill-route-readiness.csv"]
 ```
 
 This is intentionally a lightweight parser contract. It proves the release
 evidence artifacts carry enough schema to rebuild the readiness decision, but
 it does not make heavy microbench and real-bundle profile tests depend on each
 other's runtime side effects.
+
+SSM recurrence is now part of the same route-readiness surface. The full-profile
+route gate treats `ssm_recurrence_seq_bf16_f32` as the baseline route and
+`_shared_rms`, `_prewrite_decay`, and `_qkpar` kernels as experimental routes.
+The current local artifact still shows baseline preserved:
+
+| Route family | Observed full-profile route | Current readiness |
+|---|---|---|
+| `ssm_recurrence` | `baseline-route-preserved` | `reject-microbench` for `shared_rms`, `prewrite_decay`, and `qkpar` |
+
+This keeps SSM variants from being promoted on isolated phase wins alone. A
+future SSM candidate must first pass the SSM microbench route-promotion CSV,
+then show the expected experimental kernel in the Qwen full-profile route gate.
 
 There is also an explicit opt-in validation path for current local artifacts:
 
