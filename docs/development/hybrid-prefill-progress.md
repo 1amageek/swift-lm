@@ -251,6 +251,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with and without `SWIFTLM_PREFILL_SSM_QKPAR=1` | Pass; route fires for all 18 SSM recurrence dispatches, but same-build Qwen profile is slower, so default routing remains unchanged |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel SSM sweep now includes `qkpar_tg{128,256,384}` next to base/shared/prewrite variants so phase wins can be checked against full sequence-kernel behavior |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase-only `state_recurrence_cache32` reduces modeled device state traffic to 2.0 MiB/token and matches CPU reference, but regresses badly because it collapses active value-lane parallelism from 128 to 32 |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; cache staging remains rejected after the 64-lane attempt exceeded the AGX 32 KiB threadgroup-memory limit and the runnable 32-lane probe stayed much slower than baseline |
 
 ## Failed Experiments
 
@@ -272,7 +273,8 @@ flowchart TD
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
-| Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 249.85%/263.62%/245.32% of full-base time for seqLen 16/64/128 | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
+| Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 330.5%/217.4%/263.9% of baseline state-phase time for seqLen 16/64/128 in the latest run | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
+| Phase-only `state_recurrence_cache64` attempt | Pipeline creation failed before timing because the static threadgroup allocation was 34,316 bytes, above the 32,768-byte AGX threadgroup-memory limit | Rejected and not kept as a runnable harness variant |
 
 ## Open Decisions
 
@@ -1725,18 +1727,18 @@ partials and barrier do not pay for themselves:
 
 | Sequence length | Baseline state phase | `qkpar` state phase | Active lanes | Decision |
 |---:|---:|---:|---:|---|
-| 16 | 369.1 us | 375.2 us | 128 -> 128 | reject/noise |
-| 64 | 1640.1 us | 1922.8 us | 128 -> 128 | reject |
-| 128 | 3322.1 us | 2800.5 us | 128 -> 128 | phase-only candidate |
+| 16 | 365.8 us | 370.4 us | 128 -> 128 | noise |
+| 64 | 2346.6 us | 2203.5 us | 128 -> 128 | noise |
+| 128 | 3477.0 us | 2809.1 us | 128 -> 128 | phase-only candidate |
 
 The stability harness then measures 128-token state candidates repeatedly in
 the same process:
 
-| Sample | Baseline state phase | `d2` delta | `qkpar` delta |
-|---:|---:|---:|---:|
-| 0 | 3714.3 us | +40.74% | -13.13% |
-| 1 | 4315.3 us | +55.55% | -20.96% |
-| 2 | 3805.3 us | +83.18% | -27.26% |
+| Sample | Baseline state phase | `d2` delta | `qkpar` delta | `cache32` delta |
+|---:|---:|---:|---:|---:|
+| 0 | 4030.8 us | +27.01% | -24.86% | +132.82% |
+| 1 | 2832.7 us | +65.45% | +4.92% | +244.97% |
+| 2 | 2794.9 us | +72.34% | +17.65% | +244.42% |
 
 Current decision: `d2` remains rejected. `qkpar` has completed the sequence
 kernel experiment loop: the full sequence kernel is decode-equivalent, the
@@ -1756,15 +1758,18 @@ to 2.0 MiB/token, but the lost lane parallelism dominates:
 
 | Sequence length | Baseline state phase | `cache32` state phase | Modeled device traffic | Active lanes | Decision |
 |---:|---:|---:|---:|---:|---|
-| 16 | 367.2 us | 1219.5 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
-| 64 | 1723.0 us | 5019.6 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
-| 128 | 3178.0 us | 9146.9 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+| 16 | 365.8 us | 1209.0 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+| 64 | 2346.6 us | 5102.5 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
+| 128 | 3477.0 us | 9177.3 us | 3.0 -> 2.0 MiB/token | 128 -> 32 | reject |
 
 Current decision: state traffic reduction is still the right target, but
 `cache32` proves that trading away value-lane parallelism is the wrong shape.
-The next state candidate must preserve the 128-lane coalesced state-row access
-pattern, or use a different algorithmic decomposition that does not serialize
-value lanes inside one recurrent owner.
+A 64-lane cache variant was attempted next, but the pipeline was rejected by
+Metal because the static threadgroup allocation reached 34,316 bytes on a
+32,768-byte limit. The next state candidate must preserve the 128-lane
+coalesced state-row access pattern without staging a full state tile in
+threadgroup memory, or use a different algorithmic decomposition that does not
+serialize value lanes inside one recurrent owner.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 

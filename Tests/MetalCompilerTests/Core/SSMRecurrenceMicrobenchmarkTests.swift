@@ -572,7 +572,7 @@ private struct SSMPhaseResultRow {
 
     var estimatedStateTotalBytesPerToken: Int {
         guard phase.hasPrefix("state_recurrence") else { return 0 }
-        let devicePasses = phase == "state_recurrence_cache32" ? 2 : 3
+        let devicePasses = stateCacheTileWidth == nil ? 3 : 2
         return headCount * keyDimension * valueDimension * MemoryLayout<Float>.stride * devicePasses
     }
 
@@ -584,8 +584,8 @@ private struct SSMPhaseResultRow {
         if phase == "conv_silu" {
             return threadgroupWidth
         }
-        if phase == "state_recurrence_cache32" {
-            return min(threadgroupWidth, 32)
+        if let stateCacheTileWidth {
+            return min(threadgroupWidth, stateCacheTileWidth)
         }
         let valueThreadCount = (valueDimension + valueLanesPerThread - 1) / valueLanesPerThread
         return min(threadgroupWidth, valueThreadCount)
@@ -604,10 +604,17 @@ private struct SSMPhaseResultRow {
     }
 
     var serialStateLanesPerThread: Int {
-        if phase == "state_recurrence_cache32" {
-            return (valueDimension + 31) / 32
+        if let stateCacheTileWidth {
+            return (valueDimension + stateCacheTileWidth - 1) / stateCacheTileWidth
         }
         return phase.hasPrefix("state_recurrence") ? valueLanesPerThread : 0
+    }
+
+    private var stateCacheTileWidth: Int? {
+        if phase == "state_recurrence_cache32" {
+            return 32
+        }
+        return nil
     }
 }
 
