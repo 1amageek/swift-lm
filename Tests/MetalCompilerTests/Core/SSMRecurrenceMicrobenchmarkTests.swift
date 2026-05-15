@@ -50,11 +50,22 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
 
         let summaryRows = summarize(rows: rows)
+        let routePromotionRows = summarizeRoutePromotions(rows: rows)
         let artifact = try writeCSV(rows: rows)
         let summaryArtifact = try writeSummaryCSV(rows: summaryRows)
-        printReport(rows: rows, summaryRows: summaryRows, artifact: artifact, summaryArtifact: summaryArtifact)
+        let routePromotionArtifact = try writeRoutePromotionCSV(rows: routePromotionRows)
+        printReport(
+            rows: rows,
+            summaryRows: summaryRows,
+            routePromotionRows: routePromotionRows,
+            artifact: artifact,
+            summaryArtifact: summaryArtifact,
+            routePromotionArtifact: routePromotionArtifact
+        )
         #expect(rows.count == Self.sequenceLengths.count * variants.count)
         #expect(summaryRows.count == Self.sequenceLengths.count)
+        #expect(routePromotionRows.count == SSMRoutePromotionCandidate.allCases.count)
+        #expect(routePromotionRows.allSatisfy { $0.requiredSequenceCount == 2 })
     }
 
     @Test("BF16 SSM recurrence phase-isolation microbench")
@@ -245,16 +256,39 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(fastQKParallel.promotionAdmission == "candidate-qkpar-full-kernel")
     }
 
+    @Test("SSM route promotion admissions require production sequence wins")
+    func ssmRoutePromotionAdmissionsRequireProductionSequenceWins() {
+        let rows = [
+            makeSummaryFixture(sequenceLength: 16, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 16, variant: "shared_tg384", averageGpuMicroseconds: 50.0),
+            makeSummaryFixture(sequenceLength: 16, variant: "qkpar_tg384", averageGpuMicroseconds: 50.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "shared_tg384", averageGpuMicroseconds: 94.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "qkpar_tg384", averageGpuMicroseconds: 90.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "shared_tg384", averageGpuMicroseconds: 99.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "qkpar_tg384", averageGpuMicroseconds: 90.0),
+        ]
+        let routeRows = summarizeRoutePromotions(rows: rows)
+        let shared = routeRows.first { $0.candidate == .sharedRMS }
+        let qkParallel = routeRows.first { $0.candidate == .qkParallel }
+        #expect(shared?.routePromotionAdmission == "reject-cross-sequence-threshold")
+        #expect(qkParallel?.routePromotionAdmission == "candidate-qkpar-default-route")
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
+        routePromotionRows: [SSMRoutePromotionRow],
         artifact: URL,
-        summaryArtifact: URL
+        summaryArtifact: URL,
+        routePromotionArtifact: URL
     ) {
         print()
         print("=== BF16 SSM recurrence real-shape microbench ===")
         print("artifact: \(artifact.path)")
         print("summary artifact: \(summaryArtifact.path)")
+        print("route promotion artifact: \(routePromotionArtifact.path)")
         print("seq  variant       avg_us  us/token  grid   tg")
         for row in rows.sorted(by: rowSort) {
             let variant = row.variant.padding(toLength: 16, withPad: " ", startingAt: 0)
@@ -270,6 +304,13 @@ struct SSMRecurrenceMicrobenchmarkTests {
             let decision = row.decision.padding(toLength: 28, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.bestEstimatedStateTotalBytesPerToken) / 1_048_576.0
             print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(String(format: "%12.3f", stateMegabytes))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(decision) \(row.promotionAdmission)")
+        }
+        print()
+        print("=== BF16 SSM recurrence route promotion admissions ===")
+        print("candidate       pass/required  min_speedup  admission")
+        for row in routePromotionRows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
+            let candidate = row.candidate.rawValue.padding(toLength: 15, withPad: " ", startingAt: 0)
+            print("  \(candidate) \(row.passingSequenceCount)/\(row.requiredSequenceCount)          \(String(format: "%7.2f", row.minimumSpeedupPercent))%  \(row.routePromotionAdmission)")
         }
     }
 
@@ -361,6 +402,39 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(format: "%.3f", row.speedupVsBestBasePercent),
                 row.decision,
                 row.promotionAdmission,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func writeRoutePromotionCSV(rows: [SSMRoutePromotionRow]) throws -> URL {
+        let directory = repositoryRoot()
+            .appendingPathComponent(".test-artifacts/ssm-recurrence-microbench", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-route-promotions.csv")
+        var lines = [
+            [
+                "candidate",
+                "productionSequenceLengths",
+                "bestVariants",
+                "speedupPercents",
+                "passingSequenceCount",
+                "requiredSequenceCount",
+                "minimumSpeedupPercent",
+                "routePromotionAdmission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
+            lines.append([
+                row.candidate.rawValue,
+                row.productionSequenceLengths.map(String.init).joined(separator: "|"),
+                row.bestVariants.joined(separator: "|"),
+                row.speedupPercents.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+                String(row.passingSequenceCount),
+                String(row.requiredSequenceCount),
+                String(format: "%.3f", row.minimumSpeedupPercent),
+                row.routePromotionAdmission,
             ].joined(separator: ","))
         }
         try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
@@ -507,6 +581,17 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 best: best,
                 bestBase: bestBase,
                 speedupVsBestBasePercent: speedup
+            )
+        }
+    }
+
+    private func summarizeRoutePromotions(rows: [SSMResultRow]) -> [SSMRoutePromotionRow] {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= SSMSummaryFactory.minimumPromotionSequenceLength }
+        return SSMRoutePromotionCandidate.allCases.map { candidate in
+            SSMRoutePromotionFactory.make(
+                candidate: candidate,
+                productionSequenceLengths: productionSequenceLengths,
+                rows: rows
             )
         }
     }
@@ -774,9 +859,51 @@ private struct SSMSummaryRow {
     let promotionAdmission: String
 }
 
+private enum SSMRoutePromotionCandidate: String, CaseIterable {
+    case prewriteDecay = "prewrite_decay"
+    case qkParallel = "qkpar"
+    case sharedRMS = "shared_rms"
+
+    var variantPrefix: String {
+        switch self {
+        case .prewriteDecay:
+            return "prewrite_"
+        case .qkParallel:
+            return "qkpar_"
+        case .sharedRMS:
+            return "shared_"
+        }
+    }
+
+    var routePromotionAdmission: String {
+        switch self {
+        case .prewriteDecay:
+            return "candidate-prewrite-decay-default-route"
+        case .qkParallel:
+            return "candidate-qkpar-default-route"
+        case .sharedRMS:
+            return "candidate-shared-rms-default-route"
+        }
+    }
+}
+
+private struct SSMRoutePromotionRow {
+    let candidate: SSMRoutePromotionCandidate
+    let productionSequenceLengths: [Int]
+    let bestVariants: [String]
+    let speedupPercents: [Double]
+    let passingSequenceCount: Int
+    let requiredSequenceCount: Int
+    let routePromotionAdmission: String
+
+    var minimumSpeedupPercent: Double {
+        speedupPercents.min() ?? .nan
+    }
+}
+
 private enum SSMSummaryFactory {
-    private static let promotionSpeedupThresholdPercent = 3.0
-    private static let minimumPromotionSequenceLength = 64
+    static let promotionSpeedupThresholdPercent = 3.0
+    static let minimumPromotionSequenceLength = 64
 
     static func make(
         sequenceLength: Int,
@@ -828,6 +955,60 @@ private enum SSMSummaryFactory {
             return "candidate-qkpar-full-kernel"
         }
         return "reject-unknown-variant"
+    }
+}
+
+private enum SSMRoutePromotionFactory {
+    static func make(
+        candidate: SSMRoutePromotionCandidate,
+        productionSequenceLengths: [Int],
+        rows: [SSMResultRow]
+    ) -> SSMRoutePromotionRow {
+        var bestVariants: [String] = []
+        var speedupPercents: [Double] = []
+
+        for sequenceLength in productionSequenceLengths {
+            let sequenceRows = rows.filter { $0.sequenceLength == sequenceLength }
+            let baseRows = sequenceRows.filter { $0.variant.hasPrefix("base_") }
+            let candidateRows = sequenceRows.filter { $0.variant.hasPrefix(candidate.variantPrefix) }
+            guard let bestBase = baseRows.min(by: averageSort),
+                  let bestCandidate = candidateRows.min(by: averageSort) else {
+                bestVariants.append("missing")
+                speedupPercents.append(-Double.infinity)
+                continue
+            }
+            bestVariants.append(bestCandidate.variant)
+            let speedup = (bestBase.averageGpuMicroseconds - bestCandidate.averageGpuMicroseconds)
+                / bestBase.averageGpuMicroseconds * 100.0
+            speedupPercents.append(speedup)
+        }
+
+        let passingCount = speedupPercents.filter {
+            $0 >= SSMSummaryFactory.promotionSpeedupThresholdPercent
+        }.count
+        let admission = passingCount == productionSequenceLengths.count
+            ? candidate.routePromotionAdmission
+            : "reject-cross-sequence-threshold"
+
+        return SSMRoutePromotionRow(
+            candidate: candidate,
+            productionSequenceLengths: productionSequenceLengths,
+            bestVariants: bestVariants,
+            speedupPercents: speedupPercents,
+            passingSequenceCount: passingCount,
+            requiredSequenceCount: productionSequenceLengths.count,
+            routePromotionAdmission: admission
+        )
+    }
+
+    private static func averageSort(_ lhs: SSMResultRow, _ rhs: SSMResultRow) -> Bool {
+        if lhs.averageGpuMicroseconds != rhs.averageGpuMicroseconds {
+            return lhs.averageGpuMicroseconds < rhs.averageGpuMicroseconds
+        }
+        if lhs.requestedThreadgroupWidth != rhs.requestedThreadgroupWidth {
+            return lhs.requestedThreadgroupWidth < rhs.requestedThreadgroupWidth
+        }
+        return lhs.variant < rhs.variant
     }
 }
 

@@ -254,6 +254,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; cache staging remains rejected after the 64-lane attempt exceeded the AGX 32 KiB threadgroup-memory limit and the runnable 32-lane probe stayed much slower than baseline |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase/stability CSV artifacts now emit promotion admission reasons so structurally bad state candidates are rejected before full-kernel routing work |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel summary CSV now emits per-sequence promotion admission reasons and has a synthetic contract test for short-sequence, noisy-speedup, and qkpar candidate classification |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
 
 ## Failed Experiments
 
@@ -1803,6 +1804,23 @@ promotion layer:
 These are per-sequence admissions, not default-routing decisions by themselves.
 A production route still needs cross-sequence stability, Qwen reference parity,
 and full prefill profile improvement before default promotion.
+
+The route-promotion artifact adds that first cross-sequence gate:
+
+```mermaid
+flowchart LR
+  A["candidate family"] --> B["best candidate at seqLen 64"]
+  A --> C["best candidate at seqLen 128"]
+  B --> D{"both >= 3% vs best base?"}
+  C --> D
+  D -->|"yes"| E["route candidate"]
+  D -->|"no"| F["reject-cross-sequence-threshold"]
+```
+
+The current run rejects `shared_rms`, `prewrite_decay`, and `qkpar` at the
+route-promotion layer even when an individual short or medium sequence result
+looks favorable. This keeps route implementation work tied to production-length
+evidence instead of single-row timing noise.
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
