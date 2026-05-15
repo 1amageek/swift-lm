@@ -258,6 +258,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
 
 ## Failed Experiments
 
@@ -2084,3 +2085,49 @@ direct baseline-vs-fused MLP window comparison:
 The fused kernel has a dedicated byte-traffic estimator now. Previously it fell
 through to binding-size estimation and over-reported full-buffer traffic, which
 made the MLP window artifact misleading for promotion decisions.
+
+## Full Profile Route Manifest (2026-05-15)
+
+The Qwen full-profile harness now emits one route manifest per profiled sequence
+length:
+
+```text
+.test-artifacts/prefill-profile/qwen35-prefill-route-manifest-seq16.csv
+.test-artifacts/prefill-profile/qwen35-prefill-route-manifest-seq64.csv
+.test-artifacts/prefill-profile/qwen35-prefill-route-manifest-seq128.csv
+```
+
+This artifact answers a different question from the isolated microbench route
+promotion CSVs: it records which projection route actually executed in the
+full model for that sequence length.
+
+```mermaid
+flowchart LR
+  A["full Qwen prefill profile"] --> B["per-step Metal timing"]
+  B --> C["route manifest"]
+  C --> D["active route family"]
+  C --> E["role"]
+  C --> F["route observation"]
+```
+
+| CSV column | Purpose |
+|---|---|
+| `routeFamily` | `batched_projection`, `single_projection`, or `mlp_fused_down` |
+| `role` | Normalized model role such as `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv`, `mlp.down_proj`, `linear_attn.out_proj`, or `self_attn.o_proj` |
+| `kernelName` | Exact executed Metal kernel |
+| `activeCount` | Number of active dispatches for this route group |
+| `totalGpuMicroseconds` / `averageGpuMicroseconds` | Aggregated profile timing for the active route group |
+| `routeObservation` | Whether the route is baseline, experimental, or the default runtime-gated fused MLP path |
+
+The current default profile confirms the production routing shape:
+
+| Sequence length | Fused MLP route | Remaining single projections | Batched projections |
+|---:|---|---|---|
+| 16 | not active | `mlp.down_proj`, `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
+| 64 | `mlp_fused_down` active | `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
+| 128 | `mlp_fused_down` active | `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
+
+Current decision: use the route manifest as the full-model sanity check after
+each kernel-route experiment. A microbench candidate is not enough; the full
+profile must show that the intended route actually fired and that no unrelated
+projection family changed silently.

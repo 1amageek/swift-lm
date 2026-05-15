@@ -83,6 +83,11 @@ struct Qwen35PrefillProfileTests {
                 directory: artifactDirectory,
                 basename: "qwen35-prefill-steps-seq\(seqLen)"
             )
+            let routeManifestArtifact = try writeRouteManifest(
+                profiles: profile.entries,
+                sequenceLength: seqLen,
+                directory: artifactDirectory
+            )
             let passProfile = try harness.profilePasses(
                 plan: isolatedPlan,
                 submission: &submission,
@@ -112,6 +117,7 @@ struct Qwen35PrefillProfileTests {
                 }
             }
             print("  artifacts: \(stepArtifacts.map(\.path).joined(separator: ", "))")
+            print("  route manifest: \(routeManifestArtifact.path)")
             print("  pass artifacts: \(passArtifacts.map(\.path).joined(separator: ", "))")
         }
 
@@ -248,6 +254,116 @@ struct Qwen35PrefillProfileTests {
             return components[(layerIndex + 2)...].joined(separator: ".")
         }
         return components.suffix(3).joined(separator: ".")
+    }
+
+    private func writeRouteManifest(
+        profiles: [MetalPrefillProfile.Entry],
+        sequenceLength: Int,
+        directory: URL
+    ) throws -> URL {
+        let url = directory.appendingPathComponent("qwen35-prefill-route-manifest-seq\(sequenceLength).csv")
+        struct Aggregate {
+            var count: Int = 0
+            var totalGpuMicroseconds: Double = 0
+        }
+
+        var groups: [String: Aggregate] = [:]
+        for profile in profiles where isProjectionRouteManifestEntry(profile) {
+            let routeFamily = projectionRouteFamily(profile.kernelName)
+            let role = projectionManifestRole(profile)
+            let key = [routeFamily, role, profile.kernelName].joined(separator: "\u{1F}")
+            var aggregate = groups[key] ?? Aggregate()
+            aggregate.count += 1
+            aggregate.totalGpuMicroseconds += profile.averageGpuMicroseconds
+            groups[key] = aggregate
+        }
+
+        var lines = [
+            [
+                "sequenceLength",
+                "routeFamily",
+                "role",
+                "kernelName",
+                "activeCount",
+                "totalGpuMicroseconds",
+                "averageGpuMicroseconds",
+                "routeObservation",
+            ].joined(separator: ","),
+        ]
+        for (key, aggregate) in groups.sorted(by: { $0.key < $1.key }) {
+            let parts = key.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
+            let routeFamily = parts[0]
+            let role = parts[1]
+            let kernelName = parts[2]
+            lines.append([
+                String(sequenceLength),
+                routeFamily,
+                csvEscape(role),
+                csvEscape(kernelName),
+                String(aggregate.count),
+                String(format: "%.3f", aggregate.totalGpuMicroseconds),
+                String(format: "%.3f", aggregate.totalGpuMicroseconds / Double(max(aggregate.count, 1))),
+                routeObservation(kernelName: kernelName, sequenceLength: sequenceLength),
+            ].joined(separator: ","))
+        }
+
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func isProjectionRouteManifestEntry(_ entry: MetalPrefillProfile.Entry) -> Bool {
+        entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
+            || entry.kernelName.hasPrefix("batched_gemv")
+            || entry.kernelName.hasPrefix("mlp_fused_swiglu_down")
+    }
+
+    private func projectionRouteFamily(_ kernelName: String) -> String {
+        if kernelName.hasPrefix("mlp_fused_swiglu_down") {
+            return "mlp_fused_down"
+        }
+        if kernelName.hasPrefix("batched_gemv") {
+            return "batched_projection"
+        }
+        if kernelName.hasPrefix("gemv_seq_bf16_f32s") {
+            return "single_projection"
+        }
+        return "other"
+    }
+
+    private func routeObservation(kernelName: String, sequenceLength: Int) -> String {
+        if kernelName.hasSuffix("_tile2") || kernelName.hasSuffix("_tile4") || kernelName.hasSuffix("_rps2") {
+            return "experimental-route-observed"
+        }
+        if kernelName.hasPrefix("mlp_fused_swiglu_down") {
+            return sequenceLength >= 64 ? "default-runtime-gated-route" : "unexpected-short-sequence-route"
+        }
+        return "baseline-route-observed"
+    }
+
+    private func csvEscape(_ value: String) -> String {
+        if value.contains(",") || value.contains("\"") || value.contains("\n") {
+            return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+        return value
+    }
+
+    private func projectionManifestRole(_ entry: MetalPrefillProfile.Entry) -> String {
+        let tensorName = entry.weightTensorName ?? ""
+        if entry.kernelName.hasPrefix("batched_gemv") {
+            if tensorName.contains("linear_attn.in_proj") {
+                return "linear_attn.in_proj"
+            }
+            if tensorName.contains("mlp.gate_proj") || tensorName.contains("mlp.up_proj") {
+                return "mlp.gate_up"
+            }
+            if tensorName.contains("self_attn.q_proj")
+                || tensorName.contains("self_attn.k_proj")
+                || tensorName.contains("self_attn.v_proj") {
+                return "self_attn.qkv"
+            }
+            return "batched_projection"
+        }
+        return entry.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
     }
 
     private func printScalingReport(profilesByLength: [Int: [MetalPrefillProfile.Entry]], iterations: Int) {
