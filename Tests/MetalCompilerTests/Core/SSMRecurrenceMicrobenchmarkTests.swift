@@ -273,7 +273,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
         let shared = routeRows.first { $0.candidate == .sharedRMS }
         let qkParallel = routeRows.first { $0.candidate == .qkParallel }
         #expect(shared?.routePromotionAdmission == "reject-cross-sequence-threshold")
+        #expect(shared?.failingSequenceLengths == [128])
+        #expect(shared?.thresholdShortfallPercent == 2.0)
         #expect(qkParallel?.routePromotionAdmission == "candidate-qkpar-default-route")
+        #expect(qkParallel?.failingSequenceLengths == [])
+        #expect(qkParallel?.thresholdShortfallPercent == 0.0)
     }
 
     private func printReport(
@@ -307,10 +311,11 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
         print()
         print("=== BF16 SSM recurrence route promotion admissions ===")
-        print("candidate       pass/required  min_speedup  admission")
+        print("candidate       pass/required  min_speedup  shortfall  failing_seq  admission")
         for row in routePromotionRows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
             let candidate = row.candidate.rawValue.padding(toLength: 15, withPad: " ", startingAt: 0)
-            print("  \(candidate) \(row.passingSequenceCount)/\(row.requiredSequenceCount)          \(String(format: "%7.2f", row.minimumSpeedupPercent))%  \(row.routePromotionAdmission)")
+            let failingSequences = row.failingSequenceLengths.map(String.init).joined(separator: "|")
+            print("  \(candidate) \(row.passingSequenceCount)/\(row.requiredSequenceCount)          \(String(format: "%7.2f", row.minimumSpeedupPercent))%  \(String(format: "%8.2f", row.thresholdShortfallPercent))%  \(failingSequences.padding(toLength: 11, withPad: " ", startingAt: 0))  \(row.routePromotionAdmission)")
         }
     }
 
@@ -422,6 +427,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 "passingSequenceCount",
                 "requiredSequenceCount",
                 "minimumSpeedupPercent",
+                "thresholdShortfallPercent",
+                "failingSequenceLengths",
                 "routePromotionAdmission",
             ].joined(separator: ","),
         ]
@@ -434,6 +441,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.passingSequenceCount),
                 String(row.requiredSequenceCount),
                 String(format: "%.3f", row.minimumSpeedupPercent),
+                String(format: "%.3f", row.thresholdShortfallPercent),
+                row.failingSequenceLengths.map(String.init).joined(separator: "|"),
                 row.routePromotionAdmission,
             ].joined(separator: ","))
         }
@@ -894,10 +903,16 @@ private struct SSMRoutePromotionRow {
     let speedupPercents: [Double]
     let passingSequenceCount: Int
     let requiredSequenceCount: Int
+    let failingSequenceLengths: [Int]
     let routePromotionAdmission: String
 
     var minimumSpeedupPercent: Double {
         speedupPercents.min() ?? .nan
+    }
+
+    var thresholdShortfallPercent: Double {
+        guard minimumSpeedupPercent.isFinite else { return .infinity }
+        return max(0.0, SSMSummaryFactory.promotionSpeedupThresholdPercent - minimumSpeedupPercent)
     }
 }
 
@@ -989,6 +1004,9 @@ private enum SSMRoutePromotionFactory {
         let admission = passingCount == productionSequenceLengths.count
             ? candidate.routePromotionAdmission
             : "reject-cross-sequence-threshold"
+        let failingSequenceLengths = zip(productionSequenceLengths, speedupPercents).compactMap { sequenceLength, speedup in
+            speedup >= SSMSummaryFactory.promotionSpeedupThresholdPercent ? nil : sequenceLength
+        }
 
         return SSMRoutePromotionRow(
             candidate: candidate,
@@ -997,6 +1015,7 @@ private enum SSMRoutePromotionFactory {
             speedupPercents: speedupPercents,
             passingSequenceCount: passingCount,
             requiredSequenceCount: productionSequenceLengths.count,
+            failingSequenceLengths: failingSequenceLengths,
             routePromotionAdmission: admission
         )
     }

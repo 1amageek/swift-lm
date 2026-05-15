@@ -255,6 +255,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; phase/stability CSV artifacts now emit promotion admission reasons so structurally bad state candidates are rejected before full-kernel routing work |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; full-kernel summary CSV now emits per-sequence promotion admission reasons and has a synthetic contract test for short-sequence, noisy-speedup, and qkpar candidate classification |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
+| 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
 
 ## Failed Experiments
 
@@ -1821,6 +1822,16 @@ The current run rejects `shared_rms`, `prewrite_decay`, and `qkpar` at the
 route-promotion layer even when an individual short or medium sequence result
 looks favorable. This keeps route implementation work tied to production-length
 evidence instead of single-row timing noise.
+
+The route-promotion CSV includes these diagnostic columns:
+
+| CSV column | Meaning |
+|---|---|
+| `passingSequenceCount` / `requiredSequenceCount` | How many production sequence lengths clear the promotion threshold |
+| `minimumSpeedupPercent` | Worst speedup across production sequence lengths |
+| `thresholdShortfallPercent` | How far the worst sequence length is below the 3% threshold |
+| `failingSequenceLengths` | Production sequence lengths that prevent route promotion |
+| `routePromotionAdmission` | Final per-family route admission or rejection reason |
 
 ## Batched MPP Equivalence Harness (2026-05-12)
 
