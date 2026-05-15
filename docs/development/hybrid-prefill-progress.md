@@ -291,6 +291,7 @@ flowchart TD
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` and `.../routeReadinessCanBeReconstructedFromArtifactCSVs` | Pass; route-readiness schema now has an `observedProfileSpeedGate` column, so future default promotion can require both route observation and an explicit full-profile speedup artifact instead of treating route presence as speed evidence |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; full-profile speed gate CSV generation now distinguishes `full-profile-speedup-observed`, `full-profile-regression-observed`, and `missing-production-sequence`, and route readiness only promotes recurrent row-grid routes when the generated speed gate is positive |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
+| 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
 
 ## Failed Experiments
 
@@ -2340,6 +2341,20 @@ at production sequence lengths `64` and `128`. A route can only become a
 production candidate when every production length meets the configured speedup
 threshold. This prevents a route from being promoted because a narrow kernel or
 microbench improved while the full Qwen profile regressed.
+
+Persisted profile runs can generate the speed gate with:
+
+```bash
+scripts/benchmarks/compare-qwen35-prefill-speed-gate.py \
+  --baseline-dir .test-artifacts/prefill-profile-baseline \
+  --experimental-dir .test-artifacts/prefill-profile-row-grid \
+  --output .test-artifacts/prefill-profile/qwen35-prefill-full-profile-speed-gate.csv
+```
+
+Both input directories must contain `qwen35-prefill-steps-seq64.csv` and
+`qwen35-prefill-steps-seq128.csv` from `Qwen35PrefillProfileTests`; otherwise
+the generated gate records `missing-production-sequence` instead of silently
+promoting the route.
 
 The readiness layer is now reconstructable from artifact CSVs:
 
