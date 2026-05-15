@@ -1720,6 +1720,10 @@ private struct PrefillStepPlanner {
                 bufferPrecision: planBuildContext.kernelContext.bufferPrecision,
                 weightFormat: planBuildContext.kernelContext.weightFormat
             )
+        case .stateUpdateThenRowGridFanInRows:
+            throw MetalCompilerError.deviceSetupFailed(
+                "Fused recurrent block row-grid fan-in route is not implemented"
+            )
         }
         let reduceKernelName = "recurrent_block_partial_reduce_seq_f32"
         guard let fusedPipeline = planBuildContext.pipelineCache[fusedKernelName] else {

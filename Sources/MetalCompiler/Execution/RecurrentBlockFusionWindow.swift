@@ -208,11 +208,24 @@ enum RecurrentBlockFusionTwoStageDecision: Sendable, Equatable {
 enum RecurrentBlockFusionFusedStageExecutionShape: String, Sendable, Equatable {
     case groupOwnedStateUpdateThenPartialRows = "group-owned-state-update-then-partial-rows"
     case partialPartitionOwnedStateUpdatesThenPartialRows = "partial-partition-owned-state-updates-then-partial-rows"
+    case stateUpdateThenRowGridFanInRows = "state-update-then-row-grid-fan-in-rows"
 
     var preservesOutputRowGridParallelism: Bool {
         switch self {
         case .groupOwnedStateUpdateThenPartialRows,
              .partialPartitionOwnedStateUpdatesThenPartialRows:
+            return false
+        case .stateUpdateThenRowGridFanInRows:
+            return true
+        }
+    }
+
+    var isImplementedRoute: Bool {
+        switch self {
+        case .groupOwnedStateUpdateThenPartialRows,
+             .partialPartitionOwnedStateUpdatesThenPartialRows:
+            return true
+        case .stateUpdateThenRowGridFanInRows:
             return false
         }
     }
@@ -255,6 +268,7 @@ enum RecurrentBlockFusionFusedStageDecision: Sendable, Equatable {
 
 enum RecurrentBlockFusionDefaultPromotionRejection: Sendable, Equatable {
     case outputRowGridParallelismNotPreserved(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
+    case executionShapeNotImplemented(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
     case unsafeRowGridFusionAllowed
     case nonPositiveDispatchReduction(estimatedDispatchReduction: Int)
     case numericalContractNotReferenceGated(RecurrentBlockFusionNumericalContract)
@@ -513,6 +527,37 @@ enum RecurrentBlockFusionPrototypePlanner {
         ))
     }
 
+    static func rowGridPreservingFusedStageTargetDecision(
+        for window: RecurrentBlockFusionAdmissionWindow,
+        entries: [DispatchEntry],
+        implicitBridgeStepCount: Int = 0
+    ) -> RecurrentBlockFusionFusedStageDecision {
+        switch fusedStageDecision(
+            for: window,
+            entries: entries,
+            implicitBridgeStepCount: implicitBridgeStepCount
+        ) {
+        case .candidate(let plan):
+            return .candidate(RecurrentBlockFusionFusedStagePlan(
+                layerIndex: plan.layerIndex,
+                partitionCount: plan.partitionCount,
+                recurrentGroupsPerPartition: plan.recurrentGroupsPerPartition,
+                headsPerPartition: plan.headsPerPartition,
+                partitionInputDimension: plan.partitionInputDimension,
+                recurrentOutputDimension: plan.recurrentOutputDimension,
+                outputDimension: plan.outputDimension,
+                currentReplaceableStepCount: plan.currentReplaceableStepCount,
+                targetFusedStageStepCount: plan.targetFusedStageStepCount,
+                estimatedDispatchReduction: plan.estimatedDispatchReduction,
+                executionShape: .stateUpdateThenRowGridFanInRows,
+                unsafeRowGridFusionAllowed: false,
+                numericalContract: plan.numericalContract
+            ))
+        case .rejected(let rejections):
+            return .rejected(rejections)
+        }
+    }
+
     static func defaultPromotionDecision(
         for plan: RecurrentBlockFusionFusedStagePlan
     ) -> RecurrentBlockFusionDefaultPromotionDecision {
@@ -520,6 +565,9 @@ enum RecurrentBlockFusionPrototypePlanner {
 
         if !plan.executionShape.preservesOutputRowGridParallelism {
             rejections.append(.outputRowGridParallelismNotPreserved(executionShape: plan.executionShape))
+        }
+        if !plan.executionShape.isImplementedRoute {
+            rejections.append(.executionShapeNotImplemented(executionShape: plan.executionShape))
         }
         if plan.unsafeRowGridFusionAllowed {
             rejections.append(.unsafeRowGridFusionAllowed)

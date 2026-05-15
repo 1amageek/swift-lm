@@ -313,6 +313,51 @@ struct RecurrentBlockFusionWindowTests {
         ]))
     }
 
+    @Test("Prototype planner exposes row-grid preserving fused-stage target as unimplemented")
+    func prototypePlannerExposesRowGridPreservingFusedStageTargetAsUnimplemented() throws {
+        let entries = [
+            dispatchInputProjection(index: 0, layer: 8, groups: 4),
+            dispatchRecurrence(index: 1, layer: 8, groups: 4),
+            DispatchEntry(
+                index: 2,
+                fragment: ElementwiseFragment(count: 256, kind: .swiglu),
+                layerIndex: 8
+            ),
+            dispatchOutputProjection(index: 3, layer: 8),
+        ]
+        let window = try #require(RecurrentBlockFusionAdmissionScanner.linearAttentionWindows(in: entries).first)
+
+        let decision = RecurrentBlockFusionPrototypePlanner.rowGridPreservingFusedStageTargetDecision(
+            for: window,
+            entries: entries
+        )
+
+        let expectedPlan = RecurrentBlockFusionFusedStagePlan(
+            layerIndex: 8,
+            partitionCount: 4,
+            recurrentGroupsPerPartition: 1,
+            headsPerPartition: 4,
+            partitionInputDimension: 64,
+            recurrentOutputDimension: 256,
+            outputDimension: 2048,
+            currentReplaceableStepCount: 3,
+            targetFusedStageStepCount: 2,
+            estimatedDispatchReduction: 1,
+            executionShape: .stateUpdateThenRowGridFanInRows,
+            unsafeRowGridFusionAllowed: false,
+            numericalContract: .referenceGated
+        )
+
+        #expect(decision == .candidate(expectedPlan))
+        #expect(expectedPlan.executionShape.preservesOutputRowGridParallelism)
+        #expect(!expectedPlan.executionShape.isImplementedRoute)
+        #expect(RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision(
+            for: expectedPlan
+        ) == .rejected([
+            .executionShapeNotImplemented(executionShape: .stateUpdateThenRowGridFanInRows),
+        ]))
+    }
+
     @Test("Scanner finds linear attention recurrent block windows")
     func scannerFindsLinearAttentionWindows() {
         let entries = [

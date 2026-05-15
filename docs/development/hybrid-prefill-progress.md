@@ -275,6 +275,7 @@ flowchart TD
 | 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; opt-in fused recurrent route remains schema v6 reference-equivalent after preserving F32 partial scratch storage |
 | 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests` | Pass; storage-round dispatches dropped from the opt-in fused route, but seqLen 128 still regressed to 966.593 ms because the partition-owned recurrent partial kernel dominates at 737.264 ms |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes machine-readable `defaultPromotionAdmission` and `defaultPromotionRejections` columns |
+| 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; planner now separates implemented-but-row-serial fused-stage shapes from the future row-grid-preserving target shape, and default promotion rejects the target until a real route exists |
 
 ## Failed Experiments
 
@@ -315,8 +316,8 @@ flowchart TD
 | Whether q/k parallel-reduction SSM recurrence should default | No; correctness is green, but the full Qwen profile regresses despite isolated phase stability wins |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
 | Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
-| Next recurrent-block optimization unit | Redesign the partition-owned fused kernel to avoid recomputing/re-reading the full partial projection per partition. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
-| Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups |
+| Next recurrent-block optimization unit | Implement a row-grid-preserving fan-in route for `state-update-then-row-grid-fan-in-rows`. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
+| Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups, and rejects the row-grid target until its route is implemented |
 
 ## Opt-in Fused Recurrent Partial-Emission Status
 
@@ -358,6 +359,21 @@ The profile harness now exposes the failure mode directly:
 | `recurrenceThreadgroupCount` | Number of threadgroups used by the recurrence-stage entry |
 | `outputProjectionThreadgroupCount` | Number of threadgroups used by the output-projection/reduce entries |
 | `rowGridParallelismPreserved` | `false` when a fused recurrence partial-emission kernel serializes output-row projection inside the sequence loop |
+| `defaultPromotionAdmission` / `defaultPromotionRejections` | Machine-readable promotion gate result for the active window shape |
+
+The planner now names the next acceptable recurrent-block target separately from
+the implemented slow routes:
+
+| Execution shape | Row-grid preserved | Implemented route | Default promotion |
+|---|---:|---:|---|
+| `group-owned-state-update-then-partial-rows` | no | yes | reject: serializes output rows |
+| `partial-partition-owned-state-updates-then-partial-rows` | no | yes | reject: serializes output rows |
+| `state-update-then-row-grid-fan-in-rows` | yes | no | reject: route not implemented |
+
+This prevents the next optimization from being framed as "make the current
+partial-emission route faster." The required route shape is different: state
+update ownership must stay well-defined, while output projection fan-in must
+recover row-grid parallelism.
 | `parallelismRisk` | Machine-readable reason that must be cleared before default routing |
 | `defaultPromotionAdmission` | `reject`, `requires-prototype-planner-admission`, or `not-a-fused-stage` |
 | `defaultPromotionRejections` | Machine-readable blocker list for current fused routes |
