@@ -265,6 +265,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes `qwen35-prefill-route-gate.csv`, showing `mlp_fused_down` active at production lengths and all remaining projection routes preserved as baseline |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; synthetic readiness contract requires both a microbench candidate admission and the expected full-profile route gate before a projection route can be treated as production-ready |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` and `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` | Pass; route-promotion CSVs expose the required full-profile route gate and readiness prerequisite so microbench candidates cannot be mistaken for production-ready routes |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; route-readiness CSV now consumes the microbench `readinessPrerequisite` column and rejects candidate-shaped admissions unless they explicitly require the full-profile route gate |
 
 ## Failed Experiments
 
@@ -2218,6 +2219,7 @@ flowchart LR
 | Readiness input | Required value |
 |---|---|
 | `microbenchAdmission` | Must start with `candidate-` |
+| `readinessPrerequisite` | Must equal `requires-full-profile-route-gate`; otherwise reject as `reject-microbench-prerequisite` |
 | `requiredProfileRouteGate` | Published by the microbench route-promotion CSV for every candidate route |
 | `observedProfileRouteGate` | Must equal the route's required profile gate |
 | Missing profile route | Reject as `reject-missing-full-profile-route` |

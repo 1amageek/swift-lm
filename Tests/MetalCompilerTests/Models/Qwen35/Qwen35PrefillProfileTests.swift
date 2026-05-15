@@ -20,6 +20,7 @@ struct Qwen35PrefillProfileTests {
         let role: String
         let variant: String
         let microbenchAdmission: String
+        let readinessPrerequisite: String
         let requiredProfileRouteGate: String
     }
 
@@ -34,6 +35,7 @@ struct Qwen35PrefillProfileTests {
         let role: String
         let variant: String
         let microbenchAdmission: String
+        let readinessPrerequisite: String
         let requiredProfileRouteGate: String
         let observedProfileRouteGate: String?
         let routeReadiness: String
@@ -286,6 +288,7 @@ struct Qwen35PrefillProfileTests {
                     role: "linear_attn.out_proj",
                     variant: "rps2",
                     microbenchAdmission: "candidate-single-gemv-default-route",
+                    readinessPrerequisite: "requires-full-profile-route-gate",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
                 RoutePromotionCandidate(
@@ -293,6 +296,7 @@ struct Qwen35PrefillProfileTests {
                     role: "self_attn.o_proj",
                     variant: "tile2",
                     microbenchAdmission: "reject-cross-sequence-threshold",
+                    readinessPrerequisite: "microbench-rejected",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
                 RoutePromotionCandidate(
@@ -300,6 +304,7 @@ struct Qwen35PrefillProfileTests {
                     role: "mlp.gate_up",
                     variant: "tile2",
                     microbenchAdmission: "candidate-batched-gemv-default-route",
+                    readinessPrerequisite: "requires-full-profile-route-gate",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
                 RoutePromotionCandidate(
@@ -307,6 +312,15 @@ struct Qwen35PrefillProfileTests {
                     role: "self_attn.qkv",
                     variant: "tile4",
                     microbenchAdmission: "candidate-batched-gemv-default-route",
+                    readinessPrerequisite: "requires-full-profile-route-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+                RoutePromotionCandidate(
+                    routeFamily: "single_projection",
+                    role: "mlp.down_proj",
+                    variant: "tile4",
+                    microbenchAdmission: "candidate-single-gemv-default-route",
+                    readinessPrerequisite: "microbench-rejected",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
             ],
@@ -331,16 +345,22 @@ struct Qwen35PrefillProfileTests {
                     role: "self_attn.qkv",
                     routeGate: "missing-production-sequence"
                 ),
+                ProfileRouteGate(
+                    routeFamily: "single_projection",
+                    role: "mlp.down_proj",
+                    routeGate: "experimental-route-observed"
+                ),
             ]
         )
         let url = try writeRouteReadiness(rows: rows, directory: directory)
         let csv = try String(contentsOf: url, encoding: .utf8)
 
-        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,requiredProfileRouteGate,observedProfileRouteGate,routeReadiness"))
-        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,experimental-route-observed,experimental-route-observed,candidate-production-route"))
-        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,experimental-route-observed,experimental-route-observed,reject-microbench"))
-        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
-        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
+        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,readinessPrerequisite,requiredProfileRouteGate,observedProfileRouteGate,routeReadiness"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,experimental-route-observed,candidate-production-route"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench"))
+        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
+        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
+        #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench-prerequisite"))
     }
 
     // MARK: - Bundle resolution
@@ -616,6 +636,7 @@ struct Qwen35PrefillProfileTests {
                 "role",
                 "variant",
                 "microbenchAdmission",
+                "readinessPrerequisite",
                 "requiredProfileRouteGate",
                 "observedProfileRouteGate",
                 "routeReadiness",
@@ -627,6 +648,7 @@ struct Qwen35PrefillProfileTests {
                 csvEscape(row.role),
                 csvEscape(row.variant),
                 csvEscape(row.microbenchAdmission),
+                csvEscape(row.readinessPrerequisite),
                 csvEscape(row.requiredProfileRouteGate),
                 csvEscape(row.observedProfileRouteGate ?? ""),
                 csvEscape(row.routeReadiness),
@@ -649,10 +671,12 @@ struct Qwen35PrefillProfileTests {
                 role: candidate.role,
                 variant: candidate.variant,
                 microbenchAdmission: candidate.microbenchAdmission,
+                readinessPrerequisite: candidate.readinessPrerequisite,
                 requiredProfileRouteGate: candidate.requiredProfileRouteGate,
                 observedProfileRouteGate: observedGate,
                 routeReadiness: routeReadiness(
                     microbenchAdmission: candidate.microbenchAdmission,
+                    readinessPrerequisite: candidate.readinessPrerequisite,
                     requiredProfileRouteGate: candidate.requiredProfileRouteGate,
                     observedProfileRouteGate: observedGate
                 )
@@ -662,11 +686,15 @@ struct Qwen35PrefillProfileTests {
 
     private func routeReadiness(
         microbenchAdmission: String,
+        readinessPrerequisite: String,
         requiredProfileRouteGate: String,
         observedProfileRouteGate: String?
     ) -> String {
         guard microbenchAdmission.hasPrefix("candidate-") else {
             return "reject-microbench"
+        }
+        guard readinessPrerequisite == "requires-full-profile-route-gate" else {
+            return "reject-microbench-prerequisite"
         }
         guard let observedProfileRouteGate else {
             return "reject-missing-full-profile-route"
