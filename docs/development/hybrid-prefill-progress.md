@@ -263,6 +263,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default-environment full profile now hard-checks active route shape: seqLen 16 keeps unfused `mlp.down_proj`, seqLen 64/128 use fused MLP, and remaining single projections stay limited to `linear_attn.out_proj` plus `self_attn.o_proj` |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeGateSummarizesProductionSequenceRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-gate contract verifies 64/128 cross-sequence route summaries classify baseline, default runtime-gated, and experimental routes distinctly |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes `qwen35-prefill-route-gate.csv`, showing `mlp_fused_down` active at production lengths and all remaining projection routes preserved as baseline |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; synthetic readiness contract requires both a microbench candidate admission and the expected full-profile route gate before a projection route can be treated as production-ready |
 
 ## Failed Experiments
 
@@ -2186,3 +2187,29 @@ length group with an experimental kernel is classified as
 The same contract verifies a route missing either 64 or 128 is classified as
 `missing-production-sequence`, so partial evidence cannot be read as a
 production-length route.
+
+The next admission layer combines this route gate with the microbench promotion
+CSV. It is intentionally tested as a lightweight synthetic contract instead of
+making heavy tests depend on each other's artifact execution order:
+
+```mermaid
+flowchart LR
+  A["microbench route promotion"] --> C["route readiness"]
+  B["full-profile route gate"] --> C
+  C --> D{"candidate-production-route?"}
+  D -->|"yes"| E["eligible for routed correctness/profile run"]
+  D -->|"no"| F["keep experimental or reject"]
+```
+
+| Readiness input | Required value |
+|---|---|
+| `microbenchAdmission` | Must start with `candidate-` |
+| `observedProfileRouteGate` | Must equal the route's required profile gate |
+| Missing profile route | Reject as `reject-missing-full-profile-route` |
+| Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |
+| Baseline preserved when an experimental route was required | Reject as `reject-full-profile-route-not-observed` |
+
+Current decision: future projection experiments must pass this readiness layer
+before moving to route-default discussion. A microbench win alone does not
+authorize routing; the full profile must show the intended route actually
+executed across the production sequence lengths.

@@ -15,6 +15,30 @@ struct Qwen35PrefillProfileTests {
     static let sequenceLengths = [16, 64, 128]
     static let iterations = 5
 
+    private struct RoutePromotionCandidate {
+        let routeFamily: String
+        let role: String
+        let variant: String
+        let microbenchAdmission: String
+        let requiredProfileRouteGate: String
+    }
+
+    private struct ProfileRouteGate {
+        let routeFamily: String
+        let role: String
+        let routeGate: String
+    }
+
+    private struct RouteReadinessRow {
+        let routeFamily: String
+        let role: String
+        let variant: String
+        let microbenchAdmission: String
+        let requiredProfileRouteGate: String
+        let observedProfileRouteGate: String?
+        let routeReadiness: String
+    }
+
     @Test("Per-step prefill timing at seqLen 16/64/128")
     func perStepPrefillTimingByLength() throws {
         guard let bundlePath = try resolveBundlePath() else {
@@ -247,6 +271,76 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,,default-runtime-gated-route-active"))
         #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,64,1,200.000,baseline-route-observed,128,missing-production-sequence"))
         #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
+    }
+
+    @Test("Route readiness combines microbench and full profile gates")
+    func routeReadinessCombinesMicrobenchAndFullProfileGates() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-route-readiness-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let rows = routeReadinessRows(
+            candidates: [
+                RoutePromotionCandidate(
+                    routeFamily: "single_projection",
+                    role: "linear_attn.out_proj",
+                    variant: "rps2",
+                    microbenchAdmission: "candidate-single-gemv-default-route",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+                RoutePromotionCandidate(
+                    routeFamily: "single_projection",
+                    role: "self_attn.o_proj",
+                    variant: "tile2",
+                    microbenchAdmission: "reject-cross-sequence-threshold",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+                RoutePromotionCandidate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    variant: "tile2",
+                    microbenchAdmission: "candidate-batched-gemv-default-route",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+                RoutePromotionCandidate(
+                    routeFamily: "batched_projection",
+                    role: "self_attn.qkv",
+                    variant: "tile4",
+                    microbenchAdmission: "candidate-batched-gemv-default-route",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+            ],
+            profileGates: [
+                ProfileRouteGate(
+                    routeFamily: "single_projection",
+                    role: "linear_attn.out_proj",
+                    routeGate: "experimental-route-observed"
+                ),
+                ProfileRouteGate(
+                    routeFamily: "single_projection",
+                    role: "self_attn.o_proj",
+                    routeGate: "experimental-route-observed"
+                ),
+                ProfileRouteGate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    routeGate: "baseline-route-preserved"
+                ),
+                ProfileRouteGate(
+                    routeFamily: "batched_projection",
+                    role: "self_attn.qkv",
+                    routeGate: "missing-production-sequence"
+                ),
+            ]
+        )
+        let url = try writeRouteReadiness(rows: rows, directory: directory)
+        let csv = try String(contentsOf: url, encoding: .utf8)
+
+        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,requiredProfileRouteGate,observedProfileRouteGate,routeReadiness"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,experimental-route-observed,experimental-route-observed,candidate-production-route"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,experimental-route-observed,experimental-route-observed,reject-microbench"))
+        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
+        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
     }
 
     // MARK: - Bundle resolution
@@ -514,6 +608,78 @@ struct Qwen35PrefillProfileTests {
         return url
     }
 
+    private func writeRouteReadiness(rows: [RouteReadinessRow], directory: URL) throws -> URL {
+        let url = directory.appendingPathComponent("qwen35-prefill-route-readiness.csv")
+        var lines = [
+            [
+                "routeFamily",
+                "role",
+                "variant",
+                "microbenchAdmission",
+                "requiredProfileRouteGate",
+                "observedProfileRouteGate",
+                "routeReadiness",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: routeReadinessSort) {
+            lines.append([
+                csvEscape(row.routeFamily),
+                csvEscape(row.role),
+                csvEscape(row.variant),
+                csvEscape(row.microbenchAdmission),
+                csvEscape(row.requiredProfileRouteGate),
+                csvEscape(row.observedProfileRouteGate ?? ""),
+                csvEscape(row.routeReadiness),
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func routeReadinessRows(
+        candidates: [RoutePromotionCandidate],
+        profileGates: [ProfileRouteGate]
+    ) -> [RouteReadinessRow] {
+        candidates.map { candidate in
+            let observedGate = profileGates.first {
+                $0.routeFamily == candidate.routeFamily && $0.role == candidate.role
+            }?.routeGate
+            return RouteReadinessRow(
+                routeFamily: candidate.routeFamily,
+                role: candidate.role,
+                variant: candidate.variant,
+                microbenchAdmission: candidate.microbenchAdmission,
+                requiredProfileRouteGate: candidate.requiredProfileRouteGate,
+                observedProfileRouteGate: observedGate,
+                routeReadiness: routeReadiness(
+                    microbenchAdmission: candidate.microbenchAdmission,
+                    requiredProfileRouteGate: candidate.requiredProfileRouteGate,
+                    observedProfileRouteGate: observedGate
+                )
+            )
+        }
+    }
+
+    private func routeReadiness(
+        microbenchAdmission: String,
+        requiredProfileRouteGate: String,
+        observedProfileRouteGate: String?
+    ) -> String {
+        guard microbenchAdmission.hasPrefix("candidate-") else {
+            return "reject-microbench"
+        }
+        guard let observedProfileRouteGate else {
+            return "reject-missing-full-profile-route"
+        }
+        guard observedProfileRouteGate != "missing-production-sequence" else {
+            return "reject-full-profile-missing-production-sequence"
+        }
+        guard observedProfileRouteGate == requiredProfileRouteGate else {
+            return "reject-full-profile-route-not-observed"
+        }
+        return "candidate-production-route"
+    }
+
     private func isProjectionRouteManifestEntry(_ entry: MetalPrefillProfile.Entry) -> Bool {
         entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
             || entry.kernelName.hasPrefix("batched_gemv")
@@ -588,6 +754,12 @@ struct Qwen35PrefillProfileTests {
             return "batched_projection"
         }
         return entry.weightTensorName.map(weightRoleSummary) ?? "(unknown)"
+    }
+
+    private func routeReadinessSort(_ lhs: RouteReadinessRow, _ rhs: RouteReadinessRow) -> Bool {
+        if lhs.routeFamily != rhs.routeFamily { return lhs.routeFamily < rhs.routeFamily }
+        if lhs.role != rhs.role { return lhs.role < rhs.role }
+        return lhs.variant < rhs.variant
     }
 
     private func assertDefaultProjectionRoutes(profiles: [MetalPrefillProfile.Entry], sequenceLength: Int) {
