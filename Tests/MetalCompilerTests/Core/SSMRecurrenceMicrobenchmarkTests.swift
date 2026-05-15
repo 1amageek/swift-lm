@@ -51,21 +51,25 @@ struct SSMRecurrenceMicrobenchmarkTests {
 
         let summaryRows = summarize(rows: rows)
         let routePromotionRows = summarizeRoutePromotions(rows: rows)
+        let threadgroupPolicyRows = summarizeThreadgroupPolicies(rows: rows)
         let artifact = try writeCSV(rows: rows)
         let summaryArtifact = try writeSummaryCSV(rows: summaryRows)
         let routePromotionArtifact = try writeRoutePromotionCSV(rows: routePromotionRows)
+        let threadgroupPolicyArtifact = try writeThreadgroupPolicyCSV(rows: threadgroupPolicyRows)
         printReport(
             rows: rows,
             summaryRows: summaryRows,
             routePromotionRows: routePromotionRows,
             artifact: artifact,
             summaryArtifact: summaryArtifact,
-            routePromotionArtifact: routePromotionArtifact
+            routePromotionArtifact: routePromotionArtifact,
+            threadgroupPolicyArtifact: threadgroupPolicyArtifact
         )
         #expect(rows.count == Self.sequenceLengths.count * variants.count)
         #expect(summaryRows.count == Self.sequenceLengths.count)
         #expect(routePromotionRows.count == SSMRoutePromotionCandidate.allCases.count)
         #expect(routePromotionRows.allSatisfy { $0.requiredSequenceCount == 2 })
+        #expect(threadgroupPolicyRows.count == SSMThreadgroupPolicyCandidate.allCases.count)
     }
 
     @Test("BF16 SSM recurrence phase-isolation microbench")
@@ -287,6 +291,26 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(qkParallel?.thresholdShortfallPercent == 0.0)
     }
 
+    @Test("SSM threadgroup policy admissions classify fixed and adaptive candidates")
+    func ssmThreadgroupPolicyAdmissionsClassifyCandidates() {
+        let rows = [
+            makeSummaryFixture(sequenceLength: 64, variant: "base_tg128", averageGpuMicroseconds: 120.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "base_tg256", averageGpuMicroseconds: 94.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "base_tg128", averageGpuMicroseconds: 140.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "base_tg256", averageGpuMicroseconds: 101.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "base_tg384", averageGpuMicroseconds: 100.0),
+        ]
+
+        let policyRows = summarizeThreadgroupPolicies(rows: rows)
+        let fixed256 = policyRows.first { $0.candidate == .fixed256 }
+        let adaptive = policyRows.first { $0.candidate == .adaptiveBestBase }
+        #expect(fixed256?.routePromotionAdmission == "reject-cross-sequence-threshold")
+        #expect(fixed256?.failingSequenceLengths == [128])
+        #expect(adaptive?.routePromotionAdmission == "candidate-adaptive-ssm-threadgroup-policy")
+        #expect(adaptive?.selectedVariants == ["base_tg256", "base_tg384"])
+    }
+
     @Test("SSM phase/full bridge blocks phase-only route promotion")
     func ssmPhaseFullBridgeBlocksPhaseOnlyRoutePromotion() throws {
         let stabilityRows = [
@@ -365,13 +389,15 @@ struct SSMRecurrenceMicrobenchmarkTests {
         routePromotionRows: [SSMRoutePromotionRow],
         artifact: URL,
         summaryArtifact: URL,
-        routePromotionArtifact: URL
+        routePromotionArtifact: URL,
+        threadgroupPolicyArtifact: URL
     ) {
         print()
         print("=== BF16 SSM recurrence real-shape microbench ===")
         print("artifact: \(artifact.path)")
         print("summary artifact: \(summaryArtifact.path)")
         print("route promotion artifact: \(routePromotionArtifact.path)")
+        print("threadgroup policy artifact: \(threadgroupPolicyArtifact.path)")
         print("seq  variant       avg_us  us/token  grid   tg")
         for row in rows.sorted(by: rowSort) {
             let variant = row.variant.padding(toLength: 16, withPad: " ", startingAt: 0)
@@ -521,6 +547,44 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 String(row.requiredSequenceCount),
                 String(format: "%.3f", row.minimumSpeedupPercent),
                 String(format: "%.3f", row.thresholdShortfallPercent),
+                row.failingSequenceLengths.map(String.init).joined(separator: "|"),
+                row.routePromotionAdmission,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func writeThreadgroupPolicyCSV(rows: [SSMThreadgroupPolicyRow]) throws -> URL {
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-threadgroup-policies.csv")
+        var lines = [
+            [
+                "candidate",
+                "productionSequenceLengths",
+                "baselineVariants",
+                "selectedVariants",
+                "speedupPercents",
+                "winningSequenceCount",
+                "requiredSequenceCount",
+                "minimumSpeedupPercent",
+                "maximumRegressionPercent",
+                "failingSequenceLengths",
+                "routePromotionAdmission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
+            lines.append([
+                row.candidate.rawValue,
+                row.productionSequenceLengths.map(String.init).joined(separator: "|"),
+                row.baselineVariants.joined(separator: "|"),
+                row.selectedVariants.joined(separator: "|"),
+                row.speedupPercents.map { String(format: "%.3f", $0) }.joined(separator: "|"),
+                String(row.winningSequenceCount),
+                String(row.requiredSequenceCount),
+                String(format: "%.3f", row.minimumSpeedupPercent),
+                String(format: "%.3f", row.maximumRegressionPercent),
                 row.failingSequenceLengths.map(String.init).joined(separator: "|"),
                 row.routePromotionAdmission,
             ].joined(separator: ","))
@@ -732,6 +796,17 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
     }
 
+    private func summarizeThreadgroupPolicies(rows: [SSMResultRow]) -> [SSMThreadgroupPolicyRow] {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= SSMSummaryFactory.minimumPromotionSequenceLength }
+        return SSMThreadgroupPolicyCandidate.allCases.map { candidate in
+            SSMThreadgroupPolicyFactory.make(
+                candidate: candidate,
+                productionSequenceLengths: productionSequenceLengths,
+                rows: rows
+            )
+        }
+    }
+
     private func repositoryRoot() -> URL {
         URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
@@ -784,7 +859,14 @@ struct SSMRecurrenceMicrobenchmarkTests {
         variant: String,
         averageGpuMicroseconds: Double
     ) -> SSMResultRow {
-        SSMResultRow(
+        let requestedThreadgroupWidth = if variant.hasSuffix("_tg128") {
+            128
+        } else if variant.hasSuffix("_tg256") {
+            256
+        } else {
+            384
+        }
+        return SSMResultRow(
             sequenceLength: sequenceLength,
             variant: variant,
             headCount: 16,
@@ -794,8 +876,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
             convKernelSize: 4,
             gridWidth: 16,
             gridHeight: 1,
-            threadgroupWidth: 384,
-            requestedThreadgroupWidth: 384,
+            threadgroupWidth: requestedThreadgroupWidth,
+            requestedThreadgroupWidth: requestedThreadgroupWidth,
             averageGpuMicroseconds: averageGpuMicroseconds
         )
     }
@@ -1278,6 +1360,23 @@ private enum SSMRoutePromotionCandidate: String, CaseIterable {
     }
 }
 
+private enum SSMThreadgroupPolicyCandidate: String, CaseIterable {
+    case adaptiveBestBase = "adaptive_best_base"
+    case fixed128 = "fixed_tg128"
+    case fixed256 = "fixed_tg256"
+
+    var fixedWidth: Int? {
+        switch self {
+        case .adaptiveBestBase:
+            return nil
+        case .fixed128:
+            return 128
+        case .fixed256:
+            return 256
+        }
+    }
+}
+
 private struct SSMRoutePromotionRow {
     let candidate: SSMRoutePromotionCandidate
     let productionSequenceLengths: [Int]
@@ -1295,6 +1394,26 @@ private struct SSMRoutePromotionRow {
     var thresholdShortfallPercent: Double {
         guard minimumSpeedupPercent.isFinite else { return .infinity }
         return max(0.0, SSMSummaryFactory.promotionSpeedupThresholdPercent - minimumSpeedupPercent)
+    }
+}
+
+private struct SSMThreadgroupPolicyRow {
+    let candidate: SSMThreadgroupPolicyCandidate
+    let productionSequenceLengths: [Int]
+    let baselineVariants: [String]
+    let selectedVariants: [String]
+    let speedupPercents: [Double]
+    let winningSequenceCount: Int
+    let requiredSequenceCount: Int
+    let failingSequenceLengths: [Int]
+    let routePromotionAdmission: String
+
+    var minimumSpeedupPercent: Double {
+        speedupPercents.min() ?? .nan
+    }
+
+    var maximumRegressionPercent: Double {
+        abs(min(0.0, minimumSpeedupPercent))
     }
 }
 
@@ -1352,6 +1471,89 @@ private enum SSMSummaryFactory {
             return "candidate-qkpar-full-kernel"
         }
         return "reject-unknown-variant"
+    }
+}
+
+private enum SSMThreadgroupPolicyFactory {
+    static let defaultThreadgroupWidth = 384
+    static let maximumAllowedRegressionPercent = 1.0
+
+    static func make(
+        candidate: SSMThreadgroupPolicyCandidate,
+        productionSequenceLengths: [Int],
+        rows: [SSMResultRow]
+    ) -> SSMThreadgroupPolicyRow {
+        var baselineVariants: [String] = []
+        var selectedVariants: [String] = []
+        var speedupPercents: [Double] = []
+
+        for sequenceLength in productionSequenceLengths {
+            let sequenceRows = rows.filter { $0.sequenceLength == sequenceLength && $0.variant.hasPrefix("base_") }
+            guard let baseline = sequenceRows.first(where: { $0.requestedThreadgroupWidth == defaultThreadgroupWidth }),
+                  let selected = selectedRow(candidate: candidate, rows: sequenceRows) else {
+                baselineVariants.append("missing")
+                selectedVariants.append("missing")
+                speedupPercents.append(-Double.infinity)
+                continue
+            }
+            baselineVariants.append(baseline.variant)
+            selectedVariants.append(selected.variant)
+            speedupPercents.append(
+                (baseline.averageGpuMicroseconds - selected.averageGpuMicroseconds)
+                    / baseline.averageGpuMicroseconds * 100.0
+            )
+        }
+
+        let winningCount = speedupPercents.filter {
+            $0 >= SSMSummaryFactory.promotionSpeedupThresholdPercent
+        }.count
+        let failingSequenceLengths = zip(productionSequenceLengths, speedupPercents).compactMap { sequenceLength, speedup in
+            speedup < SSMSummaryFactory.promotionSpeedupThresholdPercent ? sequenceLength : nil
+        }
+        let minimumSpeedup = speedupPercents.min() ?? -.infinity
+        let admission: String
+        switch candidate {
+        case .adaptiveBestBase:
+            admission = minimumSpeedup >= -maximumAllowedRegressionPercent && winningCount > 0
+                ? "candidate-adaptive-ssm-threadgroup-policy"
+                : "reject-cross-sequence-threshold"
+        case .fixed128, .fixed256:
+            admission = winningCount == productionSequenceLengths.count
+                ? "candidate-fixed-ssm-threadgroup-route"
+                : "reject-cross-sequence-threshold"
+        }
+
+        return SSMThreadgroupPolicyRow(
+            candidate: candidate,
+            productionSequenceLengths: productionSequenceLengths,
+            baselineVariants: baselineVariants,
+            selectedVariants: selectedVariants,
+            speedupPercents: speedupPercents,
+            winningSequenceCount: winningCount,
+            requiredSequenceCount: productionSequenceLengths.count,
+            failingSequenceLengths: failingSequenceLengths,
+            routePromotionAdmission: admission
+        )
+    }
+
+    private static func selectedRow(
+        candidate: SSMThreadgroupPolicyCandidate,
+        rows: [SSMResultRow]
+    ) -> SSMResultRow? {
+        if let fixedWidth = candidate.fixedWidth {
+            return rows.first { $0.requestedThreadgroupWidth == fixedWidth }
+        }
+        return rows.min(by: averageSort)
+    }
+
+    private static func averageSort(_ lhs: SSMResultRow, _ rhs: SSMResultRow) -> Bool {
+        if lhs.averageGpuMicroseconds != rhs.averageGpuMicroseconds {
+            return lhs.averageGpuMicroseconds < rhs.averageGpuMicroseconds
+        }
+        if lhs.requestedThreadgroupWidth != rhs.requestedThreadgroupWidth {
+            return lhs.requestedThreadgroupWidth < rhs.requestedThreadgroupWidth
+        }
+        return lhs.variant < rhs.variant
     }
 }
 

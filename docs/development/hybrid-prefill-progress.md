@@ -257,6 +257,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now aggregates 64/128-token production sequence evidence so a one-sequence win cannot be mistaken for a default-routing candidate |
 | 2026-05-15 | `swift test --filter SSMRecurrenceMicrobenchmarkTests` | Pass; route-promotion CSV now records failing production sequence lengths and threshold shortfall, making rejection reasons inspectable without reading console logs |
 | 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmPhaseFullBridgeBlocksPhaseOnlyRoutePromotion` and `SWIFTLM_VALIDATE_SSM_RECURRENCE_BRIDGE_ARTIFACTS=1 .../ssmPhaseFullBridgeArtifactsCanBeReconstructedWhenRequested` | Pass; phase/full bridge artifact joins phase stability with full-kernel route promotion so phase-only wins cannot be promoted |
+| 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmThreadgroupPolicyAdmissionsClassifyCandidates` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrenceRealShapeMicrobench` | Pass; SSM threadgroup policy artifact rejects current fixed/adaptive routes, while the synthetic contract covers the policy-only candidate classification |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
@@ -1717,9 +1718,9 @@ does not justify default promotion:
 
 | Sequence length | Total prefill time | SSM time | Decision |
 |---:|---:|---:|---|
-| 16 | 43.813 ms | 9.203 ms | noise |
-| 64 | 160.583 ms | 35.392 ms | slower |
-| 128 | 315.422 ms | 70.439 ms | slower/noisy |
+| 16 | 45.247 ms | 9.183 ms | noise |
+| 64 | 162.751 ms | 35.238 ms | slower |
+| 128 | 320.168 ms | 70.153 ms | slower/noisy |
 
 Current decision: keep the width override as an opt-in diagnostic only. It is
 valuable for future sweeps because it proves narrower dispatch geometry is
@@ -1728,7 +1729,7 @@ width until a full-model profile shows a stable win.
 
 ## SSM Recurrence Decision Summary Harness (2026-05-15)
 
-The SSM recurrence microbenchmark now emits four artifacts:
+The SSM recurrence microbenchmark now emits five artifacts:
 
 | Artifact | Purpose |
 |---|---|
@@ -1736,6 +1737,7 @@ The SSM recurrence microbenchmark now emits four artifacts:
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-summary.csv` | Per-sequence best variant, best base variant, estimated state traffic, speedup against best base, and promotion decision |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phases.csv` | Synthetic per-phase timing, full-base relative share, active-thread shape, state-traffic estimate, and output checksum for conv+SiLU, state recurrence, and RMS/gate phases |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-stability.csv` | Repeated 128-token phase candidate samples compared against the baseline state phase in the same test process |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-threadgroup-policies.csv` | Fixed 128/256 and adaptive best-base threadgroup policy comparison against default 384 for production sequence lengths |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
@@ -1756,9 +1758,24 @@ Current local summary from the focused harness:
 
 | Sequence length | Best variant | Best base | Speedup vs best base | Decision |
 |---:|---|---|---:|---|
-| 16 | `base_tg384` | `base_tg384` | 0.00% | keep default |
-| 64 | `shared_tg256` | `base_tg384` | 0.88% | keep default |
-| 128 | `shared_tg384` | `base_tg384` | 0.44% | keep default |
+| 16 | `shared_tg384` | `base_tg384` | 39.27% | keep default; short sequence only |
+| 64 | `base_tg384` | `base_tg384` | 0.00% | keep default |
+| 128 | `shared_tg384` | `base_tg384` | 0.04% | keep default |
+
+Current local threadgroup-policy summary from the same harness:
+
+| Candidate | Selected variants | Speedup vs default base | Admission |
+|---|---|---:|---|
+| `adaptive_best_base` | `base_tg384` / `base_tg384` | `0.000%` / `0.000%` | `reject-cross-sequence-threshold` |
+| `fixed_tg128` | `base_tg128` / `base_tg128` | `-69.226%` / `-18.253%` | `reject-cross-sequence-threshold` |
+| `fixed_tg256` | `base_tg256` / `base_tg256` | `-2.418%` / `-1.627%` | `reject-cross-sequence-threshold` |
+
+Fixed `tg=256` remains rejected because production sequence lengths regress in
+the latest artifact. The adaptive best-base row currently selects the default
+`tg=384` base at both production lengths, so it is not a routing candidate. If
+a future artifact reclassifies it as a policy candidate, it still requires
+sequence-conditioned runtime selection, Qwen reference parity on that selected
+route, and a full profile speed gate before any production promotion.
 
 Current decision: no runtime default changes. The best isolated variant moves
 with run-to-run variance and sequence length, while the longest measured
