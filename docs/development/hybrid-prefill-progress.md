@@ -2137,6 +2137,7 @@ The cross-sequence route gate adds these fields:
 | `productionSequenceLengths` | Production sequence lengths covered by the route group, currently `64|128` |
 | `activeCounts` | Active dispatch counts per production sequence length |
 | `routeObservations` | Per-length route labels from the route manifest |
+| `missingSequenceLengths` | Production sequence lengths missing for that route group |
 | `routeGate` | Cross-sequence classification: `baseline-route-preserved`, `default-runtime-gated-route-active`, `experimental-route-observed`, or `mixed-route-observed` |
 
 The current default profile confirms the production routing shape:
@@ -2182,3 +2183,6 @@ The route manifest writer also has a lightweight synthetic contract test:
 The route gate has a separate synthetic contract that verifies a production
 length group with an experimental kernel is classified as
 `experimental-route-observed` instead of being mistaken for a default route.
+The same contract verifies a route missing either 64 or 128 is classified as
+`missing-production-sequence`, so partial evidence cannot be read as a
+production-length route.

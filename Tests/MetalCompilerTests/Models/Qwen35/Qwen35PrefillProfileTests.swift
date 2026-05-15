@@ -217,18 +217,24 @@ struct Qwen35PrefillProfileTests {
                         weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
                         averageGpuMicroseconds: 200
                     ),
+                    syntheticProfileEntry(
+                        index: 2,
+                        kernelName: "gemv_seq_bf16_f32s_rps2",
+                        weightTensorName: "model.layers.0.self_attn.o_proj.weight",
+                        averageGpuMicroseconds: 50
+                    ),
                 ],
                 128: [
                     syntheticProfileEntry(
-                        index: 2,
+                        index: 3,
                         kernelName: "mlp_fused_swiglu_down_seq_bf16_f32s",
                         weightTensorName: "model.layers.0.mlp.down_proj.weight",
                         averageGpuMicroseconds: 300
                     ),
                     syntheticProfileEntry(
-                        index: 3,
+                        index: 4,
                         kernelName: "gemv_seq_bf16_f32s_rps2",
-                        weightTensorName: "model.layers.0.linear_attn.out_proj.weight",
+                        weightTensorName: "model.layers.0.self_attn.o_proj.weight",
                         averageGpuMicroseconds: 400
                     ),
                 ],
@@ -237,10 +243,10 @@ struct Qwen35PrefillProfileTests {
         )
 
         let csv = try String(contentsOf: url, encoding: .utf8)
-        #expect(csv.contains("routeFamily,role,kernelName,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,routeGate"))
-        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,default-runtime-gated-route-active"))
-        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,64,1,200.000,baseline-route-observed,baseline-route-preserved"))
-        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s_rps2,128,1,400.000,experimental-route-observed,experimental-route-observed"))
+        #expect(csv.contains("routeFamily,role,kernelName,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate"))
+        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,,default-runtime-gated-route-active"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,64,1,200.000,baseline-route-observed,128,missing-production-sequence"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
     }
 
     // MARK: - Bundle resolution
@@ -475,6 +481,7 @@ struct Qwen35PrefillProfileTests {
                 "activeCounts",
                 "totalGpuMicroseconds",
                 "routeObservations",
+                "missingSequenceLengths",
                 "routeGate",
             ].joined(separator: ","),
         ]
@@ -483,6 +490,9 @@ struct Qwen35PrefillProfileTests {
             let routeFamily = parts[0]
             let role = parts[1]
             let kernelName = parts[2]
+            let missingSequenceLengths = productionSequenceLengths.filter {
+                !aggregate.sequenceLengths.contains($0)
+            }
             lines.append([
                 routeFamily,
                 csvEscape(role),
@@ -491,7 +501,12 @@ struct Qwen35PrefillProfileTests {
                 aggregate.activeCounts.map(String.init).joined(separator: "|"),
                 String(format: "%.3f", aggregate.totalGpuMicroseconds),
                 aggregate.routeObservations.joined(separator: "|"),
-                routeGate(routeFamily: routeFamily, routeObservations: aggregate.routeObservations),
+                missingSequenceLengths.map(String.init).joined(separator: "|"),
+                routeGate(
+                    routeFamily: routeFamily,
+                    routeObservations: aggregate.routeObservations,
+                    missingSequenceLengths: missingSequenceLengths
+                ),
             ].joined(separator: ","))
         }
 
@@ -528,7 +543,14 @@ struct Qwen35PrefillProfileTests {
         return "baseline-route-observed"
     }
 
-    private func routeGate(routeFamily: String, routeObservations: [String]) -> String {
+    private func routeGate(
+        routeFamily: String,
+        routeObservations: [String],
+        missingSequenceLengths: [Int]
+    ) -> String {
+        guard missingSequenceLengths.isEmpty else {
+            return "missing-production-sequence"
+        }
         if routeObservations.contains("experimental-route-observed") {
             return "experimental-route-observed"
         }
