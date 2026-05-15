@@ -313,8 +313,8 @@ struct RecurrentBlockFusionWindowTests {
         ]))
     }
 
-    @Test("Prototype planner exposes row-grid preserving fused-stage target as unimplemented")
-    func prototypePlannerExposesRowGridPreservingFusedStageTargetAsUnimplemented() throws {
+    @Test("Prototype planner exposes row-grid preserving fused-stage target as not default-promotable")
+    func prototypePlannerExposesRowGridPreservingFusedStageTargetAsNotDefaultPromotable() throws {
         let entries = [
             dispatchInputProjection(index: 0, layer: 8, groups: 4),
             dispatchRecurrence(index: 1, layer: 8, groups: 4),
@@ -350,11 +350,11 @@ struct RecurrentBlockFusionWindowTests {
 
         #expect(decision == .candidate(expectedPlan))
         #expect(expectedPlan.executionShape.preservesOutputRowGridParallelism)
-        #expect(!expectedPlan.executionShape.isImplementedRoute)
+        #expect(!expectedPlan.executionShape.hasDefaultPromotionEvidence)
         #expect(RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision(
             for: expectedPlan
         ) == .rejected([
-            .executionShapeNotImplemented(executionShape: .stateUpdateThenRowGridFanInRows),
+            .executionShapeLacksDefaultEvidence(executionShape: .stateUpdateThenRowGridFanInRows),
         ]))
     }
 

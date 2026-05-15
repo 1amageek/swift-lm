@@ -471,7 +471,7 @@ struct RecurrentBlockFusionKernelTests {
             BFloat16(Float((index * 13) % 37 - 18) * 0.015625)
         }
         let output = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
-        let expected = expectedPartialProjectionAndReduce(
+        let expected = expectedRowGridFanInProjection(
             input: input,
             weights: weights,
             groupCount: groupCount,
@@ -617,6 +617,36 @@ struct RecurrentBlockFusionKernelTests {
                         partial += inputValue * weightValue
                     }
                     total += partial
+                }
+                output[seq * outputRowStride + row] = total
+            }
+        }
+        return output
+    }
+
+    private func expectedRowGridFanInProjection(
+        input: [Float],
+        weights: [BFloat16],
+        groupCount: Int,
+        partitionInputDimension: Int,
+        outputDimension: Int,
+        sequenceLength: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        sentinel: Float
+    ) -> [Float] {
+        let inputDimension = groupCount * partitionInputDimension
+        var output = [Float](repeating: sentinel, count: sequenceLength * outputRowStride)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                var total: Float = 0
+                for group in 0..<groupCount {
+                    let groupInputBase = group * partitionInputDimension
+                    for column in 0..<partitionInputDimension {
+                        let inputValue = Float(BFloat16(input[seq * inputRowStride + groupInputBase + column]))
+                        let weightValue = Float(weights[row * inputDimension + groupInputBase + column])
+                        total += inputValue * weightValue
+                    }
                 }
                 output[seq * outputRowStride + row] = total
             }

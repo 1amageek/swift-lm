@@ -607,6 +607,11 @@ extension MetalSourceGenerator {
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let loadInput = { (expr: String) in
+            bufferPrecision.isPrefillSequencePrecision
+                ? MetalSourceGenerator.sequenceStorageValue("float(\(expr))", weightFormat: weightFormat)
+                : "float(\(expr))"
+        }
 
         return """
         kernel void \(name)(
@@ -644,7 +649,7 @@ extension MetalSourceGenerator {
                     for (uint j = tid; j < tileElements; j += threadsPerThreadgroup.x) {
                         const uint inputIndex = base + j;
                         inputTile[j] = inputIndex < partitionInputDimension
-                            ? inputRow[inputIndex]
+                            ? \(bt)(\(loadInput("inputRow[inputIndex]")))
                             : \(bt)(0.0f);
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -395,6 +395,14 @@ struct MetalKernelSourceCatalog {
                         }
                     }
                     if bufferPrecision.isPrefillSequencePrecision, let ssmFragment = fragment as? SSMRecurrenceFragment {
+                        let rowGridFanInKernelName = "recurrent_block_row_grid_fan_in_seq_bf16_f32"
+                        if weightFormat == .bfloat16, generatedNames.insert(rowGridFanInKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateRecurrentBlockRowGridFanInProjection(
+                                name: rowGridFanInKernelName,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            ))
+                        }
                         let partialProjectionKernelName = "recurrent_block_partial_projection_seq_bf16_f32"
                         if weightFormat == .bfloat16, generatedNames.insert(partialProjectionKernelName).inserted {
                             sources.append(MetalSourceGenerator.generateRecurrentBlockPartialProjection(

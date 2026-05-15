@@ -185,6 +185,20 @@ public struct MetalPrefillStep: @unchecked Sendable {
         )
     }
 
+    public func withMetadata(_ metadata: MetalDispatchStepMetadata) -> MetalPrefillStep {
+        MetalPrefillStep(
+            descriptor: descriptor,
+            bindings: bindings,
+            mode: mode,
+            sequenceLengthPolicy: sequenceLengthPolicy,
+            positionBufferIndex: positionBufferIndex,
+            perPositionStrides: perPositionStrides,
+            metadata: metadata,
+            executionCondition: executionCondition,
+            tileVariants: tileVariants
+        )
+    }
+
     public func bindRuntimeArguments(
         argumentTable: MTL4ArgumentTable,
         runtimeConstantBuffer: MTLBuffer,

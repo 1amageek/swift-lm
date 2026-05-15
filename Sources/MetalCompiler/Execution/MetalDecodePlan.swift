@@ -69,19 +69,23 @@ public struct MetalDispatchStepMetadata: Sendable, Equatable {
     /// The optimizer uses this to determine whether a memory barrier is needed between steps.
     /// When nil, the optimizer conservatively treats all bindings as both read and written.
     public let bufferAccessPattern: BufferAccessPattern?
+    /// Keeps sequence storage in F32 after this step even when decode storage is F16/BF16.
+    public let preservesFloat32SequenceStorage: Bool
 
     public init(
         kernelName: String? = nil,
         entryIndex: Int? = nil,
         layerIndex: Int? = nil,
         weightTensorName: String? = nil,
-        bufferAccessPattern: BufferAccessPattern? = nil
+        bufferAccessPattern: BufferAccessPattern? = nil,
+        preservesFloat32SequenceStorage: Bool = false
     ) {
         self.kernelName = kernelName
         self.entryIndex = entryIndex
         self.layerIndex = layerIndex
         self.weightTensorName = weightTensorName
         self.bufferAccessPattern = bufferAccessPattern
+        self.preservesFloat32SequenceStorage = preservesFloat32SequenceStorage
     }
 
     /// Declares which buffer binding indices are read vs written by a prefill step.

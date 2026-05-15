@@ -220,7 +220,7 @@ enum RecurrentBlockFusionFusedStageExecutionShape: String, Sendable, Equatable {
         }
     }
 
-    var isImplementedRoute: Bool {
+    var hasDefaultPromotionEvidence: Bool {
         switch self {
         case .groupOwnedStateUpdateThenPartialRows,
              .partialPartitionOwnedStateUpdatesThenPartialRows:
@@ -268,7 +268,7 @@ enum RecurrentBlockFusionFusedStageDecision: Sendable, Equatable {
 
 enum RecurrentBlockFusionDefaultPromotionRejection: Sendable, Equatable {
     case outputRowGridParallelismNotPreserved(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
-    case executionShapeNotImplemented(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
+    case executionShapeLacksDefaultEvidence(executionShape: RecurrentBlockFusionFusedStageExecutionShape)
     case unsafeRowGridFusionAllowed
     case nonPositiveDispatchReduction(estimatedDispatchReduction: Int)
     case numericalContractNotReferenceGated(RecurrentBlockFusionNumericalContract)
@@ -566,8 +566,8 @@ enum RecurrentBlockFusionPrototypePlanner {
         if !plan.executionShape.preservesOutputRowGridParallelism {
             rejections.append(.outputRowGridParallelismNotPreserved(executionShape: plan.executionShape))
         }
-        if !plan.executionShape.isImplementedRoute {
-            rejections.append(.executionShapeNotImplemented(executionShape: plan.executionShape))
+        if !plan.executionShape.hasDefaultPromotionEvidence {
+            rejections.append(.executionShapeLacksDefaultEvidence(executionShape: plan.executionShape))
         }
         if plan.unsafeRowGridFusionAllowed {
             rejections.append(.unsafeRowGridFusionAllowed)

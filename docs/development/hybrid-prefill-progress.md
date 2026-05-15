@@ -277,6 +277,8 @@ flowchart TD
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes machine-readable `defaultPromotionAdmission` and `defaultPromotionRejections` columns |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; planner now separates implemented-but-row-serial fused-stage shapes from the future row-grid-preserving target shape, and default promotion rejects the target until a real route exists |
 | 2026-05-15 | `swift test --filter RecurrentBlockFusionKernelTests` | Pass; synthetic row-grid fan-in projection kernel matches the CPU cross-group reference without writing partition partial scratch |
+| 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; opt-in row-grid fan-in route remains schema v6 reference-equivalent for block boundaries, final hidden/logits, state/KV, and decode0 |
+| 2026-05-15 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests` | Pass; route fires 18 `recurrent_block_row_grid_fan_in_seq_bf16_f32` dispatches and removes 18 `linear_attn.out_proj` GEMVs plus 18 round bridges, but seqLen 128 still regresses to 332.700 ms |
 
 ## Failed Experiments
 
@@ -298,6 +300,7 @@ flowchart TD
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
 | Preserving F32 partial scratch storage in the opt-in fused route | Correctness still passed and storage-round dispatches were reduced, but Qwen seqLen 16/64/128 still measured 126.712/482.701/966.593 ms; fused SSM remained dominant at 93.860/366.404/737.264 ms | Keep the cleanup because it removes unnecessary experimental-route dispatches, but do not treat it as a speed path. The required fix is preserving row-grid projection parallelism, not rounding cleanup |
+| Opt-in row-grid recurrent fan-in route | Correctness passed and dispatch count dropped at seqLen 128, but Qwen seqLen 16/64/128 profile measured 46.748/168.406/332.700 ms, slower than the current default production route | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1`; do not default. The row-grid projection itself costs 29.038 ms at seqLen 128, more than the removed out-proj GEMVs and round bridges save |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
 | Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 330.5%/217.4%/263.9% of baseline state-phase time for seqLen 16/64/128 in the latest run | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
 | Phase-only `state_recurrence_cache64` attempt | Pipeline creation failed before timing because the static threadgroup allocation was 34,316 bytes, above the 32,768-byte AGX threadgroup-memory limit | Rejected and not kept as a runnable harness variant |
@@ -317,8 +320,8 @@ flowchart TD
 | Whether q/k parallel-reduction SSM recurrence should default | No; correctness is green, but the full Qwen profile regresses despite isolated phase stability wins |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
 | Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
-| Next recurrent-block optimization unit | Implement a row-grid-preserving fan-in route for `state-update-then-row-grid-fan-in-rows`. It must keep schema v6 boundary, partial fan-in, state/KV, and decode0 gates green before any profile result is considered |
-| Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups, and rejects the row-grid target until its route is implemented |
+| Next recurrent-block optimization unit | Redesign row-grid fan-in so it is cheaper than the default `round + gemv_seq_bf16_f32s` path, likely by improving row/tile reuse rather than only changing dispatch boundaries |
+| Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups, and rejects the row-grid target until route evidence supports default promotion |
 
 ## Opt-in Fused Recurrent Partial-Emission Status
 
@@ -366,23 +369,23 @@ The profile harness now exposes the failure mode directly:
 The planner now names the next acceptable recurrent-block target separately from
 the implemented slow routes:
 
-| Execution shape | Row-grid preserved | Implemented route | Default promotion |
+| Execution shape | Row-grid preserved | Opt-in route | Default promotion |
 |---|---:|---:|---|
 | `group-owned-state-update-then-partial-rows` | no | yes | reject: serializes output rows |
 | `partial-partition-owned-state-updates-then-partial-rows` | no | yes | reject: serializes output rows |
-| `state-update-then-row-grid-fan-in-rows` | yes | no | reject: route not implemented |
+| `state-update-then-row-grid-fan-in-rows` | yes | yes | reject: lacks default evidence |
 
 This prevents the next optimization from being framed as "make the current
 partial-emission route faster." The required route shape is different: state
 update ownership must stay well-defined, while output projection fan-in must
 recover row-grid parallelism.
 
-The first harness for that target is now a synthetic row-grid fan-in projection
+The first route for that target is now an opt-in row-grid fan-in projection
 kernel. It dispatches over `output row x sequence`, loops over recurrent
-partitions inside each row owner, and writes the reduced hidden output directly.
-It intentionally does not route in production yet; its job is to fix the Metal
-math/layout contract that the real `state-update-then-row-grid-fan-in-rows`
-route must preserve.
+partitions inside each row owner, applies decode-equivalent BF16 input rounding
+inside the kernel, and writes the reduced hidden output directly. It removes
+the separate storage-round bridge, but the latest Qwen profile is still slower
+than default, so the route remains experimental.
 
 ## Current Production Prefill Profile
 

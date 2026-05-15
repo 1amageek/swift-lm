@@ -1187,7 +1187,8 @@ private func classify(_ kernelName: String) -> String {
         return "projection"
     }
     if name.hasPrefix("recurrent_block_partial_projection")
-        || name.hasPrefix("recurrent_block_partial_reduce") {
+        || name.hasPrefix("recurrent_block_partial_reduce")
+        || name.hasPrefix("recurrent_block_row_grid_fan_in") {
         return "projection"
     }
     if name.hasPrefix("gemm_") || name.hasPrefix("gemv_")

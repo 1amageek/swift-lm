@@ -87,6 +87,19 @@ struct MetalPrefillStepBuilder {
                 }
             }
             if let window = recurrentWindowsByRecurrenceIndex[entry.index],
+               let recurrentSteps = try planner.tryBuildRowGridRecurrentBlockFanInSteps(
+                   window: window,
+                   entriesByIndex: entriesByIndex
+               ) {
+                steps.append(contentsOf: recurrentSteps)
+                if let nextIndex = fusedEntries.firstIndex(where: { $0.index > window.outputProjectionEntryIndex }) {
+                    index = nextIndex
+                } else {
+                    index = fusedEntries.count
+                }
+                continue
+            }
+            if let window = recurrentWindowsByRecurrenceIndex[entry.index],
                let recurrentSteps = try planner.tryBuildFusedRecurrentBlockPartialSteps(
                    window: window,
                    entriesByIndex: entriesByIndex
@@ -246,6 +259,9 @@ struct MetalPrefillStepBuilder {
     }
 
     private static func shouldPreserveFloat32SequenceStorage(after step: MetalPrefillStep) -> Bool {
+        if step.metadata.preservesFloat32SequenceStorage {
+            return true
+        }
         guard let kernelName = step.metadata.kernelName else {
             return false
         }
@@ -257,6 +273,9 @@ struct MetalPrefillStepBuilder {
             return true
         }
         if kernelName.hasPrefix("recurrent_block_partial_projection") {
+            return true
+        }
+        if kernelName.hasPrefix("recurrent_block_row_grid_fan_in") {
             return true
         }
         if kernelName.hasPrefix("ssm_recurrence_seq_")
@@ -575,6 +594,18 @@ private struct PrefillStepPlanner {
     /// experimental.
     private static let bf16RecurrentBlockFusedPartialEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    /// Process-wide BF16 recurrent block row-grid fan-in feature flag.
+    ///
+    /// This opt-in route keeps the recurrence state update separate, preserves
+    /// the F32 recurrent output, and replaces the decode-equivalent storage
+    /// round plus `linear_attn.out_proj` GEMV with a row-grid fan-in projection.
+    private static let bf16RecurrentBlockRowGridFanInEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN"] else {
             return false
         }
         return raw == "1" || raw.lowercased() == "true"
@@ -1626,6 +1657,54 @@ private struct PrefillStepPlanner {
         }
     }
 
+    mutating func tryBuildRowGridRecurrentBlockFanInSteps(
+        window: RecurrentBlockFusionAdmissionWindow,
+        entriesByIndex: [Int: DispatchEntry]
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16RecurrentBlockRowGridFanInEnabled else {
+            return nil
+        }
+        guard let recurrenceEntry = entriesByIndex[window.recurrenceEntryIndex],
+              let outputEntry = entriesByIndex[window.outputProjectionEntryIndex],
+              let linear = outputEntry.fragment as? LinearFragment else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires recurrence and output projection entries"
+            )
+        }
+
+        let decision = RecurrentBlockFusionPrototypePlanner.rowGridPreservingFusedStageTargetDecision(
+            for: window,
+            entries: Array(entriesByIndex.values),
+            implicitBridgeStepCount: fusedRecurrentBlockImplicitBridgeStepCount()
+        )
+        let plan: RecurrentBlockFusionFusedStagePlan
+        switch decision {
+        case .candidate(let candidate):
+            plan = candidate
+        case .rejected(let rejections):
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in rejected: \(rejections)"
+            )
+        }
+
+        let recurrenceSteps = try buildSteps(for: recurrenceEntry).map {
+            $0.withMetadata($0.metadata.preservingFloat32SequenceStorage())
+        }
+        let outputResolver = WeightResolver(
+            entry: outputEntry,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .prefill,
+            accessPolicyResolver: planBuildContext.compileContext.accessPolicyResolver
+        )
+        let outputStep = try buildRecurrentBlockRowGridFanInOutputProjectionStep(
+            linear,
+            entry: outputEntry,
+            weightResolver: outputResolver,
+            plan: plan
+        )
+        return recurrenceSteps + [outputStep]
+    }
+
     mutating func tryBuildFusedRecurrentBlockPartialSteps(
         window: RecurrentBlockFusionAdmissionWindow,
         entriesByIndex: [Int: DispatchEntry]
@@ -1913,6 +1992,144 @@ private struct PrefillStepPlanner {
         case .float32, .float32Decode:
             return 0
         }
+    }
+
+    private mutating func buildRecurrentBlockRowGridFanInOutputProjectionStep(
+        _ linear: LinearFragment,
+        entry: DispatchEntry,
+        weightResolver: WeightResolver,
+        plan: RecurrentBlockFusionFusedStagePlan
+    ) throws -> MetalPrefillStep {
+        guard let pending = pendingRecurrentBlockOutputProjection else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires a pending recurrence output"
+            )
+        }
+        guard linear.field == "out_proj", linear.isOutput else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires linear_attn.out_proj output projection"
+            )
+        }
+        guard entry.compositeID == pending.compositeID,
+              entry.layerIndex == pending.layerIndex else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires adjacent recurrence/output projection in the same layer"
+            )
+        }
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires prefill sequence precision"
+            )
+        }
+        guard !routingState.lastOutputIsHidden,
+              routingState.currentInputOffset == 0 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires recurrence output in scratch slot 0"
+            )
+        }
+        guard linear.inputDimension == pending.recurrentOutputDimension,
+              linear.inputDimension == plan.recurrentOutputDimension,
+              linear.outputDimension == plan.outputDimension else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in shape mismatch"
+            )
+        }
+        guard linear.outputDimension <= hiddenSize else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in does not support output-head projections"
+            )
+        }
+        guard pending.recurrentGroupCount > 1,
+              linear.inputDimension % pending.recurrentGroupCount == 0 else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires an even recurrent group partition"
+            )
+        }
+
+        let descriptor = resolveProjectionWeightDescriptor(role: linear.field, entry: entry)
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Row-grid recurrent block fan-in requires BF16 row-major weights"
+            )
+        }
+
+        let kernelName = "recurrent_block_row_grid_fan_in_seq_bf16_f32"
+        guard let pipeline = planBuildContext.pipelineCache[kernelName] else {
+            throw MetalCompilerError.kernelNotFound(kernelName)
+        }
+
+        let (weightBuffer, weightOffset) = weightResolver.resolve(role: linear.field)
+        let weightTensorName = entry.parameterBindings.first(where: { $0.role == linear.field })?.tensorName
+        let inputRowStride = slotDimension
+        let outputRowStride = (buffers.hidden.length / max(maximumSequenceLength, 1)) / scratchElementSize
+        let partitionInputDimension = linear.inputDimension / pending.recurrentGroupCount
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let threads = min(
+            simdWidth * Self.decodeEquivalentSequenceRowsPerThreadgroup,
+            pipeline.maxTotalThreadsPerThreadgroup
+        )
+        let rowsPerThreadgroup = max(1, threads / simdWidth)
+
+        let step = MetalPrefillStep(
+            pipeline: pipeline,
+            gridSize: MTLSize(
+                width: (linear.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup,
+                height: maximumSequenceLength,
+                depth: 1
+            ),
+            threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, buffers.scratch, 0),
+                (1, weightBuffer, weightOffset),
+                (2, buffers.hidden, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(3, UInt32(partitionInputDimension)),
+                uint32Binding(4, UInt32(linear.outputDimension)),
+                uint32Binding(5, UInt32(pending.recurrentGroupCount)),
+                uint32Binding(6, UInt32(maximumSequenceLength)),
+                uint32Binding(7, UInt32(inputRowStride)),
+                uint32Binding(8, UInt32(outputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: kernelName,
+                entryIndex: entry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2]),
+                preservesFloat32SequenceStorage: true
+            )
+        )
+
+        recordProjectionQuantization(
+            entry: entry,
+            descriptor: descriptor,
+            mode: .batch,
+            inputRowStride: inputRowStride,
+            inputDimension: linear.inputDimension,
+            outputDimension: linear.outputDimension,
+            outputRowStride: outputRowStride,
+            selectedKernelName: kernelName,
+            usesMPPForStep: false,
+            usesSequenceGEMVForStep: true,
+            sequenceTileHeight: nil,
+            tileVariantHeights: []
+        )
+
+        routingState.lastOutputIsHidden = true
+        routingState.currentInputOffset = 0
+        routingState.projectionIndex = 1
+        pendingRecurrentBlockOutputProjection = nil
+        activeCompositeID = entry.compositeID
+        refreshCompositeInputSource()
+
+        return step
     }
 
     private mutating func buildRecurrentBlockPartialOutputProjectionSteps(
@@ -3251,6 +3468,19 @@ private struct ProjectionWeightDescriptor {
     let layout: STAFWeightLayout
     let usedFallback: Bool
     let fallbackReason: MetalQuantizationFallbackReason?
+}
+
+private extension MetalDispatchStepMetadata {
+    func preservingFloat32SequenceStorage() -> MetalDispatchStepMetadata {
+        MetalDispatchStepMetadata(
+            kernelName: kernelName,
+            entryIndex: entryIndex,
+            layerIndex: layerIndex,
+            weightTensorName: weightTensorName,
+            bufferAccessPattern: bufferAccessPattern,
+            preservesFloat32SequenceStorage: true
+        )
+    }
 }
 
 // MARK: - Quantized Dispatch Resolution
