@@ -284,6 +284,8 @@ struct MetalPrefillProfile: Codable, Sendable {
                 "estimatedDispatchReduction",
                 "fusedStageExecutionShape",
                 "unsafeRowGridFusionAllowed",
+                "defaultPromotionAdmission",
+                "defaultPromotionRejections",
             ].joined(separator: ","),
         ]
         for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
@@ -318,6 +320,8 @@ struct MetalPrefillProfile: Codable, Sendable {
                 String(timing.estimatedDispatchReduction),
                 csvEscape(timing.fusedStageExecutionShape),
                 timing.unsafeRowGridFusionAllowed ? "true" : "false",
+                csvEscape(timing.defaultPromotionAdmission),
+                csvEscape(timing.defaultPromotionRejections),
             ].joined(separator: ","))
         }
         return lines.joined(separator: "\n") + "\n"
@@ -386,6 +390,8 @@ struct MetalPrefillProfile: Codable, Sendable {
         let estimatedDispatchReduction: Int
         let fusedStageExecutionShape: String
         let unsafeRowGridFusionAllowed: Bool
+        let defaultPromotionAdmission: String
+        let defaultPromotionRejections: String
     }
 
     private func recurrentBlockWindowTiming(
@@ -435,6 +441,18 @@ struct MetalPrefillProfile: Codable, Sendable {
         let fusedStageExecutionShape = fusedStageCandidate
             ? "requires-prototype-planner-admission"
             : "not-a-dispatch-reducing-fused-stage"
+        let defaultPromotionAdmission: String
+        let defaultPromotionRejections: String
+        if !rowGridParallelismPreserved {
+            defaultPromotionAdmission = "reject"
+            defaultPromotionRejections = parallelismRisk
+        } else if fusedStageCandidate {
+            defaultPromotionAdmission = "requires-prototype-planner-admission"
+            defaultPromotionRejections = ""
+        } else {
+            defaultPromotionAdmission = "not-a-fused-stage"
+            defaultPromotionRejections = ""
+        }
         return RecurrentBlockWindowTiming(
             entryCount: windowEntries.count,
             totalGpuMicroseconds: totalGpuMicroseconds,
@@ -452,7 +470,9 @@ struct MetalPrefillProfile: Codable, Sendable {
             targetFusedStageStepCount: targetFusedStageStepCount,
             estimatedDispatchReduction: estimatedDispatchReduction,
             fusedStageExecutionShape: fusedStageExecutionShape,
-            unsafeRowGridFusionAllowed: false
+            unsafeRowGridFusionAllowed: false,
+            defaultPromotionAdmission: defaultPromotionAdmission,
+            defaultPromotionRejections: defaultPromotionRejections
         )
     }
 

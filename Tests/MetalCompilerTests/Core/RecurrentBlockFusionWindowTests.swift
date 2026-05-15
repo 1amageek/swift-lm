@@ -522,6 +522,7 @@ struct RecurrentBlockFusionWindowTests {
 
         #expect(csv.contains("recurrenceThreadgroupCount,outputProjectionThreadgroupCount,rowGridParallelismPreserved,parallelismRisk"))
         #expect(csv.contains("4,512,false,fused-recurrence-serializes-output-row-projection-inside-sequence-loop"))
+        #expect(csv.contains("reject,fused-recurrence-serializes-output-row-projection-inside-sequence-loop"))
     }
 
     @Test("Scanner rejects incomplete or cross-layer windows")
@@ -599,9 +600,9 @@ struct RecurrentBlockFusionWindowTests {
         #expect(csv.contains("windowEntryCount,totalGpuMicroseconds"))
         #expect(csv.contains("recurrenceThreadgroupCount,outputProjectionThreadgroupCount,rowGridParallelismPreserved,parallelismRisk"))
         #expect(csv.contains("fusedStageCandidate,currentReplaceableStepCount,targetFusedStageStepCount,estimatedDispatchReduction"))
-        #expect(csv.contains("fusedStageExecutionShape,unsafeRowGridFusionAllowed"))
+        #expect(csv.contains("fusedStageExecutionShape,unsafeRowGridFusionAllowed,defaultPromotionAdmission,defaultPromotionRejections"))
         #expect(csv.contains("3,0,4,0,1,2,3,3"))
-        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,1,1,true,none,true,3,2,1,requires-prototype-planner-admission,false"))
+        #expect(csv.contains("4,4.000,1.000,1.000,1.000,1.000,0,1,1,true,none,true,3,2,1,requires-prototype-planner-admission,false,requires-prototype-planner-admission,"))
     }
 
     private func linearAttentionInputWeights(layer: Int) -> String {
