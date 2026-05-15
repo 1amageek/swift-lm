@@ -363,6 +363,51 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench-prerequisite"))
     }
 
+    @Test("Route readiness can be reconstructed from artifact CSVs")
+    func routeReadinessCanBeReconstructedFromArtifactCSVs() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-route-readiness-artifact-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let singleArtifact = directory.appendingPathComponent("qwen35-bf16-single-sequence-gemv-route-promotions.csv")
+        try Data("""
+        role,variant,productionSequenceLengths,speedupPercents,passingSequenceCount,requiredSequenceCount,minimumSpeedupPercent,thresholdShortfallPercent,failingSequenceLengths,routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite
+        linear_attn.out_proj,rps2,64|128,10.000|10.000,2,2,10.000,0.000,,candidate-single-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate
+        self_attn.o_proj,tile2,64|128,1.000|10.000,1,2,1.000,2.000,64,reject-cross-sequence-threshold,,microbench-rejected
+        mlp.down_proj,tile4,64|128,10.000|10.000,2,2,10.000,0.000,,candidate-single-gemv-default-route,experimental-route-observed,microbench-rejected
+        """.utf8).write(to: singleArtifact, options: .atomic)
+
+        let batchedArtifact = directory.appendingPathComponent("qwen35-bf16-batched-sequence-gemv-route-promotions.csv")
+        try Data("""
+        role,variant,productionSequenceLengths,speedupPercents,passingSequenceCount,requiredSequenceCount,minimumSpeedupPercent,thresholdShortfallPercent,failingSequenceLengths,routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite
+        mlp.gate_up,tile2,64|128,10.000|10.000,2,2,10.000,0.000,,candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate
+        self_attn.qkv,tile4,64|128,10.000|10.000,2,2,10.000,0.000,,candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate
+        """.utf8).write(to: batchedArtifact, options: .atomic)
+
+        let routeGateArtifact = directory.appendingPathComponent("qwen35-prefill-route-gate.csv")
+        try Data("""
+        routeFamily,role,kernelName,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate
+        single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s_rps2,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
+        single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_tile2,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
+        single_projection,mlp.down_proj,gemv_seq_bf16_f32s_tile4,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
+        batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s_tile2,64|128,1|1,200.000,baseline-route-observed|baseline-route-observed,,baseline-route-preserved
+        batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s_tile4,64,1,100.000,experimental-route-observed,128,missing-production-sequence
+        """.utf8).write(to: routeGateArtifact, options: .atomic)
+
+        let rows = routeReadinessRows(
+            candidates: try routePromotionCandidates(singleArtifact: singleArtifact, batchedArtifact: batchedArtifact),
+            profileGates: try profileRouteGates(artifact: routeGateArtifact)
+        )
+        let url = try writeRouteReadiness(rows: rows, directory: directory)
+        let csv = try String(contentsOf: url, encoding: .utf8)
+
+        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,experimental-route-observed,candidate-production-route"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,microbench-rejected,,experimental-route-observed,reject-microbench"))
+        #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,experimental-route-observed,reject-microbench-prerequisite"))
+        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,baseline-route-preserved,reject-full-profile-route-not-observed"))
+        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,missing-production-sequence,reject-full-profile-missing-production-sequence"))
+    }
+
     // MARK: - Bundle resolution
 
     private func resolveBundlePath() throws -> String? {
@@ -658,6 +703,34 @@ struct Qwen35PrefillProfileTests {
         return url
     }
 
+    private func routePromotionCandidates(singleArtifact: URL, batchedArtifact: URL) throws -> [RoutePromotionCandidate] {
+        try routePromotionCandidates(artifact: singleArtifact, routeFamily: "single_projection")
+            + routePromotionCandidates(artifact: batchedArtifact, routeFamily: "batched_projection")
+    }
+
+    private func routePromotionCandidates(artifact: URL, routeFamily: String) throws -> [RoutePromotionCandidate] {
+        try parseCSV(artifact).map { row in
+            RoutePromotionCandidate(
+                routeFamily: routeFamily,
+                role: try requiredCSVValue("role", in: row, artifact: artifact),
+                variant: try requiredCSVValue("variant", in: row, artifact: artifact),
+                microbenchAdmission: try requiredCSVValue("routePromotionAdmission", in: row, artifact: artifact),
+                readinessPrerequisite: try requiredCSVValue("readinessPrerequisite", in: row, artifact: artifact),
+                requiredProfileRouteGate: try requiredCSVValue("requiredProfileRouteGate", in: row, artifact: artifact)
+            )
+        }
+    }
+
+    private func profileRouteGates(artifact: URL) throws -> [ProfileRouteGate] {
+        try parseCSV(artifact).map { row in
+            ProfileRouteGate(
+                routeFamily: try requiredCSVValue("routeFamily", in: row, artifact: artifact),
+                role: try requiredCSVValue("role", in: row, artifact: artifact),
+                routeGate: try requiredCSVValue("routeGate", in: row, artifact: artifact)
+            )
+        }
+    }
+
     private func routeReadinessRows(
         candidates: [RoutePromotionCandidate],
         profileGates: [ProfileRouteGate]
@@ -761,6 +834,83 @@ struct Qwen35PrefillProfileTests {
     private func csvEscape(_ value: String) -> String {
         if value.contains(",") || value.contains("\"") || value.contains("\n") {
             return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
+        }
+        return value
+    }
+
+    private func parseCSV(_ url: URL) throws -> [[String: String]] {
+        let csv = try String(contentsOf: url, encoding: .utf8)
+        let parsedRows = try csvRows(csv, artifact: url)
+        guard let header = parsedRows.first, !header.isEmpty else {
+            throw RouteReadinessArtifactError.emptyCSV(url.path)
+        }
+        return try parsedRows.dropFirst().map { fields in
+            guard fields.count == header.count else {
+                throw RouteReadinessArtifactError.rowWidthMismatch(
+                    path: url.path,
+                    expected: header.count,
+                    actual: fields.count
+                )
+            }
+            return Dictionary(uniqueKeysWithValues: zip(header, fields))
+        }
+    }
+
+    private func csvRows(_ csv: String, artifact: URL) throws -> [[String]] {
+        var rows: [[String]] = []
+        var row: [String] = []
+        var field = ""
+        var inQuotes = false
+        var index = csv.startIndex
+        while index < csv.endIndex {
+            let character = csv[index]
+            if inQuotes {
+                if character == "\"" {
+                    let nextIndex = csv.index(after: index)
+                    if nextIndex < csv.endIndex, csv[nextIndex] == "\"" {
+                        field.append("\"")
+                        index = nextIndex
+                    } else {
+                        inQuotes = false
+                    }
+                } else {
+                    field.append(character)
+                }
+            } else {
+                switch character {
+                case "\"":
+                    inQuotes = true
+                case ",":
+                    row.append(field)
+                    field.removeAll(keepingCapacity: true)
+                case "\n":
+                    row.append(field)
+                    field.removeAll(keepingCapacity: true)
+                    if !row.allSatisfy(\.isEmpty) {
+                        rows.append(row)
+                    }
+                    row.removeAll(keepingCapacity: true)
+                case "\r":
+                    break
+                default:
+                    field.append(character)
+                }
+            }
+            index = csv.index(after: index)
+        }
+        if inQuotes {
+            throw RouteReadinessArtifactError.unclosedQuote(artifact.path)
+        }
+        row.append(field)
+        if !row.allSatisfy(\.isEmpty) {
+            rows.append(row)
+        }
+        return rows
+    }
+
+    private func requiredCSVValue(_ key: String, in row: [String: String], artifact: URL) throws -> String {
+        guard let value = row[key] else {
+            throw RouteReadinessArtifactError.missingColumn(path: artifact.path, column: key)
         }
         return value
     }
@@ -920,6 +1070,26 @@ struct Qwen35PrefillProfileTests {
                 line += "  (\(g.0)×\(g.1), tg=\(g.2))"
             }
             print(line)
+        }
+    }
+}
+
+private enum RouteReadinessArtifactError: Error, CustomStringConvertible {
+    case emptyCSV(String)
+    case rowWidthMismatch(path: String, expected: Int, actual: Int)
+    case unclosedQuote(String)
+    case missingColumn(path: String, column: String)
+
+    var description: String {
+        switch self {
+        case .emptyCSV(let path):
+            return "CSV artifact is empty: \(path)"
+        case .rowWidthMismatch(let path, let expected, let actual):
+            return "CSV row width mismatch in \(path): expected \(expected), got \(actual)"
+        case .unclosedQuote(let path):
+            return "CSV artifact has an unclosed quote: \(path)"
+        case .missingColumn(let path, let column):
+            return "CSV artifact \(path) is missing required column \(column)"
         }
     }
 }

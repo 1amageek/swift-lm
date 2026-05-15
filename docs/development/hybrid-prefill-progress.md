@@ -266,6 +266,7 @@ flowchart TD
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; synthetic readiness contract requires both a microbench candidate admission and the expected full-profile route gate before a projection route can be treated as production-ready |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` and `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` | Pass; route-promotion CSVs expose the required full-profile route gate and readiness prerequisite so microbench candidates cannot be mistaken for production-ready routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; route-readiness CSV now consumes the microbench `readinessPrerequisite` column and rejects candidate-shaped admissions unless they explicitly require the full-profile route gate |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCanBeReconstructedFromArtifactCSVs` with `ENABLE_METAL_PROBES=1` | Pass; lightweight checker reconstructs route readiness from route-promotion CSVs plus `qwen35-prefill-route-gate.csv` without depending on heavy profile test execution order |
 
 ## Failed Experiments
 
@@ -2230,3 +2231,18 @@ Current decision: future projection experiments must pass this readiness layer
 before moving to route-default discussion. A microbench win alone does not
 authorize routing; the full profile must show the intended route actually
 executed across the production sequence lengths.
+
+The readiness layer is now reconstructable from artifact CSVs:
+
+```mermaid
+flowchart LR
+  A["single GEMV route-promotion CSV"] --> C["artifact readiness checker"]
+  B["batched GEMV route-promotion CSV"] --> C
+  D["qwen35-prefill-route-gate.csv"] --> C
+  C --> E["qwen35-prefill-route-readiness.csv"]
+```
+
+This is intentionally a lightweight parser contract. It proves the release
+evidence artifacts carry enough schema to rebuild the readiness decision, but
+it does not make heavy microbench and real-bundle profile tests depend on each
+other's runtime side effects.
