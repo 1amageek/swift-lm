@@ -260,6 +260,7 @@ flowchart TD
 | 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmThreadgroupPolicyAdmissionsClassifyCandidates` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrenceRealShapeMicrobench` | Pass; SSM threadgroup policy artifact rejects current fixed/adaptive routes, while the synthetic contract covers the policy-only candidate classification |
 | 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmStateCandidateFeasibilityRejectsUnsafeShapesBeforeTiming` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrencePhaseIsolationMicrobench` | Pass; SSM state-candidate feasibility artifact rejects serial-lane, lane-parallelism-losing, and threadgroup-memory-over-limit shapes before timing or routing |
 | 2026-05-16 | `SWIFTLM_VALIDATE_SSM_STATE_FEASIBILITY_ARTIFACTS=1 swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmStateCandidateFeasibilityArtifactCanBeReconstructedWhenRequested` | Pass; feasibility artifact can be parsed and reconstructed from the current static candidate contract |
+| 2026-05-16 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmStateCandidateBridgeCombinesFeasibilityAndStability` and `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMStateRecurrenceCandidateStabilityMicrobench` | Pass; state-candidate bridge joins static feasibility with phase stability so rejected shapes cannot advance because of isolated timing |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
@@ -1731,9 +1732,8 @@ width until a full-model profile shows a stable win.
 
 ## SSM Recurrence Decision Summary Harness (2026-05-15)
 
-The SSM recurrence microbenchmark now emits six primary artifacts, plus one
-optional phase/full bridge artifact when the route-promotion artifact is
-present:
+The SSM recurrence microbenchmark now emits these focused artifacts across the
+real-shape, phase-isolation, and stability runs:
 
 | Artifact | Purpose |
 |---|---|
@@ -1743,6 +1743,7 @@ present:
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-stability.csv` | Repeated 128-token phase candidate samples compared against the baseline state phase in the same test process |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-threadgroup-policies.csv` | Fixed 128/256 and adaptive best-base threadgroup policy comparison against default 384 for production sequence lengths |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-feasibility.csv` | Static feasibility check for state-recurrence candidate shapes before timing or route implementation |
+| `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-bridge.csv` | Join between static feasibility and phase stability for state-recurrence candidate shapes |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-full-bridge.csv` | Optional join between phase stability and full-kernel route promotion, emitted only when both inputs exist |
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
@@ -1986,6 +1987,16 @@ compiled or timed:
 | `register_block_d2` | 1,548 | serial value lanes | `reject-serial-value-lanes` |
 | `cache32` | 17,932 | 32/128 lanes | `reject-lane-parallelism-lost` |
 | `cache64` | 34,316 | 64/128 lanes and exceeds 32 KiB | `reject-threadgroup-memory-limit` |
+
+The state-candidate bridge joins that static gate to repeated phase timing:
+
+| Shape | Feasibility | Phase wins | Bridge admission |
+|---|---|---:|---|
+| `baseline` | `baseline` | 0/0 | `baseline` |
+| `qk_parallel` | `eligible-for-full-kernel-check` | 1/3 | `candidate-full-kernel-check` |
+| `register_block_d2` | `reject-serial-value-lanes` | 0/3 | `reject-static-feasibility` |
+| `cache32` | `reject-lane-parallelism-lost` | 0/3 | `reject-static-feasibility` |
+| `cache64` | `reject-threadgroup-memory-limit` | 0/0 | `reject-static-feasibility` |
 
 This keeps the next optimization loop bounded: a phase candidate can be timed
 for diagnostics, but it should not advance to route implementation unless it

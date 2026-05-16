@@ -217,7 +217,14 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
 
         let artifact = try writePhaseStabilityCSV(rows: rows)
+        let stateBridgeArtifact = try writeStateCandidateBridgeCSV(
+            rows: SSMStateCandidateBridgeFactory.make(
+                feasibilityRows: SSMStateCandidateFeasibilityFactory.makeRows(),
+                stabilityRows: rows
+            )
+        )
         printPhaseStabilityReport(rows: rows, artifact: artifact)
+        print("state candidate bridge artifact: \(stateBridgeArtifact.path)")
         if let bridgeArtifact = try writePhaseFullBridgeCSVIfRoutePromotionArtifactExists(stabilityRows: rows) {
             print("phase/full bridge artifact: \(bridgeArtifact.path)")
         }
@@ -236,6 +243,49 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(byShape[.cache32]?.admission == "reject-lane-parallelism-lost")
         #expect(byShape[.cache64]?.admission == "reject-threadgroup-memory-limit")
         #expect(byShape[.cache64]?.staticThreadgroupBytes == 34_316)
+    }
+
+    @Test("SSM state candidate bridge combines feasibility and stability")
+    func ssmStateCandidateBridgeCombinesFeasibilityAndStability() {
+        let stabilityRows = [
+            SSMPhaseStabilityRow(
+                sampleIndex: 0,
+                baseline: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence",
+                    averageGpuMicroseconds: 100.0
+                ),
+                candidate: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence_qkpar",
+                    averageGpuMicroseconds: 90.0
+                )
+            ),
+            SSMPhaseStabilityRow(
+                sampleIndex: 0,
+                baseline: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence",
+                    averageGpuMicroseconds: 100.0
+                ),
+                candidate: makePhaseFixture(
+                    sequenceLength: 128,
+                    phase: "state_recurrence_d2",
+                    averageGpuMicroseconds: 80.0
+                )
+            ),
+        ]
+        let rows = SSMStateCandidateBridgeFactory.make(
+            feasibilityRows: SSMStateCandidateFeasibilityFactory.makeRows(),
+            stabilityRows: stabilityRows
+        )
+        let byShape = Dictionary(uniqueKeysWithValues: rows.map { ($0.shape, $0) })
+
+        #expect(byShape[.qkParallel]?.bridgeAdmission == "candidate-full-kernel-check")
+        #expect(byShape[.registerBlockD2]?.phaseWinCount == 1)
+        #expect(byShape[.registerBlockD2]?.bridgeAdmission == "reject-static-feasibility")
+        #expect(byShape[.cache64]?.phaseSampleCount == 0)
+        #expect(byShape[.cache64]?.bridgeAdmission == "reject-static-feasibility")
     }
 
     @Test("SSM summary promotion admissions classify candidates")
@@ -826,6 +876,38 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
+    private func writeStateCandidateBridgeCSV(rows: [SSMStateCandidateBridgeRow]) throws -> URL {
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-state-candidate-bridge.csv")
+        var lines = [
+            [
+                "shape",
+                "feasibilityAdmission",
+                "phaseName",
+                "phaseSampleCount",
+                "phaseWinCount",
+                "minimumPhaseDeltaPercent",
+                "maximumPhaseDeltaPercent",
+                "bridgeAdmission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.shape.rawValue < $1.shape.rawValue }) {
+            lines.append([
+                row.shape.rawValue,
+                row.feasibilityAdmission,
+                row.phaseName,
+                String(row.phaseSampleCount),
+                String(row.phaseWinCount),
+                String(format: "%.3f", row.minimumPhaseDeltaPercent),
+                String(format: "%.3f", row.maximumPhaseDeltaPercent),
+                row.bridgeAdmission,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL, feasibilityArtifact: URL) {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
@@ -1393,6 +1475,69 @@ private enum SSMStateCandidateFeasibilityFactory {
         let qkPartialBytes = shape.usesParallelQKReduction ? 3 * keyDimension * floatBytes : 0
         let decayedStateCacheBytes = (shape.stateCacheTileWidth ?? 0) * keyDimension * floatBytes
         return convSiluCacheBytes + scalarCacheBytes + qkPartialBytes + decayedStateCacheBytes
+    }
+}
+
+private struct SSMStateCandidateBridgeRow {
+    let shape: SSMStateCandidateShape
+    let feasibilityAdmission: String
+    let phaseName: String
+    let phaseSampleCount: Int
+    let phaseWinCount: Int
+    let minimumPhaseDeltaPercent: Double
+    let maximumPhaseDeltaPercent: Double
+
+    var bridgeAdmission: String {
+        if feasibilityAdmission == "baseline" {
+            return "baseline"
+        }
+        guard feasibilityAdmission == "eligible-for-full-kernel-check" else {
+            return "reject-static-feasibility"
+        }
+        guard phaseSampleCount > 0 else {
+            return "reject-missing-phase-samples"
+        }
+        guard phaseWinCount > 0 else {
+            return "reject-phase-stability"
+        }
+        return "candidate-full-kernel-check"
+    }
+}
+
+private enum SSMStateCandidateBridgeFactory {
+    static func make(
+        feasibilityRows: [SSMStateCandidateFeasibilityRow],
+        stabilityRows: [SSMPhaseStabilityRow]
+    ) -> [SSMStateCandidateBridgeRow] {
+        feasibilityRows.map { feasibility in
+            let phaseName = phaseName(shape: feasibility.shape)
+            let rows = stabilityRows.filter { $0.candidatePhase == phaseName }
+            let deltas = rows.map(\.candidateDeltaPercent)
+            return SSMStateCandidateBridgeRow(
+                shape: feasibility.shape,
+                feasibilityAdmission: feasibility.admission,
+                phaseName: phaseName,
+                phaseSampleCount: rows.count,
+                phaseWinCount: rows.filter(\.candidateWins).count,
+                minimumPhaseDeltaPercent: deltas.min() ?? .nan,
+                maximumPhaseDeltaPercent: deltas.max() ?? .nan
+            )
+        }
+    }
+
+    private static func phaseName(shape: SSMStateCandidateShape) -> String {
+        switch shape {
+        case .baseline:
+            return "state_recurrence"
+        case .registerBlockD2:
+            return "state_recurrence_d2"
+        case .qkParallel:
+            return "state_recurrence_qkpar"
+        case .cache32:
+            return "state_recurrence_cache32"
+        case .cache64:
+            return "state_recurrence_cache64"
+        }
     }
 }
 
