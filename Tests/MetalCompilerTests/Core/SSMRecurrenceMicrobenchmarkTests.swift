@@ -474,6 +474,41 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
     }
 
+    @Test("SSM state candidate bridge artifact can be reconstructed when requested")
+    func ssmStateCandidateBridgeArtifactCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_STATE_BRIDGE_ARTIFACTS"] == "1" else {
+            return
+        }
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        let feasibilityArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-state-candidate-feasibility.csv")
+        let stabilityArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-phase-stability.csv")
+        let bridgeArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-state-candidate-bridge.csv")
+        try requireArtifact(feasibilityArtifact)
+        try requireArtifact(stabilityArtifact)
+        try requireArtifact(bridgeArtifact)
+
+        let feasibilityRows = try readStateCandidateFeasibilityCSV(feasibilityArtifact)
+        let stabilityRows = try readPhaseStabilityCSV(stabilityArtifact)
+        let expectedRows = SSMStateCandidateBridgeFactory.make(
+            feasibilityRows: feasibilityRows,
+            stabilityRows: stabilityRows
+        )
+        let actualRows = try readStateCandidateBridgeCSV(bridgeArtifact)
+        let actualByShape = Dictionary(uniqueKeysWithValues: actualRows.map { ($0.shape, $0) })
+
+        #expect(actualRows.count == expectedRows.count)
+        for expected in expectedRows {
+            guard let actual = actualByShape[expected.shape] else {
+                Issue.record("Missing state bridge row for \(expected.shape.rawValue)")
+                continue
+            }
+            #expect(actual.feasibilityAdmission == expected.feasibilityAdmission)
+            #expect(actual.phaseSampleCount == expected.phaseSampleCount)
+            #expect(actual.phaseWinCount == expected.phaseWinCount)
+            #expect(actual.bridgeAdmission == expected.bridgeAdmission)
+        }
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -1125,6 +1160,24 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 estimatedStateTotalBytesPerToken: try integerCSVValue("estimatedStateTotalBytesPerToken", in: row, artifact: url),
                 staticThreadgroupBytes: try integerCSVValue("staticThreadgroupBytes", in: row, artifact: url),
                 threadgroupMemoryLimitBytes: try integerCSVValue("threadgroupMemoryLimitBytes", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func readStateCandidateBridgeCSV(_ url: URL) throws -> [SSMStateCandidateBridgeRow] {
+        try parseSimpleCSV(url).map { row in
+            let shapeName = try requiredCSVValue("shape", in: row, artifact: url)
+            guard let shape = SSMStateCandidateShape(rawValue: shapeName) else {
+                throw SSMArtifactError.invalidValue(url.path, "shape", shapeName)
+            }
+            return SSMStateCandidateBridgeRow(
+                shape: shape,
+                feasibilityAdmission: try requiredCSVValue("feasibilityAdmission", in: row, artifact: url),
+                phaseName: try requiredCSVValue("phaseName", in: row, artifact: url),
+                phaseSampleCount: try integerCSVValue("phaseSampleCount", in: row, artifact: url),
+                phaseWinCount: try integerCSVValue("phaseWinCount", in: row, artifact: url),
+                minimumPhaseDeltaPercent: try doubleCSVValue("minimumPhaseDeltaPercent", in: row, artifact: url),
+                maximumPhaseDeltaPercent: try doubleCSVValue("maximumPhaseDeltaPercent", in: row, artifact: url)
             )
         }
     }
