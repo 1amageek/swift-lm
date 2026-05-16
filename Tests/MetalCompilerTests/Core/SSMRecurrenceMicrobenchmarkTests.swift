@@ -509,6 +509,34 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
     }
 
+    @Test("SSM threadgroup policy artifact can be reconstructed when requested")
+    func ssmThreadgroupPolicyArtifactCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_THREADGROUP_POLICY_ARTIFACTS"] == "1" else {
+            return
+        }
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        let rawArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence.csv")
+        let policyArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-threadgroup-policies.csv")
+        try requireArtifact(rawArtifact)
+        try requireArtifact(policyArtifact)
+
+        let rawRows = try readSSMResultCSV(rawArtifact)
+        let expectedRows = summarizeThreadgroupPolicies(rows: rawRows)
+        let actualRows = try readThreadgroupPolicyCSV(policyArtifact)
+        let actualByCandidate = Dictionary(uniqueKeysWithValues: actualRows.map { ($0.candidate, $0) })
+
+        #expect(actualRows.count == expectedRows.count)
+        for expected in expectedRows {
+            guard let actual = actualByCandidate[expected.candidate] else {
+                Issue.record("Missing threadgroup policy row for \(expected.candidate.rawValue)")
+                continue
+            }
+            #expect(actual.selectedVariants == expected.selectedVariants)
+            #expect(actual.failingSequenceLengths == expected.failingSequenceLengths)
+            #expect(actual.routePromotionAdmission == expected.routePromotionAdmission)
+        }
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -1104,6 +1132,25 @@ struct SSMRecurrenceMicrobenchmarkTests {
         )
     }
 
+    private func readSSMResultCSV(_ url: URL) throws -> [SSMResultRow] {
+        try parseSimpleCSV(url).map { row in
+            SSMResultRow(
+                sequenceLength: try integerCSVValue("sequenceLength", in: row, artifact: url),
+                variant: try requiredCSVValue("variant", in: row, artifact: url),
+                headCount: try integerCSVValue("headCount", in: row, artifact: url),
+                groupCount: try integerCSVValue("groupCount", in: row, artifact: url),
+                keyDimension: try integerCSVValue("keyDimension", in: row, artifact: url),
+                valueDimension: try integerCSVValue("valueDimension", in: row, artifact: url),
+                convKernelSize: try integerCSVValue("convKernelSize", in: row, artifact: url),
+                gridWidth: try integerCSVValue("gridWidth", in: row, artifact: url),
+                gridHeight: try integerCSVValue("gridHeight", in: row, artifact: url),
+                threadgroupWidth: try integerCSVValue("threadgroupWidth", in: row, artifact: url),
+                requestedThreadgroupWidth: try integerCSVValue("requestedThreadgroupWidth", in: row, artifact: url),
+                averageGpuMicroseconds: try doubleCSVValue("averageGpuMicroseconds", in: row, artifact: url)
+            )
+        }
+    }
+
     private func readRoutePromotionCSV(_ url: URL) throws -> [SSMRoutePromotionRow] {
         try parseSimpleCSV(url).map { row in
             let candidateName = try requiredCSVValue("candidate", in: row, artifact: url)
@@ -1116,6 +1163,26 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 bestVariants: try requiredCSVValue("bestVariants", in: row, artifact: url).split(separator: "|").map(String.init),
                 speedupPercents: try pipeSeparatedDoubles("speedupPercents", in: row, artifact: url),
                 passingSequenceCount: try integerCSVValue("passingSequenceCount", in: row, artifact: url),
+                requiredSequenceCount: try integerCSVValue("requiredSequenceCount", in: row, artifact: url),
+                failingSequenceLengths: try pipeSeparatedIntegers("failingSequenceLengths", in: row, artifact: url),
+                routePromotionAdmission: try requiredCSVValue("routePromotionAdmission", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func readThreadgroupPolicyCSV(_ url: URL) throws -> [SSMThreadgroupPolicyRow] {
+        try parseSimpleCSV(url).map { row in
+            let candidateName = try requiredCSVValue("candidate", in: row, artifact: url)
+            guard let candidate = SSMThreadgroupPolicyCandidate(rawValue: candidateName) else {
+                throw SSMArtifactError.invalidValue(url.path, "candidate", candidateName)
+            }
+            return SSMThreadgroupPolicyRow(
+                candidate: candidate,
+                productionSequenceLengths: try pipeSeparatedIntegers("productionSequenceLengths", in: row, artifact: url),
+                baselineVariants: try pipeSeparatedStrings("baselineVariants", in: row, artifact: url),
+                selectedVariants: try pipeSeparatedStrings("selectedVariants", in: row, artifact: url),
+                speedupPercents: try pipeSeparatedDoubles("speedupPercents", in: row, artifact: url),
+                winningSequenceCount: try integerCSVValue("winningSequenceCount", in: row, artifact: url),
                 requiredSequenceCount: try integerCSVValue("requiredSequenceCount", in: row, artifact: url),
                 failingSequenceLengths: try pipeSeparatedIntegers("failingSequenceLengths", in: row, artifact: url),
                 routePromotionAdmission: try requiredCSVValue("routePromotionAdmission", in: row, artifact: url)
@@ -1248,6 +1315,12 @@ struct SSMRecurrenceMicrobenchmarkTests {
             }
             return doubleValue
         }
+    }
+
+    private func pipeSeparatedStrings(_ key: String, in row: [String: String], artifact: URL) throws -> [String] {
+        let value = try requiredCSVValue(key, in: row, artifact: artifact)
+        if value.isEmpty { return [] }
+        return value.split(separator: "|").map(String.init)
     }
 
     private func requireArtifact(_ url: URL) throws {
