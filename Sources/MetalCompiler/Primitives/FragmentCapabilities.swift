@@ -1,6 +1,6 @@
 /// Capability protocols for fragment self-description.
 ///
-/// The compiler queries these protocols via capability cast (`as? ProjectionDescribing`)
+/// The compiler queries these protocols via capability cast (`as? any ProjectionDescribing`)
 /// instead of inspecting concrete fragment types (`as? LinearFragment`).
 /// Each protocol captures a single cross-cutting concern shared by multiple fragment types.
 

@@ -413,7 +413,7 @@ struct MetalEntryCollector {
 
     private func markLastProjectionAsOutput(entries: inout [DispatchEntry], from startIndex: Int) {
         for index in stride(from: entries.count - 1, through: startIndex, by: -1) {
-            if let projection = entries[index].fragment as? ProjectionDescribing {
+            if let projection = entries[index].fragment as? any ProjectionDescribing {
                 let updated = projection.withOutputProjectionEnabled()
                 entries[index] = DispatchEntry(
                     index: entries[index].index,

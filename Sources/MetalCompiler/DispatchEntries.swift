@@ -26,7 +26,7 @@ public struct DispatchEntry: Sendable {
 
     /// Human-readable description of the fragment for diagnostics and logging.
     public var fragmentDescription: String {
-        if let projection = fragment as? ProjectionDescribing {
+        if let projection = fragment as? any ProjectionDescribing {
             let fields = projection.projectionFields.map(\.field).joined(separator: ",")
             return "projection(\(fields), isOutput: \(projection.isOutputProjection))"
         }

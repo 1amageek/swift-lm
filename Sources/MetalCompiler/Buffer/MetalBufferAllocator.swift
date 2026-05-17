@@ -317,7 +317,7 @@ struct MetalBufferAllocator {
 
     private func maximumScratchProjectionDimension(in entries: [DispatchEntry]) -> Int {
         entries.reduce(into: 0) { maxDim, entry in
-            guard let projection = entry.fragment as? ProjectionDescribing,
+            guard let projection = entry.fragment as? any ProjectionDescribing,
                   !projection.isOutputProjection else { return }
             for field in projection.projectionFields {
                 maxDim = max(maxDim, field.outputDimension)
@@ -334,7 +334,7 @@ struct MetalBufferAllocator {
     ) -> Bool {
         guard let staf = stafWeightStore else { return false }
         for entry in entries {
-            guard let projection = entry.fragment as? ProjectionDescribing else { continue }
+            guard let projection = entry.fragment as? any ProjectionDescribing else { continue }
             let roles = projection.projectionFields.map(\.field)
             for role in roles {
                 if let binding = entry.parameterBindings.first(where: { $0.role == role }),
@@ -351,7 +351,7 @@ struct MetalBufferAllocator {
     /// Used to size the dequant scratch buffer for quantized→BF16 unpacking.
     private func maximumProjectionWeightElementCount(in entries: [DispatchEntry]) -> Int {
         entries.reduce(into: 0) { maxElements, entry in
-            guard let projection = entry.fragment as? ProjectionDescribing else { return }
+            guard let projection = entry.fragment as? any ProjectionDescribing else { return }
             for field in projection.projectionFields {
                 maxElements = max(maxElements, field.inputDimension * field.outputDimension)
             }
@@ -367,7 +367,7 @@ struct MetalBufferAllocator {
             if let convSlot = fragment.cacheSlots.first(where: { $0.kind == .conv }) {
                 layerCount += 1
                 kernelSize = max(kernelSize, convSlot.temporalSize)
-                if let convReq = fragment as? ConvStateRequiring {
+                if let convReq = fragment as? any ConvStateRequiring {
                     dimension = max(dimension, convReq.convStateDimension)
                 } else if case .elementwise(let fragmentDimension) = fragment.dispatchDimension {
                     dimension = max(dimension, fragmentDimension)
@@ -385,7 +385,7 @@ struct MetalBufferAllocator {
         var layerCount = 0
         var bytesPerLayer = 0
         for entry in entries {
-            if let recReq = entry.fragment as? RecurrentStateRequiring {
+            if let recReq = entry.fragment as? any RecurrentStateRequiring {
                 layerCount += 1
                 bytesPerLayer = max(bytesPerLayer, recReq.recurrentStateBytesPerLayer)
             }
@@ -397,7 +397,7 @@ struct MetalBufferAllocator {
         var layerCount = 0
         var dimension = 0
         for entry in entries {
-            if let pli = entry.fragment as? PerLayerInputCapable {
+            if let pli = entry.fragment as? any PerLayerInputCapable {
                 layerCount = max(layerCount, (entry.layerIndex ?? -1) + 1)
                 dimension = max(dimension, pli.perLayerInputDimension)
             }

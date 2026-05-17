@@ -16,7 +16,7 @@ struct DispatchEntryDiagnosticsFormatter {
     private func format(_ entry: DispatchEntry) -> String {
         let layer = entry.layerIndex.map { "L\($0)" } ?? "--"
         let kind: String
-        if let projection = entry.fragment as? ProjectionDescribing {
+        if let projection = entry.fragment as? any ProjectionDescribing {
             let fields = projection.projectionFields
             if fields.count == 1, let f = fields.first {
                 kind = "projection(\(f.field), in=\(f.inputDimension), out=\(f.outputDimension), isOutput=\(projection.isOutputProjection))"
@@ -42,7 +42,7 @@ struct OptimizationReportBuilder {
         for entry in optimizedEntries {
             let name: String
             let fragment = entry.fragment
-            if let projection = fragment as? ProjectionDescribing, projection.projectionFields.count > 1 {
+            if let projection = fragment as? any ProjectionDescribing, projection.projectionFields.count > 1 {
                 name = "batchedProjection(\(projection.projectionFields.count)-way)"
             } else if let batch = fragment as? BatchedFragment {
                 name = "batchedFragment(\(batch.fragments.count)-way)"

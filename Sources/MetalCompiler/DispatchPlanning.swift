@@ -1,6 +1,6 @@
 extension DispatchEntry {
     var decodeWeightBindingBase: (roles: [String], inputDimension: Int, outputDimension: Int)? {
-        guard let projection = fragment as? ProjectionDescribing else { return nil }
+        guard let projection = fragment as? any ProjectionDescribing else { return nil }
         let fields = projection.projectionFields
         guard let first = fields.first else { return nil }
         return (
