@@ -39,7 +39,8 @@ options:
                              Optional Qwen experimental full-profile artifact directory.
 
 When both Qwen profile directories are supplied, the Qwen route-readiness gate
-also regenerates the full-profile speed gate before validating route readiness.
+also regenerates the full-profile speed gate with the default 10% minimum
+full-profile speedup requirement before validating route readiness.
 EOF
       exit 0
       ;;

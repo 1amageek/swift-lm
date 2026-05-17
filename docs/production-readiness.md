@@ -92,6 +92,8 @@ Required expectations:
   `.test-artifacts/prefill-artifact-validation/<timestamp>/summary.csv`.
 - A route can be discussed for default promotion only when its microbench
   promotion CSV, full-profile route gate, and full-profile speed gate all agree.
+  The full-profile speed gate must show at least 10% total prefill improvement
+  at every production sequence length under review.
 
 If persisted Qwen baseline and experimental full-profile directories are
 available, pass them through the wrapper so it regenerates the speed gate before

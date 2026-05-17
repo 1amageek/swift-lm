@@ -58,6 +58,7 @@ The parent summary contained two passing child gates:
 - This evidence does not promote any new prefill route by itself.
 - A prefill route still needs correctness gates, microbench route-promotion
   evidence, full-profile route observation, and full-profile speed-gate evidence
-  before default promotion can be discussed.
+  showing at least 10% total prefill improvement at every production sequence
+  length before default promotion can be discussed.
 - Current SSM candidates remain rejected by the artifact gates unless future
   runs produce cross-sequence production wins.

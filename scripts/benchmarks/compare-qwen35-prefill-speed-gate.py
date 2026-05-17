@@ -152,7 +152,7 @@ def main() -> int:
     parser.add_argument("--route-family", default="recurrent_block_row_grid_fan_in")
     parser.add_argument("--role", default="linear_attn.out_proj")
     parser.add_argument("--variant", default="row_grid_fan_in")
-    parser.add_argument("--minimum-speedup-percent", type=float, default=5.0)
+    parser.add_argument("--minimum-speedup-percent", type=float, default=10.0)
     args = parser.parse_args()
 
     sequence_lengths = parse_sequence_lengths(args.sequence_lengths)

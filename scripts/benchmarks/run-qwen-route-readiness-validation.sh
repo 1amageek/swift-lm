@@ -46,8 +46,9 @@ options:
                            Default: .test-artifacts/prefill-profile/qwen35-prefill-full-profile-speed-gate.csv.
 
 When both --baseline-dir and --experimental-dir are supplied, this script first
-generates qwen35-prefill-full-profile-speed-gate.csv before validating current
-route-readiness reconstruction.
+generates qwen35-prefill-full-profile-speed-gate.csv with the default 10%
+minimum full-profile speedup gate before validating current route-readiness
+reconstruction.
 EOF
       exit 0
       ;;

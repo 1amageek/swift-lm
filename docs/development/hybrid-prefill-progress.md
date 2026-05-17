@@ -298,8 +298,10 @@ flowchart TD
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; runtime-gated row-grid keeps seqLen 16 on the 293-step unfused path and routes seqLen 64/128 through 18 row-grid fan-in dispatches |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` and `.../routeGateSummarizesProductionSequenceRoutes` | Pass; route manifest/gate now classify `recurrent_block_row_grid_fan_in_seq_bf16_f32` as the experimental `linear_attn.out_proj` fan-in route instead of only showing the replaced GEMV as missing |
 | 2026-05-16 | `swift test --filter RecurrentBlockFusionKernelTests/rowGridFanInInlineRoundingCostProbe` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; recurrent-block row-grid now writes a route-promotion CSV consumed by route-readiness reconstruction. Current artifact rejects default promotion because seqLen 64 missed the microbench threshold even though the full-profile route gate observed the experimental route |
-| 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` and `.../routeReadinessCanBeReconstructedFromArtifactCSVs` | Pass; route-readiness schema now has an `observedProfileSpeedGate` column, so future default promotion can require both route observation and an explicit full-profile speedup artifact instead of treating route presence as speed evidence |
+| 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` and `.../routeReadinessCanBeReconstructedFromArtifactCSVs` | Pass; route-readiness schema now has `observedProfileSpeedGate` and `observedProfileSpeedMinimumPercent` columns, so future default promotion can require both route observation and an explicit full-profile speedup artifact instead of treating route presence as speed evidence |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; full-profile speed gate CSV generation now distinguishes `full-profile-speedup-observed`, `full-profile-regression-observed`, and `missing-production-sequence`, and route readiness only promotes recurrent row-grid routes when the generated speed gate is positive |
+| 2026-05-18 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` | Pass; default-promotion full-profile speed gate now requires at least 10% total prefill improvement at every production sequence length |
+| 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; current Qwen route-readiness artifact reconstruction remains valid after adding the 10% speed-threshold evidence column |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
 | 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
@@ -2412,9 +2414,10 @@ flowchart LR
 | Missing profile route | Reject as `reject-missing-full-profile-route` |
 | Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |
 | Baseline preserved when an experimental route was required | Reject as `reject-full-profile-route-not-observed` |
-| `requires-full-profile-speed-gate` prerequisite | Requires `observedProfileSpeedGate == full-profile-speedup-observed` |
+| `requires-full-profile-speed-gate` prerequisite | Requires `observedProfileSpeedGate == full-profile-speedup-observed` and `observedProfileSpeedMinimumPercent >= 10.0` |
 | Missing full-profile speed artifact | Reject as `reject-missing-full-profile-speed-gate` |
-| Full-profile regression or threshold miss | Reject as `reject-full-profile-speed-gate-not-observed` |
+| Full-profile regression | Reject as `reject-full-profile-speed-gate-not-observed` |
+| Stale or too-low full-profile speed threshold | Reject as `reject-full-profile-speed-gate-threshold` |
 
 Current decision: future projection experiments must pass this readiness layer
 before moving to route-default discussion. A microbench win alone does not
@@ -2439,8 +2442,9 @@ flowchart LR
 The current contract compares total GPU microseconds for the full prefill plan
 at production sequence lengths `64` and `128`. A route can only become a
 production candidate when every production length meets the configured speedup
-threshold. This prevents a route from being promoted because a narrow kernel or
-microbench improved while the full Qwen profile regressed.
+threshold. The default threshold is now **10% total prefill improvement**. This
+prevents a route from being promoted because a narrow kernel or microbench
+improved while the full Qwen profile regressed or only improved marginally.
 
 Persisted profile runs can generate the speed gate with:
 
