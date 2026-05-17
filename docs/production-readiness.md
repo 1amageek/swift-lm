@@ -3,6 +3,7 @@
 This document defines the minimum release gates for `swift-lm`.
 
 Latest captured evidence: [Production Readiness Evidence - 2026-05-05](releases/production-readiness-2026-05-05.md).
+Latest prefill artifact evidence: [Prefill Artifact Readiness Evidence - 2026-05-18](releases/prefill-artifact-readiness-2026-05-18.md).
 
 ## Goal
 
