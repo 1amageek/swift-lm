@@ -582,6 +582,7 @@ Useful runners:
 
 - Qwen3.5+ multimodal suites: `scripts/benchmarks/run-qwen35-vision-tests.sh`
 - Generation benchmark pipeline: `scripts/benchmarks/run-generation-pipeline.sh`
+- Prefill route promotion artifact gate: `scripts/benchmarks/run-prefill-artifact-validation.sh`
 - Xcode timeout wrapper: `scripts/xcodebuild/test-timeout.sh`
 - Xcode hang guard: `scripts/xcodebuild/test-hang-guard.sh`
 
