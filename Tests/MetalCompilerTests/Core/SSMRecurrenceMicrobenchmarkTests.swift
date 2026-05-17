@@ -537,6 +537,52 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
     }
 
+    @Test("SSM route artifacts can be reconstructed when requested")
+    func ssmRouteArtifactsCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_ROUTE_ARTIFACTS"] == "1" else {
+            return
+        }
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        let rawArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence.csv")
+        let summaryArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-summary.csv")
+        let routeArtifact = directory.appendingPathComponent("qwen35-bf16-ssm-recurrence-route-promotions.csv")
+        try requireArtifact(rawArtifact)
+        try requireArtifact(summaryArtifact)
+        try requireArtifact(routeArtifact)
+
+        let rawRows = try readSSMResultCSV(rawArtifact)
+        let expectedSummaryRows = summarize(rows: rawRows)
+        let actualSummaryRows = try readSummaryCSV(summaryArtifact)
+        let actualSummaryBySequence = Dictionary(uniqueKeysWithValues: actualSummaryRows.map { ($0.sequenceLength, $0) })
+
+        #expect(actualSummaryRows.count == expectedSummaryRows.count)
+        for expected in expectedSummaryRows {
+            guard let actual = actualSummaryBySequence[expected.sequenceLength] else {
+                Issue.record("Missing summary row for seqLen \(expected.sequenceLength)")
+                continue
+            }
+            #expect(actual.bestVariant == expected.bestVariant)
+            #expect(actual.bestBaseVariant == expected.bestBaseVariant)
+            #expect(actual.decision == expected.decision)
+            #expect(actual.promotionAdmission == expected.promotionAdmission)
+        }
+
+        let expectedRouteRows = summarizeRoutePromotions(rows: rawRows)
+        let actualRouteRows = try readRoutePromotionCSV(routeArtifact)
+        let actualRouteByCandidate = Dictionary(uniqueKeysWithValues: actualRouteRows.map { ($0.candidate, $0) })
+
+        #expect(actualRouteRows.count == expectedRouteRows.count)
+        for expected in expectedRouteRows {
+            guard let actual = actualRouteByCandidate[expected.candidate] else {
+                Issue.record("Missing route-promotion row for \(expected.candidate.rawValue)")
+                continue
+            }
+            #expect(actual.bestVariants == expected.bestVariants)
+            #expect(actual.failingSequenceLengths == expected.failingSequenceLengths)
+            #expect(actual.routePromotionAdmission == expected.routePromotionAdmission)
+        }
+    }
+
     private func printReport(
         rows: [SSMResultRow],
         summaryRows: [SSMSummaryRow],
@@ -1147,6 +1193,26 @@ struct SSMRecurrenceMicrobenchmarkTests {
                 threadgroupWidth: try integerCSVValue("threadgroupWidth", in: row, artifact: url),
                 requestedThreadgroupWidth: try integerCSVValue("requestedThreadgroupWidth", in: row, artifact: url),
                 averageGpuMicroseconds: try doubleCSVValue("averageGpuMicroseconds", in: row, artifact: url)
+            )
+        }
+    }
+
+    private func readSummaryCSV(_ url: URL) throws -> [SSMSummaryRow] {
+        try parseSimpleCSV(url).map { row in
+            SSMSummaryRow(
+                sequenceLength: try integerCSVValue("sequenceLength", in: row, artifact: url),
+                bestVariant: try requiredCSVValue("bestVariant", in: row, artifact: url),
+                bestThreadgroupWidth: try integerCSVValue("bestThreadgroupWidth", in: row, artifact: url),
+                bestAverageGpuMicroseconds: try doubleCSVValue("bestAverageGpuMicroseconds", in: row, artifact: url),
+                bestMicrosecondsPerToken: try doubleCSVValue("bestMicrosecondsPerToken", in: row, artifact: url),
+                bestEstimatedStateTotalBytesPerToken: try integerCSVValue("bestEstimatedStateTotalBytesPerToken", in: row, artifact: url),
+                bestBaseVariant: try requiredCSVValue("bestBaseVariant", in: row, artifact: url),
+                bestBaseThreadgroupWidth: try integerCSVValue("bestBaseThreadgroupWidth", in: row, artifact: url),
+                bestBaseAverageGpuMicroseconds: try doubleCSVValue("bestBaseAverageGpuMicroseconds", in: row, artifact: url),
+                bestBaseEstimatedStateTotalBytesPerToken: try integerCSVValue("bestBaseEstimatedStateTotalBytesPerToken", in: row, artifact: url),
+                speedupVsBestBasePercent: try doubleCSVValue("speedupVsBestBasePercent", in: row, artifact: url),
+                decision: try requiredCSVValue("decision", in: row, artifact: url),
+                promotionAdmission: try requiredCSVValue("promotionAdmission", in: row, artifact: url)
             )
         }
     }
