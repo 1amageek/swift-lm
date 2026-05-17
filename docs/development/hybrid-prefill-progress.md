@@ -1750,12 +1750,14 @@ real-shape, phase-isolation, and stability runs:
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-bridge.csv` | Join between static feasibility and phase stability for state-recurrence candidate shapes |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-full-bridge.csv` | Optional join between phase stability and full-kernel route promotion, emitted only when both inputs exist |
 
-`SSMArtifactManifest.requiredArtifacts` is the code-level manifest for this
-table. The lightweight manifest test checks the expected file set without
-requiring local artifacts, while
-`SWIFTLM_VALIDATE_SSM_ARTIFACT_MANIFEST=1` additionally requires the current
-`.test-artifacts` files to exist and parse as CSV. This is the one-command
-sanity check before handing SSM evidence to another route implementation pass.
+`SSMArtifactManifest.requiredArtifacts` is the code-level manifest for the
+always-emitted files in this table, while
+`SSMArtifactManifest.optionalArtifacts` tracks the conditional
+phase/full-bridge file. The lightweight manifest test checks both sets without
+requiring local artifacts, while `SWIFTLM_VALIDATE_SSM_ARTIFACT_MANIFEST=1`
+requires every current required artifact to exist and parse as CSV, and parses
+optional artifacts when they are present. This is the one-command sanity check
+before handing SSM evidence to another route implementation pass.
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route

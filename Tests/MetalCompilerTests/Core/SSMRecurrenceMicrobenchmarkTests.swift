@@ -585,18 +585,20 @@ struct SSMRecurrenceMicrobenchmarkTests {
 
     @Test("SSM artifact manifest covers harness outputs")
     func ssmArtifactManifestCoversHarnessOutputs() {
-        let files = SSMArtifactManifest.requiredArtifacts.map(\.fileName)
+        let requiredFiles = SSMArtifactManifest.requiredArtifacts.map(\.fileName)
+        let optionalFiles = SSMArtifactManifest.optionalArtifacts.map(\.fileName)
 
-        #expect(files.count == 9)
-        #expect(files.contains("qwen35-bf16-ssm-recurrence.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-summary.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-route-promotions.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-threadgroup-policies.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-phases.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-phase-stability.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-state-candidate-feasibility.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-state-candidate-bridge.csv"))
-        #expect(files.contains("qwen35-bf16-ssm-recurrence-phase-full-bridge.csv"))
+        #expect(requiredFiles.count == 8)
+        #expect(optionalFiles.count == 1)
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-summary.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-route-promotions.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-threadgroup-policies.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-phases.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-phase-stability.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-state-candidate-feasibility.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-state-candidate-bridge.csv"))
+        #expect(optionalFiles.contains("qwen35-bf16-ssm-recurrence-phase-full-bridge.csv"))
     }
 
     @Test("SSM artifact manifest files can be parsed when requested")
@@ -608,6 +610,14 @@ struct SSMRecurrenceMicrobenchmarkTests {
         for artifact in SSMArtifactManifest.requiredArtifacts {
             let url = directory.appendingPathComponent(artifact.fileName)
             try requireArtifact(url)
+            let rows = try parseSimpleCSV(url)
+            #expect(!rows.isEmpty, "\(artifact.fileName) should contain data rows")
+        }
+        for artifact in SSMArtifactManifest.optionalArtifacts {
+            let url = directory.appendingPathComponent(artifact.fileName)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                continue
+            }
             let rows = try parseSimpleCSV(url)
             #expect(!rows.isEmpty, "\(artifact.fileName) should contain data rows")
         }
@@ -1453,6 +1463,9 @@ private enum SSMArtifactManifest {
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-recurrence-phase-stability.csv", source: "phase-stability microbench"),
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-state-candidate-feasibility.csv", source: "static state-candidate feasibility"),
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-state-candidate-bridge.csv", source: "state-candidate feasibility/stability bridge"),
+    ]
+
+    static let optionalArtifacts = [
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-recurrence-phase-full-bridge.csv", source: "phase/full route bridge"),
     ]
 }
