@@ -489,6 +489,7 @@ private struct PendingRecurrentBlockOutputProjection {
 
 private struct PrefillStepPlanner {
     private static let decodeEquivalentSequenceRowsPerThreadgroup = 2
+    private static let defaultBF16BatchedSequenceRowsPerThreadgroup = 16
 
     /// Process-wide BF16 single sequence GEMV tile2 feature flag.
     ///
@@ -516,6 +517,24 @@ private struct PrefillStepPlanner {
             return false
         }
         return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    /// Process-wide BF16 batched sequence GEMV rows-per-threadgroup policy.
+    ///
+    /// The base batched sequence kernels map one SIMD group to one output row
+    /// and one token. Increasing the number of SIMD groups in the threadgroup
+    /// processes more output rows for the same token dispatch without changing
+    /// each row's reduction order or kernel source. The default is `16` for
+    /// BF16 row-major batched sequence projections because Qwen reference gates
+    /// pass and same-build profile evidence clears the 10% seqLen-128 speed
+    /// gate. Set `SWIFTLM_PREFILL_BF16_BATCHED_ROWS=2` to restore the former
+    /// geometry for diagnosis.
+    private static let bf16BatchedRowsPerThreadgroup: Int = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_BATCHED_ROWS"],
+              let value = Int(raw) else {
+            return Self.defaultBF16BatchedSequenceRowsPerThreadgroup
+        }
+        return min(max(value, Self.decodeEquivalentSequenceRowsPerThreadgroup), 16)
     }()
 
     /// Process-wide BF16 fused SwiGLU+down_proj override.
@@ -899,6 +918,18 @@ private struct PrefillStepPlanner {
             rowsPerThreadgroup,
             MTLSize(width: threads, height: 1, depth: 1)
         )
+    }
+
+    private func batchedSequenceRowsPerThreadgroup(
+        descriptor: ProjectionWeightDescriptor,
+        pipeline: MTLComputePipelineState
+    ) -> Int {
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let maxRows = max(1, pipeline.maxTotalThreadsPerThreadgroup / simdWidth)
+        guard descriptor.schemeIdentifier == .bf16RowMajor else {
+            return min(Self.decodeEquivalentSequenceRowsPerThreadgroup, maxRows)
+        }
+        return min(Self.bf16BatchedRowsPerThreadgroup, maxRows)
     }
 
     /// Attempt to fuse a `(SwiGLU, mlp.down_proj)` entry pair into a single
@@ -2871,11 +2902,11 @@ private struct PrefillStepPlanner {
             )
             : nil
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let threads = shape?.threadgroupSize.width
-            ?? min(
-                simdWidth * Self.decodeEquivalentSequenceRowsPerThreadgroup,
-                pipeline.maxTotalThreadsPerThreadgroup
-            )
+        let untiledRowsPerThreadgroup = batchedSequenceRowsPerThreadgroup(
+            descriptor: firstDescriptor,
+            pipeline: pipeline
+        )
+        let threads = shape?.threadgroupSize.width ?? simdWidth * untiledRowsPerThreadgroup
         let rowsPerThreadgroup = shape?.rowsPerThreadgroup ?? max(1, threads / simdWidth)
         let gridHeight = shape.map { (maximumSequenceLength + $0.sequenceTile - 1) / $0.sequenceTile }
             ?? maximumSequenceLength

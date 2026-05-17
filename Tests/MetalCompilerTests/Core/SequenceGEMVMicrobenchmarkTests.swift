@@ -85,9 +85,12 @@ struct SequenceGEMVMicrobenchmarkTests {
             ),
         ]
         let variants = [
-            BatchedVariant(name: "base", sequenceTile: 1),
-            BatchedVariant(name: "tile2", sequenceTile: 2),
-            BatchedVariant(name: "tile4", sequenceTile: 4),
+            BatchedVariant(name: "base", sequenceTile: 1, simdgroupsPerThreadgroup: 2),
+            BatchedVariant(name: "rows4", sequenceTile: 1, simdgroupsPerThreadgroup: 4),
+            BatchedVariant(name: "rows8", sequenceTile: 1, simdgroupsPerThreadgroup: 8),
+            BatchedVariant(name: "rows16", sequenceTile: 1, simdgroupsPerThreadgroup: 16),
+            BatchedVariant(name: "tile2", sequenceTile: 2, simdgroupsPerThreadgroup: 4),
+            BatchedVariant(name: "tile4", sequenceTile: 4, simdgroupsPerThreadgroup: 8),
         ]
 
         var rows: [BatchedResultRow] = []
@@ -211,7 +214,7 @@ struct SequenceGEMVMicrobenchmarkTests {
         let csv = try String(contentsOf: artifact, encoding: .utf8)
         #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
         #expect(csv.contains("candidate-single-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
-        #expect(csv.contains("reject-cross-sequence-threshold,,microbench-rejected"))
+        #expect(csv.contains("reject-cross-sequence-threshold,,,microbench-rejected"))
     }
 
     @Test("BF16 batched sequence GEMV route admissions require production sequence wins")
@@ -220,19 +223,26 @@ struct SequenceGEMVMicrobenchmarkTests {
             makeBatchedResultFixture(role: "batched", sequenceLength: 16, variant: "base", averageGpuMicroseconds: 100.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 16, variant: "tile2", averageGpuMicroseconds: 50.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 64, variant: "base", averageGpuMicroseconds: 100.0),
+            makeBatchedResultFixture(role: "batched", sequenceLength: 64, variant: "rows16", averageGpuMicroseconds: 85.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 64, variant: "tile2", averageGpuMicroseconds: 90.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 64, variant: "tile4", averageGpuMicroseconds: 90.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 128, variant: "base", averageGpuMicroseconds: 100.0),
+            makeBatchedResultFixture(role: "batched", sequenceLength: 128, variant: "rows16", averageGpuMicroseconds: 85.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 128, variant: "tile2", averageGpuMicroseconds: 90.0),
             makeBatchedResultFixture(role: "batched", sequenceLength: 128, variant: "tile4", averageGpuMicroseconds: 99.0),
         ]
 
         let routeRows = summarizeBatchedRoutePromotions(rows: rows)
+        let rows16 = routeRows.first { $0.variant == "rows16" }
         let tile2 = routeRows.first { $0.variant == "tile2" }
         let tile4 = routeRows.first { $0.variant == "tile4" }
+        #expect(rows16?.routePromotionAdmission == "candidate-batched-gemv-default-route")
+        #expect(rows16?.requiredProfileRouteGate == "baseline-route-preserved")
+        #expect(rows16?.requiredProfileThreadgroupWidth == "512")
         #expect(tile2?.routePromotionAdmission == "candidate-batched-gemv-default-route")
         #expect(tile2?.failingSequenceLengths == [])
         #expect(tile2?.requiredProfileRouteGate == "experimental-route-observed")
+        #expect(tile2?.requiredProfileThreadgroupWidth == "")
         #expect(tile2?.readinessPrerequisite == "requires-full-profile-route-gate")
         #expect(tile4?.routePromotionAdmission == "reject-cross-sequence-threshold")
         #expect(tile4?.failingSequenceLengths == [128])
@@ -244,9 +254,10 @@ struct SequenceGEMVMicrobenchmarkTests {
             .appendingPathComponent("swift-lm-batched-route-promotion-test-\(UUID().uuidString)", isDirectory: true)
         let artifact = try writeBatchedRoutePromotionCSV(rows: routeRows, directory: directory)
         let csv = try String(contentsOf: artifact, encoding: .utf8)
-        #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
-        #expect(csv.contains("candidate-batched-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
-        #expect(csv.contains("reject-cross-sequence-threshold,,microbench-rejected"))
+        #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,requiredProfileThreadgroupWidth,readinessPrerequisite"))
+        #expect(csv.contains("candidate-batched-gemv-default-route,baseline-route-preserved,512,requires-full-profile-route-gate"))
+        #expect(csv.contains("candidate-batched-gemv-default-route,experimental-route-observed,,requires-full-profile-route-gate"))
+        #expect(csv.contains("reject-cross-sequence-threshold,,,microbench-rejected"))
     }
 
     private func printReport(
@@ -370,12 +381,12 @@ struct SequenceGEMVMicrobenchmarkTests {
         print("=== BF16 batched sequence GEMV real-shape microbench ===")
         print("artifact: \(artifact.path)")
         print("route promotion artifact: \(routePromotionArtifact.path)")
-        print("role                 seq  variant  count  avg_us  us/output  grid      tg")
+        print("role                 seq  variant  count  rows/tg  avg_us  us/output  grid      tg")
         for row in rows.sorted(by: batchedRowSort) {
             let role = row.role.padding(toLength: 20, withPad: " ", startingAt: 0)
             let variant = row.variant.padding(toLength: 7, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 9, withPad: " ", startingAt: 0)
-            print("  \(role) \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%5d", row.projectionCount))  \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.4f", row.microsecondsPerOutput))  \(grid) \(row.threadgroupWidth)")
+            print("  \(role) \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%5d", row.projectionCount))  \(String(format: "%7d", row.rowsPerThreadgroup))  \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.4f", row.microsecondsPerOutput))  \(grid) \(row.threadgroupWidth)")
         }
         print()
         print("=== BF16 batched sequence GEMV route promotion admissions ===")
@@ -402,6 +413,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 "sequenceLength",
                 "variant",
                 "sequenceTile",
+                "simdgroupsPerThreadgroup",
+                "rowsPerThreadgroup",
                 "projectionCount",
                 "gridWidth",
                 "gridHeight",
@@ -419,6 +432,8 @@ struct SequenceGEMVMicrobenchmarkTests {
                 String(row.sequenceLength),
                 row.variant,
                 String(row.sequenceTile),
+                String(row.simdgroupsPerThreadgroup),
+                String(row.rowsPerThreadgroup),
                 String(row.projectionCount),
                 String(row.gridWidth),
                 String(row.gridHeight),
@@ -452,6 +467,7 @@ struct SequenceGEMVMicrobenchmarkTests {
                 "failingSequenceLengths",
                 "routePromotionAdmission",
                 "requiredProfileRouteGate",
+                "requiredProfileThreadgroupWidth",
                 "readinessPrerequisite",
             ].joined(separator: ","),
         ]
@@ -468,6 +484,7 @@ struct SequenceGEMVMicrobenchmarkTests {
                 row.failingSequenceLengths.map(String.init).joined(separator: "|"),
                 row.routePromotionAdmission,
                 row.requiredProfileRouteGate,
+                row.requiredProfileThreadgroupWidth,
                 row.readinessPrerequisite,
             ].joined(separator: ","))
         }
@@ -548,7 +565,8 @@ struct SequenceGEMVMicrobenchmarkTests {
     private func batchedRowSort(_ lhs: BatchedResultRow, _ rhs: BatchedResultRow) -> Bool {
         if lhs.role != rhs.role { return lhs.role < rhs.role }
         if lhs.sequenceLength != rhs.sequenceLength { return lhs.sequenceLength < rhs.sequenceLength }
-        return lhs.sequenceTile < rhs.sequenceTile
+        if lhs.sequenceTile != rhs.sequenceTile { return lhs.sequenceTile < rhs.sequenceTile }
+        return lhs.rowsPerThreadgroup < rhs.rowsPerThreadgroup
     }
 
     private func fusedRowsSort(_ lhs: FusedRowsResultRow, _ rhs: FusedRowsResultRow) -> Bool {
@@ -638,19 +656,41 @@ struct SequenceGEMVMicrobenchmarkTests {
         variant: String,
         averageGpuMicroseconds: Double
     ) -> BatchedResultRow {
-        BatchedResultRow(
+        let shape = batchedFixtureShape(variant: variant)
+        return BatchedResultRow(
             role: role,
             inputDimension: 2048,
             outputDimensions: [1024, 1024],
             sequenceLength: sequenceLength,
             variant: variant,
-            sequenceTile: variant == "base" ? 1 : 2,
+            sequenceTile: shape.sequenceTile,
+            simdgroupsPerThreadgroup: shape.simdgroupsPerThreadgroup,
+            rowsPerThreadgroup: shape.rowsPerThreadgroup,
             projectionCount: 2,
             gridWidth: 2048,
             gridHeight: sequenceLength,
-            threadgroupWidth: 64,
+            threadgroupWidth: shape.threadgroupWidth,
             averageGpuMicroseconds: averageGpuMicroseconds
         )
+    }
+
+    private func batchedFixtureShape(
+        variant: String
+    ) -> (sequenceTile: Int, simdgroupsPerThreadgroup: Int, rowsPerThreadgroup: Int, threadgroupWidth: Int) {
+        switch variant {
+        case "rows4":
+            return (1, 4, 4, 128)
+        case "rows8":
+            return (1, 8, 8, 256)
+        case "rows16":
+            return (1, 16, 16, 512)
+        case "tile2":
+            return (2, 4, 2, 128)
+        case "tile4":
+            return (4, 8, 2, 256)
+        default:
+            return (1, 2, 2, 64)
+        }
     }
 }
 
@@ -688,6 +728,11 @@ private struct Variant {
 private struct BatchedVariant {
     let name: String
     let sequenceTile: Int
+    let simdgroupsPerThreadgroup: Int
+
+    var rowsPerThreadgroup: Int {
+        max(1, simdgroupsPerThreadgroup / max(sequenceTile, 1))
+    }
 }
 
 private struct FusedRowsVariant {
@@ -804,6 +849,8 @@ private struct BatchedResultRow {
     let sequenceLength: Int
     let variant: String
     let sequenceTile: Int
+    let simdgroupsPerThreadgroup: Int
+    let rowsPerThreadgroup: Int
     let projectionCount: Int
     let gridWidth: Int
     let gridHeight: Int
@@ -828,6 +875,7 @@ private struct BatchedGEMVRoutePromotionRow {
     let requiredSequenceCount: Int
     let failingSequenceLengths: [Int]
     let routePromotionAdmission: String
+    let requiredProfileThreadgroupWidth: String
 
     var minimumSpeedupPercent: Double {
         speedupPercents.min() ?? .nan
@@ -839,7 +887,10 @@ private struct BatchedGEMVRoutePromotionRow {
     }
 
     var requiredProfileRouteGate: String {
-        routePromotionAdmission.hasPrefix("candidate-") ? "experimental-route-observed" : ""
+        guard routePromotionAdmission.hasPrefix("candidate-") else { return "" }
+        return requiredProfileThreadgroupWidth.isEmpty
+            ? "experimental-route-observed"
+            : "baseline-route-preserved"
     }
 
     var readinessPrerequisite: String {
@@ -884,6 +935,19 @@ private enum BatchedGEMVRoutePromotionFactory {
         let admission = passingCount == productionSequenceLengths.count
             ? "candidate-batched-gemv-default-route"
             : "reject-cross-sequence-threshold"
+        let requiredProfileThreadgroupWidth: String
+        if admission.hasPrefix("candidate-"), variant.hasPrefix("rows") {
+            let widths = Set(productionSequenceLengths.compactMap { sequenceLength in
+                rows.first {
+                    $0.role == role && $0.sequenceLength == sequenceLength && $0.variant == variant
+                }?.threadgroupWidth
+            })
+            requiredProfileThreadgroupWidth = widths.count == 1
+                ? widths.map(String.init).first ?? ""
+                : ""
+        } else {
+            requiredProfileThreadgroupWidth = ""
+        }
 
         return BatchedGEMVRoutePromotionRow(
             role: role,
@@ -893,7 +957,8 @@ private enum BatchedGEMVRoutePromotionFactory {
             passingSequenceCount: passingCount,
             requiredSequenceCount: productionSequenceLengths.count,
             failingSequenceLengths: failingSequenceLengths,
-            routePromotionAdmission: admission
+            routePromotionAdmission: admission,
+            requiredProfileThreadgroupWidth: requiredProfileThreadgroupWidth
         )
     }
 }
@@ -1145,7 +1210,8 @@ private struct MicrobenchmarkHarness {
             pipeline: pipeline,
             outputDimension: shape.totalOutputDimension,
             sequenceLength: sequenceLength,
-            sequenceTile: variant.sequenceTile
+            sequenceTile: variant.sequenceTile,
+            simdgroupsPerThreadgroup: variant.simdgroupsPerThreadgroup
         )
 
         for _ in 0..<warmupIterations {
@@ -1180,6 +1246,8 @@ private struct MicrobenchmarkHarness {
             sequenceLength: sequenceLength,
             variant: variant.name,
             sequenceTile: variant.sequenceTile,
+            simdgroupsPerThreadgroup: variant.simdgroupsPerThreadgroup,
+            rowsPerThreadgroup: geometry.rowsPerThreadgroup,
             projectionCount: shape.projectionCount,
             gridWidth: geometry.grid.width,
             gridHeight: geometry.grid.height,
@@ -1265,7 +1333,7 @@ private struct MicrobenchmarkHarness {
         outputBuffer: MTLBuffer,
         shape: Shape,
         sequenceLength: Int,
-        geometry: (grid: MTLSize, threadgroup: MTLSize)
+        geometry: (grid: MTLSize, threadgroup: MTLSize, rowsPerThreadgroup: Int)
     ) throws -> Double {
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -1302,7 +1370,7 @@ private struct MicrobenchmarkHarness {
         outputBuffers: [MTLBuffer],
         shape: BatchedShape,
         sequenceLength: Int,
-        geometry: (grid: MTLSize, threadgroup: MTLSize)
+        geometry: (grid: MTLSize, threadgroup: MTLSize, rowsPerThreadgroup: Int)
     ) throws -> Double {
         guard let commandBuffer = queue.makeCommandBuffer(),
               let encoder = commandBuffer.makeComputeCommandEncoder() else {
@@ -1384,23 +1452,25 @@ private struct MicrobenchmarkHarness {
         outputDimension: Int,
         sequenceLength: Int,
         sequenceTile: Int,
-        rowsPerSimdgroup: Int = 1
-    ) -> (grid: MTLSize, threadgroup: MTLSize) {
+        rowsPerSimdgroup: Int = 1,
+        simdgroupsPerThreadgroup requestedSimdgroupsPerThreadgroup: Int? = nil
+    ) -> (grid: MTLSize, threadgroup: MTLSize, rowsPerThreadgroup: Int) {
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let simdgroupsPerThreadgroup = 2
+        let simdgroupsPerThreadgroup = max(1, requestedSimdgroupsPerThreadgroup ?? (2 * sequenceTile))
         let threads = min(
-            simdWidth * simdgroupsPerThreadgroup * sequenceTile,
+            simdWidth * simdgroupsPerThreadgroup,
             pipeline.maxTotalThreadsPerThreadgroup
         )
-        let actualSimdgroupsPerThreadgroup = max(1, (threads / simdWidth) / sequenceTile)
-        let actualRowsPerThreadgroup = actualSimdgroupsPerThreadgroup * rowsPerSimdgroup
+        let actualSimdgroupsPerThreadgroup = max(1, threads / simdWidth)
+        let sequenceGroups = max(1, actualSimdgroupsPerThreadgroup / max(sequenceTile, 1))
+        let effectiveRowsPerThreadgroup = max(1, sequenceGroups * rowsPerSimdgroup)
         let grid = MTLSize(
-            width: (outputDimension + actualRowsPerThreadgroup - 1) / actualRowsPerThreadgroup,
+            width: (outputDimension + effectiveRowsPerThreadgroup - 1) / effectiveRowsPerThreadgroup,
             height: (sequenceLength + sequenceTile - 1) / sequenceTile,
             depth: 1
         )
         let threadgroup = MTLSize(width: threads, height: 1, depth: 1)
-        return (grid, threadgroup)
+        return (grid, threadgroup, effectiveRowsPerThreadgroup)
     }
 
     private func fusedDispatchGeometry(

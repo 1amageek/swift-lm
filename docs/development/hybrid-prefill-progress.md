@@ -303,6 +303,11 @@ flowchart TD
 | 2026-05-18 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` | Pass; default-promotion full-profile speed gate now requires at least 10% total prefill improvement at every production sequence length |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; current Qwen route-readiness artifact reconstruction remains valid after adding the 10% speed-threshold evidence column |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
+| 2026-05-18 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; added rows4/rows8/rows16 geometry probes for BF16 batched sequence GEMV. rows16 is the strongest production-length candidate across `linear_attn.in_proj`, `mlp.gate_up`, and `self_attn.qkv`; tile2/tile4 remain rejected |
+| 2026-05-18 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_ROWS=16 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; rows16 batched BF16 scheduling remains schema v6 reference-equivalent for block boundaries, final hidden/logits, state/KV, and decode0 |
+| 2026-05-18 | `Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with default rows2 baseline and rows16 candidate | Pass; same-session Qwen seqLen 128 total prefill improves from 325.519 ms to 291.638 ms (10.4%), so BF16 batched sequence GEMV rows16 is promoted to default |
+| 2026-05-18 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; default environment remains reference-equivalent after promoting BF16 batched sequence GEMV rows16 scheduling |
+| 2026-05-18 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; default environment now uses `tg=512` for BF16 batched sequence GEMV and records 45.490/151.288/290.403 ms for seqLen 16/64/128 |
 | 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; validates the synthetic route-readiness reconstruction contract and the current local Qwen route-readiness artifact set, then writes `.test-artifacts/qwen-route-readiness-validation/<timestamp>/summary.csv` plus per-gate logs |
@@ -557,15 +562,51 @@ gate used by the SSM harness:
 |---|---|
 | `qwen35-bf16-single-sequence-gemv.csv` | Raw timing for base, row2, tile2, and tile4 by role and sequence length |
 | `qwen35-bf16-single-sequence-gemv-route-promotions.csv` | Per-role route admission across 64/128-token production lengths |
-| `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/tile2/tile4 by role and sequence length |
-| `qwen35-bf16-batched-sequence-gemv-route-promotions.csv` | Per-role route admission for batched tile2/tile4 across 64/128-token production lengths |
+| `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/rows4/rows8/rows16/tile2/tile4 by role and sequence length |
+| `qwen35-bf16-batched-sequence-gemv-route-promotions.csv` | Per-role route admission for batched rows and tiled variants across 64/128-token production lengths |
+
+### Batched BF16 rows-per-threadgroup default (2026-05-18)
+
+The highest-impact projection change is not cross-token tiling. The winning
+shape keeps the sequence tile at 1 and increases output-row fan-out per
+threadgroup for BF16 batched sequence GEMV:
+
+```mermaid
+flowchart LR
+  A["base batched GEMV: 2 rows/tg"] --> B["rows16: 16 rows/tg"]
+  B --> C["same per-row SIMD reduction"]
+  B --> D["fewer row-grid threadgroups"]
+  D --> E["lower projection time"]
+```
+
+Microbench result at production sequence lengths:
+
+| Role | Best candidate | seqLen 64 speedup | seqLen 128 speedup | Decision |
+|---|---:|---:|---:|---|
+| `linear_attn.in_proj` | rows16 | 17.30% min gate across 64/128 | 19.80% at 128 | default-eligible |
+| `mlp.gate_up` | rows16/rows4/rows8 close | 8.81% min gate across 64/128 | 14.91% at 128 | default-eligible |
+| `self_attn.qkv` | rows16 | 7.30% min gate across 64/128 | 13.57% at 128 | default-eligible |
+| tile2/tile4 | rejected | negative | negative | keep disabled |
+
+Same-build full Qwen profile:
+
+| Route | seqLen 16 | seqLen 64 | seqLen 128 | seqLen 128 delta |
+|---|---:|---:|---:|---:|
+| former rows2 geometry | 46.093 ms | 165.090 ms | 325.519 ms | baseline |
+| rows16 opt-in | 45.253 ms | 152.549 ms | 291.638 ms | +10.4% |
+| rows16 default after promotion | 45.490 ms | 151.288 ms | 290.403 ms | +10.8% vs baseline |
+
+Reference correctness remains green with rows16 enabled and in the default
+environment. The override remains available as
+`SWIFTLM_PREFILL_BF16_BATCHED_ROWS=2` for diagnosis or cross-device comparison.
 
 The route-promotion CSVs also publish two readiness columns that connect the
 isolated microbench decision to the full Qwen profile gate:
 
 | Column | Meaning |
 |---|---|
-| `requiredProfileRouteGate` | Full-profile route gate that must be observed before the microbench candidate can move to route-default discussion. Current candidate rows require `experimental-route-observed`. |
+| `requiredProfileRouteGate` | Full-profile route gate that must be observed before the microbench candidate can move to route-default discussion. New kernel routes require `experimental-route-observed`; same-kernel BF16 row-geometry routes require `baseline-route-preserved`. |
+| `requiredProfileThreadgroupWidth` | Optional threadgroup-width witness for same-kernel route changes such as BF16 batched rows16. Without this column, rows16 would be indistinguishable from the former rows2 geometry because the kernel name is unchanged. |
 | `readinessPrerequisite` | `requires-full-profile-route-gate` for microbench candidates and `microbench-rejected` for rejected rows. |
 
 This makes the relationship between the microbench artifacts and
@@ -2363,9 +2404,9 @@ The current route gate over seqLen 64/128 reports:
 | Route family / role | Gate |
 |---|---|
 | `mlp_fused_down / mlp.down_proj` | `default-runtime-gated-route-active` |
-| `batched_projection / linear_attn.in_proj` | `baseline-route-preserved` |
-| `batched_projection / mlp.gate_up` | `baseline-route-preserved` |
-| `batched_projection / self_attn.qkv` | `baseline-route-preserved` |
+| `batched_projection / linear_attn.in_proj` | default BF16 rows16 geometry (`tg=512`) |
+| `batched_projection / mlp.gate_up` | default BF16 rows16 geometry (`tg=512`) |
+| `batched_projection / self_attn.qkv` | default BF16 rows16 geometry (`tg=512`) |
 | `single_projection / linear_attn.out_proj` | `baseline-route-preserved` |
 | `single_projection / self_attn.o_proj` | `baseline-route-preserved` |
 
@@ -2379,9 +2420,9 @@ The route manifest writer also has a lightweight synthetic contract test:
 
 | Contract case | Expected route manifest label |
 |---|---|
-| `batched_gemv4_seq_bf16_f32s` over `linear_attn.in_proj_*` | `batched_projection / linear_attn.in_proj / baseline-route-observed` |
-| `batched_gemv2_seq_bf16_f32s` over `mlp.gate_proj + mlp.up_proj` | `batched_projection / mlp.gate_up / baseline-route-observed` |
-| `batched_gemv3_seq_bf16_f32s` over `self_attn.q/k/v_proj` | `batched_projection / self_attn.qkv / baseline-route-observed` |
+| `batched_gemv4_seq_bf16_f32s` over `linear_attn.in_proj_*` | `batched_projection / linear_attn.in_proj`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
+| `batched_gemv2_seq_bf16_f32s` over `mlp.gate_proj + mlp.up_proj` | `batched_projection / mlp.gate_up`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
+| `batched_gemv3_seq_bf16_f32s` over `self_attn.q/k/v_proj` | `batched_projection / self_attn.qkv`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
 | `mlp_fused_swiglu_down_seq_bf16_f32s` at seqLen 128 | `mlp_fused_down / mlp.down_proj / default-runtime-gated-route` |
 | `gemv_seq_bf16_f32s_rps2` | `single_projection / self_attn.o_proj / experimental-route-observed` |
 
@@ -2411,7 +2452,10 @@ flowchart LR
 | `readinessPrerequisite` | Must equal `requires-full-profile-route-gate`; otherwise reject as `reject-microbench-prerequisite` |
 | `requiredProfileRouteGate` | Published by the microbench route-promotion CSV for every candidate route |
 | `observedProfileRouteGate` | Must equal the route's required profile gate |
+| `requiredProfileThreadgroupWidth` | When non-empty, the full-profile route gate must expose the same `threadgroupWidth` |
+| `observedProfileThreadgroupWidth` | Published by the full-profile route gate so same-kernel geometry changes can be admitted or rejected |
 | Missing profile route | Reject as `reject-missing-full-profile-route` |
+| Missing required threadgroup width | Reject as `reject-full-profile-threadgroup-not-observed` |
 | Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |
 | Baseline preserved when an experimental route was required | Reject as `reject-full-profile-route-not-observed` |
 | `requires-full-profile-speed-gate` prerequisite | Requires `observedProfileSpeedGate == full-profile-speedup-observed` and `observedProfileSpeedMinimumPercent >= 10.0` |
