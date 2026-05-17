@@ -264,6 +264,7 @@ flowchart TD
 | 2026-05-16 | `SWIFTLM_VALIDATE_SSM_STATE_BRIDGE_ARTIFACTS=1 swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmStateCandidateBridgeArtifactCanBeReconstructedWhenRequested` | Pass; state-candidate bridge artifact can be reconstructed from feasibility and phase-stability artifacts |
 | 2026-05-16 | `SWIFTLM_VALIDATE_SSM_THREADGROUP_POLICY_ARTIFACTS=1 swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmThreadgroupPolicyArtifactCanBeReconstructedWhenRequested` | Pass; threadgroup policy artifact can be reconstructed from the raw SSM recurrence microbench artifact |
 | 2026-05-18 | `SWIFTLM_VALIDATE_SSM_ROUTE_ARTIFACTS=1 swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmRouteArtifactsCanBeReconstructedWhenRequested` | Pass; SSM summary and route-promotion artifacts can be reconstructed from the raw recurrence microbench artifact |
+| 2026-05-18 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/ssmArtifactManifestCoversHarnessOutputs` and `SWIFTLM_VALIDATE_SSM_ARTIFACT_MANIFEST=1 .../ssmArtifactManifestFilesCanBeParsedWhenRequested` | Pass; SSM artifact manifest covers and parses all current harness outputs |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
@@ -1748,6 +1749,13 @@ real-shape, phase-isolation, and stability runs:
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-feasibility.csv` | Static feasibility check for state-recurrence candidate shapes before timing or route implementation |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-state-candidate-bridge.csv` | Join between static feasibility and phase stability for state-recurrence candidate shapes |
 | `.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-recurrence-phase-full-bridge.csv` | Optional join between phase stability and full-kernel route promotion, emitted only when both inputs exist |
+
+`SSMArtifactManifest.requiredArtifacts` is the code-level manifest for this
+table. The lightweight manifest test checks the expected file set without
+requiring local artifacts, while
+`SWIFTLM_VALIDATE_SSM_ARTIFACT_MANIFEST=1` additionally requires the current
+`.test-artifacts` files to exist and parse as CSV. This is the one-command
+sanity check before handing SSM evidence to another route implementation pass.
 
 This keeps the next SSM decision mechanical: a variant must beat the best base
 kernel for the relevant sequence lengths before it can become a runtime route
