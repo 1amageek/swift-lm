@@ -304,6 +304,7 @@ flowchart TD
 | 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; validates the synthetic route-readiness reconstruction contract and the current local Qwen route-readiness artifact set, then writes `.test-artifacts/qwen-route-readiness-validation/<timestamp>/summary.csv` plus per-gate logs |
+| 2026-05-18 | `scripts/benchmarks/run-prefill-artifact-validation.sh --timeout 120` | Pass; parent wrapper validates SSM artifact gates and Qwen route-readiness gates, then writes `.test-artifacts/prefill-artifact-validation/<timestamp>/summary.csv` with child log links |
 
 ## Failed Experiments
 

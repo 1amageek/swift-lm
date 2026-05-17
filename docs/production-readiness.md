@@ -61,6 +61,47 @@ Review items:
 - context-length decode scaling must remain monotonic
 - host overhead must remain low relative to GPU time
 
+## Prefill Route Promotion Artifact Gate
+
+Prefill route promotion must be evidence-backed before a faster route becomes
+the production default. Run the artifact validation wrapper after the focused
+prefill microbench/profile artifacts have been generated:
+
+```bash
+scripts/benchmarks/run-prefill-artifact-validation.sh --timeout 120
+```
+
+The wrapper records a replayable result bundle:
+
+```mermaid
+flowchart LR
+  A["prefill artifact validation"] --> B["SSM artifact gates"]
+  A --> C["Qwen route-readiness gates"]
+  B --> D["summary.csv + per-gate logs"]
+  C --> D
+```
+
+Required expectations:
+
+- SSM route, threadgroup policy, state feasibility, state bridge, phase/full
+  bridge, and artifact-manifest reconstruction gates pass.
+- Qwen route-readiness reconstruction passes for both the synthetic contract
+  and the current local artifact set.
+- The parent summary is written under
+  `.test-artifacts/prefill-artifact-validation/<timestamp>/summary.csv`.
+- A route can be discussed for default promotion only when its microbench
+  promotion CSV, full-profile route gate, and full-profile speed gate all agree.
+
+If persisted Qwen baseline and experimental full-profile directories are
+available, pass them through the wrapper so it regenerates the speed gate before
+route-readiness validation:
+
+```bash
+scripts/benchmarks/run-prefill-artifact-validation.sh \
+  --qwen-baseline-dir .test-artifacts/prefill-profile-baseline \
+  --qwen-experimental-dir .test-artifacts/prefill-profile-row-grid
+```
+
 ## Model-Aware Policy Gate
 
 The default inference policy is not a universal RotorQuant default.
