@@ -89,6 +89,7 @@ struct SequenceGEMVMicrobenchmarkTests {
             BatchedVariant(name: "rows4", sequenceTile: 1, simdgroupsPerThreadgroup: 4),
             BatchedVariant(name: "rows8", sequenceTile: 1, simdgroupsPerThreadgroup: 8),
             BatchedVariant(name: "rows16", sequenceTile: 1, simdgroupsPerThreadgroup: 16),
+            BatchedVariant(name: "rows32", sequenceTile: 1, simdgroupsPerThreadgroup: 32),
             BatchedVariant(name: "tile2", sequenceTile: 2, simdgroupsPerThreadgroup: 4),
             BatchedVariant(name: "tile4", sequenceTile: 4, simdgroupsPerThreadgroup: 8),
         ]
@@ -684,6 +685,8 @@ struct SequenceGEMVMicrobenchmarkTests {
             return (1, 8, 8, 256)
         case "rows16":
             return (1, 16, 16, 512)
+        case "rows32":
+            return (1, 32, 32, 1024)
         case "tile2":
             return (2, 4, 2, 128)
         case "tile4":

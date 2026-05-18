@@ -308,6 +308,8 @@ flowchart TD
 | 2026-05-18 | `Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with default rows2 baseline and rows16 candidate | Pass; same-session Qwen seqLen 128 total prefill improves from 325.519 ms to 291.638 ms (10.4%), so BF16 batched sequence GEMV rows16 is promoted to default |
 | 2026-05-18 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; default environment remains reference-equivalent after promoting BF16 batched sequence GEMV rows16 scheduling |
 | 2026-05-18 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; default environment now uses `tg=512` for BF16 batched sequence GEMV and records 45.490/151.288/290.403 ms for seqLen 16/64/128 |
+| 2026-05-18 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` with rows32 included | Pass; rows32 is explicitly measured and rejected for default routing because it is slower or noise across production sequence lengths |
+| 2026-05-18 | `Qwen35PrefillProfileTests/perStepPrefillTimingByLength` default role-policy experiment vs `SWIFTLM_PREFILL_BF16_BATCHED_ROWS=16` | Pass; role-specific `self_attn.qkv` rows8 fired (`tg=256`) but regressed the full Qwen profile, so the default remains all-BF16-batched rows16 |
 | 2026-05-16 | `scripts/benchmarks/compare-qwen35-prefill-speed-gate.py --baseline-dir ... --experimental-dir ...` | Pass on synthetic profile CSVs; a standalone artifact comparator now writes `qwen35-prefill-full-profile-speed-gate.csv` for route-readiness reconstruction |
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; validates the synthetic route-readiness reconstruction contract and the current local Qwen route-readiness artifact set, then writes `.test-artifacts/qwen-route-readiness-validation/<timestamp>/summary.csv` plus per-gate logs |
@@ -562,7 +564,7 @@ gate used by the SSM harness:
 |---|---|
 | `qwen35-bf16-single-sequence-gemv.csv` | Raw timing for base, row2, tile2, and tile4 by role and sequence length |
 | `qwen35-bf16-single-sequence-gemv-route-promotions.csv` | Per-role route admission across 64/128-token production lengths |
-| `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/rows4/rows8/rows16/tile2/tile4 by role and sequence length |
+| `qwen35-bf16-batched-sequence-gemv.csv` | Raw timing for batched base/rows4/rows8/rows16/rows32/tile2/tile4 by role and sequence length |
 | `qwen35-bf16-batched-sequence-gemv-route-promotions.csv` | Per-role route admission for batched rows and tiled variants across 64/128-token production lengths |
 
 ### Batched BF16 rows-per-threadgroup default (2026-05-18)
@@ -586,6 +588,7 @@ Microbench result at production sequence lengths:
 | `linear_attn.in_proj` | rows16 | 17.30% min gate across 64/128 | 19.80% at 128 | default-eligible |
 | `mlp.gate_up` | rows16/rows4/rows8 close | 8.81% min gate across 64/128 | 14.91% at 128 | default-eligible |
 | `self_attn.qkv` | rows16 | 7.30% min gate across 64/128 | 13.57% at 128 | default-eligible |
+| rows32 | rejected | slower/noise | slower/noise | keep experimental only |
 | tile2/tile4 | rejected | negative | negative | keep disabled |
 
 Same-build full Qwen profile:
@@ -599,6 +602,20 @@ Same-build full Qwen profile:
 Reference correctness remains green with rows16 enabled and in the default
 environment. The override remains available as
 `SWIFTLM_PREFILL_BF16_BATCHED_ROWS=2` for diagnosis or cross-device comparison.
+Values above the default are allowed only as explicit experiments; rows32 is
+measured by the harness but is not a production route.
+
+The follow-up role-specific default experiment was rejected:
+
+| Default policy | seqLen 64 | seqLen 128 | Decision |
+|---|---:|---:|---|
+| `self_attn.qkv` rows8, other BF16 batched rows16 | 166.703 ms | 290.808 ms | reject |
+| all BF16 batched rows16 | 150.549 ms | 287.806 ms | keep default |
+
+The rows8 QKV route fired as intended (`batched_gemv3_seq_bf16_f32s`,
+`tg=256`), but the full-model profile did not improve. This keeps the default
+simple: all BF16 row-major batched sequence GEMV uses rows16 unless
+`SWIFTLM_PREFILL_BF16_BATCHED_ROWS` explicitly overrides the geometry.
 
 The route-promotion CSVs also publish two readiness columns that connect the
 isolated microbench decision to the full Qwen profile gate:
@@ -614,11 +631,12 @@ This makes the relationship between the microbench artifacts and
 microbench CSV is only an invitation to run the full-profile route gate; it is
 not production-ready by itself.
 
-Latest run: batched tile2/tile4 remains non-default; every batched role fails
-at least one production sequence length. The single-GEMV microbench can produce
-per-role candidates under favorable timing, but this is still only a
-microbench-level admission. Default routing still requires Qwen reference
-parity plus full prefill profile improvement for the same flag, because prior
+Latest run: batched rows32/tile2/tile4 remain non-default; every rejected
+batched route fails at least one production sequence length or regresses the
+full profile. The single-GEMV microbench can produce per-role candidates under
+favorable timing, but this is still only a microbench-level admission. Default
+routing still requires Qwen reference correctness, route-gate evidence, and a
+same-session full-profile speed gate for the same flag, because prior
 full-model tile2/row2 runs regressed or stayed within noise.
 
 The live profile test now also prints the BF16 single sequence GEMV role

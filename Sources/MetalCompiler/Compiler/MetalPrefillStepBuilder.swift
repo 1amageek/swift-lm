@@ -528,13 +528,14 @@ private struct PrefillStepPlanner {
     /// BF16 row-major batched sequence projections because Qwen reference gates
     /// pass and same-build profile evidence clears the 10% seqLen-128 speed
     /// gate. Set `SWIFTLM_PREFILL_BF16_BATCHED_ROWS=2` to restore the former
-    /// geometry for diagnosis.
+    /// geometry for diagnosis. Values above the default remain experimental
+    /// until they clear the same full-profile promotion gate.
     private static let bf16BatchedRowsPerThreadgroup: Int = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_BATCHED_ROWS"],
               let value = Int(raw) else {
             return Self.defaultBF16BatchedSequenceRowsPerThreadgroup
         }
-        return min(max(value, Self.decodeEquivalentSequenceRowsPerThreadgroup), 16)
+        return min(max(value, Self.decodeEquivalentSequenceRowsPerThreadgroup), 32)
     }()
 
     /// Process-wide BF16 fused SwiGLU+down_proj override.
@@ -2859,6 +2860,7 @@ private struct PrefillStepPlanner {
         guard let pipeline = planBuildContext.pipelineCache[kernelName] else {
             throw MetalCompilerError.kernelNotFound(kernelName)
         }
+        let weightTensorName = Self.batchedWeightTensorName(for: batched, entry: entry)
 
         var bufferBindings: [(Int, MTLBuffer, Int)] = [(0, inputBuffer, inputOffset)]
         var totalOutputDim = 0
@@ -2956,7 +2958,7 @@ private struct PrefillStepPlanner {
             metadata: .init(
                 kernelName: kernelName,
                 entryIndex: entry.index,
-                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                weightTensorName: weightTensorName,
                 bufferAccessPattern: .init(reads: readIndices, writes: writeIndices)
             )
         )
