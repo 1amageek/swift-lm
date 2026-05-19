@@ -304,6 +304,10 @@ flowchart TD
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; current Qwen route-readiness artifact reconstruction remains valid after adding the 10% speed-threshold evidence column |
 | 2026-05-19 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits `*-linear-attn-traffic.csv` with per-window time, estimated traffic, materialized-boundary, and target-rationale columns |
 | 2026-05-19 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; Qwen seqLen 16/64/128 profiles write linear-attention traffic artifacts and seqLen 128 confirms recurrence remains the next structural target |
+| 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; partition-owned fused partial recurrence remains schema v6 reference-equivalent |
+| 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass but rejected; seqLen 16/64/128 regressed to 127.095/487.774/951.079 ms because partition-owned execution serializes too much projection work inside recurrence owners |
+| 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; row-grid fan-in route remains schema v6 reference-equivalent |
+| 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass but not promotable; seqLen 64/128 run at 151.338/287.292 ms and reduce active steps to 251, but do not clear the 10% full-profile speed gate |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
 | 2026-05-18 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; added rows4/rows8/rows16 geometry probes for BF16 batched sequence GEMV. rows16 is the strongest production-length candidate across `linear_attn.in_proj`, `mlp.gate_up`, and `self_attn.qkv`; tile2/tile4 remain rejected |
 | 2026-05-18 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_ROWS=16 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; rows16 batched BF16 scheduling remains schema v6 reference-equivalent for block boundaries, final hidden/logits, state/KV, and decode0 |
@@ -1455,6 +1459,29 @@ total, including about 3.35 ms for input projection, 3.87 ms for recurrence,
 0.02 ms bridge overhead, and 1.14 ms output projection. The artifact marks
 `state-recurrence-memory-traffic` as the next target because recurrence owns the
 largest sequential state traffic and dominates the replaceable window.
+
+M3D.12 closes the current recurrent-block route experiments against the 10%
+production speed gate. Both routes are correctness-valid, but neither should be
+promoted:
+
+| Route | Correctness | seqLen 128 profile | Decision |
+|---|---|---:|---|
+| Partition-owned fused partial recurrence | Passes schema v6 reference gates | 951.079 ms | Reject; the route serializes output projection work inside four partition owners and destroys row parallelism |
+| Row-grid fan-in after recurrence | Passes schema v6 reference gates | 287.292 ms | Keep opt-in; dispatch count drops to 251 but total speedup is only about 0.6% versus the same-session default profile |
+
+The result changes the next optimization target. Replacing only
+`round + linear_attn.out_proj` saves too little because output projection is
+about 20 ms of the seqLen 128 profile, while recurrence itself is about 69 ms.
+A further 10% full-profile improvement requires reducing the SSM recurrence
+cost without sacrificing the state-update owner invariant.
+
+```mermaid
+flowchart LR
+  A["out_proj-only route"] --> B["small dispatch and materialization win"]
+  B --> C["does not clear 10% gate"]
+  D["SSM recurrence state loop"] --> E["dominant remaining target"]
+  E --> F["needs chunk/scan or higher-lane state update design"]
+```
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
