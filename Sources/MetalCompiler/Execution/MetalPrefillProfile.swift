@@ -327,6 +327,86 @@ struct MetalPrefillProfile: Codable, Sendable {
         return lines.joined(separator: "\n") + "\n"
     }
 
+    var linearAttentionTrafficCSVString: String {
+        var lines: [String] = [
+            [
+                "layerIndex",
+                "rangeStart",
+                "rangeEnd",
+                "inputProjectionKernelName",
+                "recurrenceKernelName",
+                "outputProjectionKernelNames",
+                "windowAverageGpuMicroseconds",
+                "inputProjectionAverageGpuMicroseconds",
+                "recurrenceAverageGpuMicroseconds",
+                "bridgeAverageGpuMicroseconds",
+                "outputProjectionAverageGpuMicroseconds",
+                "windowEstimatedReadBytes",
+                "windowEstimatedWriteBytes",
+                "windowEstimatedTotalBytes",
+                "inputProjectionEstimatedReadBytes",
+                "inputProjectionEstimatedWriteBytes",
+                "inputProjectionEstimatedTotalBytes",
+                "recurrenceEstimatedReadBytes",
+                "recurrenceEstimatedWriteBytes",
+                "recurrenceEstimatedTotalBytes",
+                "bridgeEstimatedReadBytes",
+                "bridgeEstimatedWriteBytes",
+                "bridgeEstimatedTotalBytes",
+                "outputProjectionEstimatedReadBytes",
+                "outputProjectionEstimatedWriteBytes",
+                "outputProjectionEstimatedTotalBytes",
+                "materializedBoundaryEstimatedBytes",
+                "recurrenceOutputMaterializedBytes",
+                "bridgeEstimatedBytes",
+                "outputProjectionInputEstimatedBytes",
+                "estimatedBytesPerAverageMicrosecond",
+                "nextOptimizationTarget",
+                "targetRationale",
+            ].joined(separator: ","),
+        ]
+        for window in RecurrentBlockFusionWindowScanner.linearAttentionWindows(in: entries) {
+            let traffic = linearAttentionTraffic(for: window)
+            var row: [String] = []
+            row.reserveCapacity(33)
+            row.append(String(window.layerIndex))
+            row.append(String(window.rangeStart))
+            row.append(String(window.rangeEnd))
+            row.append(csvEscape(window.inputProjectionKernelName))
+            row.append(csvEscape(window.recurrenceKernelName))
+            row.append(csvEscape(window.outputProjectionKernelNames.joined(separator: ";")))
+            row.append(String(format: "%.3f", traffic.windowAverageGpuMicroseconds))
+            row.append(String(format: "%.3f", traffic.inputProjection.averageGpuMicroseconds))
+            row.append(String(format: "%.3f", traffic.recurrence.averageGpuMicroseconds))
+            row.append(String(format: "%.3f", traffic.bridge.averageGpuMicroseconds))
+            row.append(String(format: "%.3f", traffic.outputProjection.averageGpuMicroseconds))
+            row.append(String(traffic.window.readBytes))
+            row.append(String(traffic.window.writeBytes))
+            row.append(String(traffic.window.totalBytes))
+            row.append(String(traffic.inputProjection.readBytes))
+            row.append(String(traffic.inputProjection.writeBytes))
+            row.append(String(traffic.inputProjection.totalBytes))
+            row.append(String(traffic.recurrence.readBytes))
+            row.append(String(traffic.recurrence.writeBytes))
+            row.append(String(traffic.recurrence.totalBytes))
+            row.append(String(traffic.bridge.readBytes))
+            row.append(String(traffic.bridge.writeBytes))
+            row.append(String(traffic.bridge.totalBytes))
+            row.append(String(traffic.outputProjection.readBytes))
+            row.append(String(traffic.outputProjection.writeBytes))
+            row.append(String(traffic.outputProjection.totalBytes))
+            row.append(String(traffic.materializedBoundaryEstimatedBytes))
+            row.append(String(traffic.recurrenceOutputMaterializedBytes))
+            row.append(String(traffic.bridge.totalBytes))
+            row.append(String(traffic.outputProjectionInputEstimatedBytes))
+            row.append(String(format: "%.3f", traffic.estimatedBytesPerAverageMicrosecond))
+            row.append(csvEscape(traffic.nextOptimizationTarget))
+            row.append(csvEscape(traffic.targetRationale))
+            lines.append(row.joined(separator: ","))
+        }
+        return lines.joined(separator: "\n") + "\n"
+    }
+
     var mlpFusionWindowCSVString: String {
         var lines: [String] = [
             [
@@ -489,6 +569,31 @@ struct MetalPrefillProfile: Codable, Sendable {
         let estimatedTotalBytes: Int
     }
 
+    private struct LinearAttentionStageTraffic {
+        let averageGpuMicroseconds: Double
+        let readBytes: Int
+        let writeBytes: Int
+
+        var totalBytes: Int {
+            readBytes + writeBytes
+        }
+    }
+
+    private struct LinearAttentionTraffic {
+        let windowAverageGpuMicroseconds: Double
+        let window: LinearAttentionStageTraffic
+        let inputProjection: LinearAttentionStageTraffic
+        let recurrence: LinearAttentionStageTraffic
+        let bridge: LinearAttentionStageTraffic
+        let outputProjection: LinearAttentionStageTraffic
+        let materializedBoundaryEstimatedBytes: Int
+        let recurrenceOutputMaterializedBytes: Int
+        let outputProjectionInputEstimatedBytes: Int
+        let estimatedBytesPerAverageMicrosecond: Double
+        let nextOptimizationTarget: String
+        let targetRationale: String
+    }
+
     private func mlpFusionWindowTiming(
         for window: MLPFusionWindow
     ) -> MLPFusionWindowTiming {
@@ -519,6 +624,73 @@ struct MetalPrefillProfile: Codable, Sendable {
         )
     }
 
+    private func linearAttentionTraffic(
+        for window: RecurrentBlockFusionWindow
+    ) -> LinearAttentionTraffic {
+        let windowEntries = entries.filter { entry in
+            entry.rangeStart >= window.rangeStart && entry.rangeEnd <= window.rangeEnd
+        }
+        let outputProjectionStepIndices = Set(window.outputProjectionStepIndices)
+        let inputEntries = windowEntries.filter { $0.index == window.inputProjectionStepIndex }
+        let recurrenceEntries = windowEntries.filter { $0.index == window.recurrenceStepIndex }
+        let bridgeStepIndices = Set(window.bridgeStepIndices)
+        let bridgeEntries = windowEntries.filter { bridgeStepIndices.contains($0.index) }
+        let outputEntries = windowEntries.filter { outputProjectionStepIndices.contains($0.index) }
+
+        let input = summarizeStageTraffic(inputEntries)
+        let recurrence = summarizeStageTraffic(recurrenceEntries)
+        let bridge = summarizeStageTraffic(bridgeEntries)
+        let output = summarizeStageTraffic(outputEntries)
+        let windowTraffic = summarizeStageTraffic(windowEntries)
+        let outputProjectionInputBytes = outputEntries.reduce(0) { total, entry in
+            total + estimatedProjectionInputBytes(for: entry)
+        }
+        let recurrenceOutputBytes = outputProjectionInputBytes
+        let materializedBoundaryBytes = recurrenceOutputBytes + bridge.totalBytes + outputProjectionInputBytes
+        let bytesPerMicrosecond = windowTraffic.averageGpuMicroseconds > 0
+            ? Double(windowTraffic.totalBytes) / windowTraffic.averageGpuMicroseconds
+            : 0
+        let target: String
+        let rationale: String
+        if recurrence.averageGpuMicroseconds >= output.averageGpuMicroseconds {
+            target = "state-recurrence-memory-traffic"
+            rationale = "recurrence dominates the window and owns the largest sequential state traffic"
+        } else {
+            target = "output-projection-materialization"
+            rationale = "output projection dominates the window; avoid extra scratch materialization before changing recurrence"
+        }
+        return LinearAttentionTraffic(
+            windowAverageGpuMicroseconds: windowTraffic.averageGpuMicroseconds,
+            window: windowTraffic,
+            inputProjection: input,
+            recurrence: recurrence,
+            bridge: bridge,
+            outputProjection: output,
+            materializedBoundaryEstimatedBytes: materializedBoundaryBytes,
+            recurrenceOutputMaterializedBytes: recurrenceOutputBytes,
+            outputProjectionInputEstimatedBytes: outputProjectionInputBytes,
+            estimatedBytesPerAverageMicrosecond: bytesPerMicrosecond,
+            nextOptimizationTarget: target,
+            targetRationale: rationale
+        )
+    }
+
+    private func summarizeStageTraffic(_ stageEntries: [Entry]) -> LinearAttentionStageTraffic {
+        LinearAttentionStageTraffic(
+            averageGpuMicroseconds: stageEntries.reduce(0) { $0 + $1.averageGpuMicroseconds },
+            readBytes: stageEntries.reduce(0) { $0 + $1.estimatedReadBytes },
+            writeBytes: stageEntries.reduce(0) { $0 + $1.estimatedWriteBytes }
+        )
+    }
+
+    private func estimatedProjectionInputBytes(for entry: Entry) -> Int {
+        guard entry.category == "projection",
+              entry.estimatedReadBytes > 0 else {
+            return 0
+        }
+        return entry.estimatedWriteBytes
+    }
+
     func writeArtifacts(directory: URL, basename: String) throws -> [URL] {
         let manager = FileManager.default
         try manager.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -531,6 +703,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         let weightCSVURL = directory.appendingPathComponent("\(basename)-weights.csv")
         let blockCSVURL = directory.appendingPathComponent("\(basename)-blocks.csv")
         let recurrentWindowsCSVURL = directory.appendingPathComponent("\(basename)-recurrent-windows.csv")
+        let linearAttentionTrafficCSVURL = directory.appendingPathComponent("\(basename)-linear-attn-traffic.csv")
         let mlpWindowsCSVURL = directory.appendingPathComponent("\(basename)-mlp-windows.csv")
 
         let encoder = JSONEncoder()
@@ -544,6 +717,7 @@ struct MetalPrefillProfile: Codable, Sendable {
         try Data(weightRoleCSVString.utf8).write(to: weightCSVURL, options: .atomic)
         try Data(blockCSVString.utf8).write(to: blockCSVURL, options: .atomic)
         try Data(recurrentBlockWindowCSVString.utf8).write(to: recurrentWindowsCSVURL, options: .atomic)
+        try Data(linearAttentionTrafficCSVString.utf8).write(to: linearAttentionTrafficCSVURL, options: .atomic)
         try Data(mlpFusionWindowCSVString.utf8).write(to: mlpWindowsCSVURL, options: .atomic)
         return [
             jsonURL,
@@ -554,6 +728,7 @@ struct MetalPrefillProfile: Codable, Sendable {
             weightCSVURL,
             blockCSVURL,
             recurrentWindowsCSVURL,
+            linearAttentionTrafficCSVURL,
             mlpWindowsCSVURL,
         ]
     }

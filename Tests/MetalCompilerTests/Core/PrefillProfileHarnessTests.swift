@@ -96,7 +96,7 @@ struct PrefillProfileHarnessTests {
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         let urls = try profile.writeArtifacts(directory: root, basename: "synthetic")
 
-        #expect(urls.count == 9)
+        #expect(urls.count == 10)
         let jsonURL = root.appendingPathComponent("synthetic.json")
         let csvURL = root.appendingPathComponent("synthetic.csv")
         let categoryCSVURL = root.appendingPathComponent("synthetic-categories.csv")
@@ -105,6 +105,7 @@ struct PrefillProfileHarnessTests {
         let weightCSVURL = root.appendingPathComponent("synthetic-weights.csv")
         let blockCSVURL = root.appendingPathComponent("synthetic-blocks.csv")
         let recurrentWindowsCSVURL = root.appendingPathComponent("synthetic-recurrent-windows.csv")
+        let linearAttentionTrafficCSVURL = root.appendingPathComponent("synthetic-linear-attn-traffic.csv")
         let mlpWindowsCSVURL = root.appendingPathComponent("synthetic-mlp-windows.csv")
         let jsonData = try Data(contentsOf: jsonURL)
         let decoded = try JSONDecoder().decode(MetalPrefillProfile.self, from: jsonData)
@@ -131,6 +132,9 @@ struct PrefillProfileHarnessTests {
         #expect(blocks.contains("3,self_attn,projection,1,1,4096,2048,6144,20.000"))
         let recurrentWindows = try String(contentsOf: recurrentWindowsCSVURL, encoding: .utf8)
         #expect(recurrentWindows.contains("inputProjectionStepIndex"))
+        let linearAttentionTraffic = try String(contentsOf: linearAttentionTrafficCSVURL, encoding: .utf8)
+        #expect(linearAttentionTraffic.contains("materializedBoundaryEstimatedBytes"))
+        #expect(linearAttentionTraffic.contains("nextOptimizationTarget"))
         let mlpWindows = try String(contentsOf: mlpWindowsCSVURL, encoding: .utf8)
         #expect(mlpWindows.contains("gateUpProjectionStepIndex"))
     }

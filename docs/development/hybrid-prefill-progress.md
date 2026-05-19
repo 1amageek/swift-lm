@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-18
+Last updated: 2026-05-19
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -36,7 +36,7 @@ flowchart TD
 | M1 safe tiled sequence GEMV | Done / not default | Tile4 kernels compile and pass decode-equivalence tests; Qwen profile regressed when defaulted, so production planner stays on base sequence GEMV |
 | M2 reference harness | Done / hardened | LFM and Qwen3.5 both have reference dump scripts and manifest coverage; Qwen3.5 validates snapshot identity, prefill state, decode0 state, and KV cache |
 | M3 reference-equivalent MPP prefill | Pending | Requires M2 before adopting non decode-equivalent math |
-| M4 fused hybrid block prefill | In progress / partial default | BF16 SwiGLU+down fusion is default for stateful hybrid sequence prefill at seqLen >= 64; broader block fusion still requires reference probes |
+| M4 fused hybrid block prefill | In progress / partial default | BF16 SwiGLU+down fusion is default for stateful hybrid sequence prefill at seqLen >= 64; broader block fusion now has window, cross-group fan-in, and traffic artifacts before route promotion |
 | M5 benchmark-backed release claim | Pending | Requires real-bundle correctness gates first |
 | External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 as a baseline to beat, not a target to copy |
 
@@ -302,6 +302,8 @@ flowchart TD
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; full-profile speed gate CSV generation now distinguishes `full-profile-speedup-observed`, `full-profile-regression-observed`, and `missing-production-sequence`, and route readiness only promotes recurrent row-grid routes when the generated speed gate is positive |
 | 2026-05-18 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateRequiresProductionSequenceSpeedup` | Pass; default-promotion full-profile speed gate now requires at least 10% total prefill improvement at every production sequence length |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; current Qwen route-readiness artifact reconstruction remains valid after adding the 10% speed-threshold evidence column |
+| 2026-05-19 | `swift test --filter PrefillProfileHarnessTests` | Pass; profile artifact writer now emits `*-linear-attn-traffic.csv` with per-window time, estimated traffic, materialized-boundary, and target-rationale columns |
+| 2026-05-19 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; Qwen seqLen 16/64/128 profiles write linear-attention traffic artifacts and seqLen 128 confirms recurrence remains the next structural target |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
 | 2026-05-18 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; added rows4/rows8/rows16 geometry probes for BF16 batched sequence GEMV. rows16 is the strongest production-length candidate across `linear_attn.in_proj`, `mlp.gate_up`, and `self_attn.qkv`; tile2/tile4 remain rejected |
 | 2026-05-18 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_ROWS=16 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; rows16 batched BF16 scheduling remains schema v6 reference-equivalent for block boundaries, final hidden/logits, state/KV, and decode0 |
@@ -1419,6 +1421,40 @@ synthetic SSM test validates:
 This is still not routed in production. The next step is a feature-flagged
 step-builder route for Qwen that uses this partition-owned kernel, not the
 group-owned kernel, followed by schema v6 Qwen reference gates.
+
+M3D.11 adds the traffic artifact needed before another recurrent-block route
+is attempted. The profile writer now emits `*-linear-attn-traffic.csv` for every
+profile artifact set. This file is derived from the same recurrent-window
+scanner as `*-recurrent-windows.csv`, but splits each window into input
+projection, recurrence, bridge, and output projection stages and records the
+estimated bytes for each stage.
+
+```mermaid
+flowchart LR
+  A["in_proj qkv/z/b/a"] --> B["SSM recurrence"]
+  B --> C["bridge materialization"]
+  C --> D["linear_attn.out_proj"]
+  B --> E["linear-attn-traffic.csv"]
+  C --> E
+  D --> E
+```
+
+The new artifact is intentionally diagnostic. It does not change production
+routing, but it makes the next 10% improvement target explicit:
+
+| Column group | Meaning |
+|---|---|
+| Stage timing | Average GPU microseconds for input projection, recurrence, bridge, output projection, and the whole window |
+| Stage traffic | Estimated read/write/total bytes for each stage and the whole window |
+| Materialized boundary | Estimated recurrence-output, bridge, and output-projection input bytes that a fused recurrent-block design must remove or hide |
+| Target rationale | Machine-readable next target label plus a human-readable reason |
+
+Latest Qwen3.5 BF16 seqLen 128 profile writes the artifact for all 18
+linear-attention recurrent windows. The first window reports about 8.37 ms
+total, including about 3.35 ms for input projection, 3.87 ms for recurrence,
+0.02 ms bridge overhead, and 1.14 ms output projection. The artifact marks
+`state-recurrence-memory-traffic` as the next target because recurrence owns the
+largest sequential state traffic and dominates the replaceable window.
 
 ## Fused SwiGLU Down Projection Experiment (2026-05-10)
 
