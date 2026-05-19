@@ -29,6 +29,31 @@ flowchart TD
 | Speed claims | Forbidden unless the same path has green correctness evidence |
 | Fallback | Silent fallback is not allowed |
 
+## Current Workstream Finish Condition
+
+The current recurrent-block route work is considered complete when it either
+promotes a route or closes the route family with replayable evidence. The
+finish condition is deliberately binary so this work does not continue as an
+open-ended kernel search.
+
+```mermaid
+flowchart TD
+  A["candidate recurrent-block route"] --> B["schema v6 reference gate"]
+  B --> C["Qwen seqLen 64/128 full profile"]
+  C --> D{"10% total prefill speedup?"}
+  D -->|"yes"| E["eligible for default-route discussion"]
+  D -->|"no"| F["route family closed as non-promotable"]
+  F --> G["next workstream must target SSM recurrence algorithm"]
+```
+
+| Gate | Required result to finish this workstream |
+|---|---|
+| Correctness | Default, fused partial, and row-grid fan-in routes must pass Qwen schema v6 reference gates or be explicitly rejected |
+| Speed | A default candidate must clear at least 10% total prefill improvement at seqLen 64 and 128 |
+| Evidence | Profile artifacts must expose route activity, traffic target, and speed-gate decision |
+| Default behavior | Routes that do not clear the speed gate stay opt-in and production routing remains unchanged |
+| Next target | If both recurrent-block routes fail speed, the next workstream is SSM recurrence algorithm design, not more `out_proj` route variants |
+
 ## Milestone Status
 
 | Milestone | Status | Notes |
@@ -308,6 +333,7 @@ flowchart TD
 | 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass but rejected; seqLen 16/64/128 regressed to 127.095/487.774/951.079 ms because partition-owned execution serializes too much projection work inside recurrence owners |
 | 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; row-grid fan-in route remains schema v6 reference-equivalent |
 | 2026-05-19 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass but not promotable; seqLen 64/128 run at 151.338/287.292 ms and reduce active steps to 251, but do not clear the 10% full-profile speed gate |
+| 2026-05-19 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; current route-readiness artifacts reconstruct successfully, confirming recurrent-block route experiments remain opt-in and are not production-promotable |
 | 2026-05-16 | `swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/fullProfileSpeedGateCanBeReconstructedFromProfileCSVArtifacts` | Pass; the speed gate can now be generated from persisted profile CSV artifacts, so baseline and experimental profiles captured in separate processes can still feed the promotion gate |
 | 2026-05-18 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRealShapeMicrobench` | Pass; added rows4/rows8/rows16 geometry probes for BF16 batched sequence GEMV. rows16 is the strongest production-length candidate across `linear_attn.in_proj`, `mlp.gate_up`, and `self_attn.qkv`; tile2/tile4 remain rejected |
 | 2026-05-18 | `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_BATCHED_ROWS=16 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; rows16 batched BF16 scheduling remains schema v6 reference-equivalent for block boundaries, final hidden/logits, state/KV, and decode0 |
@@ -362,7 +388,7 @@ flowchart TD
 | Whether q/k parallel-reduction SSM recurrence should default | No; correctness is green, but the full Qwen profile regresses despite isolated phase stability wins |
 | Whether recurrent-block partial projection should default | No; correctness and fan-in harness are green, but the route adds dispatches and regresses Qwen profile |
 | Whether fused recurrent partial emission should default | No; correctness and Metal partial readback are green, but partition-owned partial-emission is much slower than the unfused default |
-| Next recurrent-block optimization unit | Redesign row-grid fan-in so it is cheaper than the default `round + gemv_seq_bf16_f32s` path, likely by improving row/tile reuse rather than only changing dispatch boundaries |
+| Next recurrent-block optimization unit | Closed for `out_proj`-only routes. The next unit is the SSM recurrence state loop itself: chunk/scan or another design that reduces recurrence cost while preserving the one-state-update-owner invariant |
 | Default promotion gate for fused recurrent block | Implemented; `RecurrentBlockFusionPrototypePlanner.defaultPromotionDecision` rejects current group-owned and partition-owned fused-stage plans because they serialize output-row projection inside recurrence threadgroups, and rejects the row-grid target until route evidence supports default promotion |
 
 ## Opt-in Fused Recurrent Partial-Emission Status
