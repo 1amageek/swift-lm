@@ -510,6 +510,57 @@ struct MetalKernelSourceCatalog {
                                     parallelQKReduction: true))
                             }
                         }
+                        if SSMRecurrenceFragment.isCachedParametersPrefillEnabled,
+                           bufferPrecision == .float32,
+                           weightFormat == .bfloat16 {
+                            let cachedParametersSequenceKernelName = SSMRecurrenceFragment.cachedParametersSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(cachedParametersSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: cachedParametersSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    cacheHeadParameters: true))
+                            }
+                        }
+                        let parallelStatePrefillEnabled = SSMRecurrenceFragment.parallelStatePrefillEnvironmentOverride
+                            ?? SSMRecurrenceFragment.isParallelStateDefaultEligible(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat,
+                                headCount: ssmFragment.headCount,
+                                groupCount: ssmFragment.groupCount,
+                                keyHeadDimension: ssmFragment.keyHeadDimension,
+                                valueHeadDimension: ssmFragment.valueHeadDimension
+                            )
+                        if parallelStatePrefillEnabled,
+                           bufferPrecision == .float32,
+                           weightFormat == .bfloat16 {
+                            let parallelStateSequenceKernelName = SSMRecurrenceFragment.parallelStateSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(parallelStateSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: parallelStateSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    parallelStateUpdate: true))
+                            }
+                        }
                         if SSMRecurrenceFragment.isPrewriteDecayPrefillEnabled {
                             let prewriteDecaySequenceKernelName = SSMRecurrenceFragment.prewriteDecaySequenceKernelName(
                                 bufferPrecision: bufferPrecision,

@@ -284,7 +284,7 @@ struct Qwen35PrefillProfileTests {
         #expect(csv.contains("128,batched_projection,linear_attn.in_proj,batched_gemv4_seq_bf16_f32s,512,1,100.000,100.000,baseline-route-observed"))
         #expect(csv.contains("128,batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s,512,1,200.000,200.000,baseline-route-observed"))
         #expect(csv.contains("128,batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s,512,1,300.000,300.000,baseline-route-observed"))
-        #expect(csv.contains("128,mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,1,400.000,400.000,default-runtime-gated-route"))
+        #expect(csv.contains("128,mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,1,400.000,400.000,experimental-route-observed"))
         #expect(csv.contains("128,single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,1,500.000,500.000,experimental-route-observed"))
         #expect(csv.contains("128,recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,1,600.000,600.000,experimental-route-observed"))
         #expect(csv.contains("128,ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32,1,1,700.000,700.000,baseline-route-observed"))
@@ -363,7 +363,7 @@ struct Qwen35PrefillProfileTests {
 
         let csv = try String(contentsOf: url, encoding: .utf8)
         #expect(csv.contains("routeFamily,role,kernelName,threadgroupWidth,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate"))
-        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,64|128,1|1,400.000,default-runtime-gated-route|default-runtime-gated-route,,default-runtime-gated-route-active"))
+        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,64|128,1|1,400.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
         #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,1,64,1,200.000,baseline-route-observed,128,missing-production-sequence"))
         #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
         #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,64|128,1|1,1300.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
@@ -1573,7 +1573,7 @@ struct Qwen35PrefillProfileTests {
             return "experimental-route-observed"
         }
         if kernelName.hasPrefix("mlp_fused_swiglu_down") {
-            return sequenceLength >= 64 ? "default-runtime-gated-route" : "unexpected-short-sequence-route"
+            return "experimental-route-observed"
         }
         return "baseline-route-observed"
     }
@@ -1588,10 +1588,6 @@ struct Qwen35PrefillProfileTests {
         }
         if routeObservations.contains("experimental-route-observed") {
             return "experimental-route-observed"
-        }
-        if routeFamily == "mlp_fused_down",
-           routeObservations.allSatisfy({ $0 == "default-runtime-gated-route" }) {
-            return "default-runtime-gated-route-active"
         }
         if routeObservations.allSatisfy({ $0 == "baseline-route-observed" }) {
             return "baseline-route-preserved"
@@ -1713,6 +1709,7 @@ struct Qwen35PrefillProfileTests {
 
     private func assertDefaultProjectionRoutes(profiles: [MetalPrefillProfile.Entry], sequenceLength: Int) {
         guard shouldAssertDefaultProjectionRoutes() else { return }
+        _ = sequenceLength
 
         var counts: [String: Int] = [:]
         for profile in profiles where isProjectionRouteManifestEntry(profile) {
@@ -1726,13 +1723,8 @@ struct Qwen35PrefillProfileTests {
         #expect(counts["single_projection/linear_attn.out_proj"] == 18)
         #expect(counts["single_projection/self_attn.o_proj"] == 6)
 
-        if sequenceLength >= 64 {
-            #expect(counts["mlp_fused_down/mlp.down_proj"] == 24)
-            #expect(counts["single_projection/mlp.down_proj"] == nil)
-        } else {
-            #expect(counts["mlp_fused_down/mlp.down_proj"] == nil)
-            #expect(counts["single_projection/mlp.down_proj"] == 24)
-        }
+        #expect(counts["mlp_fused_down/mlp.down_proj"] == nil)
+        #expect(counts["single_projection/mlp.down_proj"] == 24)
     }
 
     private func shouldAssertDefaultProjectionRoutes() -> Bool {
@@ -1751,6 +1743,8 @@ struct Qwen35PrefillProfileTests {
             "SWIFTLM_PREFILL_SSM_SHARED_RMS",
             "SWIFTLM_PREFILL_SSM_PREWRITE_DECAY",
             "SWIFTLM_PREFILL_SSM_QKPAR",
+            "SWIFTLM_PREFILL_SSM_CACHED_PARAMS",
+            "SWIFTLM_PREFILL_SSM_PARALLEL_STATE",
             "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH",
         ]
         return !routeOverrideKeys.contains { environment[$0] != nil }

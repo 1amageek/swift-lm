@@ -1824,6 +1824,8 @@ struct MetalSourceGeneratorTests {
         #expect(SSMRecurrenceFragment.sequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32")
         #expect(SSMRecurrenceFragment.prewriteDecaySequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_prewrite_decay")
         #expect(SSMRecurrenceFragment.qkParallelSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_qkpar")
+        #expect(SSMRecurrenceFragment.cachedParametersSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_cached_params")
+        #expect(SSMRecurrenceFragment.parallelStateSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_parallel_state")
         #expect(SSMRecurrenceFragment.groupOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_group_owned_partial")
         #expect(SSMRecurrenceFragment.partitionOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_partition_owned_partial")
     }
@@ -2289,6 +2291,8 @@ struct MetalSourceGeneratorTests {
             "ssm_recurrence_bf16_f32",
             "ssm_recurrence_seq_bf16",
             "ssm_recurrence_seq_bf16_f32",
+            "ssm_recurrence_seq_bf16_f32_cached_params",
+            "ssm_recurrence_seq_bf16_f32_parallel_state",
             "ssm_recurrence_seq_bf16_f32_group_owned_partial",
             "ssm_recurrence_seq_bf16_f32_partition_owned_partial",
         ] {

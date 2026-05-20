@@ -34,6 +34,10 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMVariant(name: "qkpar_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 128),
             SSMVariant(name: "qkpar_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 256),
             SSMVariant(name: "qkpar_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_qkpar", threadgroupWidth: 384),
+            SSMVariant(name: "cached_params_tg128", kernelName: "bench_ssm_recurrence_seq_bf16_f32_cached_params", threadgroupWidth: 128),
+            SSMVariant(name: "cached_params_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_cached_params", threadgroupWidth: 256),
+            SSMVariant(name: "cached_params_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_cached_params", threadgroupWidth: 384),
+            SSMVariant(name: "parallel_state_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state", threadgroupWidth: 384),
         ]
 
         var rows: [SSMResultRow] = []
@@ -1925,6 +1929,10 @@ private enum SSMPhaseFullBridgeFactory {
             return "state_recurrence_qkpar"
         case .sharedRMS:
             return "state_recurrence_shared_rms"
+        case .cachedParameters:
+            return "state_recurrence_cached_params"
+        case .parallelState:
+            return "state_recurrence_parallel_state"
         }
     }
 }
@@ -1974,12 +1982,18 @@ private struct SSMSummaryRow {
 }
 
 private enum SSMRoutePromotionCandidate: String, CaseIterable {
+    case cachedParameters = "cached_params"
+    case parallelState = "parallel_state"
     case prewriteDecay = "prewrite_decay"
     case qkParallel = "qkpar"
     case sharedRMS = "shared_rms"
 
     var variantPrefix: String {
         switch self {
+        case .cachedParameters:
+            return "cached_params_"
+        case .parallelState:
+            return "parallel_state_"
         case .prewriteDecay:
             return "prewrite_"
         case .qkParallel:
@@ -1991,6 +2005,10 @@ private enum SSMRoutePromotionCandidate: String, CaseIterable {
 
     var routePromotionAdmission: String {
         switch self {
+        case .cachedParameters:
+            return "candidate-cached-params-default-route"
+        case .parallelState:
+            return "candidate-parallel-state-default-route"
         case .prewriteDecay:
             return "candidate-prewrite-decay-default-route"
         case .qkParallel:
@@ -2110,6 +2128,9 @@ private enum SSMSummaryFactory {
         }
         if bestVariant.hasPrefix("qkpar_") {
             return "candidate-qkpar-full-kernel"
+        }
+        if bestVariant.hasPrefix("parallel_state_") {
+            return "candidate-parallel-state-full-kernel"
         }
         return "reject-unknown-variant"
     }
@@ -2330,6 +2351,30 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 valueHeadDimension: 128,
                 parallelQKReduction: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_cached_params",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                cacheHeadParameters: true
+            ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_parallel_state",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                parallelStateUpdate: true
+            ),
             Self.generatePhaseConvSiluKernel(),
             Self.generatePhaseStateRecurrenceKernel(),
             Self.generatePhaseStateRecurrenceKernel(
@@ -2354,6 +2399,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_recurrence_seq_bf16_f32_shared_rms",
             "bench_ssm_recurrence_seq_bf16_f32_prewrite_decay",
             "bench_ssm_recurrence_seq_bf16_f32_qkpar",
+            "bench_ssm_recurrence_seq_bf16_f32_cached_params",
+            "bench_ssm_recurrence_seq_bf16_f32_parallel_state",
             "bench_ssm_phase_conv_silu_bf16_f32",
             "bench_ssm_phase_state_recurrence_f32",
             "bench_ssm_phase_state_recurrence_d2_f32",

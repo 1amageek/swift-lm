@@ -538,19 +538,19 @@ private struct PrefillStepPlanner {
         return min(max(value, Self.decodeEquivalentSequenceRowsPerThreadgroup), 32)
     }()
 
-    /// Process-wide BF16 fused SwiGLU+down_proj override.
+    /// Process-wide BF16 fused SwiGLU+down_proj feature flag.
     ///
-    /// By default the planner enables the fused route only for stateful hybrid
-    /// sequence prefill (`convState` or `recurrentState` present), where Qwen
-    /// reference gates and profile windows show a stable long-prompt benefit.
-    /// Set `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` to disable it, or `=1` to
-    /// force-enable it for experiments on non-hybrid plans. Admission still
-    /// requires matching compositeID/layerIndex, BF16 sequence prefill
-    /// precision, BF16 dense weight, output writing back to hidden, and `.batch`
-    /// mode. Other projections, schemes, and decode are unaffected.
-    private static let bf16FusedMlpDownOverride: Bool? = {
+    /// This route stays opt-in because the Qwen prompt-ingestion
+    /// decode-equivalence gate can expose activation drift at the fused
+    /// down-projection boundary. Set
+    /// `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` to force-enable it for targeted
+    /// experiments. Admission still requires matching compositeID/layerIndex,
+    /// BF16 sequence prefill precision, BF16 dense weight, output writing back
+    /// to hidden, and `.batch` mode. Other projections, schemes, and decode are
+    /// unaffected.
+    private static let bf16FusedMlpDownFeatureEnabled: Bool = {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN"] else {
-            return nil
+            return false
         }
         return raw == "1" || raw.lowercased() == "true"
     }()
@@ -718,7 +718,7 @@ private struct PrefillStepPlanner {
     }
 
     var bf16FusedMlpDownEnabled: Bool {
-        Self.bf16FusedMlpDownOverride ?? needsDecodeEquivalentSequenceProjectionMath
+        Self.bf16FusedMlpDownFeatureEnabled
     }
 
     var usesRuntimeGatedFusedMlpDown: Bool {

@@ -61,7 +61,7 @@ flowchart TD
 | M1 safe tiled sequence GEMV | Done / not default | Tile4 kernels compile and pass decode-equivalence tests; Qwen profile regressed when defaulted, so production planner stays on base sequence GEMV |
 | M2 reference harness | Done / hardened | LFM and Qwen3.5 both have reference dump scripts and manifest coverage; Qwen3.5 validates snapshot identity, prefill state, decode0 state, and KV cache |
 | M3 reference-equivalent MPP prefill | Pending | Requires M2 before adopting non decode-equivalent math |
-| M4 fused hybrid block prefill | In progress / partial default | BF16 SwiGLU+down fusion is default for stateful hybrid sequence prefill at seqLen >= 64; broader block fusion now has window, cross-group fan-in, and traffic artifacts before route promotion |
+| M4 fused hybrid block prefill | In progress / opt-in only | BF16 SwiGLU+down fusion remains an opt-in experiment because prompt-ingestion decode-equivalence exposed activation drift; broader block fusion now has window, cross-group fan-in, and traffic artifacts before route promotion |
 | M5 benchmark-backed release claim | Pending | Requires real-bundle correctness gates first |
 | External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 as a baseline to beat, not a target to copy |
 
@@ -228,7 +228,7 @@ flowchart TD
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; opt-in partial route still detects 18 recurrent-block windows and writes partial projection/reduce step indices to `*-recurrent-windows.csv` |
 | 2026-05-14 | `swift test --filter RecurrentBlockFusionWindowTests` | Pass; recurrent-window CSV now includes per-window GPU timing and estimated total bytes |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1 ENABLE_METAL_PROBES=1` | Pass; seqLen 128 recurrent-window artifact reports 18 timed windows with input projection, recurrence, bridge, and output projection timing columns |
-| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in recurrent-block partial projection remains reference-equivalent after the fused MLP default route |
+| 2026-05-14 | `swift test --filter Qwen35ReferenceComparisonTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; opt-in recurrent-block partial projection remained reference-equivalent in the earlier fused-MLP experiment |
 | 2026-05-14 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1 SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_PARTIAL=1` | Pass; route removes 18 `linear_attn.out_proj` GEMV dispatches but adds partial projection/reduce stages and regresses total profile, so it stays non-default |
 | 2026-05-14 | `swift build` | Pass after adding the opt-in fused packed-sigmoid attention output kernel and router |
 | 2026-05-14 | `swift test --filter MetalSourceGeneratorTests` | Pass; complete generated library compiles with `attn_fused_sigmoid_o_seq_bf16_f32s` |
@@ -293,11 +293,11 @@ flowchart TD
 | 2026-05-18 | `scripts/benchmarks/run-ssm-artifact-validation.sh --timeout 120` | Pass; validates all current SSM artifact reconstruction and manifest gates, then writes `.test-artifacts/ssm-artifact-validation/<timestamp>/summary.csv` plus per-gate logs for replayable handoff evidence |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; single sequence GEMV microbench now writes route-promotion CSV and rejects row2/tile2/tile4 because each fails at least one production sequence length |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests` | Pass; batched sequence GEMV microbench now writes route-promotion CSV and rejects tile2/tile4 for all batched production roles |
-| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile now writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing default runtime-gated fused MLP from baseline projection routes |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes route-manifest CSVs for seqLen 16/64/128, recording active projection route families and distinguishing experimental fused MLP from baseline projection routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeManifestClassifiesProjectionRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-manifest contract hard-checks batched role normalization, fused MLP runtime-gated labeling, and experimental single-GEMV route labeling |
-| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Pass; default-environment full profile now hard-checks active route shape: seqLen 16 keeps unfused `mlp.down_proj`, seqLen 64/128 use fused MLP, and remaining single projections stay limited to `linear_attn.out_proj` plus `self_attn.o_proj` |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests` with `ENABLE_METAL_PROBES=1` | Superseded; default-environment profile now keeps unfused `mlp.down_proj` at seqLen 16/64/128 after prompt-ingestion drift was found in fused MLP |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeGateSummarizesProductionSequenceRoutes` with `ENABLE_METAL_PROBES=1` | Pass; synthetic route-gate contract verifies 64/128 cross-sequence route summaries classify baseline, default runtime-gated, and experimental routes distinctly |
-| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Pass; full Qwen profile writes `qwen35-prefill-route-gate.csv`, showing `mlp_fused_down` active at production lengths and all remaining projection routes preserved as baseline |
+| 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` with `ENABLE_METAL_PROBES=1` | Superseded; current route gate shows `single_projection / mlp.down_proj` preserved as baseline and fused MLP only as an explicit experiment |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; synthetic readiness contract requires both a microbench candidate admission and the expected full-profile route gate before a projection route can be treated as production-ready |
 | 2026-05-15 | `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16SingleSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` and `swift test --filter SequenceGEMVMicrobenchmarkTests/bf16BatchedSequenceGEMVRouteAdmissionsRequireProductionSequenceWins` | Pass; route-promotion CSVs expose the required full-profile route gate and readiness prerequisite so microbench candidates cannot be mistaken for production-ready routes |
 | 2026-05-15 | `swift test --filter Qwen35PrefillProfileTests/routeReadinessCombinesMicrobenchAndFullProfileGates` with `ENABLE_METAL_PROBES=1` | Pass; route-readiness CSV now consumes the microbench `readinessPrerequisite` column and rejects candidate-shaped admissions unless they explicitly require the full-profile route gate |
@@ -362,7 +362,7 @@ flowchart TD
 | Feature-flagged SSM recurrence threadgroup-width override | Correctness passed at `tg=128` and `tg=256`, but Qwen full-model profile with `tg=256` was 43.813/160.583/315.422 ms for seqLen 16/64/128 and did not beat the default profile | Kept behind `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH`; default SSM sequence kernel keeps the device-derived width |
 | Batched BF16 sequence GEMV tile2/tile4 | Isolated real-shape benchmark passed, but base is faster for the dominant seqLen 64/128 MLP gate+up, SSM in-proj, and attention QKV shapes | Do not route tiled batched BF16 kernels by default; future batched work should change data movement or use a different math path, not just sequence tiling |
 | BF16 dense batched MPP priority | Reference comparison failed immediately: case 0 prefill token drifted from HF `760` to Metal `120905`, final hidden max error was `26.9375`, and state/KV drift propagated through decode0 | Rejected and not retained as an opt-in runtime route; any future MPP work must first make the MPP math/storage contract reference-equivalent in isolation |
-| Opt-in recurrent-block partial output projection | Correctness remains green, but latest Qwen profile after fused MLP default changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 67.771/163.120/320.098 ms | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
+| Opt-in recurrent-block partial output projection | Correctness remains green, but the route adds dispatches and regressed the Qwen profile in the earlier fused-MLP experiment | Kept as a diagnostic and reference-gated prototype; do not promote without a lower-dispatch recurrent block design |
 | Opt-in fused packed-sigmoid attention output projection | Correctness remains green, but latest Qwen profile changed seqLen 16/64/128 from 56.241/159.820/314.525 ms to 58.374/170.403/330.607 ms | Kept as a rejected opt-in experiment; the fused kernel recomputes the sigmoid-gated tile for every output row group and loses to the unfused path |
 | Forced group-owned recurrent partial-emission route on Qwen | Failed admission before reference comparison because Qwen requires fewer scratch partitions than recurrent groups; one scratch slot per recurrent group is not a valid Qwen route contract | Removed the route and corrected the planner contract to admit partial-partition-owned state updates when groups divide evenly into scratch partitions |
 | Opt-in fused recurrent partial-emission route | Correctness passed, but Qwen seqLen 16/64/128 profile regressed to 127.961/480.688/955.549 ms; the fused partition-owned SSM kernel dominates at 94.242/364.396/728.192 ms | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_FUSED_PARTIAL=1`; do not default. The next kernel design must reduce partition-owned partial projection cost before route promotion |
@@ -382,7 +382,7 @@ flowchart TD
 | Whether M2 should route tile2 for dependent single projections | Stay non-default; correctness passed but Qwen3.5 BF16 profile was noise/slower |
 | Qwen reference dump schema for M2 | Implemented and validated as schema v6 multi-case with selected block-boundary capture and cross-group fan-in partial tensors |
 | Q3 sequence prefill support | Implemented for current packed and batched Q3 projection paths plus Q3 embedding lookup |
-| Whether fused SwiGLU + down should default | Yes, narrowly: rows=8 is default only for stateful hybrid BF16 sequence prefill with runtime admission at seqLen >= 64; `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` disables it |
+| Whether fused SwiGLU + down should default | No; reference comparison passed, but Qwen prompt-ingestion decode-equivalence exposed activation drift at the fused down-projection boundary. Keep it behind `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` until that boundary is fixed |
 | Whether shared-RMS SSM recurrence should default | No; correctness is green but profile evidence is marginal/noisy, so it remains opt-in |
 | Whether narrower SSM threadgroup width should default | No; correctness is green at narrower widths, but `tg=256` did not improve the full Qwen prefill profile |
 | Whether q/k parallel-reduction SSM recurrence should default | No; correctness is green, but the full Qwen profile regresses despite isolated phase stability wins |
@@ -1522,9 +1522,10 @@ flowchart LR
   D --> E["hidden output"]
 ```
 
-Routing is default-enabled only for stateful hybrid BF16 sequence prefill, with
-runtime admission at seqLen >= 64. `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0`
-explicitly disables it, and `=1` force-enables it for non-default experiments.
+Routing is opt-in only. `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1`
+force-enables the fused route for targeted experiments; the default production
+path keeps the unfused SwiGLU plus down-projection sequence until the
+prompt-ingestion decode-equivalence drift is fixed.
 
 | Gate | Requirement |
 |---|---|
@@ -1699,8 +1700,8 @@ the previous unfused 293-step plan without editing code.
 |---|---|---|
 | `swift build` | Pass | Planner change compiles |
 | `Qwen35ReferenceComparisonTests` default route | Pass, 5/5 | HF reference gates remain green |
-| `Qwen35PrefillProfileTests` default route | Pass | seqLen 16 unfused, seqLen 64/128 fused rows=8 |
-| `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=0` | Pass | Explicit override restores the unfused plan |
+| `Qwen35PrefillProfileTests` default route | Pass | seqLen 16/64/128 keep the unfused MLP path |
+| `Qwen35PrefillProfileTests` with `SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN=1` | Pass | Explicit override enables the fused experiment |
 
 ### Rows-per-SIMD lower-recompute experiment (2026-05-10)
 
@@ -2481,7 +2482,7 @@ flowchart LR
 | `kernelName` | Exact executed Metal kernel |
 | `activeCount` | Number of active dispatches for this route group |
 | `totalGpuMicroseconds` / `averageGpuMicroseconds` | Aggregated profile timing for the active route group |
-| `routeObservation` | Whether the route is baseline, experimental, or the default runtime-gated fused MLP path |
+| `routeObservation` | Whether the route is baseline or experimental |
 
 The cross-sequence route gate adds these fields:
 
@@ -2491,15 +2492,15 @@ The cross-sequence route gate adds these fields:
 | `activeCounts` | Active dispatch counts per production sequence length |
 | `routeObservations` | Per-length route labels from the route manifest |
 | `missingSequenceLengths` | Production sequence lengths missing for that route group |
-| `routeGate` | Cross-sequence classification: `baseline-route-preserved`, `default-runtime-gated-route-active`, `experimental-route-observed`, or `mixed-route-observed` |
+| `routeGate` | Cross-sequence classification: `baseline-route-preserved`, `experimental-route-observed`, or `mixed-route-observed` |
 
 The current default profile confirms the production routing shape:
 
 | Sequence length | Fused MLP route | Remaining single projections | Batched projections |
 |---:|---|---|---|
 | 16 | not active | `mlp.down_proj`, `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
-| 64 | `mlp_fused_down` active | `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
-| 128 | `mlp_fused_down` active | `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
+| 64 | not active | `mlp.down_proj`, `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
+| 128 | not active | `mlp.down_proj`, `linear_attn.out_proj`, `self_attn.o_proj` | `linear_attn.in_proj`, `mlp.gate_up`, `self_attn.qkv` |
 
 Current decision: use the route manifest as the full-model sanity check after
 each kernel-route experiment. A microbench candidate is not enough; the full
@@ -2510,7 +2511,7 @@ The current route gate over seqLen 64/128 reports:
 
 | Route family / role | Gate |
 |---|---|
-| `mlp_fused_down / mlp.down_proj` | `default-runtime-gated-route-active` |
+| `single_projection / mlp.down_proj` | `baseline-route-preserved` |
 | `batched_projection / linear_attn.in_proj` | default BF16 rows16 geometry (`tg=512`) |
 | `batched_projection / mlp.gate_up` | default BF16 rows16 geometry (`tg=512`) |
 | `batched_projection / self_attn.qkv` | default BF16 rows16 geometry (`tg=512`) |
@@ -2530,7 +2531,7 @@ The route manifest writer also has a lightweight synthetic contract test:
 | `batched_gemv4_seq_bf16_f32s` over `linear_attn.in_proj_*` | `batched_projection / linear_attn.in_proj`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
 | `batched_gemv2_seq_bf16_f32s` over `mlp.gate_proj + mlp.up_proj` | `batched_projection / mlp.gate_up`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
 | `batched_gemv3_seq_bf16_f32s` over `self_attn.q/k/v_proj` | `batched_projection / self_attn.qkv`; per-step profile `threadgroupWidth` distinguishes rows2 diagnostics from rows16 default |
-| `mlp_fused_swiglu_down_seq_bf16_f32s` at seqLen 128 | `mlp_fused_down / mlp.down_proj / default-runtime-gated-route` |
+| `mlp_fused_swiglu_down_seq_bf16_f32s` at seqLen 128 | `mlp_fused_down / mlp.down_proj / experimental-route-observed` |
 | `gemv_seq_bf16_f32s_rps2` | `single_projection / self_attn.o_proj / experimental-route-observed` |
 
 The route gate has a separate synthetic contract that verifies a production

@@ -110,6 +110,20 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_qkpar"
     }
 
+    static func cachedParametersSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_cached_params"
+    }
+
+    static func parallelStateSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_parallel_state"
+    }
+
     static func groupOwnedPartialProjectionSequenceKernelName(
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat
@@ -134,6 +148,45 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
 
     static var isQKParallelPrefillEnabled: Bool {
         ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_QKPAR"] == "1"
+    }
+
+    static var isCachedParametersPrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_CACHED_PARAMS"] == "1"
+    }
+
+    static var parallelStatePrefillEnvironmentOverride: Bool? {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PARALLEL_STATE"] else {
+            return nil
+        }
+        if raw == "1" { return true }
+        if raw == "0" { return false }
+        return nil
+    }
+
+    static func parallelStatePrefillOverride() throws -> Bool? {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PARALLEL_STATE"] else {
+            return nil
+        }
+        if raw == "1" { return true }
+        if raw == "0" { return false }
+        throw MetalCompilerError.deviceSetupFailed(
+            "SWIFTLM_PREFILL_SSM_PARALLEL_STATE must be 0 or 1, got '\(raw)'"
+        )
+    }
+
+    static func isParallelStateDefaultEligible(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        headCount: Int,
+        groupCount: Int,
+        keyHeadDimension: Int,
+        valueHeadDimension: Int
+    ) -> Bool {
+        bufferPrecision == .float32
+            && weightFormat == .bfloat16
+            && headCount == groupCount
+            && keyHeadDimension == 128
+            && valueHeadDimension == 128
     }
 
     static var isConvDebugPrefillEnabled: Bool {
@@ -268,19 +321,38 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         let sharedRMSPrefillEnabled = Self.isSharedRMSPrefillEnabled
         let prewriteDecayPrefillEnabled = Self.isPrewriteDecayPrefillEnabled
         let qkParallelPrefillEnabled = Self.isQKParallelPrefillEnabled
-        let enabledVariantCount = [sharedRMSPrefillEnabled, prewriteDecayPrefillEnabled, qkParallelPrefillEnabled]
+        let cachedParametersPrefillEnabled = Self.isCachedParametersPrefillEnabled
+        let parallelStateOverride = try Self.parallelStatePrefillOverride()
+        let explicitParallelStatePrefillEnabled = parallelStateOverride == true
+        let explicitVariantCount = [
+            sharedRMSPrefillEnabled,
+            prewriteDecayPrefillEnabled,
+            qkParallelPrefillEnabled,
+            cachedParametersPrefillEnabled,
+            explicitParallelStatePrefillEnabled,
+        ]
             .filter { $0 }
             .count
-        if enabledVariantCount > 1 {
+        if explicitVariantCount > 1 {
             throw MetalCompilerError.deviceSetupFailed(
-                "SWIFTLM_PREFILL_SSM_SHARED_RMS, SWIFTLM_PREFILL_SSM_PREWRITE_DECAY, and SWIFTLM_PREFILL_SSM_QKPAR are mutually exclusive"
+                "SWIFTLM_PREFILL_SSM_SHARED_RMS, SWIFTLM_PREFILL_SSM_PREWRITE_DECAY, SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE are mutually exclusive"
             )
         }
-        if qkParallelPrefillEnabled {
+        let defaultParallelStatePrefillEnabled = explicitVariantCount == 0
+            && Self.isParallelStateDefaultEligible(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyHeadDimension,
+                valueHeadDimension: valueHeadDimension
+            )
+        let parallelStatePrefillEnabled = parallelStateOverride ?? defaultParallelStatePrefillEnabled
+        if qkParallelPrefillEnabled || cachedParametersPrefillEnabled || parallelStatePrefillEnabled {
             guard context.kernelContext.bufferPrecision == .float32,
                   context.kernelContext.weightFormat == .bfloat16 else {
                 throw MetalCompilerError.deviceSetupFailed(
-                    "SWIFTLM_PREFILL_SSM_QKPAR currently supports only BF16 weights with F32 sequence buffers"
+                    "SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE currently support only BF16 weights with F32 sequence buffers"
                 )
             }
         }
@@ -291,6 +363,16 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             )
         } else if qkParallelPrefillEnabled {
             Self.qkParallelSequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        } else if cachedParametersPrefillEnabled {
+            Self.cachedParametersSequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        } else if parallelStatePrefillEnabled {
+            Self.parallelStateSequenceKernelName(
                 bufferPrecision: context.kernelContext.bufferPrecision,
                 weightFormat: context.kernelContext.weightFormat
             )

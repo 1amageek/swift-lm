@@ -552,7 +552,9 @@ public static func generateSSMRecurrenceSequence(
     prewriteDecayedState: Bool = false,
     emitsGroupOwnedPartialProjection: Bool = false,
     emitsPartitionOwnedPartialProjection: Bool = false,
-    parallelQKReduction: Bool = false
+    parallelQKReduction: Bool = false,
+    cacheHeadParameters: Bool = false,
+    parallelStateUpdate: Bool = false
 ) -> String {
     precondition(
         !(emitsGroupOwnedPartialProjection && emitsPartitionOwnedPartialProjection),
@@ -572,8 +574,17 @@ public static func generateSSMRecurrenceSequence(
     let safeGroupCount = max(groupCount, 1)
     let headsPerGroup = max(1, headCount / safeGroupCount)
     let localDim = 2 * keyHeadDimension + headsPerGroup * valueHeadDimension
+    let stateReductionLanes = max(1, maxThreadgroupSize / max(1, headsPerGroup * valueHeadDimension))
     let rmsScaleCacheDeclaration = shareRMSScale
         ? "\n        threadgroup float rmsScaleCache[\(headsPerGroup)];"
+        : ""
+    let needsHeadParameterCache = cacheHeadParameters || parallelStateUpdate
+    let headParameterCacheDeclaration = needsHeadParameterCache
+        ? """
+
+        threadgroup float decayCache[\(headsPerGroup)];
+        threadgroup float betaCache[\(headsPerGroup)];
+        """
         : ""
     let qkPartialCacheDeclaration = parallelQKReduction
         ? """
@@ -581,6 +592,24 @@ public static func generateSSMRecurrenceSequence(
         threadgroup float qNormSqPartials[\(headsPerGroup * keyHeadDimension)];
         threadgroup float kNormSqPartials[\(headsPerGroup * keyHeadDimension)];
         threadgroup float kqSumPartials[\(headsPerGroup * keyHeadDimension)];
+        """
+        : ""
+    let parallelStateCacheDeclaration = parallelStateUpdate
+        ? """
+
+        threadgroup float kvmemPartials[\(headsPerGroup * valueHeadDimension * stateReductionLanes)];
+        threadgroup float sqSumPartials[\(headsPerGroup * valueHeadDimension * stateReductionLanes)];
+        threadgroup float kInvDeltaCache[\(headsPerGroup * valueHeadDimension)];
+        """
+        : ""
+    let headParameterCachePhase = cacheHeadParameters && !parallelStateUpdate
+        ? """
+
+                            const uint headIndex = headStart + localHead;
+                            float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
+                            float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
+                            decayCache[localHead] = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
+                            betaCache[localHead] = stable_sigmoid(betaInput);
         """
         : ""
     let rmsPhase = shareRMSScale
@@ -733,7 +762,7 @@ public static func generateSSMRecurrenceSequence(
                             }
                             qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
                             kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
-                            kqSumCache[localHead] = kqSum;
+                            kqSumCache[localHead] = kqSum;\(headParameterCachePhase)
                         }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -757,10 +786,163 @@ public static func generateSSMRecurrenceSequence(
                             }
                             qInvCache[localHead] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
                             kInvCache[localHead] = rsqrt(kNormSq + 1e-6f);
-                            kqSumCache[localHead] = kqSum;
+                            kqSumCache[localHead] = kqSum;\(headParameterCachePhase)
                         }
                     }
                     threadgroup_barrier(mem_flags::mem_threadgroup);
+        """
+    let headParameterLoad = cacheHeadParameters
+        ? """
+                        float decay = decayCache[localHead];
+                        float beta = betaCache[localHead];
+        """
+        : """
+                        float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
+                        float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
+                        float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
+                        float beta = stable_sigmoid(betaInput);
+        """
+
+    let stateRecurrencePhase = parallelStateUpdate
+        ? """
+                    if (tid < headsPerGroup) {
+                        const uint headIndex = headStart + tid;
+                        float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
+                        float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
+                        decayCache[tid] = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
+                        betaCache[tid] = stable_sigmoid(betaInput);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    const uint stateLaneCount = max(1u, tgSize / max(headsPerGroup * dv, 1u));
+                    const uint stateThreadsPerHead = dv * stateLaneCount;
+                    const uint stateActiveThreads = headsPerGroup * stateThreadsPerHead;
+                    if (tid < stateActiveThreads) {
+                        const uint localHead = tid / stateThreadsPerHead;
+                        const uint headLocalTid = tid - localHead * stateThreadsPerHead;
+                        const uint d = headLocalTid / stateLaneCount;
+                        const uint lane = headLocalTid - d * stateLaneCount;
+                        const uint headIndex = headStart + localHead;
+                        device float* state = recurrentState + headIndex * dk * dv;
+                        const uint qBase = 0u;
+                        const uint kBase = dk;
+                        const uint vBase = 2u * dk + localHead * dv;
+                        float decay = decayCache[localHead];
+                        float kvmemRaw = 0.0f;
+                        float sqSum = 0.0f;
+                        for (uint j = lane; j < dk; j += stateLaneCount) {
+                            float s = state[j * dv + d] * decay;
+                            kvmemRaw += s * convSiluCache[kBase + j];
+                            sqSum += s * convSiluCache[qBase + j];
+                        }
+                        const uint partialIndex = (localHead * dv + d) * stateLaneCount + lane;
+                        kvmemPartials[partialIndex] = kvmemRaw;
+                        sqSumPartials[partialIndex] = sqSum;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    const uint stateReducerThreads = headsPerGroup * dv;
+                    if (tid < stateReducerThreads) {
+                        const uint localHead = tid / dv;
+                        const uint d = tid - localHead * dv;
+                        const uint headIndex = headStart + localHead;
+                        const uint kBase = dk;
+                        const uint vBase = 2u * dk + localHead * dv;
+                        float kvmemRaw = 0.0f;
+                        float sqSum = 0.0f;
+                        for (uint lane = 0; lane < stateLaneCount; ++lane) {
+                            const uint partialIndex = (localHead * dv + d) * stateLaneCount + lane;
+                            kvmemRaw += kvmemPartials[partialIndex];
+                            sqSum += sqSumPartials[partialIndex];
+                        }
+                        float beta = betaCache[localHead];
+                        float qInv = qInvCache[localHead];
+                        float kInv = kInvCache[localHead];
+                        float kqSum = kqSumCache[localHead];
+                        float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
+                        float kInvDelta = kInv * delta;
+                        float dot = (sqSum + kInvDelta * kqSum) * qInv;
+                        kInvDeltaCache[localHead * dv + d] = kInvDelta;
+                        float storedDot = \(activationStorageValue("dot"));
+                        dotCache[localHead * dv + d] = storedDot;
+                        outputPos[headIndex * dv + d] = \(bt)(storedDot);
+                        normPartials[localHead * dv + d] = dot * dot;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    if (tid < stateActiveThreads) {
+                        const uint localHead = tid / stateThreadsPerHead;
+                        const uint headLocalTid = tid - localHead * stateThreadsPerHead;
+                        const uint d = headLocalTid / stateLaneCount;
+                        const uint lane = headLocalTid - d * stateLaneCount;
+                        const uint headIndex = headStart + localHead;
+                        device float* state = recurrentState + headIndex * dk * dv;
+                        const uint kBase = dk;
+                        float decay = decayCache[localHead];
+                        float kInvDelta = kInvDeltaCache[localHead * dv + d];
+                        for (uint j = lane; j < dk; j += stateLaneCount) {
+                            state[j * dv + d] = state[j * dv + d] * decay + convSiluCache[kBase + j] * kInvDelta;
+                        }
+                    }
+        """
+        : """
+                    if (tid < activeThreads) {
+                        const uint localHead = tid / threadsPerHead;
+                        const uint headIndex = headStart + localHead;
+                        const uint localTid = tid % threadsPerHead;
+                        const uint dChunk = dv / threadsPerHead;
+                        const uint dStart = localTid * dChunk;
+                        const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
+
+                        \(headParameterLoad)
+                        device float* state = recurrentState + headIndex * dk * dv;
+
+                        // Local cache indices for this recurrent group:
+                        const uint qBase = 0u;
+                        const uint kBase = dk;
+                        const uint vBase = 2u * dk + localHead * dv;
+                        float qInv = qInvCache[localHead];
+                        float kInv = kInvCache[localHead];
+                        float kqSum = kqSumCache[localHead];
+
+                        // Algebraic identity used below:
+                        //   state_after[j] = state_before[j]·decay + K[j]·kInvDelta
+                        //   dot = Σ state_after[j]·Q[j]
+                        //       = Σ (state_before[j]·decay)·Q[j] + kInvDelta · Σ K[j]·Q[j]
+                        //       = sqSum + kInvDelta · kqSum
+                        // This lets us compute `dot` from sqSum (one accumulator gathered
+                        // during the decay pass) + a precomputed kqSum, eliminating the
+                        // second Σ over updated state. Per j we now do 2 state reads + 1
+                        // state write (vs 3 reads + 2 writes previously).
+                        float localNormSq = 0.0f;
+                        for (uint d = dStart; d < dEnd; ++d) {
+                            // Pass 1: read state, accumulate kvmemRaw and sqSum.
+                            // No state write here — deferred to Pass 2 for a single full write.
+                            float kvmemRaw = 0.0f;
+                            float sqSum = 0.0f;
+                            for (uint j = 0; j < dk; ++j) {
+                                \(recurrencePass1StateLine)
+                                kvmemRaw += s * convSiluCache[kBase + j];
+                                sqSum += s * convSiluCache[qBase + j];
+                            }
+
+                            float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
+                            float kInvDelta = kInv * delta;
+                            float dot = (sqSum + kInvDelta * kqSum) * qInv;
+
+                            // Pass 2: write final state = decay·old + K·kInvDelta (full write, no RMW).
+                            for (uint j = 0; j < dk; ++j) {
+                                state[j * dv + d] = \(recurrencePass2StateExpr) + convSiluCache[kBase + j] * kInvDelta;
+                            }
+
+                            float storedDot = \(activationStorageValue("dot"));
+                            dotCache[localHead * dv + d] = storedDot;
+                            outputPos[headIndex * dv + d] = \(bt)(storedDot);
+                            localNormSq += dot * dot;
+                        }
+
+                        normPartials[tid] = localNormSq;
+                    }
         """
 
     return """
@@ -825,7 +1007,7 @@ public static func generateSSMRecurrenceSequence(
         threadgroup float normPartials[\(maxThreadgroupSize)];
         threadgroup float qInvCache[\(headsPerGroup)];
         threadgroup float kInvCache[\(headsPerGroup)];
-        threadgroup float kqSumCache[\(headsPerGroup)];\(rmsScaleCacheDeclaration)\(qkPartialCacheDeclaration)
+        threadgroup float kqSumCache[\(headsPerGroup)];\(rmsScaleCacheDeclaration)\(headParameterCacheDeclaration)\(qkPartialCacheDeclaration)\(parallelStateCacheDeclaration)
 
         for (uint pos = 0; pos < sequenceLength; ++pos) {
             device const \(bt)* projectedQKVPos = projectedQKV + pos * activationRowStride;
@@ -879,66 +1061,7 @@ public static func generateSSMRecurrenceSequence(
                     const uint activeThreads = headsPerGroup * threadsPerHead;
                     \(qkReductionPhase)
 
-                    if (tid < activeThreads) {
-                        const uint localHead = tid / threadsPerHead;
-                        const uint headIndex = headStart + localHead;
-                        const uint localTid = tid % threadsPerHead;
-                        const uint dChunk = dv / threadsPerHead;
-                        const uint dStart = localTid * dChunk;
-                        const uint dEnd = (localTid + 1 == threadsPerHead) ? dv : dStart + dChunk;
-
-                        float alpha = \(activationStorageValue("float(projectedAlphaPos[headIndex])"));
-                        float betaInput = \(activationStorageValue("float(projectedBetaPos[headIndex])"));
-                        float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
-                        float beta = stable_sigmoid(betaInput);
-                        device float* state = recurrentState + headIndex * dk * dv;
-
-                        // Local cache indices for this recurrent group:
-                        const uint qBase = 0u;
-                        const uint kBase = dk;
-                        const uint vBase = 2u * dk + localHead * dv;
-                        float qInv = qInvCache[localHead];
-                        float kInv = kInvCache[localHead];
-                        float kqSum = kqSumCache[localHead];
-
-                        // Algebraic identity used below:
-                        //   state_after[j] = state_before[j]·decay + K[j]·kInvDelta
-                        //   dot = Σ state_after[j]·Q[j]
-                        //       = Σ (state_before[j]·decay)·Q[j] + kInvDelta · Σ K[j]·Q[j]
-                        //       = sqSum + kInvDelta · kqSum
-                        // This lets us compute `dot` from sqSum (one accumulator gathered
-                        // during the decay pass) + a precomputed kqSum, eliminating the
-                        // second Σ over updated state. Per j we now do 2 state reads + 1
-                        // state write (vs 3 reads + 2 writes previously).
-                        float localNormSq = 0.0f;
-                        for (uint d = dStart; d < dEnd; ++d) {
-                            // Pass 1: read state, accumulate kvmemRaw and sqSum.
-                            // No state write here — deferred to Pass 2 for a single full write.
-                            float kvmemRaw = 0.0f;
-                            float sqSum = 0.0f;
-                            for (uint j = 0; j < dk; ++j) {
-                                \(recurrencePass1StateLine)
-                                kvmemRaw += s * convSiluCache[kBase + j];
-                                sqSum += s * convSiluCache[qBase + j];
-                            }
-
-                            float delta = beta * (convSiluCache[vBase + d] - kvmemRaw * kInv);
-                            float kInvDelta = kInv * delta;
-                            float dot = (sqSum + kInvDelta * kqSum) * qInv;
-
-                            // Pass 2: write final state = decay·old + K·kInvDelta (full write, no RMW).
-                            for (uint j = 0; j < dk; ++j) {
-                                state[j * dv + d] = \(recurrencePass2StateExpr) + convSiluCache[kBase + j] * kInvDelta;
-                            }
-
-                            float storedDot = \(activationStorageValue("dot"));
-                            dotCache[localHead * dv + d] = storedDot;
-                            outputPos[headIndex * dv + d] = \(bt)(storedDot);
-                            localNormSq += dot * dot;
-                        }
-
-                        normPartials[tid] = localNormSq;
-                    }
+                    \(stateRecurrencePhase)
                 }
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
