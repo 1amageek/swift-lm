@@ -124,6 +124,14 @@ extension MetalSourceGenerator {
         sources.append(generateGEMV(name: "gemv_bf16_f32s", bufferPrecision: prefill, weightFormat: .bfloat16, tileElements: 256))
         sources.append(generateSequenceGEMV(name: "gemv_seq_f32s", bufferPrecision: prefill, weightFormat: .float16, tileElements: 256))
         sources.append(generateSequenceGEMV(name: "gemv_seq_bf16_f32s", bufferPrecision: prefill, weightFormat: .bfloat16, tileElements: 256))
+        sources.append(generatePackStridedSequenceInputToCompact(name: "pack_strided_seq_f32_to_compact", bufferPrecision: prefill))
+        for count in 1...4 {
+            sources.append(generateScatterCompactSequenceOutputsToStridedSlots(
+                name: "scatter_compact_seq_outputs\(count)_to_strided",
+                count: count,
+                bufferPrecision: prefill
+            ))
+        }
         sources.append(generateBatchedSequenceGEMV(name: "batched_gemv2_seq_f32s", count: 2, bufferPrecision: prefill, weightFormat: .float16))
         sources.append(generateBatchedSequenceGEMV(name: "batched_gemv2_seq_bf16_f32s", count: 2, bufferPrecision: prefill, weightFormat: .bfloat16))
         sources.append(generateBatchedSequenceGEMV(name: "batched_gemv2_seq_fp32_f32s", count: 2, bufferPrecision: prefill, weightFormat: .float32))

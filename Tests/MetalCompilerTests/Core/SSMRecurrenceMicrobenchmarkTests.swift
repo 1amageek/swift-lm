@@ -92,7 +92,10 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMPhaseVariant(name: "state_recurrence_d2", kernelName: "bench_ssm_phase_state_recurrence_d2_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_qkpar", kernelName: "bench_ssm_phase_state_recurrence_qkpar_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_cache32", kernelName: "bench_ssm_phase_state_recurrence_cache32_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence_parallel_state", kernelName: "bench_ssm_phase_state_recurrence_parallel_state_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence_parallel_state_transposed", kernelName: "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "rms_gate", kernelName: "bench_ssm_phase_rms_gate_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "rms_gate_parallel_reduce", kernelName: "bench_ssm_phase_rms_gate_parallel_reduce_f32", threadgroupWidth: 384),
         ]
 
         var rows: [SSMPhaseResultRow] = []
@@ -152,6 +155,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
             "bench_ssm_phase_state_recurrence_d2_f32",
             "bench_ssm_phase_state_recurrence_qkpar_f32",
             "bench_ssm_phase_state_recurrence_cache32_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
         ] {
             let validation = try harness.validateStateRecurrencePhase(kernelName: kernelName, sequenceLength: 5)
             #expect(
@@ -2389,7 +2394,15 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 name: "bench_ssm_phase_state_recurrence_cache32_f32",
                 stateCacheTileWidth: 32
             ),
+            Self.generatePhaseStateRecurrenceParallelStateKernel(
+                name: "bench_ssm_phase_state_recurrence_parallel_state_f32"
+            ),
+            Self.generatePhaseStateRecurrenceParallelStateKernel(
+                name: "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
+                transposedStateLayout: true
+            ),
             Self.generatePhaseRMSGateKernel(),
+            Self.generatePhaseRMSGateParallelReduceKernel(),
         ].joined(separator: "\n")
         let options = MTLCompileOptions()
         options.languageVersion = .version4_0
@@ -2406,7 +2419,10 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_phase_state_recurrence_d2_f32",
             "bench_ssm_phase_state_recurrence_qkpar_f32",
             "bench_ssm_phase_state_recurrence_cache32_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
             "bench_ssm_phase_rms_gate_f32",
+            "bench_ssm_phase_rms_gate_parallel_reduce_f32",
         ]
         var compiled: [String: MTLComputePipelineState] = [:]
         for name in names {
@@ -2575,12 +2591,28 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         )
 
         let actualOutput = readFloatBuffer(output, count: sequenceLength * activationRowStride)
-        let actualState = readFloatBuffer(recurrentState, count: headCount * keyDimension * valueDimension)
+        var actualState = readFloatBuffer(recurrentState, count: headCount * keyDimension * valueDimension)
+        if kernelName.contains("_transposed") {
+            actualState = canonicalStateFromTransposed(actualState)
+        }
         let reference = cpuStateRecurrenceReference(inputs: inputs, sequenceLength: sequenceLength)
         return SSMStatePhaseValidation(
             outputMaxError: maxAbsoluteError(actualOutput, reference.output),
             recurrentStateMaxError: maxAbsoluteError(actualState, reference.recurrentState)
         )
+    }
+
+    private func canonicalStateFromTransposed(_ transposed: [Float]) -> [Float] {
+        var canonical = [Float](repeating: 0, count: transposed.count)
+        for head in 0..<headCount {
+            let headBase = head * keyDimension * valueDimension
+            for d in 0..<valueDimension {
+                for j in 0..<keyDimension {
+                    canonical[headBase + j * valueDimension + d] = transposed[headBase + d * keyDimension + j]
+                }
+            }
+        }
+        return canonical
     }
 
     private static func generatePhaseConvSiluKernel() -> String {
@@ -2976,6 +3008,159 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         """
     }
 
+    private static func generatePhaseStateRecurrenceParallelStateKernel(
+        name: String,
+        transposedStateLayout: Bool = false
+    ) -> String {
+        let stateRead = transposedStateLayout
+            ? "state[d * dk + j]"
+            : "state[j * dv + d]"
+        let stateWrite = transposedStateLayout
+            ? "state[d * dk + j]"
+            : "state[j * dv + d]"
+        return """
+        kernel void \(name)(
+            device const float* convSilu [[buffer(0)]],
+            device const float* projectedZ [[buffer(1)]],
+            device const float* projectedBeta [[buffer(2)]],
+            device const float* projectedAlpha [[buffer(3)]],
+            device const uint16_t* convWeight [[buffer(4)]],
+            device const float* normWeight [[buffer(5)]],
+            device const uint16_t* dtBias [[buffer(6)]],
+            device const float* aLog [[buffer(7)]],
+            device float* recurrentState [[buffer(8)]],
+            device uint16_t* convState [[buffer(9)]],
+            device float* output [[buffer(10)]],
+            constant uint& numHeads [[buffer(11)]],
+            constant uint& groupCount [[buffer(12)]],
+            constant uint& keyDimension [[buffer(13)]],
+            constant uint& valueDimension [[buffer(14)]],
+            constant uint& convKernelSize [[buffer(15)]],
+            constant uint& sequenceLength [[buffer(16)]],
+            constant uint& activationRowStride [[buffer(17)]],
+            device float* debugConvSilu [[buffer(18)]],
+            constant uint& debugConvRowStride [[buffer(19)]],
+            constant uint& debugConvEnabled [[buffer(20)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgSize [[threads_per_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]]
+        ) {
+            const uint dk = keyDimension;
+            const uint dv = valueDimension;
+            const uint safeGroupCount = max(groupCount, 1u);
+            const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
+            const uint keyGroupDim = safeGroupCount * dk;
+            const uint localDim = 2u * dk + headsPerGroup * dv;
+            const uint groupIndex = tgid;
+            if (groupIndex >= safeGroupCount) { return; }
+            const uint headStart = groupIndex * headsPerGroup;
+
+            threadgroup float convSiluCache[384];
+            threadgroup float qInvCache[1];
+            threadgroup float kInvCache[1];
+            threadgroup float kqSumCache[1];
+            threadgroup float decayCache[1];
+            threadgroup float betaCache[1];
+            threadgroup float kvmemPartials[128 * 3];
+            threadgroup float sqSumPartials[128 * 3];
+            threadgroup float kInvDeltaCache[128];
+
+            for (uint pos = 0; pos < sequenceLength; ++pos) {
+                device const float* convSiluPos = convSilu + pos * activationRowStride;
+                device const float* betaPos = projectedBeta + pos * activationRowStride;
+                device const float* alphaPos = projectedAlpha + pos * activationRowStride;
+                device float* outputPos = output + pos * activationRowStride;
+
+                for (uint localCh = tid; localCh < localDim; localCh += tgSize) {
+                    uint globalCh;
+                    if (localCh < dk) {
+                        globalCh = groupIndex * dk + localCh;
+                    } else if (localCh < 2u * dk) {
+                        globalCh = keyGroupDim + groupIndex * dk + (localCh - dk);
+                    } else {
+                        globalCh = 2u * keyGroupDim + headStart * dv + (localCh - 2u * dk);
+                    }
+                    convSiluCache[localCh] = convSiluPos[globalCh];
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid == 0) {
+                    float qNormSq = 0.0f;
+                    float kNormSq = 0.0f;
+                    float kqSum = 0.0f;
+                    for (uint j = 0; j < dk; ++j) {
+                        float q = convSiluCache[j];
+                        float k = convSiluCache[dk + j];
+                        qNormSq += q * q;
+                        kNormSq += k * k;
+                        kqSum += q * k;
+                    }
+                    qInvCache[0] = rsqrt(qNormSq + 1e-6f) * rsqrt(float(dk));
+                    kInvCache[0] = rsqrt(kNormSq + 1e-6f);
+                    kqSumCache[0] = kqSum;
+
+                    float alpha = alphaPos[headStart];
+                    float betaInput = betaPos[headStart];
+                    decayCache[0] = exp(-exp(aLog[headStart]) * stable_softplus(alpha + bf16_to_float(dtBias[headStart])));
+                    betaCache[0] = stable_sigmoid(betaInput);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                const uint stateLaneCount = max(1u, tgSize / max(dv, 1u));
+                const uint stateActiveThreads = dv * stateLaneCount;
+                if (tid < stateActiveThreads) {
+                    const uint d = tid / stateLaneCount;
+                    const uint lane = tid - d * stateLaneCount;
+                    device float* state = recurrentState + headStart * dk * dv;
+                    float decay = decayCache[0];
+                    float kvmemRaw = 0.0f;
+                    float sqSum = 0.0f;
+                    for (uint j = lane; j < dk; j += stateLaneCount) {
+                        float s = \(stateRead) * decay;
+                        kvmemRaw += s * convSiluCache[dk + j];
+                        sqSum += s * convSiluCache[j];
+                    }
+                    const uint partialIndex = d * stateLaneCount + lane;
+                    kvmemPartials[partialIndex] = kvmemRaw;
+                    sqSumPartials[partialIndex] = sqSum;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < dv) {
+                    const uint d = tid;
+                    float kvmemRaw = 0.0f;
+                    float sqSum = 0.0f;
+                    for (uint lane = 0; lane < stateLaneCount; ++lane) {
+                        const uint partialIndex = d * stateLaneCount + lane;
+                        kvmemRaw += kvmemPartials[partialIndex];
+                        sqSum += sqSumPartials[partialIndex];
+                    }
+                    float delta = betaCache[0] * (convSiluCache[2u * dk + d] - kvmemRaw * kInvCache[0]);
+                    float kInvDelta = kInvCache[0] * delta;
+                    kInvDeltaCache[d] = kInvDelta;
+                    float dot = (sqSum + kInvDelta * kqSumCache[0]) * qInvCache[0];
+                    outputPos[headStart * dv + d] = dot;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                if (tid < stateActiveThreads) {
+                    const uint d = tid / stateLaneCount;
+                    const uint lane = tid - d * stateLaneCount;
+                    device float* state = recurrentState + headStart * dk * dv;
+                    float decay = decayCache[0];
+                    float kInvDelta = kInvDeltaCache[d];
+                    for (uint j = lane; j < dk; j += stateLaneCount) {
+                        \(stateWrite) = \(stateRead) * decay + convSiluCache[dk + j] * kInvDelta;
+                    }
+                }
+                if (pos + 1 < sequenceLength) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                }
+            }
+        }
+        """
+    }
+
     private static func generatePhaseRMSGateKernel() -> String {
         """
         kernel void bench_ssm_phase_rms_gate_f32(
@@ -3056,6 +3241,84 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                         float z = zPos[headIndex * dv + d];
                         outputPos[headIndex * dv + d] = normed * z * stable_sigmoid(z);
                     }
+                }
+                if (pos + 1 < sequenceLength) {
+                    threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);
+                }
+            }
+        }
+        """
+    }
+
+    private static func generatePhaseRMSGateParallelReduceKernel() -> String {
+        """
+        kernel void bench_ssm_phase_rms_gate_parallel_reduce_f32(
+            device const float* dotInput [[buffer(0)]],
+            device const float* projectedZ [[buffer(1)]],
+            device const float* projectedBeta [[buffer(2)]],
+            device const float* projectedAlpha [[buffer(3)]],
+            device const uint16_t* convWeight [[buffer(4)]],
+            device const float* normWeight [[buffer(5)]],
+            device const uint16_t* dtBias [[buffer(6)]],
+            device const float* aLog [[buffer(7)]],
+            device float* recurrentState [[buffer(8)]],
+            device uint16_t* convState [[buffer(9)]],
+            device float* output [[buffer(10)]],
+            constant uint& numHeads [[buffer(11)]],
+            constant uint& groupCount [[buffer(12)]],
+            constant uint& keyDimension [[buffer(13)]],
+            constant uint& valueDimension [[buffer(14)]],
+            constant uint& convKernelSize [[buffer(15)]],
+            constant uint& sequenceLength [[buffer(16)]],
+            constant uint& activationRowStride [[buffer(17)]],
+            device float* debugConvSilu [[buffer(18)]],
+            constant uint& debugConvRowStride [[buffer(19)]],
+            constant uint& debugConvEnabled [[buffer(20)]],
+            uint tid [[thread_index_in_threadgroup]],
+            uint tgSize [[threads_per_threadgroup]],
+            uint tgid [[threadgroup_position_in_grid]]
+        ) {
+            const uint dv = valueDimension;
+            const uint safeGroupCount = max(groupCount, 1u);
+            const uint headsPerGroup = max(1u, numHeads / safeGroupCount);
+            const uint groupIndex = tgid;
+            if (groupIndex >= safeGroupCount) { return; }
+            const uint headStart = groupIndex * headsPerGroup;
+            const uint threadsPerHead = min(tgSize / max(headsPerGroup, 1u), dv);
+            const uint activeThreads = headsPerGroup * threadsPerHead;
+            threadgroup float simdPartials[4];
+            threadgroup float rmsScaleCache[1];
+
+            for (uint pos = 0; pos < sequenceLength; ++pos) {
+                device const float* dotPos = dotInput + pos * activationRowStride;
+                device const float* zPos = projectedZ + pos * activationRowStride;
+                device float* outputPos = output + pos * activationRowStride;
+                const uint localTid = tid % threadsPerHead;
+                float normSq = 0.0f;
+                if (tid < activeThreads && localTid < dv) {
+                    const uint headIndex = headStart;
+                    float value = dotPos[headIndex * dv + localTid];
+                    normSq = value * value;
+                }
+                float simdNormSq = simd_sum(normSq);
+                if (tid < activeThreads && (tid % SIMD_WIDTH) == 0u) {
+                    simdPartials[tid / SIMD_WIDTH] = simdNormSq;
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid == 0) {
+                    float totalNormSq = 0.0f;
+                    const uint simdCount = (threadsPerHead + SIMD_WIDTH - 1u) / SIMD_WIDTH;
+                    for (uint i = 0; i < simdCount; ++i) {
+                        totalNormSq += simdPartials[i];
+                    }
+                    rmsScaleCache[0] = rsqrt(totalNormSq / float(dv) + 1e-6f);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                if (tid < activeThreads && localTid < dv) {
+                    const uint headIndex = headStart;
+                    float normed = dotPos[headIndex * dv + localTid] * rmsScaleCache[0] * normWeight[localTid];
+                    float z = zPos[headIndex * dv + localTid];
+                    outputPos[headIndex * dv + localTid] = normed * z * stable_sigmoid(z);
                 }
                 if (pos + 1 < sequenceLength) {
                     threadgroup_barrier(mem_flags::mem_threadgroup | mem_flags::mem_device);

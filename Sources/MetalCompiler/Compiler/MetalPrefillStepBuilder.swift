@@ -519,6 +519,43 @@ private struct PrefillStepPlanner {
         return raw == "1" || raw.lowercased() == "true"
     }()
 
+    /// Process-wide BF16 compact-input MPP route for dependent single prefill
+    /// projections.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1`, admitted dependent
+    /// output projections first pack their strided scratch input into compact
+    /// sequence storage when needed, then run the existing MPP GEMM. The route
+    /// is opt-in until Qwen reference and full-profile evidence prove it should
+    /// replace the decode-equivalent sequence GEMV path.
+    private static let bf16SingleCompactMPPEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
+    private static let compactMPPOutputProjectionFields: Set<String> = [
+        "down_proj",
+        "o_proj",
+        "out_proj",
+    ]
+
+    /// Process-wide BF16 compact-input/output MPP route for batched prefill
+    /// projections.
+    ///
+    /// When `SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1`, admitted BF16
+    /// batched sequence projections pack strided inputs when needed, run the
+    /// existing batched MPP GEMM into compact scratch slots, then scatter the
+    /// compact outputs back to the strided scratch layout consumed by later
+    /// fragments. The route is opt-in because MPP accumulation is not
+    /// decode-equivalent.
+    private static let bf16BatchedCompactMPPEnabled: Bool = {
+        guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP"] else {
+            return false
+        }
+        return raw == "1" || raw.lowercased() == "true"
+    }()
+
     /// Process-wide BF16 batched sequence GEMV rows-per-threadgroup policy.
     ///
     /// The base batched sequence kernels map one SIMD group to one output row
@@ -1381,6 +1418,23 @@ private struct PrefillStepPlanner {
                 outputRowStride = projection.outputDimension
             } else {
                 outputRowStride = slotDimension
+            }
+            if let compactMPPProjectionSteps = try buildCompactInputMPPProjectionSteps(
+                projection: projection,
+                entry: entry,
+                descriptor: quantizationDescriptor,
+                weightResolver: weightResolver,
+                weightTensorName: weightTensorName,
+                inputBuffer: inputBuffer,
+                inputOffset: inputOffset,
+                inputRowStride: inputRowStride,
+                outputBuffer: outputBuffer,
+                outputOffset: outputOffset,
+                outputRowStride: outputRowStride,
+                mode: mode,
+                seqLenValue: seqLenValue
+            ) {
+                return compactMPPProjectionSteps
             }
             // Prefer direct quantized GEMM (dequant in registers) when available.
             // Falls back to dequant→AMX when no direct kernel exists.
@@ -2466,6 +2520,19 @@ private struct PrefillStepPlanner {
             role: batched.projections[0].field, entry: entry
         )
 
+        if let compactMPPSteps = try buildCompactBatchedMPPGEMMSteps(
+            batched: batched,
+            entry: entry,
+            weightResolver: weightResolver,
+            firstDescriptor: firstDescriptor,
+            inputBuffer: inputBuffer,
+            inputOffset: inputOffset,
+            inputRowStride: inputRowStride,
+            scratchSlotSize: scratchSlotSize
+        ) {
+            return annotate(compactMPPSteps, entryIndex: entry.index, layerIndex: entry.layerIndex)
+        }
+
         if let sequenceStep = try buildDecodeEquivalentBatchedSequenceGEMVStep(
             batched: batched,
             entry: entry,
@@ -2964,6 +3031,558 @@ private struct PrefillStepPlanner {
         )
     }
 
+    private mutating func buildCompactBatchedMPPGEMMSteps(
+        batched: BatchedProjection,
+        entry: DispatchEntry,
+        weightResolver: WeightResolver,
+        firstDescriptor: ProjectionWeightDescriptor,
+        inputBuffer: MTLBuffer,
+        inputOffset: Int,
+        inputRowStride: Int,
+        scratchSlotSize: Int
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16BatchedCompactMPPEnabled else { return nil }
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else { return nil }
+        let count = batched.projections.count
+        guard count >= 2 && count <= 4 else { return nil }
+        guard firstDescriptor.schemeIdentifier == .bf16RowMajor,
+              !firstDescriptor.schemeIdentifier.isWeightQuantized else {
+            return nil
+        }
+
+        let sharedInputDim = batched.projections[0].inputDimension
+        guard sharedInputDim <= slotDimension else { return nil }
+        let allOutputDimensionsMPPTiled = batched.projections.allSatisfy {
+            $0.outputDimension <= slotDimension && $0.outputDimension % 32 == 0
+        }
+        if !allOutputDimensionsMPPTiled,
+           let splitSteps = try buildLeadingCompactMPPAndTailSequenceSteps(
+            batched: batched,
+            entry: entry,
+            weightResolver: weightResolver,
+            inputBuffer: inputBuffer,
+            inputOffset: inputOffset,
+            inputRowStride: inputRowStride,
+            scratchSlotSize: scratchSlotSize
+           ) {
+            return splitSteps
+        }
+        for projection in batched.projections {
+            guard projection.inputDimension == sharedInputDim,
+                  projection.outputDimension <= slotDimension,
+                  projection.outputDimension % 32 == 0 else {
+                return nil
+            }
+        }
+
+        guard let compactScratch = buffers.compactProjectionScratch else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Compact batched MPP projection requires compactProjectionScratch"
+            )
+        }
+        let requiredCompactSlots = count + (inputRowStride == sharedInputDim ? 0 : 1)
+        let compactSlotSize = maximumSequenceLength * slotDimension * scratchElementSize
+        guard compactScratch.length >= requiredCompactSlots * compactSlotSize else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Compact batched MPP projection requires \(requiredCompactSlots) compact scratch slots"
+            )
+        }
+
+        let mppKernelName = "batched_gemm_bf16_f32s_\(count)"
+        guard let mppPipeline = planBuildContext.pipelineCache[mppKernelName] else {
+            throw MetalCompilerError.kernelNotFound(mppKernelName)
+        }
+        let scatterKernelName = "scatter_compact_seq_outputs\(count)_to_strided"
+        guard let scatterPipeline = planBuildContext.pipelineCache[scatterKernelName] else {
+            throw MetalCompilerError.kernelNotFound(scatterKernelName)
+        }
+
+        var steps: [MetalPrefillStep] = []
+        let mppInputBuffer: MTLBuffer
+        let mppInputOffset: Int
+        let mppInputRowStride: Int
+        let outputCompactSlotBase: Int
+        if inputRowStride == sharedInputDim {
+            mppInputBuffer = inputBuffer
+            mppInputOffset = inputOffset
+            mppInputRowStride = inputRowStride
+            outputCompactSlotBase = 0
+        } else {
+            let packKernelName = "pack_strided_seq_f32_to_compact"
+            guard let packPipeline = planBuildContext.pipelineCache[packKernelName] else {
+                throw MetalCompilerError.kernelNotFound(packKernelName)
+            }
+            let packThreads = min(256, max(packPipeline.maxTotalThreadsPerThreadgroup, 1))
+            steps.append(MetalPrefillStep(
+                pipeline: packPipeline,
+                gridSize: MTLSize(
+                    width: (sharedInputDim + packThreads - 1) / packThreads,
+                    height: maximumSequenceLength,
+                    depth: 1
+                ),
+                threadgroupSize: MTLSize(width: packThreads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, inputBuffer, inputOffset),
+                    (1, compactScratch, 0),
+                ],
+                bytesBindings: [
+                    uint32Binding(2, UInt32(sharedInputDim)),
+                    uint32Binding(3, UInt32(maximumSequenceLength)),
+                    uint32Binding(4, UInt32(inputRowStride)),
+                ],
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                mode: .batch,
+                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 3),
+                positionBufferIndex: nil,
+                perPositionStrides: [:],
+                metadata: .init(
+                    kernelName: packKernelName,
+                    entryIndex: entry.index,
+                    weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                    bufferAccessPattern: .init(reads: [0], writes: [1])
+                )
+            ))
+            mppInputBuffer = compactScratch
+            mppInputOffset = 0
+            mppInputRowStride = sharedInputDim
+            outputCompactSlotBase = 1
+        }
+
+        var mppBindings: [(Int, MTLBuffer, Int)] = [(0, mppInputBuffer, mppInputOffset)]
+        var scatterBindings: [(Int, MTLBuffer, Int)] = []
+        var totalNTiles = 0
+        let firstOutputSlot = firstNonAliasingScratchOutputSlot(
+            inputBuffer: inputBuffer,
+            inputOffset: inputOffset,
+            scratchSlotSize: scratchSlotSize
+        )
+        var lastOutputOffset = routingState.currentInputOffset
+
+        for (index, projection) in batched.projections.enumerated() {
+            let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
+            mppBindings.append((1 + index, weightBuffer, weightOffset))
+            let compactOutputOffset = (outputCompactSlotBase + index) * compactSlotSize
+            mppBindings.append((1 + count + index, compactScratch, compactOutputOffset))
+            scatterBindings.append((index, compactScratch, compactOutputOffset))
+            totalNTiles += projection.outputDimension / 32
+        }
+        for index in 0..<count {
+            let outputOffset = (firstOutputSlot + index) * scratchSlotSize
+            lastOutputOffset = outputOffset
+            scatterBindings.append((count + index, buffers.scratch, outputOffset))
+        }
+
+        let dimBase = 1 + 2 * count
+        var mppBytes: [(index: Int, value: [UInt8])] = [
+            uint32Binding(dimBase, UInt32(sharedInputDim)),
+        ]
+        for (index, projection) in batched.projections.enumerated() {
+            mppBytes.append(uint32Binding(dimBase + 1 + index, UInt32(projection.outputDimension)))
+        }
+        let mppSeqLenIndex = dimBase + 1 + count
+        mppBytes.append(uint32Binding(mppSeqLenIndex, UInt32(maximumSequenceLength)))
+        mppBytes.append(uint32Binding(mppSeqLenIndex + 1, UInt32(mppInputRowStride)))
+
+        let mTile = MetalSourceGenerator.mppGEMMDefaultTileSize
+        let paddedMaxSeqLen = ((maximumSequenceLength + mTile - 1) / mTile) * mTile
+        let mppGridSize = MTLSize(width: totalNTiles, height: paddedMaxSeqLen / mTile, depth: 1)
+        let mppThreadgroupSize = MTLSize(
+            width: min(max(mppPipeline.threadExecutionWidth, 1) * 4, mppPipeline.maxTotalThreadsPerThreadgroup),
+            height: 1,
+            depth: 1
+        )
+        let tileVariants = makeMPPTileVariants(
+            baseKernelName: mppKernelName,
+            gridWidth: mppGridSize.width,
+            maxSequenceLength: maximumSequenceLength,
+            threadgroupSize: mppThreadgroupSize,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier
+        )
+        let mppReadIndices = Set(0...count)
+        let mppWriteIndices = Set((count + 1)...(2 * count))
+        steps.append(MetalPrefillStep(
+            pipeline: mppPipeline,
+            gridSize: mppGridSize,
+            threadgroupSize: mppThreadgroupSize,
+            bufferBindings: mppBindings,
+            bytesBindings: mppBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeightTiled(index: mppSeqLenIndex, tileHeight: mTile),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: "compact_mpp::\(mppKernelName)",
+                entryIndex: entry.index,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                bufferAccessPattern: .init(reads: mppReadIndices, writes: mppWriteIndices)
+            ),
+            tileVariants: tileVariants
+        ))
+
+        var scatterBytes: [(index: Int, value: [UInt8])] = []
+        for (index, projection) in batched.projections.enumerated() {
+            scatterBytes.append(uint32Binding(2 * count + index, UInt32(projection.outputDimension)))
+        }
+        let scatterSeqLenIndex = 3 * count
+        scatterBytes.append(uint32Binding(scatterSeqLenIndex, UInt32(maximumSequenceLength)))
+        scatterBytes.append(uint32Binding(scatterSeqLenIndex + 1, UInt32(slotDimension)))
+        let scatterThreads = min(256, max(scatterPipeline.maxTotalThreadsPerThreadgroup, 1))
+        let maxOutputDimension = batched.projections.map(\.outputDimension).max() ?? 0
+        steps.append(MetalPrefillStep(
+            pipeline: scatterPipeline,
+            gridSize: MTLSize(
+                width: (maxOutputDimension + scatterThreads - 1) / scatterThreads,
+                height: maximumSequenceLength,
+                depth: count
+            ),
+            threadgroupSize: MTLSize(width: scatterThreads, height: 1, depth: 1),
+            bufferBindings: scatterBindings,
+            bytesBindings: scatterBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: scatterSeqLenIndex),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: scatterKernelName,
+                entryIndex: entry.index,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                bufferAccessPattern: .init(reads: Set(0..<count), writes: Set(count..<(2 * count)))
+            )
+        ))
+
+        routingState.lastOutputIsHidden = false
+        routingState.currentInputOffset = lastOutputOffset
+        routingState.projectionIndex = firstOutputSlot + count - 1
+
+        for projection in batched.projections {
+            let descriptor = resolveProjectionWeightDescriptor(role: projection.field, entry: entry)
+            recordProjectionQuantization(
+                entry: entry,
+                descriptor: descriptor,
+                mode: .batch,
+                inputRowStride: mppInputRowStride,
+                inputDimension: projection.inputDimension,
+                outputDimension: projection.outputDimension,
+                outputRowStride: slotDimension,
+                selectedKernelName: "compact_mpp::\(mppKernelName)",
+                usesMPPForStep: true,
+                usesSequenceGEMVForStep: false,
+                sequenceTileHeight: mTile,
+                tileVariantHeights: tileVariants.map(\.tileHeight),
+                projectionCount: count
+            )
+        }
+
+        return steps
+    }
+
+    private mutating func buildLeadingCompactMPPAndTailSequenceSteps(
+        batched: BatchedProjection,
+        entry: DispatchEntry,
+        weightResolver: WeightResolver,
+        inputBuffer: MTLBuffer,
+        inputOffset: Int,
+        inputRowStride: Int,
+        scratchSlotSize: Int
+    ) throws -> [MetalPrefillStep]? {
+        let count = batched.projections.count
+        guard count == 4 else { return nil }
+        let sharedInputDimension = batched.projections[0].inputDimension
+        var mppPrefixCount = 0
+        for projection in batched.projections {
+            guard projection.inputDimension == sharedInputDimension,
+                  projection.outputDimension <= slotDimension else {
+                return nil
+            }
+            if projection.outputDimension % 32 == 0 {
+                mppPrefixCount += 1
+            } else {
+                break
+            }
+        }
+        guard mppPrefixCount >= 2, mppPrefixCount < count else { return nil }
+        let mppProjections = Array(batched.projections.prefix(mppPrefixCount))
+        let tailProjections = Array(batched.projections.dropFirst(mppPrefixCount))
+        let tailCount = tailProjections.count
+        guard (2...3).contains(tailCount) else { return nil }
+        for projection in tailProjections {
+            guard projection.inputDimension == sharedInputDimension,
+                  projection.outputDimension <= slotDimension else {
+                return nil
+            }
+        }
+
+        guard let compactScratch = buffers.compactProjectionScratch else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Split compact MPP projection requires compactProjectionScratch"
+            )
+        }
+        let compactSlotSize = maximumSequenceLength * slotDimension * scratchElementSize
+        let needsInputPack = inputRowStride != sharedInputDimension
+        let requiredCompactSlots = mppPrefixCount + (needsInputPack ? 1 : 0)
+        guard compactScratch.length >= requiredCompactSlots * compactSlotSize else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Split compact MPP projection requires \(requiredCompactSlots) compact scratch slots"
+            )
+        }
+        let mppKernelName = "batched_gemm_bf16_f32s_\(mppPrefixCount)"
+        guard let mppPipeline = planBuildContext.pipelineCache[mppKernelName] else {
+            throw MetalCompilerError.kernelNotFound(mppKernelName)
+        }
+        let scatterKernelName = "scatter_compact_seq_outputs\(mppPrefixCount)_to_strided"
+        guard let scatterPipeline = planBuildContext.pipelineCache[scatterKernelName] else {
+            throw MetalCompilerError.kernelNotFound(scatterKernelName)
+        }
+        let tailKernelName = "batched_gemv\(tailCount)_seq_bf16_f32s"
+        guard let tailPipeline = planBuildContext.pipelineCache[tailKernelName] else {
+            throw MetalCompilerError.kernelNotFound(tailKernelName)
+        }
+
+        var steps: [MetalPrefillStep] = []
+        let mppInputBuffer: MTLBuffer
+        let mppInputOffset: Int
+        let mppInputRowStride: Int
+        let outputCompactSlotBase: Int
+        if needsInputPack {
+            let packKernelName = "pack_strided_seq_f32_to_compact"
+            guard let packPipeline = planBuildContext.pipelineCache[packKernelName] else {
+                throw MetalCompilerError.kernelNotFound(packKernelName)
+            }
+            let packThreads = min(256, max(packPipeline.maxTotalThreadsPerThreadgroup, 1))
+            steps.append(MetalPrefillStep(
+                pipeline: packPipeline,
+                gridSize: MTLSize(width: (sharedInputDimension + packThreads - 1) / packThreads, height: maximumSequenceLength, depth: 1),
+                threadgroupSize: MTLSize(width: packThreads, height: 1, depth: 1),
+                bufferBindings: [(0, inputBuffer, inputOffset), (1, compactScratch, 0)],
+                bytesBindings: [
+                    uint32Binding(2, UInt32(sharedInputDimension)),
+                    uint32Binding(3, UInt32(maximumSequenceLength)),
+                    uint32Binding(4, UInt32(inputRowStride)),
+                ],
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                mode: .batch,
+                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 3),
+                positionBufferIndex: nil,
+                perPositionStrides: [:],
+                metadata: .init(
+                    kernelName: packKernelName,
+                    entryIndex: entry.index,
+                    weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                    bufferAccessPattern: .init(reads: [0], writes: [1])
+                )
+            ))
+            mppInputBuffer = compactScratch
+            mppInputOffset = 0
+            mppInputRowStride = sharedInputDimension
+            outputCompactSlotBase = 1
+        } else {
+            mppInputBuffer = inputBuffer
+            mppInputOffset = inputOffset
+            mppInputRowStride = inputRowStride
+            outputCompactSlotBase = 0
+        }
+
+        let firstOutputSlot = firstNonAliasingScratchOutputSlot(
+            inputBuffer: inputBuffer,
+            inputOffset: inputOffset,
+            scratchSlotSize: scratchSlotSize
+        )
+        var mppBindings: [(Int, MTLBuffer, Int)] = [(0, mppInputBuffer, mppInputOffset)]
+        var scatterBindings: [(Int, MTLBuffer, Int)] = []
+        var totalNTiles = 0
+        var lastOutputOffset = firstOutputSlot * scratchSlotSize
+        for (index, projection) in mppProjections.enumerated() {
+            let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
+            mppBindings.append((1 + index, weightBuffer, weightOffset))
+            let compactOutputOffset = (outputCompactSlotBase + index) * compactSlotSize
+            mppBindings.append((1 + mppPrefixCount + index, compactScratch, compactOutputOffset))
+            scatterBindings.append((index, compactScratch, compactOutputOffset))
+            totalNTiles += projection.outputDimension / 32
+        }
+        for index in 0..<mppPrefixCount {
+            let outputOffset = (firstOutputSlot + index) * scratchSlotSize
+            lastOutputOffset = outputOffset
+            scatterBindings.append((mppPrefixCount + index, buffers.scratch, outputOffset))
+        }
+
+        let mTile = MetalSourceGenerator.mppGEMMDefaultTileSize
+        let paddedMaxSeqLen = ((maximumSequenceLength + mTile - 1) / mTile) * mTile
+        let mppGridSize = MTLSize(width: totalNTiles, height: paddedMaxSeqLen / mTile, depth: 1)
+        let mppThreadgroupSize = MTLSize(
+            width: min(max(mppPipeline.threadExecutionWidth, 1) * 4, mppPipeline.maxTotalThreadsPerThreadgroup),
+            height: 1,
+            depth: 1
+        )
+        let mppTileVariants = makeMPPTileVariants(
+            baseKernelName: mppKernelName,
+            gridWidth: mppGridSize.width,
+            maxSequenceLength: maximumSequenceLength,
+            threadgroupSize: mppThreadgroupSize,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier
+        )
+        let dimBase = 1 + 2 * mppPrefixCount
+        var mppBytes: [(index: Int, value: [UInt8])] = [
+            uint32Binding(dimBase, UInt32(sharedInputDimension)),
+        ]
+        for (index, projection) in mppProjections.enumerated() {
+            mppBytes.append(uint32Binding(dimBase + 1 + index, UInt32(projection.outputDimension)))
+        }
+        let mppSeqLenIndex = dimBase + 1 + mppPrefixCount
+        mppBytes.append(uint32Binding(mppSeqLenIndex, UInt32(maximumSequenceLength)))
+        mppBytes.append(uint32Binding(mppSeqLenIndex + 1, UInt32(mppInputRowStride)))
+        steps.append(MetalPrefillStep(
+            pipeline: mppPipeline,
+            gridSize: mppGridSize,
+            threadgroupSize: mppThreadgroupSize,
+            bufferBindings: mppBindings,
+            bytesBindings: mppBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeightTiled(index: mppSeqLenIndex, tileHeight: mTile),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: "compact_mpp::\(mppKernelName)",
+                entryIndex: entry.index,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                bufferAccessPattern: .init(reads: Set(0...mppPrefixCount), writes: Set((mppPrefixCount + 1)...(2 * mppPrefixCount)))
+            ),
+            tileVariants: mppTileVariants
+        ))
+
+        var scatterBytes: [(index: Int, value: [UInt8])] = []
+        for (index, projection) in mppProjections.enumerated() {
+            scatterBytes.append(uint32Binding(2 * mppPrefixCount + index, UInt32(projection.outputDimension)))
+        }
+        let scatterSeqLenIndex = 3 * mppPrefixCount
+        scatterBytes.append(uint32Binding(scatterSeqLenIndex, UInt32(maximumSequenceLength)))
+        scatterBytes.append(uint32Binding(scatterSeqLenIndex + 1, UInt32(slotDimension)))
+        let scatterThreads = min(256, max(scatterPipeline.maxTotalThreadsPerThreadgroup, 1))
+        steps.append(MetalPrefillStep(
+            pipeline: scatterPipeline,
+            gridSize: MTLSize(
+                width: ((mppProjections.map(\.outputDimension).max() ?? 0) + scatterThreads - 1) / scatterThreads,
+                height: maximumSequenceLength,
+                depth: mppPrefixCount
+            ),
+            threadgroupSize: MTLSize(width: scatterThreads, height: 1, depth: 1),
+            bufferBindings: scatterBindings,
+            bytesBindings: scatterBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: scatterSeqLenIndex),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: scatterKernelName,
+                entryIndex: entry.index,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                bufferAccessPattern: .init(reads: Set(0..<mppPrefixCount), writes: Set(mppPrefixCount..<(2 * mppPrefixCount)))
+            )
+        ))
+
+        var tailBindings: [(Int, MTLBuffer, Int)] = [(0, inputBuffer, inputOffset)]
+        var totalTailRows = 0
+        for (index, projection) in tailProjections.enumerated() {
+            let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
+            tailBindings.append((1 + index, weightBuffer, weightOffset))
+        }
+        for (index, projection) in tailProjections.enumerated() {
+            let outputOffset = (firstOutputSlot + mppPrefixCount + index) * scratchSlotSize
+            lastOutputOffset = outputOffset
+            tailBindings.append((1 + tailProjections.count + index, buffers.scratch, outputOffset))
+            totalTailRows += projection.outputDimension
+        }
+        let tailDimBase = 1 + 2 * tailCount
+        var tailBytes: [(index: Int, value: [UInt8])] = [
+            uint32Binding(tailDimBase, UInt32(sharedInputDimension)),
+        ]
+        for (index, projection) in tailProjections.enumerated() {
+            tailBytes.append(uint32Binding(tailDimBase + 1 + index, UInt32(projection.outputDimension)))
+        }
+        let tailSeqLenIndex = tailDimBase + 1 + tailCount
+        tailBytes.append(uint32Binding(tailSeqLenIndex, UInt32(maximumSequenceLength)))
+        tailBytes.append(uint32Binding(tailSeqLenIndex + 1, UInt32(inputRowStride)))
+        tailBytes.append(uint32Binding(tailSeqLenIndex + 2, UInt32(slotDimension)))
+        let tailSimdWidth = max(tailPipeline.threadExecutionWidth, 1)
+        let tailRowsPerThreadgroup = batchedSequenceRowsPerThreadgroup(
+            descriptor: resolveProjectionWeightDescriptor(role: tailProjections[0].field, entry: entry),
+            pipeline: tailPipeline
+        )
+        let tailThreads = min(tailSimdWidth * tailRowsPerThreadgroup, tailPipeline.maxTotalThreadsPerThreadgroup)
+        steps.append(MetalPrefillStep(
+            pipeline: tailPipeline,
+            gridSize: MTLSize(
+                width: (totalTailRows + max(1, tailThreads / tailSimdWidth) - 1) / max(1, tailThreads / tailSimdWidth),
+                height: maximumSequenceLength,
+                depth: 1
+            ),
+            threadgroupSize: MTLSize(width: tailThreads, height: 1, depth: 1),
+            bufferBindings: tailBindings,
+            bytesBindings: tailBytes,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeight(index: tailSeqLenIndex),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: "split_tail::\(tailKernelName)",
+                entryIndex: entry.index,
+                weightTensorName: Self.batchedWeightTensorName(for: batched, entry: entry),
+                bufferAccessPattern: .init(reads: Set(0...tailCount), writes: Set((tailCount + 1)...(2 * tailCount)))
+            )
+        ))
+
+        routingState.lastOutputIsHidden = false
+        routingState.currentInputOffset = lastOutputOffset
+        routingState.projectionIndex = firstOutputSlot + count - 1
+
+        for projection in mppProjections {
+            recordProjectionQuantization(
+                entry: entry,
+                descriptor: resolveProjectionWeightDescriptor(role: projection.field, entry: entry),
+                mode: .batch,
+                inputRowStride: mppInputRowStride,
+                inputDimension: projection.inputDimension,
+                outputDimension: projection.outputDimension,
+                outputRowStride: slotDimension,
+                selectedKernelName: "compact_mpp::\(mppKernelName)",
+                usesMPPForStep: true,
+                usesSequenceGEMVForStep: false,
+                sequenceTileHeight: mTile,
+                tileVariantHeights: mppTileVariants.map(\.tileHeight),
+                projectionCount: mppPrefixCount
+            )
+        }
+        for projection in tailProjections {
+            recordProjectionQuantization(
+                entry: entry,
+                descriptor: resolveProjectionWeightDescriptor(role: projection.field, entry: entry),
+                mode: .batch,
+                inputRowStride: inputRowStride,
+                inputDimension: projection.inputDimension,
+                outputDimension: projection.outputDimension,
+                outputRowStride: slotDimension,
+                selectedKernelName: "split_tail::\(tailKernelName)",
+                usesMPPForStep: false,
+                usesSequenceGEMVForStep: true,
+                projectionCount: tailCount
+            )
+        }
+        return steps
+    }
+
     private mutating func buildBatchedFragmentPrefillSteps(
         _ batch: BatchedFragment,
         entry: DispatchEntry
@@ -3301,6 +3920,170 @@ private struct PrefillStepPlanner {
                 descriptor: variantDescriptor))
         }
         return variants
+    }
+
+    private mutating func buildCompactInputMPPProjectionSteps(
+        projection: LinearFragment,
+        entry: DispatchEntry,
+        descriptor: ProjectionWeightDescriptor,
+        weightResolver: WeightResolver,
+        weightTensorName: String?,
+        inputBuffer: MTLBuffer,
+        inputOffset: Int,
+        inputRowStride: Int,
+        outputBuffer: MTLBuffer,
+        outputOffset: Int,
+        outputRowStride: Int,
+        mode: PrefillStepMode,
+        seqLenValue: UInt32
+    ) throws -> [MetalPrefillStep]? {
+        guard Self.bf16SingleCompactMPPEnabled else { return nil }
+        guard buffers.bufferPrecision.isPrefillSequencePrecision else { return nil }
+        guard mode == .batch else { return nil }
+        guard projection.isOutput,
+              Self.compactMPPOutputProjectionFields.contains(projection.field) else {
+            return nil
+        }
+        guard descriptor.schemeIdentifier == .bf16RowMajor,
+              !descriptor.schemeIdentifier.isWeightQuantized else {
+            return nil
+        }
+        guard inputRowStride >= projection.inputDimension else {
+            return nil
+        }
+        guard outputRowStride == projection.outputDimension else {
+            return nil
+        }
+        guard inputBuffer !== outputBuffer || inputOffset != outputOffset else {
+            return nil
+        }
+        guard let compactProjectionScratch = buffers.compactProjectionScratch else {
+            throw MetalCompilerError.deviceSetupFailed(
+                "Compact-input MPP projection requires compactProjectionScratch"
+            )
+        }
+        let packKernelName = "pack_strided_seq_f32_to_compact"
+        guard let packPipeline = planBuildContext.pipelineCache[packKernelName] else {
+            throw MetalCompilerError.kernelNotFound(packKernelName)
+        }
+        let mppKernelName = "gemm_bf16_f32s"
+        guard let mppPipeline = planBuildContext.pipelineCache[mppKernelName] else {
+            throw MetalCompilerError.kernelNotFound(mppKernelName)
+        }
+
+        var steps: [MetalPrefillStep] = []
+        let mppInputBuffer: MTLBuffer
+        let mppInputOffset: Int
+        let mppInputRowStride: Int
+        if inputRowStride == projection.inputDimension {
+            mppInputBuffer = inputBuffer
+            mppInputOffset = inputOffset
+            mppInputRowStride = inputRowStride
+        } else {
+            let packThreads = min(256, max(packPipeline.maxTotalThreadsPerThreadgroup, 1))
+            steps.append(MetalPrefillStep(
+                pipeline: packPipeline,
+                gridSize: MTLSize(
+                    width: (projection.inputDimension + packThreads - 1) / packThreads,
+                    height: maximumSequenceLength,
+                    depth: 1
+                ),
+                threadgroupSize: MTLSize(width: packThreads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, inputBuffer, inputOffset),
+                    (1, compactProjectionScratch, 0),
+                ],
+                bytesBindings: [
+                    uint32Binding(2, UInt32(projection.inputDimension)),
+                    uint32Binding(3, seqLenValue),
+                    uint32Binding(4, UInt32(inputRowStride)),
+                ],
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                mode: .batch,
+                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 3),
+                positionBufferIndex: nil,
+                perPositionStrides: [:],
+                metadata: .init(
+                    kernelName: packKernelName,
+                    entryIndex: entry.index,
+                    weightTensorName: weightTensorName,
+                    bufferAccessPattern: .init(reads: [0], writes: [1])
+                )
+            ))
+            mppInputBuffer = compactProjectionScratch
+            mppInputOffset = 0
+            mppInputRowStride = projection.inputDimension
+        }
+
+        let (weightBuffer, weightOffset) = weightResolver.resolve(role: projection.field)
+        let mTile = MetalSourceGenerator.mppGEMMDefaultTileSize
+        let paddedMaxSeqLen = ((maximumSequenceLength + mTile - 1) / mTile) * mTile
+        let mppGridSize = MTLSize(
+            width: (projection.outputDimension + 31) / 32,
+            height: paddedMaxSeqLen / mTile,
+            depth: 1
+        )
+        let simdWidth = max(mppPipeline.threadExecutionWidth, 1)
+        let mppThreadgroupSize = MTLSize(
+            width: min(simdWidth * 4, mppPipeline.maxTotalThreadsPerThreadgroup),
+            height: 1,
+            depth: 1
+        )
+        let tileVariants = makeMPPTileVariants(
+            baseKernelName: mppKernelName,
+            gridWidth: mppGridSize.width,
+            maxSequenceLength: maximumSequenceLength,
+            threadgroupSize: mppThreadgroupSize,
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier
+        )
+        let mppStep = MetalPrefillStep(
+            pipeline: mppPipeline,
+            gridSize: mppGridSize,
+            threadgroupSize: mppThreadgroupSize,
+            bufferBindings: [
+                (0, mppInputBuffer, mppInputOffset),
+                (1, weightBuffer, weightOffset),
+                (2, outputBuffer, outputOffset),
+            ],
+            bytesBindings: [
+                uint32Binding(3, UInt32(projection.inputDimension)),
+                uint32Binding(4, UInt32(projection.outputDimension)),
+                uint32Binding(5, seqLenValue),
+                uint32Binding(6, UInt32(mppInputRowStride)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            mode: .batch,
+            sequenceLengthPolicy: .bindAndAdjustGridHeightTiled(index: 5, tileHeight: mTile),
+            positionBufferIndex: nil,
+            perPositionStrides: [:],
+            metadata: .init(
+                kernelName: "compact_mpp::\(mppKernelName)",
+                entryIndex: entry.index,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2])
+            ),
+            tileVariants: tileVariants
+        )
+
+        recordProjectionQuantization(
+            entry: entry,
+            descriptor: descriptor,
+            mode: mode,
+            inputRowStride: mppInputRowStride,
+            inputDimension: projection.inputDimension,
+            outputDimension: projection.outputDimension,
+            outputRowStride: outputRowStride,
+            selectedKernelName: "compact_mpp::\(mppKernelName)",
+            usesMPPForStep: true,
+            usesSequenceGEMVForStep: false,
+            sequenceTileHeight: mTile,
+            tileVariantHeights: tileVariants.map(\.tileHeight)
+        )
+        steps.append(mppStep)
+        return steps
     }
 
     /// Build a single batched MPP GEMM step for BF16/FP16/FP32 dense weights.

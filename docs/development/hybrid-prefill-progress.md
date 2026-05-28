@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-19
+Last updated: 2026-05-20
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -346,6 +346,14 @@ flowchart TD
 | 2026-05-16 | `ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` and `SWIFTLM_VALIDATE_QWEN_ROUTE_READINESS_ARTIFACTS=1 .../currentRouteReadinessArtifactsCanBeReconstructedWhenRequested` | Pass; Qwen full-profile route gate now records SSM recurrence routes. Current artifacts show `ssm_recurrence_seq_bf16_f32` as `baseline-route-preserved`, and all SSM default-promotion candidates remain rejected by microbench evidence |
 | 2026-05-18 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --timeout 120` | Pass; validates the synthetic route-readiness reconstruction contract and the current local Qwen route-readiness artifact set, then writes `.test-artifacts/qwen-route-readiness-validation/<timestamp>/summary.csv` plus per-gate logs |
 | 2026-05-18 | `scripts/benchmarks/run-prefill-artifact-validation.sh --timeout 120` | Pass; parent wrapper validates SSM artifact gates and Qwen route-readiness gates, then writes `.test-artifacts/prefill-artifact-validation/<timestamp>/summary.csv` with child log links |
+| 2026-05-20 | `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1 SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1 ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; explicit compact MPP route-activation gate plus schema v6 HF reference, block boundaries, states, KV, final logits, and decode0 all remain green under the opt-in aggressive route |
+| 2026-05-20 | `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1 SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1 ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; extended compact MPP route now covers `mlp.down_proj`, `self_attn.o_proj`, and `linear_attn.out_proj`, reducing Qwen seqLen 64/128 total GPU prefill to 49.260/86.125 ms |
+| 2026-05-20 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --baseline-dir .test-artifacts/prefill-profile-baseline --experimental-dir .test-artifacts/prefill-profile-observed` | Pass; reconstructs speed, 50% target, and readiness artifacts. The compact MPP route clears the 50% target but is rejected for default promotion by `reject-production-precision-contract` |
+| 2026-05-21 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMStateRecurrencePhaseMatchesCPUReference` | Pass; added harness-only state-loop and RMS/gate phase candidates while keeping production SSM routing unchanged |
+| 2026-05-21 | `swift test --filter SSMRecurrenceMicrobenchmarkTests/bf16SSMRecurrencePhaseIsolationMicrobench` | Pass; phase harness records parallel-state and parallel-RMS candidates, including RMS/gate 3.559 ms -> 0.443 ms at seqLen 128 |
+| 2026-05-21 | `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1 SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1 ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35ReferenceComparisonTests` | Pass; compact MPP route remains schema v6 reference-equivalent after rejecting the production RMS-parallel route experiment |
+| 2026-05-21 | `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1 SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1 ENABLE_METAL_PROBES=1 swift test -Xswiftc -DENABLE_METAL_PROBES --filter Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | Pass; compact route re-run measures seqLen 16/64/128 at 17.655/41.968/73.364 ms, with SSM recurrence now 64.8% of seqLen 128 |
+| 2026-05-21 | `scripts/benchmarks/run-qwen-route-readiness-validation.sh --baseline-dir .test-artifacts/prefill-profile-baseline --experimental-dir .test-artifacts/prefill-profile-observed` | Pass; route readiness summary written to `.test-artifacts/qwen-route-readiness-validation/20260520T151151Z/summary.csv`, target gate remains `full-profile-target-observed` and default promotion remains rejected by precision contract |
 
 ## Failed Experiments
 
@@ -370,6 +378,7 @@ flowchart TD
 | Opt-in row-grid recurrent fan-in route | Correctness passed and dispatch count dropped at seqLen 128, but Qwen seqLen 16/64/128 profile measured 46.748/168.406/332.700 ms, slower than the current default production route | Keep behind `SWIFTLM_PREFILL_BF16_RECURRENT_BLOCK_ROW_GRID_FAN_IN=1`; do not default. The row-grid projection itself costs 29.038 ms at seqLen 128, more than the removed out-proj GEMVs and round bridges save |
 | Initial row-grid fan-in group-loop dataflow | Correctness passed, but the same-shape probe showed pre-rounded `gemv_seq` about 2x faster than decode-rounded row-grid fan-in because the kernel reloaded and synchronized each recurrent group separately | Fixed by staging the full recurrent output tile once per row/token owner. Keep the lesson: dispatch fusion must preserve input-tile reuse, not only row-grid ownership |
 | Opt-in q/k parallel-reduction SSM recurrence | Correctness passed, but same-build Qwen profile changed seqLen 16/64/128 from 44.713/159.880/315.780 ms to 45.764/160.697/319.761 ms | Keep behind `SWIFTLM_PREFILL_SSM_QKPAR=1`; do not default. The phase-level win does not survive full sequence-kernel barriers and threadgroup-memory traffic |
+| Harness-only parallel RMS/gate phase | Synthetic phase timing improves the RMS/gate subphase, but the attempted full production route regressed compact-route profile from 72.798 ms to 86.133-101.849 ms at seqLen 128 | Production route removed. Keep the phase harness only as negative evidence; the next SSM route must reduce fused-kernel barriers/state traffic, not just replace the local RMS reduction |
 | Phase-only `state_recurrence_cache32` | CPU reference passed and modeled device state traffic drops from 3.0 to 2.0 MiB/token, but phase timing regressed to 330.5%/217.4%/263.9% of baseline state-phase time for seqLen 16/64/128 in the latest run | Rejected. Do not reduce device traffic by serializing value lanes into small tiles; any cache/staging design must preserve 128 active value lanes |
 | Phase-only `state_recurrence_cache64` attempt | Pipeline creation failed before timing because the static threadgroup allocation was 34,316 bytes, above the 32,768-byte AGX threadgroup-memory limit | Rejected and not kept as a runnable harness variant |
 
@@ -2562,14 +2571,20 @@ flowchart LR
 | `observedProfileRouteGate` | Must equal the route's required profile gate |
 | `requiredProfileThreadgroupWidth` | When non-empty, the full-profile route gate must expose the same `threadgroupWidth` |
 | `observedProfileThreadgroupWidth` | Published by the full-profile route gate so same-kernel geometry changes can be admitted or rejected |
+| `observedPrecisionContract` | Must be `decode-equivalent` for default production promotion |
 | Missing profile route | Reject as `reject-missing-full-profile-route` |
 | Missing required threadgroup width | Reject as `reject-full-profile-threadgroup-not-observed` |
 | Missing production sequence | Reject as `reject-full-profile-missing-production-sequence` |
 | Baseline preserved when an experimental route was required | Reject as `reject-full-profile-route-not-observed` |
+| MPP precision route observed | Reject as `reject-production-precision-contract` until a production MPP contract is explicitly accepted |
 | `requires-full-profile-speed-gate` prerequisite | Requires `observedProfileSpeedGate == full-profile-speedup-observed` and `observedProfileSpeedMinimumPercent >= 10.0` |
 | Missing full-profile speed artifact | Reject as `reject-missing-full-profile-speed-gate` |
 | Full-profile regression | Reject as `reject-full-profile-speed-gate-not-observed` |
 | Stale or too-low full-profile speed threshold | Reject as `reject-full-profile-speed-gate-threshold` |
+| `requires-full-profile-target-gate` prerequisite | Requires `observedProfileTargetGate == full-profile-target-observed` and `observedProfileTargetReductionPercent >= 50.0` |
+| Missing 50% target artifact | Reject as `reject-missing-full-profile-target-gate` |
+| 50% target miss | Reject as `reject-full-profile-target-gate-not-observed` |
+| Stale or too-low target threshold | Reject as `reject-full-profile-target-gate-threshold` |
 
 Current decision: future projection experiments must pass this readiness layer
 before moving to route-default discussion. A microbench win alone does not
@@ -2598,6 +2613,23 @@ threshold. The default threshold is now **10% total prefill improvement**. This
 prevents a route from being promoted because a narrow kernel or microbench
 improved while the full Qwen profile regressed or only improved marginally.
 
+For the next milestone, the readiness harness also has a separate absolute
+target gate for the **50% total prefill reduction** goal. This gate compares the
+current observed full-profile totals against a persisted baseline and requires
+seqLen `64` and `128` to be at or below half of that baseline. It is stricter
+than the 10% route-promotion gate and is intended for milestone closure, not
+for small route experiments.
+
+```mermaid
+flowchart LR
+  A["baseline full profile 64/128"] --> C["50% target gate"]
+  B["observed full profile 64/128"] --> C
+  C --> D{"observed <= baseline * 0.5?"}
+  D -->|"yes"| E["full-profile-target-observed"]
+  D -->|"no"| F["full-profile-target-missed"]
+  D -->|"missing length"| G["missing-production-sequence"]
+```
+
 Persisted profile runs can generate the speed gate with:
 
 ```bash
@@ -2605,6 +2637,15 @@ scripts/benchmarks/compare-qwen35-prefill-speed-gate.py \
   --baseline-dir .test-artifacts/prefill-profile-baseline \
   --experimental-dir .test-artifacts/prefill-profile-row-grid \
   --output .test-artifacts/prefill-profile/qwen35-prefill-full-profile-speed-gate.csv
+```
+
+Persisted profile runs can generate the 50% target gate with:
+
+```bash
+scripts/benchmarks/compare-qwen35-prefill-target-gate.py \
+  --baseline-dir .test-artifacts/prefill-profile-baseline \
+  --observed-dir .test-artifacts/prefill-profile-current \
+  --output .test-artifacts/prefill-profile/qwen35-prefill-50pct-target-gate.csv
 ```
 
 Both input directories must contain `qwen35-prefill-steps-seq64.csv` and
@@ -2660,7 +2701,7 @@ The wrapper records a timestamped result bundle under
 `.test-artifacts/qwen-route-readiness-validation/<timestamp>/`, including a
 `summary.csv` and one log per focused gate. If persisted baseline and
 experimental full-profile directories are available, the same wrapper can first
-generate the full-profile speed gate:
+generate both the 10% full-profile speed gate and the 50% target gate:
 
 ```bash
 scripts/benchmarks/run-qwen-route-readiness-validation.sh \
@@ -2671,10 +2712,278 @@ scripts/benchmarks/run-qwen-route-readiness-validation.sh \
 This gate is intentionally not enabled by default because `.test-artifacts`
 are generated by separate heavy probes. When enabled, it requires the current
 route-promotion CSVs and full-profile route gate to exist, consumes the
-full-profile speed gate when present, reconstructs
-`qwen35-prefill-route-readiness.csv`, and fails if route-promotion roles are
-stale aggregate buckets instead of the exact full-profile route keys.
+full-profile speed gate and 50% target gate when present, reconstructs
+`qwen35-prefill-route-readiness.csv`, and fails if route-promotion roles are stale
+aggregate buckets instead of the exact full-profile route keys.
 
 Synthetic route-admission contract tests must not write to the production
 artifact directory. They use temporary directories so current `.test-artifacts`
 remain a product of the real microbench/profile probes only.
+
+### 50% Target M1: Projection GEMM Feasibility (2026-05-20)
+
+M1 starts the 50% reduction path by making the projection GEMM blocker
+machine-readable. The current Qwen hybrid path cannot simply route the dominant
+BF16 sequence projections to the existing MPP GEMM kernels, even though MPP is
+the right math family for prefill. The blocker is layout, not just routing:
+
+```mermaid
+flowchart LR
+  A["Qwen scratch slot layout"] --> B{"MPP tensor_inline contiguous?"}
+  B -->|"no"| C["blocked by stride"]
+  C --> D["compact layout or strided MPP support"]
+  D --> E["reference-gated route experiment"]
+```
+
+The profile harness now writes:
+
+```text
+.test-artifacts/prefill-profile/qwen35-prefill-projection-gemm-feasibility.csv
+```
+
+The artifact groups BF16 sequence projection time across production sequence
+lengths and records why each group cannot yet use MPP GEMM:
+
+| Projection group | Current blocker | Required implementation |
+|---|---|---|
+| `batched_projection` (`mlp.gate_up`, `self_attn.qkv`, `linear_attn.in_proj`) | `scratch-output-stride-mismatch` | `compact-output-layout-or-strided-mpp-output` |
+| `single_projection` (`mlp.down_proj`, `self_attn.o_proj`, `linear_attn.out_proj`) | `scratch-input-stride-mismatch` | `compact-input-layout-or-strided-mpp-input` |
+
+This prevents a false route experiment where the planner force-enables MPP but
+feeds it strided scratch storage that the MPP kernel treats as contiguous. The
+next implementation should pick one of two explicit paths:
+
+| Path | Benefit | Risk |
+|---|---|---|
+| Compact producer/consumer layout | Enables existing MPP kernels with minimal MPP source change | Requires scratch layout ownership changes across adjacent ops |
+| Strided MPP kernel family | Keeps current scratch layout stable | Requires new MPP source generation and reference tests for padded input/output strides |
+
+Current recommendation: start with a **strided MPP reference harness** before
+changing runtime layout. If MPP cannot support the needed stride contract
+efficiently, use compact layout only inside larger block-fusion windows so the
+extra copy does not erase the GEMM win.
+
+The first compact-input lower-bound harness is now in
+`PrefillGEMMMicrobenchmarkTests/mppGEMMCompactInputBridgeSmokeBenchmark`. It
+packs a strided Qwen `mlp.down_proj`-like input (`inputDimension=3584`,
+`inputRowStride=8192`) into compact sequence storage, then runs the existing MPP
+GEMM kernel.
+
+```mermaid
+flowchart LR
+  A["strided scratch input"] --> B["pack to compact"]
+  B --> C["MPP GEMM"]
+  C --> D["compact output"]
+```
+
+Latest local lower-bound result:
+
+| seqLen | Compact MPP | Pack + MPP | Pack overhead |
+|---:|---:|---:|---:|
+| 64 | 0.459 ms | 0.458 ms | -0.2% |
+| 128 | 0.488 ms | 0.490 ms | +0.3% |
+
+The comparable current full-profile `mlp.down_proj` sequence GEMV at seqLen 128
+is about `46.770 ms / 24 = 1.949 ms` per dispatch. This does not prove route
+correctness yet, but it strongly suggests compact staging is not the bottleneck
+and that M2 should implement a correctness-gated compact-layout route for
+dependent BF16 projections before attempting a broader scratch-layout rewrite.
+
+### 50% Target M2: Compact-Input MPP Route Experiment (2026-05-20)
+
+M2 implemented the first real planner route for the M1 blocker:
+`SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1` admits Qwen-style
+`mlp.down_proj` BF16 sequence projections into a two-step path:
+
+```mermaid
+flowchart LR
+  A["strided scratch SwiGLU output"] --> B["pack_strided_seq_f32_to_compact"]
+  B --> C["compact_mpp::gemm_bf16_f32s"]
+  C --> D["hidden output"]
+```
+
+The default route remains unchanged. The compact route is opt-in because it
+uses MPP accumulation and therefore does not preserve the strict
+decode-equivalent activation trace contract.
+
+Local profile evidence with the flag enabled:
+
+| seqLen | Default profile | Compact MPP profile | Improvement |
+|---:|---:|---:|---:|
+| 64 | 139.481 ms | 119.063 ms | 14.6% |
+| 128 | 267.087 ms | 224.145 ms | 16.1% |
+
+Kernel-level evidence at seqLen 128:
+
+| Route | Dispatches | Total kernel time |
+|---|---:|---:|
+| default `mlp.down_proj` sequence GEMV | 24 | 46.452 ms |
+| compact MPP `mlp.down_proj` | 24 pack + 24 MPP | 3.100 ms (`2.964 ms` MPP + `0.136 ms` pack) |
+
+Correctness status:
+
+| Gate | Flag | Result | Interpretation |
+|---|---|---|---|
+| `Qwen35ReferenceComparisonTests` | ON | pass | HF schema v6 reference, states, logits, decode0 remain within current tolerance |
+| `Qwen35PromptIngestionTests` | OFF | pass | default production path remains valid |
+| `Qwen35PromptIngestionTests` | ON | fail | activation trace drift reaches `0.0625` against a `0.05` decode-equivalence gate |
+| `MetalSourceGeneratorTests/packStridedSequenceInputPlusMPPGEMMMatchesCPUReference` | n/a | pass | pack layout plus compact MPP math matches CPU reference within MPP tolerance |
+
+Decision: keep `SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP` experimental and do not
+promote it to default. It is the strongest speed lever observed so far, but the
+current production contract requires decode-equivalent activation trace parity,
+not just HF token/reference parity. The next production-safe route must either:
+
+1. define an explicit MPP-precision production contract and update gates
+   intentionally, or
+2. build a faster sequence kernel that keeps the decode-equivalent reduction
+   contract.
+
+### 50% Target M2b: Compact Batched MPP and Split-Tail Route (2026-05-20)
+
+M2b extends the compact-layout experiment from `mlp.down_proj` to the dominant
+batched BF16 prefill projections and the remaining dependent output
+projections (`self_attn.o_proj`, `linear_attn.out_proj`):
+
+```mermaid
+flowchart LR
+  A["strided hidden/scratch input"] --> B{"projection shape"}
+  B -->|"all outputs MPP-tiled"| C["compact batched MPP"]
+  B -->|"leading output MPP-tiled only"| D["leading compact MPP + sequence tail"]
+  C --> E["scatter compact outputs to scratch slots"]
+  D --> E
+  E --> F["existing downstream sequence kernels"]
+```
+
+The route is guarded by:
+
+```bash
+SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP=1
+SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP=1
+```
+
+The default route remains unchanged. The new route adds compact projection
+scratch allocation only when one of those flags is enabled, so production memory
+footprint is unchanged with flags off.
+
+Latest local full-profile target gate after extending the split route to keep
+`qkv + z` on compact MPP and only `beta + alpha` on sequence GEMV:
+
+| seqLen | Baseline total GPU | Compact route total GPU | Reduction | Gate |
+|---:|---:|---:|---:|---|
+| 64 | 137.603 ms | 41.968 ms | 69.5% | pass |
+| 128 | 265.439 ms | 73.364 ms | 72.4% | pass |
+
+The generated artifact records:
+
+```text
+.test-artifacts/prefill-profile/qwen35-prefill-50pct-target-gate.csv
+profileTargetGate = full-profile-target-observed
+```
+
+Route readiness also reconstructs from the artifact CSVs:
+
+```text
+.test-artifacts/qwen-route-readiness-validation/20260520T151151Z/summary.csv
+```
+
+Correctness status for the compact route:
+
+| Gate | Result | Notes |
+|---|---|---|
+| `MetalSourceGeneratorTests/scatterCompactSequenceOutputsToStridedSlotsMatchesCPUReference` | pass | Covers count 1 and 3 scatter paths |
+| `Qwen35ReferenceComparisonTests` | pass | Schema v6, block boundaries, states, logits, decode0 |
+| `Qwen35ReferenceComparisonTests/compactMPPAggressiveRouteIsExplicitWhenRequested` | pass | Verifies compact MPP, split-tail, and scatter kernels are present, including `mlp.down_proj`, `self_attn.o_proj`, and `linear_attn.out_proj` single-output projections |
+| `Qwen35PrefillProfileTests/perStepPrefillTimingByLength` | pass | Route observed at seqLen 16/64/128 |
+| Route readiness wrapper | pass | Rebuilds speed, target, and readiness artifacts |
+
+Important caveat: this is still an **experimental MPP-precision route**, not a
+default production promotion. The HF reference gates pass under the current
+reference tolerances, but the stricter decode-equivalent activation trace gate
+is not the contract used to promote this route. Promotion requires an explicit
+decision to accept the MPP-precision contract or a future route that keeps the
+decode-equivalent reduction order.
+
+The route-readiness artifact now carries this distinction in machine-readable
+form. `qwen35-prefill-route-gate.csv` publishes `precisionContract`, and
+`qwen35-prefill-route-readiness.csv` publishes `observedPrecisionContract`.
+Even when the 50% target gate is observed, any route with
+`mpp-reference-equivalent` is rejected for default production promotion as
+`reject-production-precision-contract`. Observed MPP routes that do not have a
+matching microbench promotion row are still emitted as
+`profile-observed-only`, so the readiness CSV cannot hide an active
+non-default precision route. This keeps the fast route available for explicit
+experiments without silently changing the production correctness contract.
+
+Remaining profile bottlenecks with the compact route enabled:
+
+| Category | seqLen 128 total | Share | Next lever |
+|---|---:|---:|---|
+| SSM recurrence | 47.512 ms | 64.8% | state-loop algorithm, chunk/scan, or lower-state-traffic design |
+| Projection | 15.216 ms | 20.7% | output-head cost and MPP precision-contract decision |
+| Attention | 3.863 ms | 5.3% | not the immediate bottleneck |
+
+The route now removes the largest remaining dependent single-projection cost:
+`linear_attn.out_proj` falls to `1.293 ms` total at seqLen 128, and
+`self_attn.o_proj` falls to `0.429 ms`. The dominant remaining projection is the
+split-tail `linear_attn.in_proj` tail (`14.077 ms`) because only the leading
+`qkv` projection is MPP-tiled while `z/beta/alpha` still use sequence GEMV.
+
+The split-tail route has since been tightened: `linear_attn.in_proj` now sends
+the MPP-tiled `qkv` and `z` outputs through `compact_mpp::batched_gemm_bf16_f32s_2`
+and leaves only the narrow `beta + alpha` outputs on
+`split_tail::batched_gemv2_seq_bf16_f32s`.
+
+| Route | seqLen 128 total | Dispatches | Interpretation |
+|---|---:|---:|---|
+| `compact_mpp::batched_gemm_bf16_f32s_2` for `linear_attn.in_proj` | 5.578 ms | 18 | `qkv + z` compact MPP path |
+| `split_tail::batched_gemv2_seq_bf16_f32s` for `linear_attn.in_proj` | 0.317 ms | 18 | residual `beta + alpha` tail |
+
+This removes the previous 14 ms tail as a primary bottleneck. The remaining
+dominant cost is now the SSM recurrence state loop, which means additional
+10%+ gains require changing recurrence execution rather than more projection
+route reshuffling.
+
+### 50% Target M2c: Rejected SSM RMS Parallel-Reduction Route (2026-05-21)
+
+After compact MPP removed projection as the dominant cost, the next experiment
+looked at the SSM recurrence RMS/gate subphase. The phase harness now includes
+two additional classes of candidates:
+
+```mermaid
+flowchart LR
+  A["state recurrence phase"] --> B["parallel-state layout candidates"]
+  C["RMS/gate phase"] --> D["parallel RMS reduction candidate"]
+  D --> E{"full fused kernel faster?"}
+  E -->|"no"| F["production route removed"]
+  E -->|"yes"| G["eligible for reference/profile gates"]
+```
+
+Synthetic phase evidence:
+
+| Candidate | seqLen 128 phase result | Decision |
+|---|---:|---|
+| `state_recurrence_parallel_state` | 1.686 ms | no full-route change; existing parallel-state kernel already wins the current production sweep |
+| `state_recurrence_parallel_state_transposed` | 3.226 ms | reject; transposed state layout is slower in the phase harness |
+| `rms_gate_parallel_reduce` | 0.443 ms versus 3.559 ms for the scalar RMS/gate phase | keep as harness evidence only |
+
+The attempted production SSM route using the parallel RMS/gate idea passed Qwen
+schema v6 reference comparison, but it regressed the compact-route full profile:
+
+| Route | seqLen 128 total | Decision |
+|---|---:|---|
+| compact MPP route without production RMS-parallel SSM | 72.798-73.364 ms | current best opt-in profile route |
+| compact MPP route with production RMS-parallel SSM | 86.133-101.849 ms | reject and remove production route |
+
+Decision: do not keep an opt-in production flag for this route. A phase-only
+RMS win is erased by the fused sequence kernel's added synchronization,
+occupancy, or state-memory behavior. The useful result is the negative gate:
+future SSM improvements must prove full-kernel and full-model wins, not only a
+subphase win.
+
+This changes the next milestone: the 50% total prefill reduction target is now
+observed behind flags, and the immediate remaining bottleneck is the SSM state
+loop. The next production-readiness step is not more projection routing; it is
+deciding the compact MPP precision contract and designing a state-loop route
+that reduces state traffic or synchronization while passing full reference and
+profile gates.

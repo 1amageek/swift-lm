@@ -374,6 +374,10 @@ public struct PrefillBufferSet: @unchecked Sendable {
     /// Nil when no quantized weight dequantization is needed (e.g., BF16 or FP16 models).
     public let dequantScratch: MTLBuffer?
 
+    /// Scratch buffer for staging strided sequence projection inputs into the
+    /// compact row-major layout required by MPP matmul2d.
+    public let compactProjectionScratch: MTLBuffer?
+
     /// Shared buffer for runtime constants (sequenceLength, positions, etc.)
     /// that replace `setBytes()` calls in Metal 4 prefill encoding.
     ///
@@ -401,6 +405,7 @@ public struct PrefillBufferSet: @unchecked Sendable {
             tokenIDs, positions, ropePositionAxes, tokenOut, runtimeConstantBuffer,
         ]
         if let dequantScratch { buffers.append(dequantScratch) }
+        if let compactProjectionScratch { buffers.append(compactProjectionScratch) }
         if let ssmConvDebug { buffers.append(ssmConvDebug) }
         if let convState { buffers.append(convState) }
         if let recurrentState { buffers.append(recurrentState) }

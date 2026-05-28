@@ -263,6 +263,20 @@ struct MetalBufferAllocator {
             ssmConvDebugBuffer = nil
         }
 
+        let compactProjectionScratchSlots = Self.compactProjectionScratchSlotCount()
+        let compactProjectionScratchBuffer: MTLBuffer?
+        if compactProjectionScratchSlots > 0 {
+            compactProjectionScratchBuffer = context.device.makeBuffer(
+                length: maximumSequenceLength
+                    * slotDimension
+                    * compactProjectionScratchSlots
+                    * f32ElementSize,
+                options: gpuOnlyOptions
+            )
+        } else {
+            compactProjectionScratchBuffer = nil
+        }
+
         let bufferSet = PrefillBufferSet(
             bufferPrecision: .float32,
             hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: cpuGpuOptions)!,
@@ -300,6 +314,7 @@ struct MetalBufferAllocator {
             tokenOut: context.device.makeBuffer(length: 4, options: [.storageModeShared])!,
             ssmConvDebug: ssmConvDebugBuffer,
             dequantScratch: dequantScratchBuffer,
+            compactProjectionScratch: compactProjectionScratchBuffer,
             runtimeConstantBuffer: context.device.makeBuffer(
                 length: PrefillBufferSet.runtimeConstantBufferSize(maximumSequenceLength: maximumSequenceLength),
                 options: [.storageModeShared]
@@ -313,6 +328,20 @@ struct MetalBufferAllocator {
             resolvedVocabSize: resolvedVocabSize,
             maximumSequenceLength: maximumSequenceLength
         )
+    }
+
+    private static func compactProjectionScratchSlotCount() -> Int {
+        let environment = ProcessInfo.processInfo.environment
+        let batchedEnabled = environment["SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP"].map(Self.isEnabled) ?? false
+        if batchedEnabled {
+            return 5
+        }
+        let singleEnabled = environment["SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP"].map(Self.isEnabled) ?? false
+        return singleEnabled ? 1 : 0
+    }
+
+    private static func isEnabled(_ value: String) -> Bool {
+        value == "1" || value.lowercased() == "true"
     }
 
     private func maximumScratchProjectionDimension(in entries: [DispatchEntry]) -> Int {

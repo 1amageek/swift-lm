@@ -181,6 +181,234 @@ struct MetalSourceGeneratorTests {
         #expect(maxError < 0.01, "MPP GEMM drifted: maxError=\(maxError)")
     }
 
+    @Test("Pack strided sequence input plus MPP GEMM matches CPU reference")
+    func packStridedSequenceInputPlusMPPGEMMMatchesCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        let inputDimension = 64
+        let inputRowStride = 96
+        let outputDimension = 64
+        let sequenceLength = 5
+        let mTile = 64
+
+        var stridedInput = (0..<(sequenceLength * inputRowStride)).map {
+            Float((($0 * 5) % 17) - 8) * 0.0625
+        }
+        var compactInput = [Float](repeating: .zero, count: inputDimension * sequenceLength)
+        var weight = (0..<(outputDimension * inputDimension)).map {
+            BFloat16(Float((($0 * 3) % 13) - 6) * 0.125)
+        }
+        var output = [Float](repeating: .zero, count: outputDimension * sequenceLength)
+
+        let stridedInputBuffer = try #require(device.makeBuffer(
+            bytes: &stridedInput,
+            length: stridedInput.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let compactInputBuffer = try #require(device.makeBuffer(
+            bytes: &compactInput,
+            length: compactInput.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: &weight,
+            length: weight.count * MemoryLayout<BFloat16>.size,
+            options: .storageModeShared
+        ))
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.size,
+            options: .storageModeShared
+        ))
+
+        let packKernelName = "test_pack_strided_seq_f32_to_compact"
+        let mppKernelName = "test_mpp_gemm_bf16_f32s_compact_input"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generatePackStridedSequenceInputToCompact(
+                name: packKernelName,
+                bufferPrecision: .float32
+            ) + "\n\n"
+            + MetalSourceGenerator.generateMPPGEMM(
+                name: mppKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                mTile: mTile
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let packPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: packKernelName))
+        )
+        let mppPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: mppKernelName))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+
+        var inDim = UInt32(inputDimension)
+        var seqLen = UInt32(sequenceLength)
+        var inStride = UInt32(inputRowStride)
+        encoder.setComputePipelineState(packPipeline)
+        encoder.setBuffer(stridedInputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(compactInputBuffer, offset: 0, index: 1)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 2)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&inStride, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (inputDimension + 255) / 256, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+
+        var outDim = UInt32(outputDimension)
+        var compactStride = UInt32(inputDimension)
+        encoder.setComputePipelineState(mppPipeline)
+        encoder.setBuffer(compactInputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        encoder.setBytes(&inDim, length: MemoryLayout<UInt32>.size, index: 3)
+        encoder.setBytes(&outDim, length: MemoryLayout<UInt32>.size, index: 4)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 5)
+        encoder.setBytes(&compactStride, length: MemoryLayout<UInt32>.size, index: 6)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + 31) / 32, height: (sequenceLength + mTile - 1) / mTile, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(mppPipeline.threadExecutionWidth * 4, mppPipeline.maxTotalThreadsPerThreadgroup),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        let result = outputBuffer.contents().bindMemory(to: Float.self, capacity: output.count)
+        var expected = [Float](repeating: .zero, count: output.count)
+        for seq in 0..<sequenceLength {
+            for row in 0..<outputDimension {
+                var sum: Float = 0
+                for column in 0..<inputDimension {
+                    sum += stridedInput[seq * inputRowStride + column]
+                        * Float(weight[row * inputDimension + column])
+                }
+                expected[seq * outputDimension + row] = sum
+            }
+        }
+
+        let actual = (0..<output.count).map { result[$0] }
+        let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+            max(partial, abs(pair.0 - pair.1))
+        }
+        #expect(maxError < 0.01, "Pack+MPP GEMM drifted: maxError=\(maxError)")
+    }
+
+    @Test("Scatter compact sequence outputs to strided slots matches CPU reference")
+    func scatterCompactSequenceOutputsToStridedSlotsMatchesCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        for count in [1, 3] {
+            try runScatterCompactSequenceOutputsReferenceTest(device: device, count: count)
+        }
+    }
+
+    private func runScatterCompactSequenceOutputsReferenceTest(device: MTLDevice, count: Int) throws {
+        let sequenceLength = 5
+        let outputDimensions = Array([32, 64, 96, 128].prefix(count))
+        let outputRowStride = 128
+        let compactInputs = outputDimensions.enumerated().map { projection, dimension in
+            (0..<(sequenceLength * dimension)).map {
+                Float(projection * 1000 + $0) * 0.03125
+            }
+        }
+        var stridedOutputs = (0..<count).map { _ in
+            [Float](repeating: -777, count: sequenceLength * outputRowStride)
+        }
+
+        let inputBuffers = try compactInputs.map { input in
+            var mutable = input
+            return try #require(device.makeBuffer(
+                bytes: &mutable,
+                length: mutable.count * MemoryLayout<Float>.size,
+                options: .storageModeShared
+            ))
+        }
+        let outputBuffers = try stridedOutputs.indices.map { index in
+            device.makeBuffer(
+                bytes: &stridedOutputs[index],
+                length: stridedOutputs[index].count * MemoryLayout<Float>.size,
+                options: .storageModeShared
+            )
+        }.map { try #require($0) }
+
+        let kernelName = "test_scatter_compact_seq_outputs\(count)_to_strided"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateScatterCompactSequenceOutputsToStridedSlots(
+                name: kernelName,
+                count: count,
+                bufferPrecision: .float32
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        for index in 0..<count {
+            encoder.setBuffer(inputBuffers[index], offset: 0, index: index)
+            encoder.setBuffer(outputBuffers[index], offset: 0, index: count + index)
+        }
+        var dims = outputDimensions.map(UInt32.init)
+        for index in 0..<count {
+            encoder.setBytes(&dims[index], length: MemoryLayout<UInt32>.size, index: 2 * count + index)
+        }
+        var seqLen = UInt32(sequenceLength)
+        var stride = UInt32(outputRowStride)
+        encoder.setBytes(&seqLen, length: MemoryLayout<UInt32>.size, index: 3 * count)
+        encoder.setBytes(&stride, length: MemoryLayout<UInt32>.size, index: 3 * count + 1)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputRowStride + 255) / 256, height: sequenceLength, depth: count),
+            threadsPerThreadgroup: MTLSize(width: 256, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        for projection in 0..<count {
+            let result = outputBuffers[projection].contents().bindMemory(
+                to: Float.self,
+                capacity: sequenceLength * outputRowStride
+            )
+            for seq in 0..<sequenceLength {
+                for column in 0..<outputRowStride {
+                    let actual = result[seq * outputRowStride + column]
+                    if column < outputDimensions[projection] {
+                        let expected = compactInputs[projection][seq * outputDimensions[projection] + column]
+                        #expect(actual == expected)
+                    } else {
+                        #expect(actual == -777)
+                    }
+                }
+            }
+        }
+    }
+
     @Test("Q3 dequant then MPP GEMM matches CPU reference for all group sizes")
     func q3DequantThenMPPGEMMMatchesCPUReferenceForAllGroupSizes() throws {
         guard let device = MTLCreateSystemDefaultDevice() else {

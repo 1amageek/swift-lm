@@ -94,6 +94,7 @@ struct TextEmbeddingContainerIsolationTests {
             tokenOut: try requiredSharedBuffer(device, length: 4),
             ssmConvDebug: nil,
             dequantScratch: nil,
+            compactProjectionScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )
     }

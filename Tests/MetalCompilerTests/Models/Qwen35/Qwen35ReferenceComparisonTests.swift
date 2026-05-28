@@ -126,6 +126,52 @@ struct Qwen35ReferenceComparisonTests {
         }
     }
 
+    @Test("Compact MPP aggressive route is explicit when requested")
+    func compactMPPAggressiveRouteIsExplicitWhenRequested() throws {
+        guard Self.compactMPPAggressiveRouteRequested() else {
+            print("[Qwen35Ref] compact MPP route check skipped; enable both compact MPP prefill flags")
+            return
+        }
+
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+        BenchmarkSupport.settleGPU()
+
+        let env = try Self.setupOrSkip()
+        let prefillPlan = try #require(env.model.prefillPlan)
+        let kernelNames = prefillPlan.steps.map { step in
+            step.metadata.kernelName ?? step.pipeline.label ?? ""
+        }
+        func hasCompactMPPWeight(_ tensorSuffix: String) -> Bool {
+            prefillPlan.steps.contains { step in
+                let kernelName = step.metadata.kernelName ?? step.pipeline.label ?? ""
+                let weightTensorName = step.metadata.weightTensorName ?? ""
+                return kernelName.hasPrefix("compact_mpp::")
+                    && weightTensorName.contains(tensorSuffix)
+            }
+        }
+
+        #expect(
+            kernelNames.contains { $0.hasPrefix("compact_mpp::batched_gemm") },
+            "Batched compact MPP route did not appear in Qwen35 prefill plan"
+        )
+        #expect(
+            kernelNames.contains { $0.hasPrefix("compact_mpp::gemm") },
+            "Single compact MPP route did not appear in Qwen35 prefill plan"
+        )
+        #expect(
+            kernelNames.contains { $0.hasPrefix("split_tail::batched_gemv") },
+            "Split-tail route did not appear in Qwen35 prefill plan"
+        )
+        #expect(
+            kernelNames.contains { $0.hasPrefix("scatter_compact_seq_outputs") },
+            "Compact scatter route did not appear in Qwen35 prefill plan"
+        )
+        #expect(hasCompactMPPWeight("mlp.down_proj.weight"))
+        #expect(hasCompactMPPWeight("self_attn.o_proj.weight"))
+        #expect(hasCompactMPPWeight("linear_attn.out_proj.weight"))
+    }
+
     @Test("Prefill linear-attention block boundaries match HuggingFace reference")
     func prefillLinearAttentionBlockBoundariesMatchReference() throws {
         let gpuLock = try GPUTestExclusion.acquire()
@@ -412,6 +458,14 @@ struct Qwen35ReferenceComparisonTests {
 
     private struct LinearAttentionBoundarySteps {
         let projection: Int
+        let projectedQKVStep: Int
+        let projectedQKVBindingIndex: Int
+        let projectedZStep: Int
+        let projectedZBindingIndex: Int
+        let projectedBetaStep: Int
+        let projectedBetaBindingIndex: Int
+        let projectedAlphaStep: Int
+        let projectedAlphaBindingIndex: Int
         let recurrence: Int
         let partialProjection: Int?
         let partialProjectionBindingIndex: Int
@@ -536,6 +590,19 @@ struct Qwen35ReferenceComparisonTests {
         return try MetalInferenceModel(compiledModel: isolated, device: model.device)
     }
 
+    private static func compactMPPAggressiveRouteRequested() -> Bool {
+        environmentFlagEnabled("SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP")
+            && environmentFlagEnabled("SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP")
+    }
+
+    private static func environmentFlagEnabled(_ key: String) -> Bool {
+        guard let value = ProcessInfo.processInfo.environment[key] else {
+            return false
+        }
+        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return normalized == "1" || normalized == "true" || normalized == "yes" || normalized == "on"
+    }
+
     private static func linearAttentionBoundarySteps(
         prefillPlan: MetalPrefillPlan,
         layerIndex: Int
@@ -546,6 +613,30 @@ struct Qwen35ReferenceComparisonTests {
         }) else {
             throw SetupError.stepNotFound("linear attention projection for layer \(layerIndex)")
         }
+        let projectedQKV = try Self.linearAttentionScratchOutputLocation(
+            prefillPlan: prefillPlan,
+            layerToken: layerToken,
+            tensorSuffix: "in_proj_qkv.weight",
+            batchedPosition: 0
+        )
+        let projectedZ = try Self.linearAttentionScratchOutputLocation(
+            prefillPlan: prefillPlan,
+            layerToken: layerToken,
+            tensorSuffix: "in_proj_z.weight",
+            batchedPosition: 1
+        )
+        let projectedBeta = try Self.linearAttentionScratchOutputLocation(
+            prefillPlan: prefillPlan,
+            layerToken: layerToken,
+            tensorSuffix: "in_proj_b.weight",
+            batchedPosition: 2
+        )
+        let projectedAlpha = try Self.linearAttentionScratchOutputLocation(
+            prefillPlan: prefillPlan,
+            layerToken: layerToken,
+            tensorSuffix: "in_proj_a.weight",
+            batchedPosition: 3
+        )
         guard let recurrence = prefillPlan.steps.indices.first(where: { index in
             guard index > projection else { return false }
             let step = prefillPlan.steps[index]
@@ -557,7 +648,12 @@ struct Qwen35ReferenceComparisonTests {
             let step = prefillPlan.steps[index]
             return step.metadata.weightTensorName?.contains("\(layerToken)out_proj.weight") == true
         }
-        guard let firstOutProjection = outProjectionCandidates.first else {
+        guard let firstOutProjection = outProjectionCandidates.first(where: { index in
+            let kernel = prefillPlan.steps[index].metadata.kernelName
+                ?? prefillPlan.steps[index].pipeline.label
+                ?? ""
+            return !kernel.hasPrefix("pack_strided_seq_f32_to_compact")
+        }) else {
             throw SetupError.stepNotFound("linear attention output projection for layer \(layerIndex)")
         }
         let firstOutProjectionKernel = prefillPlan.steps[firstOutProjection].metadata.kernelName
@@ -611,12 +707,140 @@ struct Qwen35ReferenceComparisonTests {
         }
         return LinearAttentionBoundarySteps(
             projection: projection,
+            projectedQKVStep: projectedQKV.stepIndex,
+            projectedQKVBindingIndex: projectedQKV.bindingIndex,
+            projectedZStep: projectedZ.stepIndex,
+            projectedZBindingIndex: projectedZ.bindingIndex,
+            projectedBetaStep: projectedBeta.stepIndex,
+            projectedBetaBindingIndex: projectedBeta.bindingIndex,
+            projectedAlphaStep: projectedAlpha.stepIndex,
+            projectedAlphaBindingIndex: projectedAlpha.bindingIndex,
             recurrence: recurrence,
             partialProjection: partialProjection,
             partialProjectionBindingIndex: partialProjectionBindingIndex,
             outProjection: outProjection,
             outProjectionBindingIndex: outProjectionBindingIndex
         )
+    }
+
+    private static func linearAttentionScratchOutputLocation(
+        prefillPlan: MetalPrefillPlan,
+        layerToken: String,
+        tensorSuffix: String,
+        batchedPosition: Int
+    ) throws -> (stepIndex: Int, bindingIndex: Int) {
+        let tensorName = "\(layerToken)\(tensorSuffix)"
+        let tensorKey = tensorSuffix.replacingOccurrences(of: ".weight", with: "")
+        let fullNameCandidateIndices = prefillPlan.steps.indices.filter { index in
+            guard let weightTensorName = prefillPlan.steps[index].metadata.weightTensorName else {
+                return false
+            }
+            return weightTensorName.contains(tensorName)
+        }
+        let candidateIndices = fullNameCandidateIndices.isEmpty
+            ? prefillPlan.steps.indices.filter { index in
+                guard let weightTensorName = prefillPlan.steps[index].metadata.weightTensorName else {
+                    return false
+                }
+                return weightTensorName.contains(tensorKey)
+            }
+            : fullNameCandidateIndices
+        guard !candidateIndices.isEmpty else {
+            throw SetupError.stepNotFound("linear attention projection output for \(tensorName)")
+        }
+
+        var compactScatterCount = 0
+        if let scatterIndex = candidateIndices.first(where: { index in
+            let kernel = prefillPlan.steps[index].metadata.kernelName
+                ?? prefillPlan.steps[index].pipeline.label
+                ?? ""
+            return kernel.hasPrefix("scatter_compact_seq_outputs")
+        }) {
+            let count = try Self.compactScatterProjectionCount(
+                kernelName: prefillPlan.steps[scatterIndex].metadata.kernelName
+                    ?? prefillPlan.steps[scatterIndex].pipeline.label
+                    ?? ""
+            )
+            compactScatterCount = count
+            if batchedPosition < count {
+                return (scatterIndex, count + batchedPosition)
+            }
+        }
+
+        if let splitIndex = candidateIndices.first(where: { index in
+            let kernel = prefillPlan.steps[index].metadata.kernelName
+                ?? prefillPlan.steps[index].pipeline.label
+                ?? ""
+            return kernel.hasPrefix("split_tail::")
+        }) {
+            let tailPosition = batchedPosition - compactScatterCount
+            guard tailPosition >= 0 else {
+                throw SetupError.stepNotFound("split-tail leading output must be read from scatter for \(tensorName)")
+            }
+            let tailCount = try Self.splitTailProjectionCount(
+                kernelName: prefillPlan.steps[splitIndex].metadata.kernelName
+                    ?? prefillPlan.steps[splitIndex].pipeline.label
+                    ?? ""
+            )
+            guard tailPosition < tailCount else {
+                throw SetupError.stepNotFound("split-tail output binding for \(tensorName)")
+            }
+            return (splitIndex, 1 + tailCount + tailPosition)
+        }
+
+        guard let firstIndex = candidateIndices.first else {
+            throw SetupError.stepNotFound("linear attention projection output for \(tensorName)")
+        }
+        let kernel = prefillPlan.steps[firstIndex].metadata.kernelName
+            ?? prefillPlan.steps[firstIndex].pipeline.label
+            ?? ""
+        if kernel.hasPrefix("batched_gemv") {
+            let count = try Self.batchedGEMVProjectionCount(kernelName: kernel)
+            guard batchedPosition < count else {
+                throw SetupError.stepNotFound("batched GEMV output binding for \(tensorName)")
+            }
+            return (firstIndex, 1 + count + batchedPosition)
+        }
+        return (firstIndex, 2)
+    }
+
+    private static func compactScatterProjectionCount(kernelName: String) throws -> Int {
+        let prefix = "scatter_compact_seq_outputs"
+        guard kernelName.hasPrefix(prefix) else {
+            throw SetupError.stepNotFound("compact scatter count for \(kernelName)")
+        }
+        let suffix = kernelName.dropFirst(prefix.count)
+        let digits = suffix.prefix { $0.isNumber }
+        guard let count = Int(digits), count > 0 else {
+            throw SetupError.stepNotFound("compact scatter count for \(kernelName)")
+        }
+        return count
+    }
+
+    private static func splitTailProjectionCount(kernelName: String) throws -> Int {
+        let marker = "batched_gemv"
+        guard let markerRange = kernelName.range(of: marker) else {
+            throw SetupError.stepNotFound("split-tail count for \(kernelName)")
+        }
+        let suffix = kernelName[markerRange.upperBound...]
+        let digits = suffix.prefix { $0.isNumber }
+        guard let count = Int(digits), count > 0 else {
+            throw SetupError.stepNotFound("split-tail count for \(kernelName)")
+        }
+        return count
+    }
+
+    private static func batchedGEMVProjectionCount(kernelName: String) throws -> Int {
+        let prefix = "batched_gemv"
+        guard kernelName.hasPrefix(prefix) else {
+            throw SetupError.stepNotFound("batched GEMV count for \(kernelName)")
+        }
+        let suffix = kernelName.dropFirst(prefix.count)
+        let digits = suffix.prefix { $0.isNumber }
+        guard let count = Int(digits), count > 0 else {
+            throw SetupError.stepNotFound("batched GEMV count for \(kernelName)")
+        }
+        return count
     }
 
     private static func linearAttentionBoundaryStages(
@@ -631,8 +855,8 @@ struct Qwen35ReferenceComparisonTests {
             LinearAttentionBoundaryStage(
                 name: "\(labelPrefix).projected_qkv",
                 referenceName: "\(blockPrefix).projected_qkv",
-                stepIndex: steps.projection,
-                bindingIndex: 5,
+                stepIndex: steps.projectedQKVStep,
+                bindingIndex: steps.projectedQKVBindingIndex,
                 rowStride: slotDimension,
                 count: 6144,
                 tolerance: 1.25
@@ -640,8 +864,8 @@ struct Qwen35ReferenceComparisonTests {
             LinearAttentionBoundaryStage(
                 name: "\(labelPrefix).projected_z",
                 referenceName: "\(blockPrefix).projected_z",
-                stepIndex: steps.projection,
-                bindingIndex: 6,
+                stepIndex: steps.projectedZStep,
+                bindingIndex: steps.projectedZBindingIndex,
                 rowStride: slotDimension,
                 count: 2048,
                 tolerance: 1.25
@@ -649,8 +873,8 @@ struct Qwen35ReferenceComparisonTests {
             LinearAttentionBoundaryStage(
                 name: "\(labelPrefix).projected_beta",
                 referenceName: "\(blockPrefix).projected_beta",
-                stepIndex: steps.projection,
-                bindingIndex: 7,
+                stepIndex: steps.projectedBetaStep,
+                bindingIndex: steps.projectedBetaBindingIndex,
                 rowStride: slotDimension,
                 count: 16,
                 tolerance: 0.25
@@ -658,8 +882,8 @@ struct Qwen35ReferenceComparisonTests {
             LinearAttentionBoundaryStage(
                 name: "\(labelPrefix).projected_alpha",
                 referenceName: "\(blockPrefix).projected_alpha",
-                stepIndex: steps.projection,
-                bindingIndex: 8,
+                stepIndex: steps.projectedAlphaStep,
+                bindingIndex: steps.projectedAlphaBindingIndex,
                 rowStride: slotDimension,
                 count: 16,
                 tolerance: 0.25

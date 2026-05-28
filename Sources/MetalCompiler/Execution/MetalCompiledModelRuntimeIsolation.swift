@@ -153,6 +153,11 @@ private struct MetalCompiledModelRuntimeCloner {
         } else {
             nil
         }
+        let compactProjectionScratch: MTLBuffer? = if let compactProjectionScratch = buffers.compactProjectionScratch {
+            try clonedRuntimeBuffer(compactProjectionScratch)
+        } else {
+            nil
+        }
         let ssmConvDebug: MTLBuffer? = if let ssmConvDebug = buffers.ssmConvDebug {
             try clonedRuntimeBuffer(ssmConvDebug)
         } else {
@@ -180,6 +185,7 @@ private struct MetalCompiledModelRuntimeCloner {
             tokenOut: try clonedRuntimeBuffer(buffers.tokenOut),
             ssmConvDebug: ssmConvDebug,
             dequantScratch: dequantScratch,
+            compactProjectionScratch: compactProjectionScratch,
             runtimeConstantBuffer: try clonedRuntimeBuffer(buffers.runtimeConstantBuffer)
         )
     }

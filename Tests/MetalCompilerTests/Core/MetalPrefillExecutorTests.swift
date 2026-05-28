@@ -47,6 +47,7 @@ struct MetalPrefillExecutorTests {
             tokenOut: try requiredSharedBuffer(device, length: MemoryLayout<Int32>.stride),
             ssmConvDebug: nil,
             dequantScratch: nil,
+            compactProjectionScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(
                 device,
                 length: PrefillBufferSet.runtimeConstantBufferSize(
@@ -118,6 +119,7 @@ struct MetalPrefillExecutorTests {
             tokenOut: try requiredSharedBuffer(device, length: MemoryLayout<Int32>.stride),
             ssmConvDebug: nil,
             dequantScratch: nil,
+            compactProjectionScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(
                 device,
                 length: PrefillBufferSet.runtimeConstantBufferSize(

@@ -80,6 +80,74 @@ extension MetalSourceGenerator {
         """
     }
 
+    public static func generatePackStridedSequenceInputToCompact(
+        name: String,
+        bufferPrecision: BufferPrecision
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        return """
+        kernel void \(name)(
+            device const \(bt)* input       [[buffer(0)]],
+            device \(bt)* output            [[buffer(1)]],
+            constant uint& inputDimension   [[buffer(2)]],
+            constant uint& sequenceLength   [[buffer(3)]],
+            constant uint& inputRowStride   [[buffer(4)]],
+            uint2 gid                       [[thread_position_in_grid]]
+        ) {
+            const uint column = gid.x;
+            const uint seqPos = gid.y;
+            if (column >= inputDimension || seqPos >= sequenceLength) return;
+            output[seqPos * inputDimension + column] = input[seqPos * inputRowStride + column];
+        }
+        """
+    }
+
+    public static func generateScatterCompactSequenceOutputsToStridedSlots(
+        name: String,
+        count: Int,
+        bufferPrecision: BufferPrecision
+    ) -> String {
+        precondition(count >= 1 && count <= 4, "scatter compact outputs supports 1...4 projections")
+        let bt = bufferPrecision.metalType
+        let inputBindings = (0..<count).map {
+            "device const \(bt)* input\($0)  [[buffer(\($0))]],"
+        }.joined(separator: "\n    ")
+        let outputBindings = (0..<count).map {
+            "device \(bt)* output\($0)       [[buffer(\(count + $0))]],"
+        }.joined(separator: "\n    ")
+        let dimBindings = (0..<count).map {
+            "constant uint& outputDim\($0)   [[buffer(\(2 * count + $0))]],"
+        }.joined(separator: "\n    ")
+        let branchLines = (0..<count).map { index in
+            let prefix = index == 0 ? "if" : "else if"
+            return """
+                \(prefix) (projection == \(index)u) {
+                    if (column < outputDim\(index)) {
+                        output\(index)[seqPos * outputRowStride + column] =
+                            input\(index)[seqPos * outputDim\(index) + column];
+                    }
+                }
+                """
+        }.joined(separator: "\n            ")
+
+        return """
+        kernel void \(name)(
+            \(inputBindings)
+            \(outputBindings)
+            \(dimBindings)
+            constant uint& sequenceLength    [[buffer(\(3 * count))]],
+            constant uint& outputRowStride   [[buffer(\(3 * count + 1))]],
+            uint3 gid                        [[thread_position_in_grid]]
+        ) {
+            const uint column = gid.x;
+            const uint seqPos = gid.y;
+            const uint projection = gid.z;
+            if (seqPos >= sequenceLength || projection >= \(count)u) return;
+            \(branchLines)
+        }
+        """
+    }
+
     /// Generate MSL source for a batched MPP GEMM kernel with BF16 or native dense weights.
     ///
     /// All `count` projections share the same input `A`. Each projection has its

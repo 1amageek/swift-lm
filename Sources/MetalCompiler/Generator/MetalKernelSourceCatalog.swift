@@ -796,6 +796,22 @@ struct MetalKernelSourceCatalog {
                     rowsPerSimdgroup: 2
                 ))
             }
+            if generatedNames.insert("pack_strided_seq_f32_to_compact").inserted {
+                sources.append(MetalSourceGenerator.generatePackStridedSequenceInputToCompact(
+                    name: "pack_strided_seq_f32_to_compact",
+                    bufferPrecision: bufferPrecision
+                ))
+            }
+            for count in 1...4 {
+                let scatterName = "scatter_compact_seq_outputs\(count)_to_strided"
+                if generatedNames.insert(scatterName).inserted {
+                    sources.append(MetalSourceGenerator.generateScatterCompactSequenceOutputsToStridedSlots(
+                        name: scatterName,
+                        count: count,
+                        bufferPrecision: bufferPrecision
+                    ))
+                }
+            }
             // Producer-consumer fusion of `swiglu_seq_f32` and the BF16 sequence
             // GEMV used by `mlp.down_proj`. Generated unconditionally so the
             // routing pass can pick it up when the feature flag is enabled, but

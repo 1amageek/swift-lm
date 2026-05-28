@@ -15,6 +15,7 @@ struct Qwen35PrefillProfileTests {
     static let sequenceLengths = [16, 64, 128]
     static let iterations = 5
     private static var minimumDefaultPromotionProfileSpeedupPercent: Double { 10.0 }
+    private static var productionTargetReductionPercent: Double { 50.0 }
 
     private struct RoutePromotionCandidate {
         let routeFamily: String
@@ -49,17 +50,20 @@ struct Qwen35PrefillProfileTests {
         let role: String
         let routeGate: String
         let threadgroupWidth: String
+        let precisionContract: String
 
         init(
             routeFamily: String,
             role: String,
             routeGate: String,
-            threadgroupWidth: String = ""
+            threadgroupWidth: String = "",
+            precisionContract: String = "decode-equivalent"
         ) {
             self.routeFamily = routeFamily
             self.role = role
             self.routeGate = routeGate
             self.threadgroupWidth = threadgroupWidth
+            self.precisionContract = precisionContract
         }
     }
 
@@ -69,6 +73,12 @@ struct Qwen35PrefillProfileTests {
         let variant: String
         let minimumSpeedupPercent: Double
         let speedGate: String
+    }
+
+    private struct ProfileTargetGate {
+        let targetName: String
+        let targetReductionPercent: Double
+        let targetGate: String
     }
 
     private struct RouteReadinessRow {
@@ -83,6 +93,9 @@ struct Qwen35PrefillProfileTests {
         let observedProfileThreadgroupWidth: String?
         let observedProfileSpeedGate: String?
         let observedProfileSpeedMinimumPercent: Double?
+        let observedProfileTargetGate: String?
+        let observedProfileTargetReductionPercent: Double?
+        let observedPrecisionContract: String?
         let routeReadiness: String
     }
 
@@ -200,6 +213,11 @@ struct Qwen35PrefillProfileTests {
             directory: artifactDirectory
         )
         print("route gate: \(routeGateArtifact.path)")
+        let gemmFeasibilityArtifact = try writeProjectionGEMMFeasibility(
+            profilesByLength: profilesByLength,
+            directory: artifactDirectory
+        )
+        print("projection GEMM feasibility: \(gemmFeasibilityArtifact.path)")
 
         #expect(!profilesByLength.isEmpty)
     }
@@ -362,13 +380,58 @@ struct Qwen35PrefillProfileTests {
         )
 
         let csv = try String(contentsOf: url, encoding: .utf8)
-        #expect(csv.contains("routeFamily,role,kernelName,threadgroupWidth,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate"))
-        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,64|128,1|1,400.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
-        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,1,64,1,200.000,baseline-route-observed,128,missing-production-sequence"))
-        #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
-        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,64|128,1|1,1300.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed"))
-        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32,1,64,1,800.000,baseline-route-observed,128,missing-production-sequence"))
-        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32_qkpar,1,128,1,900.000,experimental-route-observed,64,missing-production-sequence"))
+        #expect(csv.contains("routeFamily,role,kernelName,threadgroupWidth,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,precisionContract,routeGate"))
+        #expect(csv.contains("mlp_fused_down,mlp.down_proj,mlp_fused_swiglu_down_seq_bf16_f32s,1,64|128,1|1,400.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s,1,64,1,200.000,baseline-route-observed,128,decode-equivalent,missing-production-sequence"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_rps2,1,64|128,1|1,450.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed"))
+        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,64|128,1|1,1300.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed"))
+        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32,1,64,1,800.000,baseline-route-observed,128,decode-equivalent,missing-production-sequence"))
+        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32_qkpar,1,128,1,900.000,experimental-route-observed,64,decode-equivalent,missing-production-sequence"))
+    }
+
+    @Test("Projection GEMM feasibility records layout blockers")
+    func projectionGEMMFeasibilityRecordsLayoutBlockers() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-gemm-feasibility-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let url = try writeProjectionGEMMFeasibility(
+            profilesByLength: [
+                64: [
+                    syntheticProfileEntry(
+                        index: 0,
+                        kernelName: "batched_gemv2_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.gate_proj.weight;model.layers.0.mlp.up_proj.weight",
+                        averageGpuMicroseconds: 100
+                    ),
+                    syntheticProfileEntry(
+                        index: 1,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.down_proj.weight",
+                        averageGpuMicroseconds: 80
+                    ),
+                ],
+                128: [
+                    syntheticProfileEntry(
+                        index: 2,
+                        kernelName: "batched_gemv2_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.gate_proj.weight;model.layers.0.mlp.up_proj.weight",
+                        averageGpuMicroseconds: 200
+                    ),
+                    syntheticProfileEntry(
+                        index: 3,
+                        kernelName: "gemv_seq_bf16_f32s",
+                        weightTensorName: "model.layers.0.mlp.down_proj.weight",
+                        averageGpuMicroseconds: 160
+                    ),
+                ],
+            ],
+            directory: directory
+        )
+        let csv = try String(contentsOf: url, encoding: .utf8)
+        #expect(csv.contains("routeFamily,role,productionSequenceLengths,entryCounts,totalGpuMicroseconds,currentKernels,mppAdmission,blockingReason,requiredImplementation"))
+        #expect(csv.contains("batched_projection,mlp.gate_up,64|128,1|1,300.000,batched_gemv2_seq_bf16_f32s,blocked,scratch-output-stride-mismatch,compact-output-layout-or-strided-mpp-output"))
+        #expect(csv.contains("single_projection,mlp.down_proj,64|128,1|1,240.000,gemv_seq_bf16_f32s,blocked,scratch-input-stride-mismatch,compact-input-layout-or-strided-mpp-input"))
     }
 
     @Test("Full-profile speed gate requires production sequence speedup")
@@ -610,6 +673,105 @@ struct Qwen35PrefillProfileTests {
         #expect(speedGateCSV.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,64|128,300.000|400.000,250.000|350.000,16.667|12.500,2,2,10.000,0.000,,full-profile-speedup-observed"))
     }
 
+    @Test("Full-profile target gate requires fifty percent total prefill reduction")
+    func fullProfileTargetGateRequiresFiftyPercentTotalPrefillReduction() throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("swift-lm-qwen-full-profile-target-gate-test-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+
+        let passingURL = try writeFullProfileTargetGate(
+            baselineTotalsByLength: [
+                64: 200,
+                128: 400,
+            ],
+            observedTotalsByLength: [
+                64: 100,
+                128: 190,
+            ],
+            targetName: "qwen35-prefill-total-50pct",
+            targetReductionPercent: 50,
+            directory: directory
+        )
+        let passingCSV = try String(contentsOf: passingURL, encoding: .utf8)
+        #expect(passingCSV.contains("targetName,productionSequenceLengths,baselineTotalGpuMicroseconds,observedTotalGpuMicroseconds,targetTotalGpuMicroseconds,reductionPercents,passingSequenceCount,requiredSequenceCount,targetReductionPercent,thresholdShortfallPercent,failingSequenceLengths,profileTargetGate"))
+        #expect(passingCSV.contains("qwen35-prefill-total-50pct,64|128,200.000|400.000,100.000|190.000,100.000|200.000,50.000|52.500,2,2,50.000,0.000,,full-profile-target-observed"))
+
+        let rows = routeReadinessRows(
+            candidates: [
+                RoutePromotionCandidate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    variant: "row_grid_fan_in",
+                    microbenchAdmission: "candidate-recurrent-block-row-grid-default-route",
+                    readinessPrerequisite: "requires-full-profile-target-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+            ],
+            profileGates: [
+                ProfileRouteGate(
+                    routeFamily: "recurrent_block_row_grid_fan_in",
+                    role: "linear_attn.out_proj",
+                    routeGate: "experimental-route-observed"
+                ),
+            ],
+            profileTargetGates: try profileTargetGates(artifact: passingURL)
+        )
+        #expect(rows.first?.routeReadiness == "candidate-production-route")
+
+        let mppPrecisionRows = routeReadinessRows(
+            candidates: [
+                RoutePromotionCandidate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    variant: "compact_mpp",
+                    microbenchAdmission: "candidate-batched-gemv-default-route",
+                    readinessPrerequisite: "requires-full-profile-target-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+            ],
+            profileGates: [
+                ProfileRouteGate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    routeGate: "experimental-route-observed",
+                    precisionContract: "mpp-reference-equivalent"
+                ),
+            ],
+            profileTargetGates: try profileTargetGates(artifact: passingURL)
+        )
+        #expect(mppPrecisionRows.first?.routeReadiness == "reject-production-precision-contract")
+
+        let failingURL = try writeFullProfileTargetGate(
+            baselineTotalsByLength: [
+                64: 200,
+                128: 400,
+            ],
+            observedTotalsByLength: [
+                64: 120,
+                128: 190,
+            ],
+            targetName: "qwen35-prefill-total-50pct",
+            targetReductionPercent: 50,
+            directory: directory
+        )
+        let failingCSV = try String(contentsOf: failingURL, encoding: .utf8)
+        #expect(failingCSV.contains("qwen35-prefill-total-50pct,64|128,200.000|400.000,120.000|190.000,100.000|200.000,40.000|52.500,1,2,50.000,10.000,64,full-profile-target-missed"))
+
+        let missingURL = try writeFullProfileTargetGate(
+            baselineTotalsByLength: [
+                64: 200,
+            ],
+            observedTotalsByLength: [
+                64: 100,
+            ],
+            targetName: "qwen35-prefill-total-50pct",
+            targetReductionPercent: 50,
+            directory: directory
+        )
+        let missingCSV = try String(contentsOf: missingURL, encoding: .utf8)
+        #expect(missingCSV.contains("qwen35-prefill-total-50pct,64,200.000,100.000,100.000,50.000,1,2,50.000,0.000,128,missing-production-sequence"))
+    }
+
     @Test("Route readiness combines microbench and full profile gates")
     func routeReadinessCombinesMicrobenchAndFullProfileGates() throws {
         let directory = FileManager.default.temporaryDirectory
@@ -726,15 +888,16 @@ struct Qwen35PrefillProfileTests {
         let url = try writeRouteReadiness(rows: rows, directory: directory)
         let csv = try String(contentsOf: url, encoding: .utf8)
 
-        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,readinessPrerequisite,requiredProfileRouteGate,requiredProfileThreadgroupWidth,observedProfileRouteGate,observedProfileThreadgroupWidth,observedProfileSpeedGate,observedProfileSpeedMinimumPercent,routeReadiness"))
-        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,experimental-route-observed,,,,candidate-production-route"))
-        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,microbench-rejected,experimental-route-observed,,experimental-route-observed,,,,reject-microbench"))
-        #expect(csv.contains("batched_projection,mlp.gate_up,rows16,candidate-batched-gemv-default-route,requires-full-profile-route-gate,baseline-route-preserved,512,baseline-route-preserved,512,,,candidate-production-route"))
-        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,baseline-route-preserved,512,,,reject-full-profile-route-not-observed"))
-        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,missing-production-sequence,,,,reject-full-profile-missing-production-sequence"))
-        #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,,experimental-route-observed,,,,reject-microbench-prerequisite"))
-        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,candidate-recurrent-block-row-grid-default-route,requires-full-profile-speed-gate,experimental-route-observed,,experimental-route-observed,,,,reject-missing-full-profile-speed-gate"))
-        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,qkpar,candidate-qkpar-default-route,requires-full-profile-route-gate,experimental-route-observed,,experimental-route-observed,,,,candidate-production-route"))
+        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,readinessPrerequisite,requiredProfileRouteGate,requiredProfileThreadgroupWidth,observedProfileRouteGate,observedProfileThreadgroupWidth,observedProfileSpeedGate,observedProfileSpeedMinimumPercent,observedProfileTargetGate,observedProfileTargetReductionPercent,observedPrecisionContract,routeReadiness"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed"))
+        #expect(csv.contains("decode-equivalent,candidate-production-route"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold"))
+        #expect(csv.contains("decode-equivalent,reject-microbench"))
+        #expect(csv.contains("batched_projection,mlp.gate_up,rows16,candidate-batched-gemv-default-route,requires-full-profile-route-gate,baseline-route-preserved,512"))
+        #expect(csv.contains("decode-equivalent,reject-full-profile-route-not-observed"))
+        #expect(csv.contains("decode-equivalent,reject-full-profile-missing-production-sequence"))
+        #expect(csv.contains("decode-equivalent,reject-microbench-prerequisite"))
+        #expect(csv.contains("decode-equivalent,reject-missing-full-profile-speed-gate"))
     }
 
     @Test("Route readiness can be reconstructed from artifact CSVs")
@@ -775,14 +938,14 @@ struct Qwen35PrefillProfileTests {
 
         let routeGateArtifact = directory.appendingPathComponent("qwen35-prefill-route-gate.csv")
         try Data("""
-        routeFamily,role,kernelName,threadgroupWidth,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,routeGate
-        single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s_rps2,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
-        single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_tile2,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
-        single_projection,mlp.down_proj,gemv_seq_bf16_f32s_tile4,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
-        batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s,512,64|128,1|1,200.000,baseline-route-observed|baseline-route-observed,,baseline-route-preserved
-        batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s_tile4,256,64,1,100.000,experimental-route-observed,128,missing-production-sequence
-        recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,64|128,18|18,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
-        ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32_qkpar,1,64|128,18|18,200.000,experimental-route-observed|experimental-route-observed,,experimental-route-observed
+        routeFamily,role,kernelName,threadgroupWidth,productionSequenceLengths,activeCounts,totalGpuMicroseconds,routeObservations,missingSequenceLengths,precisionContract,routeGate
+        single_projection,linear_attn.out_proj,gemv_seq_bf16_f32s_rps2,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed
+        single_projection,self_attn.o_proj,gemv_seq_bf16_f32s_tile2,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed
+        single_projection,mlp.down_proj,gemv_seq_bf16_f32s_tile4,1,64|128,1|1,200.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed
+        batched_projection,mlp.gate_up,batched_gemv2_seq_bf16_f32s,512,64|128,1|1,200.000,baseline-route-observed|baseline-route-observed,,decode-equivalent,baseline-route-preserved
+        batched_projection,self_attn.qkv,batched_gemv3_seq_bf16_f32s_tile4,256,64,1,100.000,experimental-route-observed,128,decode-equivalent,missing-production-sequence
+        recurrent_block_row_grid_fan_in,linear_attn.out_proj,recurrent_block_row_grid_fan_in_seq_bf16_f32,1,64|128,18|18,200.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed
+        ssm_recurrence,linear_attn.recurrence,ssm_recurrence_seq_bf16_f32_qkpar,1,64|128,18|18,200.000,experimental-route-observed|experimental-route-observed,,decode-equivalent,experimental-route-observed
         """.utf8).write(to: routeGateArtifact, options: .atomic)
 
         let speedGateArtifact = directory.appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
@@ -804,14 +967,14 @@ struct Qwen35PrefillProfileTests {
         let url = try writeRouteReadiness(rows: rows, directory: directory)
         let csv = try String(contentsOf: url, encoding: .utf8)
 
-        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,experimental-route-observed,1,,,candidate-production-route"))
-        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold,microbench-rejected,,,experimental-route-observed,1,,,reject-microbench"))
-        #expect(csv.contains("single_projection,mlp.down_proj,tile4,candidate-single-gemv-default-route,microbench-rejected,experimental-route-observed,,experimental-route-observed,1,,,reject-microbench-prerequisite"))
-        #expect(csv.contains("batched_projection,mlp.gate_up,rows16,candidate-batched-gemv-default-route,requires-full-profile-route-gate,baseline-route-preserved,512,baseline-route-preserved,512,,,candidate-production-route"))
-        #expect(csv.contains("batched_projection,mlp.gate_up,tile2,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,baseline-route-preserved,512,,,reject-full-profile-route-not-observed"))
-        #expect(csv.contains("batched_projection,self_attn.qkv,tile4,candidate-batched-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed,,missing-production-sequence,256,,,reject-full-profile-missing-production-sequence"))
-        #expect(csv.contains("recurrent_block_row_grid_fan_in,linear_attn.out_proj,row_grid_fan_in,candidate-recurrent-block-row-grid-default-route,requires-full-profile-speed-gate,experimental-route-observed,,experimental-route-observed,1,full-profile-regression-observed,10.000,reject-full-profile-speed-gate-not-observed"))
-        #expect(csv.contains("ssm_recurrence,linear_attn.recurrence,qkpar,candidate-qkpar-default-route,requires-full-profile-route-gate,experimental-route-observed,,experimental-route-observed,1,,,candidate-production-route"))
+        #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed"))
+        #expect(csv.contains("decode-equivalent,candidate-production-route"))
+        #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold"))
+        #expect(csv.contains("decode-equivalent,reject-microbench"))
+        #expect(csv.contains("decode-equivalent,reject-microbench-prerequisite"))
+        #expect(csv.contains("decode-equivalent,reject-full-profile-route-not-observed"))
+        #expect(csv.contains("decode-equivalent,reject-full-profile-missing-production-sequence"))
+        #expect(csv.contains("decode-equivalent,reject-full-profile-speed-gate-not-observed"))
     }
 
     @Test("Opt-in current route readiness artifacts can be reconstructed")
@@ -840,6 +1003,8 @@ struct Qwen35PrefillProfileTests {
             .appendingPathComponent("qwen35-prefill-route-gate.csv")
         let speedGateArtifact = profileDirectory
             .appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
+        let targetGateArtifact = profileDirectory
+            .appendingPathComponent("qwen35-prefill-50pct-target-gate.csv")
 
         try requireArtifact(singleArtifact)
         try requireArtifact(batchedArtifact)
@@ -860,6 +1025,9 @@ struct Qwen35PrefillProfileTests {
             profileGates: try profileRouteGates(artifact: routeGateArtifact),
             profileSpeedGates: FileManager.default.fileExists(atPath: speedGateArtifact.path)
                 ? try profileSpeedGates(artifact: speedGateArtifact)
+                : [],
+            profileTargetGates: FileManager.default.fileExists(atPath: targetGateArtifact.path)
+                ? try profileTargetGates(artifact: targetGateArtifact)
                 : []
         )
         let output = try writeRouteReadiness(rows: rows, directory: profileDirectory)
@@ -1104,6 +1272,7 @@ struct Qwen35PrefillProfileTests {
                 "totalGpuMicroseconds",
                 "routeObservations",
                 "missingSequenceLengths",
+                "precisionContract",
                 "routeGate",
             ].joined(separator: ","),
         ]
@@ -1126,11 +1295,85 @@ struct Qwen35PrefillProfileTests {
                 String(format: "%.3f", aggregate.totalGpuMicroseconds),
                 aggregate.routeObservations.joined(separator: "|"),
                 missingSequenceLengths.map(String.init).joined(separator: "|"),
+                precisionContract(kernelName: kernelName),
                 routeGate(
                     routeFamily: routeFamily,
                     routeObservations: aggregate.routeObservations,
                     missingSequenceLengths: missingSequenceLengths
                 ),
+            ].joined(separator: ","))
+        }
+
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func writeProjectionGEMMFeasibility(
+        profilesByLength: [Int: [MetalPrefillProfile.Entry]],
+        directory: URL
+    ) throws -> URL {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= 64 }
+        let url = directory.appendingPathComponent("qwen35-prefill-projection-gemm-feasibility.csv")
+
+        struct Aggregate {
+            var sequenceLengths: [Int] = []
+            var entryCounts: [Int] = []
+            var totalGpuMicroseconds: Double = 0
+            var kernels: Set<String> = []
+        }
+
+        var groups: [String: Aggregate] = [:]
+        for sequenceLength in productionSequenceLengths {
+            guard let profiles = profilesByLength[sequenceLength] else { continue }
+            var sequenceGroups: [String: (count: Int, totalGpuMicroseconds: Double, kernels: Set<String>)] = [:]
+            for profile in profiles where isProjectionGEMMFeasibilityEntry(profile) {
+                let routeFamily = projectionRouteFamily(profile.kernelName)
+                let role = projectionManifestRole(profile)
+                let key = [routeFamily, role].joined(separator: "\u{1F}")
+                var sequenceAggregate = sequenceGroups[key] ?? (count: 0, totalGpuMicroseconds: 0, kernels: [])
+                sequenceAggregate.count += 1
+                sequenceAggregate.totalGpuMicroseconds += profile.averageGpuMicroseconds
+                sequenceAggregate.kernels.insert(profile.kernelName)
+                sequenceGroups[key] = sequenceAggregate
+            }
+            for (key, sequenceAggregate) in sequenceGroups {
+                var aggregate = groups[key] ?? Aggregate()
+                aggregate.sequenceLengths.append(sequenceLength)
+                aggregate.entryCounts.append(sequenceAggregate.count)
+                aggregate.totalGpuMicroseconds += sequenceAggregate.totalGpuMicroseconds
+                aggregate.kernels.formUnion(sequenceAggregate.kernels)
+                groups[key] = aggregate
+            }
+        }
+
+        var lines = [
+            [
+                "routeFamily",
+                "role",
+                "productionSequenceLengths",
+                "entryCounts",
+                "totalGpuMicroseconds",
+                "currentKernels",
+                "mppAdmission",
+                "blockingReason",
+                "requiredImplementation",
+            ].joined(separator: ","),
+        ]
+        for (key, aggregate) in groups.sorted(by: { $0.key < $1.key }) {
+            let parts = key.split(separator: "\u{1F}", omittingEmptySubsequences: false).map(String.init)
+            let routeFamily = parts[0]
+            let role = parts[1]
+            let feasibility = projectionGEMMFeasibility(routeFamily: routeFamily, role: role)
+            lines.append([
+                csvEscape(routeFamily),
+                csvEscape(role),
+                aggregate.sequenceLengths.map(String.init).joined(separator: "|"),
+                aggregate.entryCounts.map(String.init).joined(separator: "|"),
+                String(format: "%.3f", aggregate.totalGpuMicroseconds),
+                aggregate.kernels.sorted().joined(separator: "|"),
+                feasibility.admission,
+                feasibility.blockingReason,
+                feasibility.requiredImplementation,
             ].joined(separator: ","))
         }
 
@@ -1274,6 +1517,107 @@ struct Qwen35PrefillProfileTests {
         return url
     }
 
+    private func writeFullProfileTargetGate(
+        baselineTotalsByLength: [Int: Double],
+        observedTotalsByLength: [Int: Double],
+        targetName: String,
+        targetReductionPercent: Double,
+        directory: URL
+    ) throws -> URL {
+        let productionSequenceLengths = Self.sequenceLengths.filter { $0 >= 64 }
+        let url = directory.appendingPathComponent("qwen35-prefill-50pct-target-gate.csv")
+
+        var observedSequenceLengths: [Int] = []
+        var baselineTotals: [Double] = []
+        var observedTotals: [Double] = []
+        var targetTotals: [Double] = []
+        var reductionPercents: [Double] = []
+        var passingSequenceCount = 0
+        var thresholdShortfallPercent = 0.0
+        var failingSequenceLengths: [Int] = []
+        var missingSequenceLengths: [Int] = []
+
+        for sequenceLength in productionSequenceLengths {
+            guard let baselineTotal = baselineTotalsByLength[sequenceLength],
+                  let observedTotal = observedTotalsByLength[sequenceLength] else {
+                missingSequenceLengths.append(sequenceLength)
+                continue
+            }
+            let targetTotal = baselineTotal * (1.0 - targetReductionPercent / 100.0)
+            let reductionPercent = baselineTotal > 0
+                ? (baselineTotal - observedTotal) / baselineTotal * 100.0
+                : 0.0
+            observedSequenceLengths.append(sequenceLength)
+            baselineTotals.append(baselineTotal)
+            observedTotals.append(observedTotal)
+            targetTotals.append(targetTotal)
+            reductionPercents.append(reductionPercent)
+            if observedTotal <= targetTotal {
+                passingSequenceCount += 1
+            } else {
+                failingSequenceLengths.append(sequenceLength)
+                thresholdShortfallPercent = max(
+                    thresholdShortfallPercent,
+                    targetReductionPercent - reductionPercent
+                )
+            }
+        }
+
+        let profileTargetGate: String
+        if !missingSequenceLengths.isEmpty {
+            profileTargetGate = "missing-production-sequence"
+        } else if passingSequenceCount == productionSequenceLengths.count {
+            profileTargetGate = "full-profile-target-observed"
+        } else {
+            profileTargetGate = "full-profile-target-missed"
+        }
+
+        var allFailingSequenceLengths = failingSequenceLengths
+        allFailingSequenceLengths.append(contentsOf: missingSequenceLengths)
+
+        let headerFields = [
+            "targetName",
+            "productionSequenceLengths",
+            "baselineTotalGpuMicroseconds",
+            "observedTotalGpuMicroseconds",
+            "targetTotalGpuMicroseconds",
+            "reductionPercents",
+            "passingSequenceCount",
+            "requiredSequenceCount",
+            "targetReductionPercent",
+            "thresholdShortfallPercent",
+            "failingSequenceLengths",
+            "profileTargetGate",
+        ]
+        let sequenceLengthText = observedSequenceLengths.map(String.init).joined(separator: "|")
+        let baselineTotalText = baselineTotals.map { String(format: "%.3f", $0) }.joined(separator: "|")
+        let observedTotalText = observedTotals.map { String(format: "%.3f", $0) }.joined(separator: "|")
+        let targetTotalText = targetTotals.map { String(format: "%.3f", $0) }.joined(separator: "|")
+        let reductionPercentText = reductionPercents.map { String(format: "%.3f", $0) }.joined(separator: "|")
+        let failingSequenceText = allFailingSequenceLengths.map(String.init).joined(separator: "|")
+        let rowFields: [String] = [
+            csvEscape(targetName),
+            sequenceLengthText,
+            baselineTotalText,
+            observedTotalText,
+            targetTotalText,
+            reductionPercentText,
+            String(passingSequenceCount),
+            String(productionSequenceLengths.count),
+            String(format: "%.3f", targetReductionPercent),
+            String(format: "%.3f", max(0.0, thresholdShortfallPercent)),
+            failingSequenceText,
+            profileTargetGate,
+        ]
+        let lines = [
+            headerFields.joined(separator: ","),
+            rowFields.joined(separator: ","),
+        ]
+
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
     private func profileTotalsByLength(_ artifactsByLength: [Int: URL]) throws -> [Int: Double] {
         var totals: [Int: Double] = [:]
         for (sequenceLength, artifact) in artifactsByLength {
@@ -1315,6 +1659,9 @@ struct Qwen35PrefillProfileTests {
                 "observedProfileThreadgroupWidth",
                 "observedProfileSpeedGate",
                 "observedProfileSpeedMinimumPercent",
+                "observedProfileTargetGate",
+                "observedProfileTargetReductionPercent",
+                "observedPrecisionContract",
                 "routeReadiness",
             ].joined(separator: ","),
         ]
@@ -1331,6 +1678,9 @@ struct Qwen35PrefillProfileTests {
                 csvEscape(row.observedProfileThreadgroupWidth ?? ""),
                 csvEscape(row.observedProfileSpeedGate ?? ""),
                 row.observedProfileSpeedMinimumPercent.map { String(format: "%.3f", $0) } ?? "",
+                csvEscape(row.observedProfileTargetGate ?? ""),
+                row.observedProfileTargetReductionPercent.map { String(format: "%.3f", $0) } ?? "",
+                csvEscape(row.observedPrecisionContract ?? ""),
                 csvEscape(row.routeReadiness),
             ].joined(separator: ","))
         }
@@ -1385,7 +1735,9 @@ struct Qwen35PrefillProfileTests {
                 routeFamily: try requiredCSVValue("routeFamily", in: row, artifact: artifact),
                 role: try requiredCSVValue("role", in: row, artifact: artifact),
                 routeGate: try requiredCSVValue("routeGate", in: row, artifact: artifact),
-                threadgroupWidth: row["threadgroupWidth"] ?? ""
+                threadgroupWidth: row["threadgroupWidth"] ?? "",
+                precisionContract: row["precisionContract"]
+                    ?? precisionContract(kernelName: row["kernelName"] ?? "")
             )
         }
     }
@@ -1429,18 +1781,41 @@ struct Qwen35PrefillProfileTests {
         }
     }
 
+    private func profileTargetGates(artifact: URL) throws -> [ProfileTargetGate] {
+        try parseCSV(artifact).map { row in
+            let targetReductionText = try requiredCSVValue("targetReductionPercent", in: row, artifact: artifact)
+            guard let targetReductionPercent = Double(targetReductionText) else {
+                throw RouteReadinessArtifactError.invalidNumericValue(
+                    path: artifact.path,
+                    column: "targetReductionPercent",
+                    value: targetReductionText
+                )
+            }
+            return ProfileTargetGate(
+                targetName: try requiredCSVValue("targetName", in: row, artifact: artifact),
+                targetReductionPercent: targetReductionPercent,
+                targetGate: try requiredCSVValue("profileTargetGate", in: row, artifact: artifact)
+            )
+        }
+    }
+
     private func routeReadinessRows(
         candidates: [RoutePromotionCandidate],
         profileGates: [ProfileRouteGate],
-        profileSpeedGates: [ProfileSpeedGate] = []
+        profileSpeedGates: [ProfileSpeedGate] = [],
+        profileTargetGates: [ProfileTargetGate] = []
     ) -> [RouteReadinessRow] {
-        candidates.map { candidate in
+        let candidateRows = candidates.map { candidate in
             let observedProfileGate = matchingProfileGate(for: candidate, in: profileGates)
             let observedSpeedGate = profileSpeedGates.first {
                 $0.routeFamily == candidate.routeFamily
                     && $0.role == candidate.role
                     && $0.variant == candidate.variant
             }
+            let observedTargetGate = profileTargetGates.first {
+                $0.targetName == "qwen35-prefill-total-50pct"
+            }
+            let observedPrecisionContract = observedPrecisionContract(for: candidate, in: profileGates)
             return RouteReadinessRow(
                 routeFamily: candidate.routeFamily,
                 role: candidate.role,
@@ -1453,6 +1828,9 @@ struct Qwen35PrefillProfileTests {
                 observedProfileThreadgroupWidth: observedProfileGate?.threadgroupWidth,
                 observedProfileSpeedGate: observedSpeedGate?.speedGate,
                 observedProfileSpeedMinimumPercent: observedSpeedGate?.minimumSpeedupPercent,
+                observedProfileTargetGate: observedTargetGate?.targetGate,
+                observedProfileTargetReductionPercent: observedTargetGate?.targetReductionPercent,
+                observedPrecisionContract: observedPrecisionContract,
                 routeReadiness: routeReadiness(
                     microbenchAdmission: candidate.microbenchAdmission,
                     readinessPrerequisite: candidate.readinessPrerequisite,
@@ -1461,10 +1839,50 @@ struct Qwen35PrefillProfileTests {
                     observedProfileRouteGate: observedProfileGate?.routeGate,
                     observedProfileThreadgroupWidth: observedProfileGate?.threadgroupWidth,
                     observedProfileSpeedGate: observedSpeedGate?.speedGate,
-                    observedProfileSpeedMinimumPercent: observedSpeedGate?.minimumSpeedupPercent
+                    observedProfileSpeedMinimumPercent: observedSpeedGate?.minimumSpeedupPercent,
+                    observedProfileTargetGate: observedTargetGate?.targetGate,
+                    observedProfileTargetReductionPercent: observedTargetGate?.targetReductionPercent,
+                    observedPrecisionContract: observedPrecisionContract
                 )
             )
         }
+        let candidateKeys = Set(candidates.map { [$0.routeFamily, $0.role].joined(separator: "\u{1F}") })
+        let profileOnlyRows = profileGates.compactMap { gate -> RouteReadinessRow? in
+            guard gate.precisionContract != "decode-equivalent" else { return nil }
+            let key = [gate.routeFamily, gate.role].joined(separator: "\u{1F}")
+            guard !candidateKeys.contains(key) else { return nil }
+            return RouteReadinessRow(
+                routeFamily: gate.routeFamily,
+                role: gate.role,
+                variant: "profile-observed-only",
+                microbenchAdmission: "profile-observed-without-route-promotion",
+                readinessPrerequisite: "requires-production-precision-contract",
+                requiredProfileRouteGate: gate.routeGate,
+                requiredProfileThreadgroupWidth: gate.threadgroupWidth,
+                observedProfileRouteGate: gate.routeGate,
+                observedProfileThreadgroupWidth: gate.threadgroupWidth,
+                observedProfileSpeedGate: nil,
+                observedProfileSpeedMinimumPercent: nil,
+                observedProfileTargetGate: nil,
+                observedProfileTargetReductionPercent: nil,
+                observedPrecisionContract: gate.precisionContract,
+                routeReadiness: "reject-production-precision-contract"
+            )
+        }
+        return candidateRows + profileOnlyRows
+    }
+
+    private func observedPrecisionContract(
+        for candidate: RoutePromotionCandidate,
+        in gates: [ProfileRouteGate]
+    ) -> String? {
+        let contracts = Set(gates.filter {
+            $0.routeFamily == candidate.routeFamily && $0.role == candidate.role
+        }.map(\.precisionContract))
+        if contracts.contains("mpp-reference-equivalent") {
+            return "mpp-reference-equivalent"
+        }
+        return contracts.first
     }
 
     private func matchingProfileGate(
@@ -1495,7 +1913,10 @@ struct Qwen35PrefillProfileTests {
         observedProfileRouteGate: String?,
         observedProfileThreadgroupWidth: String?,
         observedProfileSpeedGate: String?,
-        observedProfileSpeedMinimumPercent: Double?
+        observedProfileSpeedMinimumPercent: Double?,
+        observedProfileTargetGate: String?,
+        observedProfileTargetReductionPercent: Double?,
+        observedPrecisionContract: String?
     ) -> String {
         guard microbenchAdmission.hasPrefix("candidate-") else {
             return "reject-microbench"
@@ -1525,20 +1946,80 @@ struct Qwen35PrefillProfileTests {
                   observedProfileSpeedMinimumPercent >= Self.minimumDefaultPromotionProfileSpeedupPercent else {
                 return "reject-full-profile-speed-gate-threshold"
             }
-            return "candidate-production-route"
+            return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
+        }
+        if readinessPrerequisite == "requires-full-profile-target-gate" {
+            guard let observedProfileTargetGate else {
+                return "reject-missing-full-profile-target-gate"
+            }
+            guard observedProfileTargetGate == "full-profile-target-observed" else {
+                return "reject-full-profile-target-gate-not-observed"
+            }
+            guard let observedProfileTargetReductionPercent,
+                  observedProfileTargetReductionPercent >= Self.productionTargetReductionPercent else {
+                return "reject-full-profile-target-gate-threshold"
+            }
+            return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
         }
         guard readinessPrerequisite == "requires-full-profile-route-gate" else {
             return "reject-microbench-prerequisite"
         }
+        return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
+    }
+
+    private func productionRouteReadiness(observedPrecisionContract: String?) -> String {
+        guard observedPrecisionContract == nil || observedPrecisionContract == "decode-equivalent" else {
+            return "reject-production-precision-contract"
+        }
         return "candidate-production-route"
+    }
+
+    private func precisionContract(kernelName: String) -> String {
+        if kernelName.hasPrefix("compact_mpp::") {
+            return "mpp-reference-equivalent"
+        }
+        return "decode-equivalent"
     }
 
     private func isProjectionRouteManifestEntry(_ entry: MetalPrefillProfile.Entry) -> Bool {
         entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
             || entry.kernelName.hasPrefix("batched_gemv")
             || entry.kernelName.hasPrefix("mlp_fused_swiglu_down")
+            || entry.kernelName.hasPrefix("compact_mpp::")
+            || entry.kernelName.hasPrefix("split_tail::")
             || entry.kernelName.hasPrefix("recurrent_block_row_grid_fan_in")
             || entry.kernelName.hasPrefix("ssm_recurrence_seq")
+    }
+
+    private func isProjectionGEMMFeasibilityEntry(_ entry: MetalPrefillProfile.Entry) -> Bool {
+        entry.kernelName.hasPrefix("gemv_seq_bf16_f32s")
+            || entry.kernelName.hasPrefix("batched_gemv")
+    }
+
+    private func projectionGEMMFeasibility(
+        routeFamily: String,
+        role: String
+    ) -> (admission: String, blockingReason: String, requiredImplementation: String) {
+        switch routeFamily {
+        case "batched_projection":
+            return (
+                "blocked",
+                "scratch-output-stride-mismatch",
+                "compact-output-layout-or-strided-mpp-output"
+            )
+        case "single_projection":
+            return (
+                "blocked",
+                "scratch-input-stride-mismatch",
+                "compact-input-layout-or-strided-mpp-input"
+            )
+        default:
+            return (
+                "not-applicable",
+                "not-a-bf16-sequence-projection",
+                "none"
+            )
+        }
     }
 
     private func projectionRouteFamily(_ kernelName: String) -> String {
@@ -1547,6 +2028,15 @@ struct Qwen35PrefillProfileTests {
         }
         if kernelName.hasPrefix("mlp_fused_swiglu_down") {
             return "mlp_fused_down"
+        }
+        if kernelName.hasPrefix("compact_mpp::batched_gemm") {
+            return "batched_projection_compact_mpp"
+        }
+        if kernelName.hasPrefix("split_tail::batched_gemv") {
+            return "batched_projection_split_tail"
+        }
+        if kernelName.hasPrefix("compact_mpp::") {
+            return "single_projection_compact_mpp"
         }
         if kernelName.hasPrefix("recurrent_block_row_grid_fan_in") {
             return "recurrent_block_row_grid_fan_in"
@@ -1573,6 +2063,12 @@ struct Qwen35PrefillProfileTests {
             return "experimental-route-observed"
         }
         if kernelName.hasPrefix("mlp_fused_swiglu_down") {
+            return "experimental-route-observed"
+        }
+        if kernelName.hasPrefix("compact_mpp::") {
+            return "experimental-route-observed"
+        }
+        if kernelName.hasPrefix("split_tail::") {
             return "experimental-route-observed"
         }
         return "baseline-route-observed"
@@ -1684,7 +2180,9 @@ struct Qwen35PrefillProfileTests {
             return "linear_attn.recurrence"
         }
         let tensorName = entry.weightTensorName ?? ""
-        if entry.kernelName.hasPrefix("batched_gemv") {
+        if entry.kernelName.hasPrefix("batched_gemv")
+            || entry.kernelName.hasPrefix("compact_mpp::batched_gemm")
+            || entry.kernelName.hasPrefix("split_tail::") {
             if tensorName.contains("linear_attn.in_proj") {
                 return "linear_attn.in_proj"
             }
@@ -1732,6 +2230,8 @@ struct Qwen35PrefillProfileTests {
         let routeOverrideKeys = [
             "SWIFTLM_PREFILL_BF16_SINGLE_TILE2",
             "SWIFTLM_PREFILL_BF16_SINGLE_RPS2",
+            "SWIFTLM_PREFILL_BF16_SINGLE_COMPACT_MPP",
+            "SWIFTLM_PREFILL_BF16_BATCHED_COMPACT_MPP",
             "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN",
             "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS",
             "SWIFTLM_PREFILL_BF16_FUSED_MLP_DOWN_ROWS_PER_SIMDGROUP",

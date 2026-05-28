@@ -6,6 +6,7 @@ artifacts_root="${PWD}/.test-artifacts/qwen-route-readiness-validation"
 baseline_dir=""
 experimental_dir=""
 speed_gate_output="${PWD}/.test-artifacts/prefill-profile/qwen35-prefill-full-profile-speed-gate.csv"
+target_gate_output="${PWD}/.test-artifacts/prefill-profile/qwen35-prefill-50pct-target-gate.csv"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -29,6 +30,10 @@ while [ "$#" -gt 0 ]; do
       speed_gate_output="$2"
       shift 2
       ;;
+    --target-gate-output)
+      target_gate_output="$2"
+      shift 2
+      ;;
     --help|-h)
       cat <<'EOF'
 usage: scripts/benchmarks/run-qwen-route-readiness-validation.sh [options]
@@ -44,11 +49,15 @@ options:
   --speed-gate-output <file>
                            Output path for generated full-profile speed gate.
                            Default: .test-artifacts/prefill-profile/qwen35-prefill-full-profile-speed-gate.csv.
+  --target-gate-output <file>
+                           Output path for generated 50% full-profile target gate.
+                           Default: .test-artifacts/prefill-profile/qwen35-prefill-50pct-target-gate.csv.
 
 When both --baseline-dir and --experimental-dir are supplied, this script first
 generates qwen35-prefill-full-profile-speed-gate.csv with the default 10%
-minimum full-profile speedup gate before validating current route-readiness
-reconstruction.
+minimum full-profile speedup gate and qwen35-prefill-50pct-target-gate.csv with
+the default 50% total prefill reduction target before validating current
+route-readiness reconstruction.
 EOF
       exit 0
       ;;
@@ -133,6 +142,13 @@ if [ -n "$baseline_dir" ]; then
       --baseline-dir "$baseline_dir" \
       --experimental-dir "$experimental_dir" \
       --output "$speed_gate_output"
+
+  run_command "target_gate" "compare-qwen35-prefill-target-gate.py" "-" \
+    perl -e 'alarm shift; exec @ARGV' "$timeout_seconds" \
+    scripts/benchmarks/compare-qwen35-prefill-target-gate.py \
+      --baseline-dir "$baseline_dir" \
+      --observed-dir "$experimental_dir" \
+      --output "$target_gate_output"
 fi
 
 run_swift_test "contract" "Qwen35PrefillProfileTests/routeReadinessCanBeReconstructedFromArtifactCSVs" \

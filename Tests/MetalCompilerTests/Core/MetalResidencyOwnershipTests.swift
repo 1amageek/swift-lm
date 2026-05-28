@@ -296,6 +296,7 @@ struct MetalResidencyOwnershipTests {
             tokenOut: try requiredSharedBuffer(device, length: 4),
             ssmConvDebug: nil,
             dequantScratch: nil,
+            compactProjectionScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )
         let compiledModel = MetalCompiledModel(
@@ -410,6 +411,7 @@ struct MetalResidencyOwnershipTests {
             tokenOut: try requiredSharedBuffer(device, length: 4),
             ssmConvDebug: nil,
             dequantScratch: nil,
+            compactProjectionScratch: nil,
             runtimeConstantBuffer: try requiredSharedBuffer(device, length: 32)
         )
     }
