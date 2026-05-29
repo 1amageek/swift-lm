@@ -159,6 +159,7 @@ public struct MetalBufferSet: @unchecked Sendable {
     public let hidden: MTLBuffer
     public let residual: MTLBuffer
     public let scratch: MTLBuffer
+    public let moeScratch: MTLBuffer?
     public let weights: [MTLBuffer]
     public let kvCache: MetalKVCache?
     public let convState: MTLBuffer?
@@ -180,6 +181,7 @@ public struct MetalBufferSet: @unchecked Sendable {
             hidden, residual, scratch, logits,
             position, ropePositionAxes, tokenIn, tokenOut,
         ]
+        if let moeScratch { buffers.append(moeScratch) }
         if let convState { buffers.append(convState) }
         if let recurrentState { buffers.append(recurrentState) }
         if let perLayerInputs { buffers.append(perLayerInputs) }

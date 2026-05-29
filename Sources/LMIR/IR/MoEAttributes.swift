@@ -12,6 +12,15 @@ public struct MoEAttributes: OperationAttributes, Codable, Equatable {
     /// Gating mechanism for expert selection.
     public let gateKind: MoEGateKind
 
+    /// Whether top-k routing probabilities are normalized before expert aggregation.
+    public let normalizeRoutingWeights: Bool
+
+    /// Multiplicative scale applied to routing weights after optional normalization.
+    public let routedScalingFactor: Float
+
+    /// Whether routing uses an additive expert-bias tensor for expert selection.
+    public let useExpertBias: Bool
+
     /// MLP attributes shared by all experts.
     public let expertMLP: MLPAttributes
 
@@ -19,11 +28,17 @@ public struct MoEAttributes: OperationAttributes, Codable, Equatable {
         expertCount: Int,
         expertsPerToken: Int,
         gateKind: MoEGateKind = .topK,
+        normalizeRoutingWeights: Bool = false,
+        routedScalingFactor: Float = 1.0,
+        useExpertBias: Bool = false,
         expertMLP: MLPAttributes
     ) {
         self.expertCount = expertCount
         self.expertsPerToken = expertsPerToken
         self.gateKind = gateKind
+        self.normalizeRoutingWeights = normalizeRoutingWeights
+        self.routedScalingFactor = routedScalingFactor
+        self.useExpertBias = useExpertBias
         self.expertMLP = expertMLP
     }
 }

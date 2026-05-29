@@ -335,6 +335,9 @@ public enum MetalDispatchDimension: Sendable, Equatable {
     case gather(count: Int)
     /// GEMV/GEMM projection.
     case gemv(outputDimension: Int, inputDimension: Int)
+    /// Sparse MoE projection. Multiple output rows in a threadgroup share the
+    /// same router/top-k result for the current token.
+    case sparseMoE(outputDimension: Int, inputDimension: Int, maxSimdgroups: Int)
     /// Multiple independent threadgroups, each reducing over its own partition
     /// (SSM recurrence: one threadgroup per key-group, disjoint conv channels
     /// and recurrent state slices). `threadsPerPartition` is clamped to the

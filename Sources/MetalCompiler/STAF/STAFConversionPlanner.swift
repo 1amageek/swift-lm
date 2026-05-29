@@ -30,12 +30,18 @@ struct STAFConversionPlanner: Sendable {
              shardURL: raw.shardURL)
         }
 
+        let packedMoEEntries = packedMoEEntries(in: allTensors)
+        let consumedPackedMoETensors = Set(
+            packedMoEEntries.flatMap { entry in
+                entry.packedMoE?.experts.flatMap { [$0.gate.name, $0.up.name, $0.down.name] } ?? []
+            }
+        )
         let consumedCompanions = consumedCompanions(in: allTensors)
         var entries: [STAFConversionEntry] = []
-        entries.reserveCapacity(allTensors.count)
+        entries.reserveCapacity(allTensors.count + packedMoEEntries.count)
 
         for tensor in allTensors {
-            if consumedCompanions.contains(tensor.name) {
+            if consumedCompanions.contains(tensor.name) || consumedPackedMoETensors.contains(tensor.name) {
                 continue
             }
 
@@ -57,6 +63,7 @@ struct STAFConversionPlanner: Sendable {
                 )
             )
         }
+        entries.append(contentsOf: packedMoEEntries)
 
         return STAFConversionPlan(sortedURLs: sortedURLs, entries: entries)
     }
@@ -76,6 +83,111 @@ struct STAFConversionPlanner: Sendable {
             }
         }
         return consumed
+    }
+
+    private func packedMoEEntries(
+        in allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)]
+    ) -> [STAFConversionEntry] {
+        let expertPattern = #/^(.+\.feed_forward)\.experts\.(\d+)\.(w[123])\.weight$/#
+        var groups: [String: [Int: [String: (sourceName: String, info: SafetensorsTensorInfo, shardURL: URL)]]] = [:]
+        for tensor in allTensors {
+            guard let match = tensor.name.wholeMatch(of: expertPattern) else { continue }
+            let prefix = String(match.1)
+            let expert = Int(match.2) ?? -1
+            let role = String(match.3)
+            guard expert >= 0 else { continue }
+            groups[prefix, default: [:]][expert, default: [:]][role] = (
+                sourceName: tensor.sourceName,
+                info: tensor.info,
+                shardURL: tensor.shardURL
+            )
+        }
+
+        var entries: [STAFConversionEntry] = []
+        for (prefix, expertsByIndex) in groups {
+            let expertIndices = expertsByIndex.keys.sorted()
+            guard !expertIndices.isEmpty,
+                  expertIndices == Array(0..<expertIndices.count) else { continue }
+
+            var experts: [STAFPackedMoEExpertSources] = []
+            experts.reserveCapacity(expertIndices.count)
+            var gateShape: [Int]?
+            var downShape: [Int]?
+            var allBF16 = true
+            var complete = true
+            for expertIndex in expertIndices {
+                guard let sources = expertsByIndex[expertIndex],
+                      let gate = sources["w1"],
+                      let down = sources["w2"],
+                      let up = sources["w3"] else {
+                    complete = false
+                    break
+                }
+                gateShape = gateShape ?? gate.info.shape
+                downShape = downShape ?? down.info.shape
+                guard gate.info.shape == gateShape,
+                      up.info.shape == gateShape,
+                      down.info.shape == downShape else {
+                    complete = false
+                    break
+                }
+                allBF16 = allBF16
+                    && gate.info.dtype == .bfloat16
+                    && up.info.dtype == .bfloat16
+                    && down.info.dtype == .bfloat16
+                experts.append(STAFPackedMoEExpertSources(
+                    gate: STAFPackedMoETensorSource(name: gate.sourceName, shardURL: gate.shardURL),
+                    up: STAFPackedMoETensorSource(name: up.sourceName, shardURL: up.shardURL),
+                    down: STAFPackedMoETensorSource(name: down.sourceName, shardURL: down.shardURL)
+                ))
+            }
+            guard complete, allBF16,
+                  let gateShape, gateShape.count == 2,
+                  let downShape, downShape.count == 2 else { continue }
+
+            let expertCount = experts.count
+            let intermediateDimension = gateShape[0]
+            let inputDimension = gateShape[1]
+            let outputDimension = downShape[0]
+            let gateUpInfo = SafetensorsTensorInfo(
+                name: "\(prefix).experts.gate_up_proj",
+                dtype: .bfloat16,
+                shape: [expertCount, 2 * intermediateDimension, inputDimension],
+                dataOffset: 0,
+                byteCount: expertCount * 2 * intermediateDimension * inputDimension * MemoryLayout<UInt16>.stride
+            )
+            entries.append(STAFConversionEntry(
+                name: gateUpInfo.name,
+                sourceName: gateUpInfo.name,
+                info: gateUpInfo,
+                shardIndex: 0,
+                shardURL: experts[0].gate.shardURL,
+                schemeIdentifier: .bf16RowMajor,
+                semanticRole: .moeExpertGate,
+                originalDType: .bfloat16,
+                packedMoE: STAFPackedMoEEntry(kind: .gateUp, experts: experts)
+            ))
+
+            let downInfo = SafetensorsTensorInfo(
+                name: "\(prefix).experts.down_proj",
+                dtype: .bfloat16,
+                shape: [expertCount, outputDimension, intermediateDimension],
+                dataOffset: 0,
+                byteCount: expertCount * outputDimension * intermediateDimension * MemoryLayout<UInt16>.stride
+            )
+            entries.append(STAFConversionEntry(
+                name: downInfo.name,
+                sourceName: downInfo.name,
+                info: downInfo,
+                shardIndex: 0,
+                shardURL: experts[0].down.shardURL,
+                schemeIdentifier: .bf16RowMajor,
+                semanticRole: .moeExpertDown,
+                originalDType: .bfloat16,
+                packedMoE: STAFPackedMoEEntry(kind: .down, experts: experts)
+            ))
+        }
+        return entries
     }
 
     private func determineScheme(
@@ -199,10 +311,13 @@ struct STAFConversionPlanner: Sendable {
             return .normWeight
         }
         if name.contains("lm_head") { return .languageModelHead }
+        if name.contains("experts.gate_up_proj") { return .moeExpertGate }
         if name.contains("experts") && name.contains("gate") { return .moeExpertGate }
         if name.contains("experts") && name.contains("up") { return .moeExpertUp }
         if name.contains("experts") && name.contains("down") { return .moeExpertDown }
-        if name.contains("router") || name.contains("gate.weight") && name.contains("moe") {
+        if name.contains("router")
+            || name.contains("gate.weight") && name.contains("moe")
+            || name.contains("feed_forward.gate.weight") {
             return .moeRouter
         }
         return .unknown

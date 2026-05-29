@@ -98,6 +98,10 @@ struct LFM2FeedForward: ModelComponent {
             MoE(
                 expertCount: config.expertCount!,
                 expertsPerToken: config.expertsPerToken!,
+                gateKind: .sigmoidTopK,
+                normalizeRoutingWeights: config.moeNormalizeRoutingWeights,
+                routedScalingFactor: config.moeRoutedScalingFactor,
+                useExpertBias: config.moeUseExpertBias,
                 expertInputSize: config.hiddenSize,
                 expertIntermediateSize: config.moeIntermediateSize!,
                 expertBias: config.mlpBias

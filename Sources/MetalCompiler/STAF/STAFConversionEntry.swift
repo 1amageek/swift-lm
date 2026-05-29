@@ -15,4 +15,48 @@ struct STAFConversionEntry: Sendable {
     let schemeIdentifier: QuantizationSchemeIdentifier
     let semanticRole: SemanticRole
     let originalDType: OriginalDType
+    let packedMoE: STAFPackedMoEEntry?
+
+    init(
+        name: String,
+        sourceName: String,
+        info: SafetensorsTensorInfo,
+        shardIndex: Int,
+        shardURL: URL,
+        schemeIdentifier: QuantizationSchemeIdentifier,
+        semanticRole: SemanticRole,
+        originalDType: OriginalDType,
+        packedMoE: STAFPackedMoEEntry? = nil
+    ) {
+        self.name = name
+        self.sourceName = sourceName
+        self.info = info
+        self.shardIndex = shardIndex
+        self.shardURL = shardURL
+        self.schemeIdentifier = schemeIdentifier
+        self.semanticRole = semanticRole
+        self.originalDType = originalDType
+        self.packedMoE = packedMoE
+    }
+}
+
+struct STAFPackedMoEEntry: Sendable {
+    enum Kind: Sendable {
+        case gateUp
+        case down
+    }
+
+    let kind: Kind
+    let experts: [STAFPackedMoEExpertSources]
+}
+
+struct STAFPackedMoEExpertSources: Sendable {
+    let gate: STAFPackedMoETensorSource
+    let up: STAFPackedMoETensorSource
+    let down: STAFPackedMoETensorSource
+}
+
+struct STAFPackedMoETensorSource: Sendable {
+    let name: String
+    let shardURL: URL
 }

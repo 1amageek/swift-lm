@@ -104,11 +104,17 @@ private struct MetalCompiledModelRuntimeCloner {
         } else {
             nil
         }
+        let moeScratch: MTLBuffer? = if let moeScratch = buffers.moeScratch {
+            try clonedRuntimeBuffer(moeScratch)
+        } else {
+            nil
+        }
         return MetalBufferSet(
             bufferPrecision: buffers.bufferPrecision,
             hidden: try clonedRuntimeBuffer(buffers.hidden),
             residual: try clonedRuntimeBuffer(buffers.residual),
             scratch: try clonedRuntimeBuffer(buffers.scratch),
+            moeScratch: moeScratch,
             weights: buffers.weights,
             kvCache: kvCache,
             convState: convState,
@@ -163,11 +169,17 @@ private struct MetalCompiledModelRuntimeCloner {
         } else {
             nil
         }
+        let moeScratch: MTLBuffer? = if let moeScratch = buffers.moeScratch {
+            try clonedRuntimeBuffer(moeScratch)
+        } else {
+            nil
+        }
         return PrefillBufferSet(
             bufferPrecision: buffers.bufferPrecision,
             hidden: try clonedRuntimeBuffer(buffers.hidden),
             residual: try clonedRuntimeBuffer(buffers.residual),
             scratch: try clonedRuntimeBuffer(buffers.scratch),
+            moeScratch: moeScratch,
             weights: buffers.weights,
             kvCache: kvCache,
             convState: convState,

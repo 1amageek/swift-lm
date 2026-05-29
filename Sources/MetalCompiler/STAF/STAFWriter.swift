@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 struct STAFWriter: Sendable {
@@ -9,6 +10,53 @@ struct STAFWriter: Sendable {
     }
 
     func write(plan: STAFConversionPlan, outputURL: URL, metadata: STAFFileMetadata) throws {
+        let tempURL = outputURL
+            .deletingLastPathComponent()
+            .appendingPathComponent(
+                ".\(outputURL.lastPathComponent).tmp.\(ProcessInfo.processInfo.processIdentifier)"
+            )
+        try writeTemporaryFile(plan: plan, outputURL: tempURL, metadata: metadata)
+        try atomicallyReplaceItem(at: outputURL, with: tempURL)
+    }
+
+    private func writeTemporaryFile(
+        plan: STAFConversionPlan,
+        outputURL: URL,
+        metadata: STAFFileMetadata
+    ) throws {
+        if FileManager.default.fileExists(atPath: outputURL.path) {
+            try FileManager.default.removeItem(at: outputURL)
+        }
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil) else {
+            throw STAFWriterError.createFailed(outputURL.path)
+        }
+
+        let fileHandle = try FileHandle(forWritingTo: outputURL)
+        do {
+            try writeOpenFile(plan: plan, fileHandle: fileHandle, metadata: metadata)
+            try fileHandle.synchronize()
+            try fileHandle.close()
+        } catch {
+            let originalError = error
+            do {
+                try fileHandle.close()
+            } catch {
+                throw STAFWriterError.cleanupFailed(original: originalError, cleanup: error)
+            }
+            do {
+                try FileManager.default.removeItem(at: outputURL)
+            } catch {
+                throw STAFWriterError.cleanupFailed(original: originalError, cleanup: error)
+            }
+            throw originalError
+        }
+    }
+
+    private func writeOpenFile(
+        plan: STAFConversionPlan,
+        fileHandle: FileHandle,
+        metadata: STAFFileMetadata
+    ) throws {
         let entries = plan.entries
         let sectionCount = entries.count
         let sectionTableOffset = STAF.headerSize
@@ -68,8 +116,8 @@ struct STAFWriter: Sendable {
             currentOffset = alignedOffset + tensorSize
         }
 
-        var fileData = Data()
-        fileData.append(buildHeaderData(
+        var prefixData = Data()
+        prefixData.append(buildHeaderData(
             metadataEntryCount: metadataTableEntries.count,
             metadataTableOffset: metadataTableOffset,
             sectionCount: sectionCount,
@@ -79,7 +127,7 @@ struct STAFWriter: Sendable {
         ))
 
         for (index, entry) in entries.enumerated() {
-            fileData.append(
+            prefixData.append(
                 buildSectionEntryData(
                     entry: entry,
                     nameOffset: nameOffsets[index],
@@ -99,25 +147,40 @@ struct STAFWriter: Sendable {
                 base.storeBytes(of: metadataEntry.payload0, toByteOffset: 12, as: UInt64.self)
                 base.storeBytes(of: metadataEntry.payload1, toByteOffset: 20, as: UInt64.self)
             }
-            fileData.append(entryData)
+            prefixData.append(entryData)
         }
 
-        fileData.append(stringTableData)
+        prefixData.append(stringTableData)
 
-        let paddingNeeded = payloadStart - fileData.count
+        let paddingNeeded = payloadStart - prefixData.count
         if paddingNeeded > 0 {
-            fileData.append(Data(count: paddingNeeded))
+            prefixData.append(Data(count: paddingNeeded))
         }
+
+        try fileHandle.write(contentsOf: prefixData)
+        var writtenByteCount = prefixData.count
 
         for (index, entry) in entries.enumerated() {
             let targetOffset = Int(payloadOffsets[index])
-            if fileData.count < targetOffset {
-                fileData.append(Data(count: targetOffset - fileData.count))
+            if writtenByteCount < targetOffset {
+                let padding = Data(count: targetOffset - writtenByteCount)
+                try fileHandle.write(contentsOf: padding)
+                writtenByteCount = targetOffset
             }
-            fileData.append(try payloadConverter.convertPayload(for: entry))
+            let payload = try payloadConverter.convertPayload(for: entry)
+            try fileHandle.write(contentsOf: payload)
+            writtenByteCount += payload.count
         }
+    }
 
-        try fileData.write(to: outputURL)
+    private func atomicallyReplaceItem(at outputURL: URL, with tempURL: URL) throws {
+        if rename(tempURL.path, outputURL.path) != 0 {
+            throw STAFWriterError.renameFailed(
+                source: tempURL.path,
+                destination: outputURL.path,
+                errno: errno
+            )
+        }
     }
 
     private func buildHeaderData(
@@ -265,5 +328,22 @@ struct STAFWriter: Sendable {
     private func alignUp(_ value: Int, to alignment: Int) -> Int {
         let remainder = value % alignment
         return remainder == 0 ? value : value + (alignment - remainder)
+    }
+}
+
+enum STAFWriterError: Error, CustomStringConvertible {
+    case createFailed(String)
+    case renameFailed(source: String, destination: String, errno: Int32)
+    case cleanupFailed(original: Error, cleanup: Error)
+
+    var description: String {
+        switch self {
+        case .createFailed(let path):
+            return "STAFWriterError: failed to create temporary file at \(path)"
+        case .renameFailed(let source, let destination, let errno):
+            return "STAFWriterError: failed to replace \(destination) with \(source): \(String(cString: strerror(errno)))"
+        case .cleanupFailed(let original, let cleanup):
+            return "STAFWriterError: cleanup failed after \(original): \(cleanup)"
+        }
     }
 }

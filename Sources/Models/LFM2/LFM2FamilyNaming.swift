@@ -72,14 +72,11 @@ public struct LFM2FamilyNaming: WeightNamingConvention {
             let ffPrefix = "\(prefix).feed_forward"
             var bindings = [
                 ParameterBinding(role: "router", tensorName: "\(ffPrefix).gate.weight"),
-                ParameterBinding(role: "expert_bias", tensorName: "\(ffPrefix).expert_bias"),
+                ParameterBinding(role: "expert_gate_up_proj", tensorName: "\(ffPrefix).experts.gate_up_proj"),
+                ParameterBinding(role: "expert_down_proj", tensorName: "\(ffPrefix).experts.down_proj"),
             ]
-            for i in 0..<attrs.expertCount {
-                bindings.append(contentsOf: [
-                    ParameterBinding(role: "expert_\(i)_gate_proj", tensorName: "\(ffPrefix).experts.\(i).w1.weight"),
-                    ParameterBinding(role: "expert_\(i)_up_proj", tensorName: "\(ffPrefix).experts.\(i).w3.weight"),
-                    ParameterBinding(role: "expert_\(i)_down_proj", tensorName: "\(ffPrefix).experts.\(i).w2.weight"),
-                ])
+            if attrs.useExpertBias {
+                bindings.append(ParameterBinding(role: "expert_bias", tensorName: "\(ffPrefix).expert_bias"))
             }
             return bindings
         }

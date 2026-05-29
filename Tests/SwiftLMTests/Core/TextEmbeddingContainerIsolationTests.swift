@@ -77,6 +77,7 @@ struct TextEmbeddingContainerIsolationTests {
             hidden: try requiredSharedBuffer(device, length: 1024),
             residual: try requiredPrivateBuffer(device, length: 1024),
             scratch: try requiredPrivateBuffer(device, length: 2048),
+            moeScratch: nil,
             weights: weights,
             kvCache: nil,
             convState: nil,

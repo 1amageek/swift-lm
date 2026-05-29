@@ -41,6 +41,12 @@ public struct ModelConfig: Sendable {
     /// Per-expert intermediate size (when different from `intermediateSize`).
     /// Used by LFM2 MoE variants where expert FFN width differs from dense FFN width.
     public let moeIntermediateSize: Int?
+    /// Whether MoE routing probabilities are normalized after top-k selection.
+    public let moeNormalizeRoutingWeights: Bool
+    /// Multiplicative scale applied to MoE routing weights.
+    public let moeRoutedScalingFactor: Float
+    /// Whether MoE routing uses an additive expert-bias tensor for selection.
+    public let moeUseExpertBias: Bool
 
     // MARK: Shared-Norm Parallel Attention/MLP (optional)
 
@@ -141,6 +147,9 @@ public struct ModelConfig: Sendable {
             ropeScaling: ropeScaling, tiedEmbeddings: tiedEmbeddings,
             expertCount: expertCount, expertsPerToken: expertsPerToken,
             moeIntermediateSize: moeIntermediateSize,
+            moeNormalizeRoutingWeights: moeNormalizeRoutingWeights,
+            moeRoutedScalingFactor: moeRoutedScalingFactor,
+            moeUseExpertBias: moeUseExpertBias,
             qkNorm: qkNorm,
             fullAttentionInterval: fullAttentionInterval,
             ssmNumHeads: ssmNumHeads, ssmGroupCount: ssmGroupCount,
@@ -188,6 +197,9 @@ public struct ModelConfig: Sendable {
         expertCount: Int?,
         expertsPerToken: Int?,
         moeIntermediateSize: Int? = nil,
+        moeNormalizeRoutingWeights: Bool = false,
+        moeRoutedScalingFactor: Float = 1.0,
+        moeUseExpertBias: Bool = false,
         qkNorm: Bool,
         fullAttentionInterval: Int?,
         ssmNumHeads: Int?,
@@ -234,6 +246,9 @@ public struct ModelConfig: Sendable {
         self.expertCount = expertCount
         self.expertsPerToken = expertsPerToken
         self.moeIntermediateSize = moeIntermediateSize
+        self.moeNormalizeRoutingWeights = moeNormalizeRoutingWeights
+        self.moeRoutedScalingFactor = moeRoutedScalingFactor
+        self.moeUseExpertBias = moeUseExpertBias
         self.qkNorm = qkNorm
         self.fullAttentionInterval = fullAttentionInterval
         self.ssmNumHeads = ssmNumHeads

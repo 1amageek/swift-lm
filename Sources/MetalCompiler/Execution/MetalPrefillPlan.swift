@@ -348,6 +348,7 @@ public struct PrefillBufferSet: @unchecked Sendable {
     public let hidden: MTLBuffer
     public let residual: MTLBuffer
     public let scratch: MTLBuffer
+    public let moeScratch: MTLBuffer?
     public let weights: [MTLBuffer]
     public let kvCache: MetalKVCache?
     public let convState: MTLBuffer?
@@ -404,6 +405,7 @@ public struct PrefillBufferSet: @unchecked Sendable {
             hidden, residual, scratch, logits,
             tokenIDs, positions, ropePositionAxes, tokenOut, runtimeConstantBuffer,
         ]
+        if let moeScratch { buffers.append(moeScratch) }
         if let dequantScratch { buffers.append(dequantScratch) }
         if let compactProjectionScratch { buffers.append(compactProjectionScratch) }
         if let ssmConvDebug { buffers.append(ssmConvDebug) }

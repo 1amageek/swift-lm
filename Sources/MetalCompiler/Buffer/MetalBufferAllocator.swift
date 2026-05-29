@@ -23,6 +23,17 @@ struct MetalBufferAllocator {
         let hiddenBuffer = context.device.makeBuffer(length: context.hiddenSize * elementSize, options: gpuOnlyOptions)!
         let residualBuffer = context.device.makeBuffer(length: context.hiddenSize * elementSize, options: gpuOnlyOptions)!
         let scratchBuffer = context.device.makeBuffer(length: scratchElementCount * elementSize, options: gpuOnlyOptions)!
+        let moeScratchBuffer: MTLBuffer? = {
+            let elementCount = maximumSparseMoEScratchElementCount(
+                in: fusedEntries,
+                maximumSequenceLength: 1
+            )
+            guard elementCount > 0 else { return nil }
+            return context.device.makeBuffer(
+                length: elementCount * MemoryLayout<Float>.stride,
+                options: gpuOnlyOptions
+            )
+        }()
         let logitsBuffer = context.device.makeBuffer(length: resolvedVocabSize * elementSize, options: cpuAccessOptions)!
         let positionBuffer = context.device.makeBuffer(length: 4, options: cpuAccessOptions)!
         let ropePositionAxesBuffer = context.device.makeBuffer(length: 3 * 4, options: cpuAccessOptions)!
@@ -113,6 +124,7 @@ struct MetalBufferAllocator {
                 hidden: hiddenBuffer,
                 residual: residualBuffer,
                 scratch: scratchBuffer,
+                moeScratch: moeScratchBuffer,
                 weights: weightBuffers,
                 kvCache: kvCache,
                 convState: convStateBuffer,
@@ -277,11 +289,24 @@ struct MetalBufferAllocator {
             compactProjectionScratchBuffer = nil
         }
 
+        let moeScratchBuffer: MTLBuffer? = {
+            let elementCount = maximumSparseMoEScratchElementCount(
+                in: fusedEntries,
+                maximumSequenceLength: maximumSequenceLength
+            )
+            guard elementCount > 0 else { return nil }
+            return context.device.makeBuffer(
+                length: elementCount * f32ElementSize,
+                options: gpuOnlyOptions
+            )
+        }()
+
         let bufferSet = PrefillBufferSet(
             bufferPrecision: .float32,
             hidden: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: cpuGpuOptions)!,
             residual: context.device.makeBuffer(length: maximumSequenceLength * context.hiddenSize * f32ElementSize, options: gpuOnlyOptions)!,
             scratch: context.device.makeBuffer(length: maximumSequenceLength * scratchElementCount * f32ElementSize, options: gpuOnlyOptions)!,
+            moeScratch: moeScratchBuffer,
             weights: context.stafWeightStore?.residencyCandidateBuffers ?? [],
             kvCache: prefillKVCache,
             convState: prefillConvStateBuffer,
@@ -351,6 +376,17 @@ struct MetalBufferAllocator {
             for field in projection.projectionFields {
                 maxDim = max(maxDim, field.outputDimension)
             }
+        }
+    }
+
+    private func maximumSparseMoEScratchElementCount(
+        in entries: [DispatchEntry],
+        maximumSequenceLength: Int
+    ) -> Int {
+        entries.reduce(into: 0) { maxElements, entry in
+            guard let moe = entry.fragment as? SparseMoEFragment else { return }
+            let elementsPerToken = moe.scratchElementsPerToken
+            maxElements = max(maxElements, maximumSequenceLength * elementsPerToken)
         }
     }
 

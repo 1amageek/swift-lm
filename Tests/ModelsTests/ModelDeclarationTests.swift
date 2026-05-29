@@ -489,6 +489,24 @@ struct ModelDeclarationTests {
         #expect(moeCount == 22, "Expected 22 MoE layers, got \(moeCount)")
     }
 
+    @Test("LFM2.5 8B-A1B MoE routing contract matches HF config")
+    func lfm25_8B_A1B_MoERoutingContract() throws {
+        let graph = try ModelGraph(LFM2(config: TestConfigs.lfm2_8B_A1B))
+        let operation = try #require(findFirstOperation(in: graph.rootRegion) { $0 is MoEAttributes })
+        let moe = try #require(primitiveAttributes(operation.kind) as? MoEAttributes)
+
+        #expect(moe.gateKind == .sigmoidTopK)
+        #expect(moe.normalizeRoutingWeights == true)
+        #expect(moe.routedScalingFactor == 1.0)
+        #expect(moe.useExpertBias == true)
+        #expect(moe.expertCount == 32)
+        #expect(moe.expertsPerToken == 4)
+        #expect(moe.expertMLP.inputSize == 2048)
+        #expect(moe.expertMLP.intermediateSize == 1792)
+        #expect(moe.expertMLP.outputSize == 2048)
+        #expect(moe.expertMLP.bias == false)
+    }
+
     @Test("LFM2 non-MoE graph has all MLP, no MoE")
     func lfm2AllMLPInGraph() throws {
         let graph = try ModelGraph(LFM2(config: TestConfigs.lfm25_1_2B))
@@ -1034,16 +1052,19 @@ private enum TestConfigs {
         ])
     )
 
-    /// LFM2 8B-A1B MoE: (conv*2+attn)*1, (conv*3+attn)*4, (conv*2+attn)*1, conv*2 = 24 layers
+    /// LFM2.5 8B-A1B MoE: (conv*2+attn)*1, (conv*3+attn)*4, (conv*2+attn)*1, conv*2 = 24 layers
     static let lfm2_8B_A1B = ModelConfig(
-        hiddenSize: 2048, layerCount: 24, intermediateSize: 7168, vocabSize: 65536,
+        hiddenSize: 2048, layerCount: 24, intermediateSize: 7168, vocabSize: 128000,
         attentionHeads: 32, kvHeads: 8, headDim: 64,
-        attentionBias: false, mlpBias: true,
+        attentionBias: false, mlpBias: false,
         normEps: 1e-5, normKind: .rmsNorm,
-        ropeTheta: 1_000_000.0, ropeDimension: 64, ropeScaling: nil,
+        ropeTheta: 5_000_000.0, ropeDimension: 64, ropeScaling: nil,
         tiedEmbeddings: true,
         expertCount: 32, expertsPerToken: 4,
         moeIntermediateSize: 1792,
+        moeNormalizeRoutingWeights: true,
+        moeRoutedScalingFactor: 1.0,
+        moeUseExpertBias: true,
         qkNorm: true,
         fullAttentionInterval: nil,
         ssmNumHeads: nil, ssmKeyHeadDim: nil, ssmValueHeadDim: nil,
@@ -1061,7 +1082,7 @@ private enum TestConfigs {
     static let lfm2_24B_A2B = ModelConfig(
         hiddenSize: 2048, layerCount: 40, intermediateSize: 11776, vocabSize: 65536,
         attentionHeads: 32, kvHeads: 8, headDim: 64,
-        attentionBias: false, mlpBias: true,
+        attentionBias: false, mlpBias: false,
         normEps: 1e-5, normKind: .rmsNorm,
         ropeTheta: 1_000_000.0, ropeDimension: 64, ropeScaling: nil,
         tiedEmbeddings: true,

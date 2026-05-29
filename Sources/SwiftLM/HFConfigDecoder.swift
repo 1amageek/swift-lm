@@ -119,6 +119,11 @@ struct HFConfigDecoder {
             expertCount: json["num_local_experts"] as? Int ?? json["num_experts"] as? Int,
             expertsPerToken: json["num_experts_per_tok"] as? Int,
             moeIntermediateSize: json["moe_intermediate_size"] as? Int,
+            moeNormalizeRoutingWeights: json["norm_topk_prob"] as? Bool ?? false,
+            moeRoutedScalingFactor: (json["routed_scaling_factor"] as? Double).map {
+                Float($0)
+            } ?? 1.0,
+            moeUseExpertBias: json["use_expert_bias"] as? Bool ?? false,
             qkNorm: json["qk_norm"] as? Bool
                 ?? (["lfm2", "lfm2_moe"].contains(json["model_type"] as? String ?? "")),
             fullAttentionInterval: json["full_attention_interval"] as? Int,

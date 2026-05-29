@@ -3,6 +3,10 @@ import Foundation
 struct STAFPayloadConverter: Sendable {
 
     func convertPayload(for entry: STAFConversionEntry) throws -> Data {
+        if let packedMoE = entry.packedMoE {
+            return try packMoEPayload(packedMoE)
+        }
+
         var tensorData = try loadRawTensorData(entry: entry)
 
         // MLX VLM bundles bake the `+1.0` offset into Gemma-style layernorm
@@ -204,6 +208,33 @@ struct STAFPayloadConverter: Sendable {
             throw STAFConversionError.readFailed(entry.name)
         }
         return tensorData
+    }
+
+    private func packMoEPayload(_ packedMoE: STAFPackedMoEEntry) throws -> Data {
+        var output = Data()
+        for expert in packedMoE.experts {
+            switch packedMoE.kind {
+            case .gateUp:
+                output.append(try loadBF16TensorData(expert.gate))
+                output.append(try loadBF16TensorData(expert.up))
+            case .down:
+                output.append(try loadBF16TensorData(expert.down))
+            }
+        }
+        return output
+    }
+
+    private func loadBF16TensorData(_ source: STAFPackedMoETensorSource) throws -> Data {
+        let (data, dtype) = try loadTensorFromSafetensorsWithDType(
+            name: source.name,
+            shardURL: source.shardURL
+        )
+        guard dtype == .bfloat16 else {
+            fatalError(
+                "Packed MoE source tensor \(source.name) has dtype \(dtype.rawValue); " +
+                "only BF16 expert packing is currently supported.")
+        }
+        return data
     }
 
     private func repackMLXQuantized(entry: STAFConversionEntry, weightData: Data) throws -> Data {

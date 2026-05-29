@@ -53,6 +53,7 @@ struct LanguageModelContainerIsolationTests {
             hidden: try requiredPrivateBuffer(device, length: 256),
             residual: try requiredPrivateBuffer(device, length: 256),
             scratch: try requiredPrivateBuffer(device, length: 512),
+            moeScratch: nil,
             weights: weights,
             kvCache: nil,
             convState: nil,

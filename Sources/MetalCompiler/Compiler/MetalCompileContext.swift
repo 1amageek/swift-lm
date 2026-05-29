@@ -259,6 +259,16 @@ struct DispatchHeuristics {
                 0
             )
 
+        case .sparseMoE(let outputDimension, _, let maxSimdgroups):
+            let simdgroupCount = max(1, min(maxSimdgroups, maxThreads / max(simdWidth, 1)))
+            let threads = min(simdgroupCount * simdWidth, maxThreads)
+            let groupCount = (outputDimension + simdgroupCount - 1) / simdgroupCount
+            return (
+                MTLSize(width: groupCount, height: 1, depth: 1),
+                MTLSize(width: threads, height: 1, depth: 1),
+                0
+            )
+
         case .perHead(let headCount):
             let threads = min(256, maxThreads)
             return (

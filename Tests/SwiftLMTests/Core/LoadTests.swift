@@ -197,6 +197,79 @@ struct LoadTests {
         #expect(config.fullAttentionRoPEScaling?.kind == .custom("proportional"))
     }
 
+    @Test("Parse LFM2.5 8B-A1B MoE config")
+    func parseLFM25_8B_A1B_MoEConfig() throws {
+        let configJSON = """
+        {
+          "model_type": "lfm2_moe",
+          "architectures": ["Lfm2MoeForCausalLM"],
+          "hidden_size": 2048,
+          "num_hidden_layers": 24,
+          "intermediate_size": 7168,
+          "moe_intermediate_size": 1792,
+          "vocab_size": 128000,
+          "num_attention_heads": 32,
+          "num_key_value_heads": 8,
+          "norm_eps": 1.0e-5,
+          "tie_word_embeddings": true,
+          "conv_L_cache": 3,
+          "conv_bias": false,
+          "num_dense_layers": 2,
+          "num_experts": 32,
+          "num_experts_per_tok": 4,
+          "use_expert_bias": true,
+          "norm_topk_prob": true,
+          "routed_scaling_factor": 1.0,
+          "rope_parameters": {
+            "rope_theta": 5000000.0,
+            "rope_type": "default"
+          },
+          "layer_types": [
+            "conv", "conv", "full_attention", "conv", "conv", "conv", "full_attention",
+            "conv", "conv", "conv", "full_attention", "conv", "conv", "conv",
+            "full_attention", "conv", "conv", "conv", "full_attention", "conv",
+            "conv", "full_attention", "conv", "conv"
+          ]
+        }
+        """
+
+        let configData = try #require(configJSON.data(using: .utf8))
+        let config = try HFConfigDecoder().decode(from: configData)
+        let modelType = try HFConfigDecoder().modelType(from: configData)
+
+        #expect(modelType == "lfm2_moe")
+        #expect(config.hiddenSize == 2048)
+        #expect(config.layerCount == 24)
+        #expect(config.vocabSize == 128000)
+        #expect(config.ropeTheta == 5_000_000.0)
+        #expect(config.convLCache == 3)
+        #expect(config.expertCount == 32)
+        #expect(config.expertsPerToken == 4)
+        #expect(config.moeIntermediateSize == 1792)
+        #expect(config.numDenseLayers == 2)
+        #expect(config.moeNormalizeRoutingWeights == true)
+        #expect(config.moeRoutedScalingFactor == 1.0)
+        #expect(config.moeUseExpertBias == true)
+        #expect(config.mlpBias == false)
+        #expect(config.layerTypes?.count == 24)
+
+        let graph = try ModelGraphResolver().resolveModelGraph(modelType: modelType, config: config)
+        #expect(graph.rootRegion.operations.isEmpty == false)
+    }
+
+    @Test("Resolve LFM2.5 8B-A1B packed MoE parameter bindings")
+    func resolveLFM25_8B_A1B_PackedMoEParameters() throws {
+        let graph = try ModelGraph(LFM2(config: Self.lfm25_8B_A1B_Config))
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
+
+        let tensorNames = collectTensorNames(in: resolved.rootRegion)
+        #expect(tensorNames.contains("model.layers.2.feed_forward.gate.weight"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.expert_bias"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.gate_up_proj"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.down_proj"))
+        #expect(!tensorNames.contains("model.layers.2.feed_forward.experts.0.w1.weight"))
+    }
+
     @Test("Resolve Gemma4 parameter bindings")
     func resolveGemma4Parameters() throws {
         let config = ModelConfig(
@@ -258,7 +331,7 @@ struct LoadTests {
 
         let graph: ModelGraph
         switch modelType.lowercased() {
-        case "lfm2":
+        case "lfm2", "lfm2_moe":
             graph = try ModelGraph(LFM2(config: config))
         case "qwen3_5", "qwen3_vl", "qwen2_5_vl", "qwen2_vl":
             graph = try ModelGraph(Qwen35(config: config))
@@ -280,8 +353,15 @@ struct LoadTests {
         let config = try HFConfigDecoder().decode(from: configData)
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
-        let graph = try ModelGraph(Transformer(config: config))
-        let convention: any WeightNamingConvention = modelType == "lfm2" ? LFM2FamilyNaming() : LlamaFamilyNaming()
+        let graph: ModelGraph
+        let convention: any WeightNamingConvention
+        if ["lfm2", "lfm2_moe"].contains(modelType.lowercased()) {
+            graph = try ModelGraph(LFM2(config: config))
+            convention = LFM2FamilyNaming()
+        } else {
+            graph = try ModelGraph(Transformer(config: config))
+            convention = LlamaFamilyNaming()
+        }
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
         // Check that primitive operations have parameterBindings
@@ -305,8 +385,15 @@ struct LoadTests {
         let config = try HFConfigDecoder().decode(from: configData)
         let modelType = try HFConfigDecoder().modelType(from: configData)
 
-        let graph = try ModelGraph(Transformer(config: config))
-        let convention: any WeightNamingConvention = modelType == "lfm2" ? LFM2FamilyNaming() : LlamaFamilyNaming()
+        let graph: ModelGraph
+        let convention: any WeightNamingConvention
+        if ["lfm2", "lfm2_moe"].contains(modelType.lowercased()) {
+            graph = try ModelGraph(LFM2(config: config))
+            convention = LFM2FamilyNaming()
+        } else {
+            graph = try ModelGraph(Transformer(config: config))
+            convention = LlamaFamilyNaming()
+        }
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
         let compiler = MetalInferenceCompiler()
@@ -323,6 +410,31 @@ struct LoadTests {
     }
 
     // MARK: - Helpers
+
+    private static let lfm25_8B_A1B_Config = ModelConfig(
+        hiddenSize: 2048, layerCount: 24, intermediateSize: 7168, vocabSize: 128000,
+        attentionHeads: 32, kvHeads: 8, headDim: 64,
+        attentionBias: false, mlpBias: false,
+        normEps: 1e-5, normKind: .rmsNorm,
+        ropeTheta: 5_000_000.0, ropeDimension: 64, ropeScaling: nil,
+        tiedEmbeddings: true,
+        expertCount: 32, expertsPerToken: 4,
+        moeIntermediateSize: 1792,
+        moeNormalizeRoutingWeights: true,
+        moeRoutedScalingFactor: 1.0,
+        moeUseExpertBias: true,
+        qkNorm: true,
+        fullAttentionInterval: nil,
+        ssmNumHeads: nil, ssmKeyHeadDim: nil, ssmValueHeadDim: nil,
+        convKernelSize: nil, convLCache: 3, partialRotaryFactor: nil, slidingWindow: nil,
+        layerTypes: [
+            "conv", "conv", "full_attention", "conv", "conv", "conv", "full_attention",
+            "conv", "conv", "conv", "full_attention", "conv", "conv", "conv",
+            "full_attention", "conv", "conv", "conv", "full_attention", "conv",
+            "conv", "full_attention", "conv", "conv",
+        ],
+        numDenseLayers: 2
+    )
 
     private func findModelDirectoryOrSkip() throws -> URL? {
         guard let directory = try findModelDirectory() else {

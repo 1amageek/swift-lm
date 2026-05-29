@@ -1,5 +1,7 @@
+import Foundation
 import Testing
 import Metal
+import LMIR
 @testable import MetalCompiler
 
 /// Verify MetalSourceGenerator produces valid, compilable MSL
@@ -50,6 +52,9 @@ struct MetalSourceGeneratorTests {
             options.languageVersion = .version4_0
             let library = try device.makeLibrary(source: source, options: options)
             #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
+            #expect(library.makeFunction(name: "\(name)_router") != nil, "Failed to compile \(name)_router")
+            #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
+            #expect(library.makeFunction(name: "\(name)_down") != nil, "Failed to compile \(name)_down")
         }
     }
 
@@ -74,6 +79,448 @@ struct MetalSourceGeneratorTests {
                 #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
             }
         }
+    }
+
+    @Test("Generated Sparse MoE compiles for decode and prefill BF16")
+    func sparseMoECompiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let cases: [(MetalSourceGenerator.BufferPrecision, String)] = [
+            (.float16, "decode"),
+            (.float32, "prefill"),
+        ]
+        for (precision, label) in cases {
+            let name = "sparse_moe_\(label)_bf16"
+            let source = MetalSourceGenerator.commonHeader + "\n\n"
+                + MetalSourceGenerator.generateSparseMoE(
+                    name: name,
+                    bufferPrecision: precision,
+                    weightFormat: .bfloat16,
+                    gateKind: .sigmoidTopK
+                )
+            let options = MTLCompileOptions()
+            options.languageVersion = .version4_0
+            let library = try device.makeLibrary(source: source, options: options)
+            #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
+        }
+    }
+
+    @Test("Generated Sparse MoE prefill matches CPU reference")
+    func sparseMoEPrefillMatchesCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try runSparseMoEPrefillReferenceTest(device: device, gateKind: .sigmoidTopK)
+        try runSparseMoEPrefillReferenceTest(device: device, gateKind: .topK)
+    }
+
+    @Test("Generated Sparse MoE shared activation path handles tail rows and sentinel strides")
+    func sparseMoESharedActivationTailRowsMatchCPUReference() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+        let gpuLock = try GPUTestExclusion.acquire()
+        defer { gpuLock.release() }
+
+        try runSparseMoEPrefillTailReferenceTest(device: device, gateKind: .sigmoidTopK, useExpertBias: true)
+        try runSparseMoEPrefillTailReferenceTest(device: device, gateKind: .topK, useExpertBias: false)
+    }
+
+    private func runSparseMoEPrefillReferenceTest(device: MTLDevice, gateKind: MoEGateKind) throws {
+        let kernelName = "test_sparse_moe_seq_bf16_f32_\(gateKind == .sigmoidTopK ? "sigmoid" : "topk")"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateSparseMoE(
+                name: kernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                gateKind: gateKind
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let inputDimension = 5
+        let outputDimension = 4
+        let intermediateDimension = 3
+        let expertCount = 3
+        let expertsPerToken = 2
+        let sequenceLength = 2
+        let inputRowStride = 7
+        let outputRowStride = 6
+        let normalizeRoutingWeights = true
+        let routedScalingFactor: Float = 0.875
+        let useExpertBias = true
+
+        var input = [Float](repeating: -333.0, count: sequenceLength * inputRowStride)
+        for seq in 0..<sequenceLength {
+            for column in 0..<inputDimension {
+                input[seq * inputRowStride + column] = Float((seq + 1) * 11 + column * 5 - 17) * 0.0625
+            }
+        }
+        var routerWeight = (0..<(expertCount * inputDimension)).map { index in
+            BFloat16(Float((index * 7) % 19 - 9) * 0.03125)
+        }
+        var expertGateUpWeight = (0..<(expertCount * 2 * intermediateDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 5) % 23 - 11) * 0.0234375)
+        }
+        var expertDownWeight = (0..<(expertCount * outputDimension * intermediateDimension)).map { index in
+            BFloat16(Float((index * 3) % 17 - 8) * 0.0390625)
+        }
+        var expertBias: [Float] = [0.04, -0.02, 0.015]
+        var output = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
+
+        let expected = sparseMoEReference(
+            input: input,
+            routerWeight: routerWeight,
+            expertGateUpWeight: expertGateUpWeight,
+            expertDownWeight: expertDownWeight,
+            expertBias: expertBias,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            intermediateDimension: intermediateDimension,
+            expertCount: expertCount,
+            expertsPerToken: expertsPerToken,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            outputRowStride: outputRowStride,
+            normalizeRoutingWeights: normalizeRoutingWeights,
+            routedScalingFactor: routedScalingFactor,
+            useExpertBias: useExpertBias,
+            gateKind: gateKind,
+            sentinel: -999.0
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: &input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let routerBuffer = try #require(device.makeBuffer(
+            bytes: &routerWeight,
+            length: routerWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let gateUpBuffer = try #require(device.makeBuffer(
+            bytes: &expertGateUpWeight,
+            length: expertGateUpWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let downBuffer = try #require(device.makeBuffer(
+            bytes: &expertDownWeight,
+            length: expertDownWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let expertBiasBuffer = try #require(device.makeBuffer(
+            bytes: &expertBias,
+            length: expertBias.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(routerBuffer, offset: 0, index: 1)
+        encoder.setBuffer(gateUpBuffer, offset: 0, index: 2)
+        encoder.setBuffer(downBuffer, offset: 0, index: 3)
+        encoder.setBuffer(expertBiasBuffer, offset: 0, index: 4)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 5)
+        encoder.setBytes([UInt32(inputDimension)], length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes([UInt32(intermediateDimension)], length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes([UInt32(expertCount)], length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.setBytes([normalizeRoutingWeights ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 11)
+        var scale = routedScalingFactor
+        encoder.setBytes(&scale, length: MemoryLayout<Float>.stride, index: 12)
+        encoder.setBytes([useExpertBias ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 13)
+        encoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 14)
+        encoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 15)
+        encoder.setBytes([UInt32(outputRowStride)], length: MemoryLayout<UInt32>.stride, index: 16)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: outputDimension, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: pipeline.threadExecutionWidth, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let actualPointer = outputBuffer.contents().bindMemory(to: Float.self, capacity: output.count)
+        let actual = (0..<output.count).map { actualPointer[$0] }
+        var maxError: Float = 0
+        for index in actual.indices {
+            maxError = Swift.max(maxError, abs(actual[index] - expected[index]))
+        }
+        #expect(maxError < 0.0025, "Sparse MoE prefill drifted: maxError=\(maxError)")
+
+        var splitOutput = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
+        var splitScratch = [Float](
+            repeating: .zero,
+            count: sequenceLength * expertsPerToken * (intermediateDimension + 2)
+        )
+        let splitOutputBuffer = try #require(device.makeBuffer(
+            bytes: &splitOutput,
+            length: splitOutput.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let splitScratchBuffer = try #require(device.makeBuffer(
+            bytes: &splitScratch,
+            length: splitScratch.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let routerPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "\(kernelName)_router"))
+        )
+        let gateUpPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "\(kernelName)_gate_up"))
+        )
+        let downPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "\(kernelName)_down"))
+        )
+
+        let splitCommandBuffer = try #require(queue.makeCommandBuffer())
+        let splitEncoder = try #require(splitCommandBuffer.makeComputeCommandEncoder())
+        let scratchRowStride = expertsPerToken * (intermediateDimension + 2)
+        splitEncoder.setComputePipelineState(routerPipeline)
+        splitEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        splitEncoder.setBuffer(routerBuffer, offset: 0, index: 1)
+        splitEncoder.setBuffer(expertBiasBuffer, offset: 0, index: 2)
+        splitEncoder.setBuffer(splitScratchBuffer, offset: 0, index: 3)
+        splitEncoder.setBytes([UInt32(inputDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        splitEncoder.setBytes([UInt32(expertCount)], length: MemoryLayout<UInt32>.stride, index: 5)
+        splitEncoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 6)
+        splitEncoder.setBytes([normalizeRoutingWeights ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 7)
+        splitEncoder.setBytes(&scale, length: MemoryLayout<Float>.stride, index: 8)
+        splitEncoder.setBytes([useExpertBias ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 9)
+        splitEncoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 10)
+        splitEncoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 11)
+        splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 12)
+        splitEncoder.dispatchThreadgroups(
+            MTLSize(width: sequenceLength, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: routerPipeline.threadExecutionWidth, height: 1, depth: 1)
+        )
+
+        let gateUpThreads = min(256, max(gateUpPipeline.threadExecutionWidth, 1) * 8)
+        splitEncoder.setComputePipelineState(gateUpPipeline)
+        splitEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        splitEncoder.setBuffer(gateUpBuffer, offset: 0, index: 1)
+        splitEncoder.setBuffer(splitScratchBuffer, offset: 0, index: 2)
+        splitEncoder.setBytes([UInt32(inputDimension)], length: MemoryLayout<UInt32>.stride, index: 3)
+        splitEncoder.setBytes([UInt32(intermediateDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        splitEncoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 5)
+        splitEncoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 6)
+        splitEncoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 7)
+        splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 8)
+        splitEncoder.dispatchThreadgroups(
+            MTLSize(
+                width: (expertsPerToken * intermediateDimension + gateUpThreads - 1) / gateUpThreads,
+                height: sequenceLength,
+                depth: 1
+            ),
+            threadsPerThreadgroup: MTLSize(width: gateUpThreads, height: 1, depth: 1)
+        )
+
+        let downSimdWidth = max(downPipeline.threadExecutionWidth, 1)
+        let downSimdgroups = max(1, min(32, downPipeline.maxTotalThreadsPerThreadgroup / downSimdWidth))
+        splitEncoder.setComputePipelineState(downPipeline)
+        splitEncoder.setBuffer(splitScratchBuffer, offset: 0, index: 0)
+        splitEncoder.setBuffer(downBuffer, offset: 0, index: 1)
+        splitEncoder.setBuffer(splitOutputBuffer, offset: 0, index: 2)
+        splitEncoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 3)
+        splitEncoder.setBytes([UInt32(intermediateDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        splitEncoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 5)
+        splitEncoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 6)
+        splitEncoder.setBytes([UInt32(outputRowStride)], length: MemoryLayout<UInt32>.stride, index: 7)
+        splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 8)
+        splitEncoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + downSimdgroups - 1) / downSimdgroups, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: downSimdgroups * downSimdWidth, height: 1, depth: 1)
+        )
+        splitEncoder.endEncoding()
+        splitCommandBuffer.commit()
+        splitCommandBuffer.waitUntilCompleted()
+
+        if let error = splitCommandBuffer.error {
+            throw error
+        }
+
+        let splitPointer = splitOutputBuffer.contents().bindMemory(to: Float.self, capacity: splitOutput.count)
+        let splitActual = (0..<splitOutput.count).map { splitPointer[$0] }
+        var splitMaxError: Float = 0
+        for index in splitActual.indices {
+            splitMaxError = Swift.max(splitMaxError, abs(splitActual[index] - expected[index]))
+        }
+        #expect(splitMaxError < 0.0025, "Split Sparse MoE prefill drifted: maxError=\(splitMaxError)")
+    }
+
+    private func runSparseMoEPrefillTailReferenceTest(
+        device: MTLDevice,
+        gateKind: MoEGateKind,
+        useExpertBias: Bool
+    ) throws {
+        let kernelName = "test_sparse_moe_seq_tail_\(gateKind == .sigmoidTopK ? "sigmoid" : "topk")_\(useExpertBias ? "bias" : "nobias")"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateSparseMoE(
+                name: kernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                gateKind: gateKind
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: kernelName))
+        )
+
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let simdgroups = max(1, min(32, pipeline.maxTotalThreadsPerThreadgroup / simdWidth))
+        guard simdgroups > 1 else {
+            Issue.record("Sparse MoE tail-row test requires multiple SIMD groups")
+            return
+        }
+
+        let inputDimension = 7
+        let outputDimension = simdgroups + 3
+        let intermediateDimension = 5
+        let expertCount = 5
+        let expertsPerToken = 3
+        let sequenceLength = 3
+        let inputRowStride = 11
+        let outputRowStride = outputDimension + 4
+        let normalizeRoutingWeights = gateKind == .sigmoidTopK
+        let routedScalingFactor: Float = gateKind == .sigmoidTopK ? 0.75 : 1.125
+        let sentinel: Float = -999.25
+
+        var input = [Float](repeating: -123.0, count: sequenceLength * inputRowStride)
+        for seq in 0..<sequenceLength {
+            for column in 0..<inputDimension {
+                input[seq * inputRowStride + column] = Float(((seq + 3) * 13 + column * 7) % 29 - 14) * 0.03125
+            }
+        }
+        var routerWeight = (0..<(expertCount * inputDimension)).map { index in
+            BFloat16(Float((index * 11) % 31 - 15) * 0.01953125)
+        }
+        var expertGateUpWeight = (0..<(expertCount * 2 * intermediateDimension * inputDimension)).map { index in
+            BFloat16(Float((index * 13) % 37 - 18) * 0.015625)
+        }
+        var expertDownWeight = (0..<(expertCount * outputDimension * intermediateDimension)).map { index in
+            BFloat16(Float((index * 17) % 41 - 20) * 0.017578125)
+        }
+        var expertBias = (0..<expertCount).map { Float($0 - 2) * 0.03125 }
+        var output = [Float](repeating: sentinel, count: sequenceLength * outputRowStride)
+
+        let expected = sparseMoEReference(
+            input: input,
+            routerWeight: routerWeight,
+            expertGateUpWeight: expertGateUpWeight,
+            expertDownWeight: expertDownWeight,
+            expertBias: expertBias,
+            inputDimension: inputDimension,
+            outputDimension: outputDimension,
+            intermediateDimension: intermediateDimension,
+            expertCount: expertCount,
+            expertsPerToken: expertsPerToken,
+            sequenceLength: sequenceLength,
+            inputRowStride: inputRowStride,
+            outputRowStride: outputRowStride,
+            normalizeRoutingWeights: normalizeRoutingWeights,
+            routedScalingFactor: routedScalingFactor,
+            useExpertBias: useExpertBias,
+            gateKind: gateKind,
+            sentinel: sentinel
+        )
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: &input,
+            length: input.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let routerBuffer = try #require(device.makeBuffer(
+            bytes: &routerWeight,
+            length: routerWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let gateUpBuffer = try #require(device.makeBuffer(
+            bytes: &expertGateUpWeight,
+            length: expertGateUpWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let downBuffer = try #require(device.makeBuffer(
+            bytes: &expertDownWeight,
+            length: expertDownWeight.count * MemoryLayout<BFloat16>.stride,
+            options: .storageModeShared
+        ))
+        let expertBiasBuffer = try #require(device.makeBuffer(
+            bytes: &expertBias,
+            length: expertBias.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let outputBuffer = try #require(device.makeBuffer(
+            bytes: &output,
+            length: output.count * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(routerBuffer, offset: 0, index: 1)
+        encoder.setBuffer(gateUpBuffer, offset: 0, index: 2)
+        encoder.setBuffer(downBuffer, offset: 0, index: 3)
+        encoder.setBuffer(expertBiasBuffer, offset: 0, index: 4)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 5)
+        encoder.setBytes([UInt32(inputDimension)], length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes([UInt32(intermediateDimension)], length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.setBytes([UInt32(expertCount)], length: MemoryLayout<UInt32>.stride, index: 9)
+        encoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 10)
+        encoder.setBytes([normalizeRoutingWeights ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 11)
+        var scale = routedScalingFactor
+        encoder.setBytes(&scale, length: MemoryLayout<Float>.stride, index: 12)
+        encoder.setBytes([useExpertBias ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 13)
+        encoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 14)
+        encoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 15)
+        encoder.setBytes([UInt32(outputRowStride)], length: MemoryLayout<UInt32>.stride, index: 16)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + simdgroups - 1) / simdgroups, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: simdgroups * simdWidth, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let actualPointer = outputBuffer.contents().bindMemory(to: Float.self, capacity: output.count)
+        let actual = (0..<output.count).map { actualPointer[$0] }
+        var maxError: Float = 0
+        for index in actual.indices {
+            maxError = Swift.max(maxError, abs(actual[index] - expected[index]))
+        }
+        #expect(maxError < 0.003, "Sparse MoE tail-row path drifted: maxError=\(maxError)")
     }
 
     @Test("MPP GEMM matches CPU reference for BF16 prefill projection")
@@ -407,6 +854,126 @@ struct MetalSourceGeneratorTests {
                 }
             }
         }
+    }
+
+    private func sparseMoEReference(
+        input: [Float],
+        routerWeight: [BFloat16],
+        expertGateUpWeight: [BFloat16],
+        expertDownWeight: [BFloat16],
+        expertBias: [Float],
+        inputDimension: Int,
+        outputDimension: Int,
+        intermediateDimension: Int,
+        expertCount: Int,
+        expertsPerToken: Int,
+        sequenceLength: Int,
+        inputRowStride: Int,
+        outputRowStride: Int,
+        normalizeRoutingWeights: Bool,
+        routedScalingFactor: Float,
+        useExpertBias: Bool,
+        gateKind: MoEGateKind,
+        sentinel: Float
+    ) -> [Float] {
+        var output = [Float](repeating: sentinel, count: sequenceLength * outputRowStride)
+        for seq in 0..<sequenceLength {
+            let inputBase = seq * inputRowStride
+            var routingWeights = [Float](repeating: .zero, count: expertCount)
+            var routingScores = [Float](repeating: .zero, count: expertCount)
+            for expert in 0..<expertCount {
+                var logit: Float = 0
+                for column in 0..<inputDimension {
+                    logit += input[inputBase + column]
+                        * Float(routerWeight[expert * inputDimension + column])
+                }
+                switch gateKind {
+                case .sigmoidTopK:
+                    let routingWeight = sigmoid(logit)
+                    routingWeights[expert] = routingWeight
+                    routingScores[expert] = useExpertBias
+                        ? routingWeight + expertBias[expert]
+                        : routingWeight
+                case .topK:
+                    routingWeights[expert] = logit
+                    routingScores[expert] = logit
+                case .custom:
+                    preconditionFailure("Custom MoE routing is not supported by this reference")
+                }
+            }
+
+            if gateKind == .topK {
+                let maxLogit = routingWeights.max() ?? 0
+                var weightSum: Float = 0
+                for expert in 0..<expertCount {
+                    let weight = Float(Foundation.exp(Double(routingWeights[expert] - maxLogit)))
+                    routingWeights[expert] = weight
+                    weightSum += weight
+                }
+                for expert in 0..<expertCount {
+                    let routingWeight = routingWeights[expert] / weightSum
+                    routingWeights[expert] = routingWeight
+                    routingScores[expert] = useExpertBias
+                        ? routingWeight + expertBias[expert]
+                        : routingWeight
+                }
+            }
+
+            var selectedExperts: [Int] = []
+            var selectedWeights: [Float] = []
+            var selectedWeightSum: Float = 0
+            for _ in 0..<expertsPerToken {
+                var bestScore = -Float.infinity
+                var bestExpert = 0
+                for expert in 0..<expertCount where !selectedExperts.contains(expert) {
+                    if routingScores[expert] > bestScore {
+                        bestScore = routingScores[expert]
+                        bestExpert = expert
+                    }
+                }
+                let weight = routingWeights[bestExpert]
+                selectedExperts.append(bestExpert)
+                selectedWeights.append(weight)
+                selectedWeightSum += weight
+            }
+            if normalizeRoutingWeights {
+                selectedWeights = selectedWeights.map { $0 / (selectedWeightSum + 1.0e-6) }
+            }
+            selectedWeights = selectedWeights.map { $0 * routedScalingFactor }
+
+            for row in 0..<outputDimension {
+                var total: Float = 0
+                for routeIndex in 0..<selectedExperts.count {
+                    let expert = selectedExperts[routeIndex]
+                    let routeWeight = selectedWeights[routeIndex]
+                    let gateUpExpertBase = expert * 2 * intermediateDimension * inputDimension
+                    let downExpertBase = expert * outputDimension * intermediateDimension
+                    for intermediate in 0..<intermediateDimension {
+                        var gate: Float = 0
+                        var up: Float = 0
+                        let gateBase = gateUpExpertBase + intermediate * inputDimension
+                        let upBase = gateUpExpertBase + intermediateDimension * inputDimension
+                            + intermediate * inputDimension
+                        for column in 0..<inputDimension {
+                            let x = input[inputBase + column]
+                            gate += Float(expertGateUpWeight[gateBase + column]) * x
+                            up += Float(expertGateUpWeight[upBase + column]) * x
+                        }
+                        let activated = gate * sigmoid(gate) * up
+                        let down = Float(expertDownWeight[
+                            downExpertBase + row * intermediateDimension + intermediate
+                        ])
+                        total += down * activated * routeWeight
+                    }
+                }
+                output[seq * outputRowStride + row] = Float(BFloat16(total))
+            }
+        }
+        return output
+    }
+
+    private func sigmoid(_ value: Float) -> Float {
+        1.0 / (1.0 + Float(Foundation.exp(Double(-value))))
     }
 
     @Test("Q3 dequant then MPP GEMM matches CPU reference for all group sizes")
@@ -2054,6 +2621,8 @@ struct MetalSourceGeneratorTests {
         #expect(SSMRecurrenceFragment.qkParallelSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_qkpar")
         #expect(SSMRecurrenceFragment.cachedParametersSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_cached_params")
         #expect(SSMRecurrenceFragment.parallelStateSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_parallel_state")
+        #expect(SSMRecurrenceFragment.parallelStateSharedRMSSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_parallel_state_shared_rms")
+        #expect(SSMRecurrenceFragment.coalescedParallelStateSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_parallel_state_coalesced")
         #expect(SSMRecurrenceFragment.groupOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_group_owned_partial")
         #expect(SSMRecurrenceFragment.partitionOwnedPartialProjectionSequenceKernelName(bufferPrecision: .float32, weightFormat: .bfloat16) == "ssm_recurrence_seq_bf16_f32_partition_owned_partial")
     }

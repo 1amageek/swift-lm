@@ -40,6 +40,28 @@ struct MetalDispatchStepBuilder {
             let resolved = try resolveDispatch(entry)
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
+            if let sparseMoE = entry.fragment as? SparseMoEFragment {
+                let splitSteps = try sparseMoE.splitDecodeSteps(
+                    bindings: bindings,
+                    pipelineCache: planBuildContext.pipelineCache,
+                    kernelContext: planBuildContext.kernelContext
+                )
+                steps.append(contentsOf: splitSteps.map { step in
+                    MetalDispatchStep(
+                        descriptor: step.descriptor,
+                        bindings: step.bindings,
+                        bufferAccesses: step.bufferAccesses,
+                        metadata: MetalDispatchStepMetadata(
+                            kernelName: step.metadata.kernelName,
+                            entryIndex: entry.index,
+                            layerIndex: entry.layerIndex,
+                            weightTensorName: step.metadata.weightTensorName,
+                            bufferAccessPattern: step.metadata.bufferAccessPattern
+                        )
+                    )
+                })
+                continue
+            }
             let writeIndices = routingPlanner.lastFragmentWriteBufferIndices
             let bufferAccessPattern = Self.decodeBufferAccessPattern(
                 for: entry,

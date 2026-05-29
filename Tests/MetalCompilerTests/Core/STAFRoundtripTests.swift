@@ -125,6 +125,60 @@ struct STAFRoundtripTests {
         }
     }
 
+    @Test("LFM2 MoE expert tensors are packed into executable STAF tensors")
+    func lfm2MoEExpertPacking() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            Issue.record("No Metal device")
+            return
+        }
+
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("staf_lfm2_moe_pack_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer {
+            do {
+                try FileManager.default.removeItem(at: tempDirectory)
+            } catch {
+                Issue.record("Failed to remove temporary STAF directory: \(error)")
+            }
+        }
+
+        let prefix = "model.layers.2.feed_forward"
+        let tensors = makeLFM2MoETestTensors(prefix: prefix)
+        let safetensorsURL = tempDirectory.appendingPathComponent("model.safetensors")
+        try writeSafetensors(tensors: tensors, to: safetensorsURL)
+
+        let stafURL = tempDirectory.appendingPathComponent("model.staf")
+        try STAFConverter().convert(safetensorsURLs: [safetensorsURL], outputURL: stafURL)
+        let store = try STAFLoader().load(at: stafURL, device: device)
+
+        let gateUpName = "\(prefix).experts.gate_up_proj"
+        let downName = "\(prefix).experts.down_proj"
+        let gateUpEntry = try #require(store.entries[gateUpName])
+        let downEntry = try #require(store.entries[downName])
+        #expect(gateUpEntry.shape == [2, 6, 4])
+        #expect(downEntry.shape == [2, 5, 3])
+        #expect(store.entries["\(prefix).experts.0.w1.weight"] == nil)
+        #expect(store.entries["\(prefix).experts.0.w2.weight"] == nil)
+        #expect(store.entries["\(prefix).experts.0.w3.weight"] == nil)
+
+        let gateUpPointer = store.buffer.contents()
+            .advanced(by: gateUpEntry.bufferOffset)
+            .bindMemory(to: BFloat16.self, capacity: 2 * 6 * 4)
+        let downPointer = store.buffer.contents()
+            .advanced(by: downEntry.bufferOffset)
+            .bindMemory(to: BFloat16.self, capacity: 2 * 5 * 3)
+
+        let expectedGateUp = expectedPackedLFM2GateUp()
+        let expectedDown = expectedPackedLFM2Down()
+        for index in expectedGateUp.indices {
+            #expect(gateUpPointer[index] == expectedGateUp[index])
+        }
+        for index in expectedDown.indices {
+            #expect(downPointer[index] == expectedDown[index])
+        }
+    }
+
     // MARK: - Float32 Preservation
 
     @Test("Float32 tensor is preserved as Float32 in STAF")
@@ -766,6 +820,68 @@ struct STAFRoundtripTests {
         #expect(store.metadata["model.norm_eps"] == .float32(1e-5))
     }
 
+    @Test("STAF writer keeps existing cache when replacement conversion fails")
+    func writerKeepsExistingCacheWhenReplacementFails() throws {
+        let tempDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("staf_test_\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+        defer {
+            do {
+                try FileManager.default.removeItem(at: tempDirectory)
+            } catch {
+                Issue.record("Failed to remove temporary STAF directory: \(error)")
+            }
+        }
+
+        var values: [Float16] = [1, 2, 3, 4]
+        let safetensorsURL = tempDirectory.appendingPathComponent("model.safetensors")
+        try writeSafetensors(
+            tensors: [
+                TestTensor(
+                    name: "test.weight",
+                    dtype: "F16",
+                    shape: [4],
+                    data: Data(bytes: &values, count: values.count * MemoryLayout<Float16>.size)
+                )
+            ],
+            to: safetensorsURL
+        )
+
+        let stafURL = tempDirectory.appendingPathComponent("model.staf")
+        try STAFConverter().convert(safetensorsURLs: [safetensorsURL], outputURL: stafURL)
+        let originalData = try Data(contentsOf: stafURL)
+
+        let missingURL = tempDirectory.appendingPathComponent("missing.safetensors")
+        let failingEntry = STAFConversionEntry(
+            name: "missing.weight",
+            sourceName: "missing.weight",
+            info: SafetensorsTensorInfo(
+                name: "missing.weight",
+                dtype: .float16,
+                shape: [4],
+                dataOffset: 0,
+                byteCount: 8
+            ),
+            shardIndex: 0,
+            shardURL: missingURL,
+            schemeIdentifier: .fp16RowMajor,
+            semanticRole: .unknown,
+            originalDType: .float16
+        )
+        let failingPlan = STAFConversionPlan(sortedURLs: [missingURL], entries: [failingEntry])
+
+        do {
+            try STAFWriter().write(plan: failingPlan, outputURL: stafURL, metadata: .empty)
+            Issue.record("Expected replacement conversion to fail")
+        } catch {
+            let retainedData = try Data(contentsOf: stafURL)
+            #expect(retainedData == originalData)
+            let temporaryFiles = try FileManager.default.contentsOfDirectory(atPath: tempDirectory.path)
+                .filter { $0.hasPrefix(".model.staf.tmp.") }
+            #expect(temporaryFiles.isEmpty)
+        }
+    }
+
     @Test("isValid rejects stale converter metadata without explicit expected metadata")
     func isValidRejectsStaleConverterMetadataByDefault() throws {
         let tempDirectory = FileManager.default.temporaryDirectory
@@ -963,6 +1079,65 @@ struct STAFRoundtripTests {
     }
 
     private func converter() -> STAFConverter { STAFConverter() }
+
+    private func makeLFM2MoETestTensors(prefix: String) -> [TestTensor] {
+        var tensors: [TestTensor] = []
+        for expert in 0..<2 {
+            tensors.append(TestTensor(
+                name: "\(prefix).experts.\(expert).w1.weight",
+                dtype: "BF16",
+                shape: [3, 4],
+                data: bf16Data(expectedLFM2ExpertGate(expert: expert))
+            ))
+            tensors.append(TestTensor(
+                name: "\(prefix).experts.\(expert).w2.weight",
+                dtype: "BF16",
+                shape: [5, 3],
+                data: bf16Data(expectedLFM2ExpertDown(expert: expert))
+            ))
+            tensors.append(TestTensor(
+                name: "\(prefix).experts.\(expert).w3.weight",
+                dtype: "BF16",
+                shape: [3, 4],
+                data: bf16Data(expectedLFM2ExpertUp(expert: expert))
+            ))
+        }
+        return tensors
+    }
+
+    private func expectedPackedLFM2GateUp() -> [BFloat16] {
+        var values: [BFloat16] = []
+        for expert in 0..<2 {
+            values.append(contentsOf: expectedLFM2ExpertGate(expert: expert))
+            values.append(contentsOf: expectedLFM2ExpertUp(expert: expert))
+        }
+        return values
+    }
+
+    private func expectedPackedLFM2Down() -> [BFloat16] {
+        var values: [BFloat16] = []
+        for expert in 0..<2 {
+            values.append(contentsOf: expectedLFM2ExpertDown(expert: expert))
+        }
+        return values
+    }
+
+    private func expectedLFM2ExpertGate(expert: Int) -> [BFloat16] {
+        (0..<12).map { BFloat16(Float(100 + expert * 1000 + $0)) }
+    }
+
+    private func expectedLFM2ExpertUp(expert: Int) -> [BFloat16] {
+        (0..<12).map { BFloat16(Float(200 + expert * 1000 + $0)) }
+    }
+
+    private func expectedLFM2ExpertDown(expert: Int) -> [BFloat16] {
+        (0..<15).map { BFloat16(Float(300 + expert * 1000 + $0)) }
+    }
+
+    private func bf16Data(_ values: [BFloat16]) -> Data {
+        var mutable = values
+        return Data(bytes: &mutable, count: mutable.count * MemoryLayout<BFloat16>.stride)
+    }
 
     private func verifyTensorValues(
         store: STAFWeightStore, name: String,

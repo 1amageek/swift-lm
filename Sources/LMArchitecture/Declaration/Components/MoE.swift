@@ -17,6 +17,9 @@ public struct MoE: ModelComponent {
     public let expertCount: Int
     public let expertsPerToken: Int
     public let gateKind: MoEGateKind
+    public let normalizeRoutingWeights: Bool
+    public let routedScalingFactor: Float
+    public let useExpertBias: Bool
     public let expertInputSize: Int
     public let expertOutputSize: Int
     public let expertIntermediateSize: Int
@@ -28,6 +31,9 @@ public struct MoE: ModelComponent {
         expertCount: Int,
         expertsPerToken: Int,
         gateKind: MoEGateKind = .topK,
+        normalizeRoutingWeights: Bool = false,
+        routedScalingFactor: Float = 1.0,
+        useExpertBias: Bool = false,
         expertInputSize: Int,
         expertOutputSize: Int? = nil,
         expertIntermediateSize: Int,
@@ -45,6 +51,9 @@ public struct MoE: ModelComponent {
         self.expertCount = expertCount
         self.expertsPerToken = expertsPerToken
         self.gateKind = gateKind
+        self.normalizeRoutingWeights = normalizeRoutingWeights
+        self.routedScalingFactor = routedScalingFactor
+        self.useExpertBias = useExpertBias
         self.expertInputSize = expertInputSize
         self.expertOutputSize = resolvedExpertOutputSize
         self.expertIntermediateSize = expertIntermediateSize
@@ -61,6 +70,9 @@ extension MoE {
             expertCount: expertCount,
             expertsPerToken: expertsPerToken,
             gateKind: gateKind,
+            normalizeRoutingWeights: normalizeRoutingWeights,
+            routedScalingFactor: routedScalingFactor,
+            useExpertBias: useExpertBias,
             expertMLP: MLPAttributes(
                 inputSize: expertInputSize,
                 outputSize: expertOutputSize,

@@ -14,4 +14,18 @@ enum ReleaseSmokeTestSupport {
         }
         return URL(fileURLWithPath: snapshot)
     }
+
+    /// Resolves the LFM2.5-8B-A1B bundle from the HuggingFace cache.
+    ///
+    /// This model is substantially larger than the default release-smoke
+    /// LFM2.5-1.2B bundle, so tests must never download it implicitly.
+    static func readableLFM25A1BModelDirectoryOrSkip() -> URL? {
+        guard let snapshot = HFCacheLocator.resolveSnapshotPath(
+            repoDirectoryName: "models--LiquidAI--LFM2.5-8B-A1B"
+        ) else {
+            print("[Skip] LFM2.5-8B-A1B not cached. Run `huggingface-cli download LiquidAI/LFM2.5-8B-A1B`.")
+            return nil
+        }
+        return URL(fileURLWithPath: snapshot)
+    }
 }

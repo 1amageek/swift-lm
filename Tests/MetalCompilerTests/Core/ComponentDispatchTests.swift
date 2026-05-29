@@ -287,22 +287,32 @@ struct ComponentDispatchTests {
 
     // MARK: - MoE
 
-    @Test("MoE produces router projection")
-    func moeRouterProjection() {
+    @Test("MoE produces full sparse MoE fragment")
+    func moeSparseFragment() {
         let moe = MoEAttributes(
             expertCount: 8,
             expertsPerToken: 2,
+            gateKind: .sigmoidTopK,
+            normalizeRoutingWeights: true,
+            routedScalingFactor: 1.25,
+            useExpertBias: true,
             expertMLP: MLPAttributes(
                 inputSize: 2048, outputSize: 2048,
                 intermediateSize: 8192,
                 activation: .silu, gating: .swiglu, bias: false
             )
         )
-        let linears = collectLinearFragments(fragmentTree(moe))
-        #expect(linears.count == 1)
-        #expect(linears[0].field == "router")
-        #expect(linears[0].inputDimension == 2048)
-        #expect(linears[0].outputDimension == 8)
+        let fragments = collectPrimitives(fragmentTree(moe)).compactMap { $0 as? SparseMoEFragment }
+        #expect(fragments.count == 1)
+        #expect(fragments[0].expertCount == 8)
+        #expect(fragments[0].expertsPerToken == 2)
+        #expect(fragments[0].gateKind == .sigmoidTopK)
+        #expect(fragments[0].inputDimension == 2048)
+        #expect(fragments[0].outputDimension == 2048)
+        #expect(fragments[0].intermediateDimension == 8192)
+        #expect(fragments[0].normalizeRoutingWeights == true)
+        #expect(fragments[0].routedScalingFactor == 1.25)
+        #expect(fragments[0].useExpertBias == true)
     }
 
     // MARK: - PerLayerInput
