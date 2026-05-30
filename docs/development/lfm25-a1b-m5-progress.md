@@ -76,6 +76,7 @@ flowchart LR
 | gate/up packed4 `fast::exp` sigmoid | HF strict-capital trace pass | `81.9` wall tok/s / `85.5` GPU tok/s | Reject; approximation did not improve the bottleneck and should not remain as another route variant |
 | decode sync host-overhead diagnostic on legacy LFM2.5-1.2B harness | diagnostic pass | `401us/token` host overhead, `4.7%` of total | Not an A1B gate; supports the interpretation that A1B M5 needs GPU kernel work, not only host submission work |
 | vocab fixed-dimension GEMV source | HF strict-capital trace pass | `82.4` wall tok/s / `86.0` GPU tok/s; vocab profile unchanged at `1354us` | Reject; fixed bounds/barrier cleanup did not reduce output-head time |
+| MoE BF16 activation scratch | HF strict-capital trace pass | `82.0` wall tok/s / `85.8` GPU tok/s | Reject; reduced scratch bandwidth was outweighed by activation conversion and BF16 reload cost |
 
 ## Decision Log
 
