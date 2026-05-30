@@ -423,6 +423,14 @@ struct LFM25A1BRealBundleTests {
             #expect(timing.decodeWallTokensPerSecond > 60.0)
             #expect(timing.decodeGPUTokensPerSecond > 60.0)
         } else {
+            if ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"] == "1" {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_scores" })
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_select" })
+                #expect(timing.decodeStepCount <= 224)
+            } else {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_parallel" })
+                #expect(timing.decodeStepCount <= 202)
+            }
             #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed4" })
             #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
             #expect(timing.decodeWallTokensPerSecond > 78.0)

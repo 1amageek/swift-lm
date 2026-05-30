@@ -42,11 +42,12 @@ Required expectations:
   monolithic route is diagnostic-only and must not be used as correctness
   oracle because it is not HuggingFace first-token equivalent on the current
   A1B bundle.
-- LFM2.5 8B-A1B Sparse MoE routing uses the parallel expert router
-  (`router_scores` + `router_select`) and BF16 packed4 gate/up + down kernels
+- LFM2.5 8B-A1B Sparse MoE routing uses the fused parallel expert router
+  (`sparse_moe_bf16_router_parallel`) and BF16 packed4 gate/up + down kernels
   by default. The 64-token strict-capital decode timing gate must match the
-  HuggingFace token trace exactly, route through the packed4 kernels, and clear
-  78 wall-clock tok/s plus 80 GPU tok/s.
+  HuggingFace token trace exactly, route through the parallel router and
+  packed4 kernels, stay at or below 202 decode steps, and clear 78 wall-clock
+  tok/s plus 80 GPU tok/s.
 - LFM2.5 8B-A1B default Sparse MoE routing stays bounded across short, chat,
   and longer prompt lengths so the production route cannot silently regress to
   diagnostic monolithic latency.

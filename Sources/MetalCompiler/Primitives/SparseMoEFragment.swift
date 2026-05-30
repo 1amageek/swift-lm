@@ -189,7 +189,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let routerSelectThreads = max(routerSelectPipeline.threadExecutionWidth, 1)
         let routerParallelSimdWidth = max(routerParallelPipeline.threadExecutionWidth, 1)
         let routerParallelMaxSimdgroups = max(1, routerParallelPipeline.maxTotalThreadsPerThreadgroup / routerParallelSimdWidth)
-        let usesParallelRouter = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ROUTER_PARALLEL"])
+        let disablesParallelRouter = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"])
+        let usesParallelRouter = !disablesParallelRouter
             && expertCount <= routerParallelMaxSimdgroups
         let routerParallelThreads = expertCount * routerParallelSimdWidth
         let flatGateUpCount = expertsPerToken * intermediateDimension
