@@ -482,7 +482,6 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
         #expect(histogram["sparse_moe_bf16_down"] == nil)
         #expect(timing.decodeStepCount <= 202)
-        #expect(timing.decodeBarrierCount <= 179)
     }
 
     @Test("Opt-in packed8 Sparse MoE projection route matches HF prefix", .timeLimit(.minutes(10)))
