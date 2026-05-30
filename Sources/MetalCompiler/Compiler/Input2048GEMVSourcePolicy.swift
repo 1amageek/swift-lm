@@ -75,8 +75,8 @@ struct Input2048GEMVSourcePolicy: Sendable {
     static func expanded6144(weightFormat: WeightFormat) -> Self {
         Self(
             fixedOutputDimension: 6_144,
-            fixedRowsPerThreadgroup: 4,
-            fixedSimdgroups: 4,
+            fixedRowsPerThreadgroup: 8,
+            fixedSimdgroups: 8,
             stagesInputAsFloat: false,
             unrollFactor: 4,
             bf16ArgumentReadPolicy: weightFormat.isBFloat16 ? .packed4ThreadgroupFixedPointerInput : .scalar,

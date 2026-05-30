@@ -41,6 +41,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         let decodeStepCount: Int
         let decodeBarrierCount: Int
         let decodeKernelHistogram: [(kernelName: String, count: Int)]
+        let hostSamplingLogitReadCount: Int
     }
 
     private var inferenceModel: MetalInferenceModel
@@ -54,6 +55,7 @@ public final class LanguageModelContext: @unchecked Sendable {
     private let thinkingTagPolicy: ThinkingTagPolicy?
     private let visionRuntime: QwenVisionRuntime?
     private let gemma4Runtime: Gemma4Runtime?
+    private var debugHostSamplingLogitReadCount = 0
 
     public convenience init(_ container: LanguageModelContainer) throws {
         try self.init(prototypeContext: container.prototypeContext)
@@ -1589,6 +1591,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         parameters: GenerationParameters
     ) throws -> DebugRawGenerationTiming {
         let resolvedParameters = resolvedGenerateParameters(parameters)
+        debugHostSamplingLogitReadCount = 0
         let prefillStart = CFAbsoluteTimeGetCurrent()
         let prefillResult = try prefill(prompt: prompt)
         let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
@@ -1615,7 +1618,8 @@ public final class LanguageModelContext: @unchecked Sendable {
                 decodeGPUTokensPerSecond: 0,
                 decodeStepCount: inferenceModel.decodePlan.steps.count,
                 decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
-                decodeKernelHistogram: debugDecodeKernelHistogram()
+                decodeKernelHistogram: debugDecodeKernelHistogram(),
+                hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
             )
         }
 
@@ -1656,7 +1660,8 @@ public final class LanguageModelContext: @unchecked Sendable {
             decodeGPUTokensPerSecond: decodeGPUTPS,
             decodeStepCount: inferenceModel.decodePlan.steps.count,
             decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
-            decodeKernelHistogram: debugDecodeKernelHistogram()
+            decodeKernelHistogram: debugDecodeKernelHistogram(),
+            hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
         )
     }
 
@@ -2400,16 +2405,18 @@ public final class LanguageModelContext: @unchecked Sendable {
         }
         let suppressedTokenIDs = specialTokensToSuppress
         let needsGreedyRepair = suppressedTokenIDs.contains(Int(fallbackToken))
-        let requiresHostLogitPostprocessing = finalLogitSoftcapping != nil
-        let shouldSampleOnHost =
-            parameters.temperature > 0
-            || parameters.topP < 1
-            || parameters.topK != nil
-            || parameters.minP > 0
-            || parameters.repetitionPenalty != nil
+        let requiresHostLogitPostprocessing = finalLogitSoftcapping.map { $0 > 0 } ?? false
+        let requiresHostLogitMutation =
+            parameters.repetitionPenalty != nil
             || parameters.presencePenalty != nil
             || needsGreedyRepair
-            || requiresHostLogitPostprocessing
+        let canTrustGreedyFallbackThroughSoftcap =
+            parameters.temperature == 0
+            && !requiresHostLogitMutation
+        let shouldSampleOnHost =
+            parameters.temperature > 0
+            || requiresHostLogitMutation
+            || (requiresHostLogitPostprocessing && !canTrustGreedyFallbackThroughSoftcap)
 
         if ProcessInfo.processInfo.environment["SWIFTLM_TRACE_SAMPLING"] == "1" {
             print(
@@ -2433,6 +2440,7 @@ public final class LanguageModelContext: @unchecked Sendable {
             vocabularySize: vocabularySize,
             precision: precision
         )
+        debugHostSamplingLogitReadCount += 1
         applySuppressedTokenMask(suppressedTokenIDs, to: &logits)
         applyPresencePenalty(
             to: &logits,

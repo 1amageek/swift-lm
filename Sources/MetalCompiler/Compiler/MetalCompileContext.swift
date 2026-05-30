@@ -44,7 +44,7 @@ enum DecodeProjectionShapeFamily {
         case .vocabDense:
             return 16
         case .input20486144Dense:
-            return 4
+            return 8
         case .input2048ExpandedDense, .input20488192Dense:
             return 8
         case .input2048SquareDense:
@@ -298,6 +298,7 @@ struct DispatchHeuristics {
             )
         }
     }
+
 }
 
 struct ConvStateRequirements {

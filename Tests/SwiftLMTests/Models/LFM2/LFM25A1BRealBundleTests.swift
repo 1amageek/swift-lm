@@ -403,7 +403,7 @@ struct LFM25A1BRealBundleTests {
         let hostOverheadSeconds = max(0, timing.decodeWallSeconds - timing.decodeGPUSeconds)
 
         print(String(
-            format: "[LFM2.5 8B-A1B decode timing] tokens=%d prefill=%.3fs wall=%.3fs gpu=%.3fs wall_tok_s=%.1f gpu_tok_s=%.1f host_overhead=%.3fs steps=%d barriers=%d",
+            format: "[LFM2.5 8B-A1B decode timing] tokens=%d prefill=%.3fs wall=%.3fs gpu=%.3fs wall_tok_s=%.1f gpu_tok_s=%.1f host_overhead=%.3fs steps=%d barriers=%d host_logit_reads=%d",
             timing.tokenIDs.count,
             timing.prefillSeconds,
             timing.decodeWallSeconds,
@@ -412,7 +412,8 @@ struct LFM25A1BRealBundleTests {
             timing.decodeGPUTokensPerSecond,
             hostOverheadSeconds,
             timing.decodeStepCount,
-            timing.decodeBarrierCount
+            timing.decodeBarrierCount,
+            timing.hostSamplingLogitReadCount
         ))
         print("[LFM2.5 8B-A1B decode kernel histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
 
@@ -440,6 +441,7 @@ struct LFM25A1BRealBundleTests {
             }
             #expect(timing.decodeWallTokensPerSecond > 78.0)
             #expect(timing.decodeGPUTokensPerSecond > 80.0)
+            #expect(timing.hostSamplingLogitReadCount == 0)
         }
         #expect(timing.decodeStepCount > 0)
     }
