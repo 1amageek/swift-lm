@@ -70,7 +70,14 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     }
 
     public func kernelName(context: KernelContext) -> String {
-        let weightSuffix = context.weightFormat.isBFloat16 ? "_bf16" : ""
+        let weightSuffix: String
+        if context.weightFormat.isBFloat16 {
+            weightSuffix = "_bf16"
+        } else if context.weightFormat.isQuantized {
+            weightSuffix = "_q\(context.weightFormat.bits)_g\(context.weightFormat.groupSize)"
+        } else {
+            weightSuffix = ""
+        }
         return context.bufferPrecision.isPrefillSequencePrecision
             ? "sparse_moe_seq\(weightSuffix)_f32"
             : "sparse_moe\(weightSuffix)\(context.bufferPrecision.decodeKernelNameSuffix)"
@@ -156,30 +163,6 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         guard let routerParallelPipeline = pipelineCache["\(baseName)_router_parallel"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_router_parallel")
         }
-        guard let gateUpPipeline = pipelineCache["\(baseName)_gate_up"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up")
-        }
-        guard let gateUpPacked4Pipeline = pipelineCache["\(baseName)_gate_up_packed4"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_packed4")
-        }
-        guard let gateUpPacked8Pipeline = pipelineCache["\(baseName)_gate_up_packed8"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_packed8")
-        }
-        guard let gateUpSplit2Pipeline = pipelineCache["\(baseName)_gate_up_split2"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_split2")
-        }
-        guard let downPipeline = pipelineCache["\(baseName)_down"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_down")
-        }
-        guard let downPacked4Pipeline = pipelineCache["\(baseName)_down_packed4"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_down_packed4")
-        }
-        guard let downPacked8Pipeline = pipelineCache["\(baseName)_down_packed8"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_down_packed8")
-        }
-        guard let downSplit2Pipeline = pipelineCache["\(baseName)_down_split2"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_down_split2")
-        }
 
         let routerBuffer = routerBinding.buffer
         let routerOffset = routerBinding.offset
@@ -209,9 +192,12 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && intermediateDimension.isMultiple(of: 8)
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
         let usesGateUpSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
-        let selectedGateUpPipeline = usesGateUpSplit2
-            ? gateUpSplit2Pipeline
-            : (usesPacked8 ? gateUpPacked8Pipeline : (usesPacked4 ? gateUpPacked4Pipeline : gateUpPipeline))
+        let selectedGateUpName = usesGateUpSplit2
+            ? "\(baseName)_gate_up_split2"
+            : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"))
+        guard let selectedGateUpPipeline = pipelineCache[selectedGateUpName] else {
+            throw MetalCompilerError.kernelNotFound(selectedGateUpName)
+        }
         let gateUpSimdWidth = max(selectedGateUpPipeline.threadExecutionWidth, 1)
         let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
@@ -229,9 +215,12 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             ? gateUpRowsPerThreadgroup * 2 * 2 * MemoryLayout<Float>.stride
             : 0
         let usesDownSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
-        let selectedDownPipeline = usesDownSplit2
-            ? downSplit2Pipeline
-            : (usesPacked8 ? downPacked8Pipeline : (usesPacked4 ? downPacked4Pipeline : downPipeline))
+        let selectedDownName = usesDownSplit2
+            ? "\(baseName)_down_split2"
+            : (usesPacked8 ? "\(baseName)_down_packed8" : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down"))
+        guard let selectedDownPipeline = pipelineCache[selectedDownName] else {
+            throw MetalCompilerError.kernelNotFound(selectedDownName)
+        }
         let downSimdWidth = max(selectedDownPipeline.threadExecutionWidth, 1)
         let requestedDownSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
@@ -383,9 +372,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: moeScratch, offset: 0)]
                 ),
                 metadata: .init(
-                    kernelName: usesGateUpSplit2
-                        ? "\(baseName)_gate_up_split2"
-                        : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up")),
+                    kernelName: selectedGateUpName,
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [2])
                 )
             ))
@@ -417,9 +404,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: outputBinding.buffer, offset: outputBinding.offset)]
                 ),
                 metadata: .init(
-                    kernelName: usesDownSplit2
-                        ? "\(baseName)_down_split2"
-                        : (usesPacked8 ? "\(baseName)_down_packed8" : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down")),
+                    kernelName: selectedDownName,
                     bufferAccessPattern: .init(reads: [0, 1], writes: [2])
                 )
             ))

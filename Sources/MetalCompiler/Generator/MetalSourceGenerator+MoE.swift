@@ -7,6 +7,37 @@ extension MetalSourceGenerator {
         weightFormat: WeightFormat,
         gateKind: MoEGateKind
     ) -> String {
+        if weightFormat.isQuantized {
+            return [
+                generateSparseMoERouterParallel(
+                    name: "\(name)_router_parallel",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: weightFormat,
+                    gateKind: gateKind
+                ),
+                generateSparseMoERouterScores(
+                    name: "\(name)_router_scores",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: weightFormat,
+                    gateKind: gateKind
+                ),
+                generateSparseMoERouterSelect(
+                    name: "\(name)_router_select",
+                    gateKind: gateKind
+                ),
+                generateSparseMoEGateUp(
+                    name: "\(name)_gate_up",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: weightFormat
+                ),
+                generateSparseMoEDown(
+                    name: "\(name)_down",
+                    bufferPrecision: bufferPrecision,
+                    weightFormat: weightFormat
+                ),
+            ].joined(separator: "\n\n")
+        }
+
         return [
             generateSparseMoEMonolithic(
                 name: name,
@@ -426,6 +457,14 @@ extension MetalSourceGenerator {
         weightFormat: WeightFormat,
         gateKind: MoEGateKind
     ) -> String {
+        if weightFormat.isQuantized {
+            return generateSparseMoEQuantizedRouterParallel(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat,
+                gateKind: gateKind
+            )
+        }
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expression: String) in weightFormat.readExpression(expression) }
@@ -571,6 +610,14 @@ extension MetalSourceGenerator {
         weightFormat: WeightFormat,
         gateKind: MoEGateKind
     ) -> String {
+        if weightFormat.isQuantized {
+            return generateSparseMoEQuantizedRouterScores(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat,
+                gateKind: gateKind
+            )
+        }
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expression: String) in weightFormat.readExpression(expression) }
@@ -733,6 +780,13 @@ extension MetalSourceGenerator {
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat
     ) -> String {
+        if weightFormat.isQuantized {
+            return generateSparseMoEQuantizedGateUp(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expression: String) in weightFormat.readExpression(expression) }
@@ -801,6 +855,13 @@ extension MetalSourceGenerator {
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat
     ) -> String {
+        if weightFormat.isQuantized {
+            return generateSparseMoEQuantizedDown(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
         let bt = bufferPrecision.metalType
         let wt = weightFormat.bufferType
         let readWeight = { (expression: String) in weightFormat.readExpression(expression) }
@@ -853,6 +914,413 @@ extension MetalSourceGenerator {
             }
         }
         """
+    }
+
+    private static func generateSparseMoEQuantizedRouterParallel(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        gateKind: MoEGateKind
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let weightsPerBlock = weightFormat.weightsPerBlock
+        let bytesPerBlock = weightFormat.bytesPerBlock
+        let readWeight = quantizedPerWeightExpression(weightFormat)
+        let routingStore: String
+        let softmaxPreparation: String
+        switch gateKind {
+        case .sigmoidTopK:
+            routingStore = """
+                const float weight = 1.0f / (1.0f + exp(-logit));
+                routingWeights[expert] = weight;
+                routingScores[expert] = useExpertBias != 0u
+                    ? weight + expertBias[expert]
+                    : weight;
+            """
+            softmaxPreparation = ""
+        case .topK:
+            routingStore = """
+                routingWeights[expert] = logit;
+                routingScores[expert] = useExpertBias != 0u ? expertBias[expert] : 0.0f;
+            """
+            softmaxPreparation = """
+
+            if (tid == 0u) {
+                float maxLogit = -INFINITY;
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    maxLogit = max(maxLogit, routingWeights[expert]);
+                }
+                float weightSum = 0.0f;
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    const float scoreBias = routingScores[expert];
+                    const float weight = exp(routingWeights[expert] - maxLogit);
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = scoreBias;
+                    weightSum += weight;
+                }
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    const float scoreBias = routingScores[expert];
+                    const float weight = routingWeights[expert] / weightSum;
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = weight + scoreBias;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+        case .custom:
+            preconditionFailure("Sparse MoE generation does not support custom routing gates")
+        }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const uchar* routerWeight       [[buffer(1)]],
+            device const float* expertBias         [[buffer(2)]],
+            device float* moeScratch               [[buffer(3)]],
+            constant uint& inputDimension          [[buffer(4)]],
+            constant uint& expertCount             [[buffer(5)]],
+            constant uint& expertsPerToken         [[buffer(6)]],
+            constant uint& normalizeRoutingWeights [[buffer(7)]],
+            constant float& routedScalingFactor    [[buffer(8)]],
+            constant uint& useExpertBias           [[buffer(9)]],
+            constant uint& sequenceLength          [[buffer(10)]],
+            constant uint& inputRowStride          [[buffer(11)]],
+            constant uint& scratchRowStride        [[buffer(12)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            const uint maxExperts = 128u;
+            const uint maxTopK = 8u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint seqPos = gid.x;
+            if (seqPos >= sequenceLength
+                || expertCount > maxExperts
+                || expertsPerToken > maxTopK
+                || expertCount > simdgroupsPerThreadgroup) {
+                return;
+            }
+
+            threadgroup float routingWeights[128];
+            threadgroup float routingScores[128];
+
+            const uint expert = sgitg;
+            const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device float* selectedExpertScratch = scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+            if (expert < expertCount) {
+                float logit = 0.0f;
+                device const uchar* routerRow = routerWeight + expert * blocksPerRow * BYTES_PER_BLOCK;
+                for (uint blockIndex = 0; blockIndex < blocksPerRow; blockIndex++) {
+                    device const uchar* block = routerRow + blockIndex * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    for (uint q = tiisg; q < WEIGHTS_PER_BLOCK; q += SIMD_WIDTH) {
+                        const uint j = blockIndex * WEIGHTS_PER_BLOCK + q;
+                        logit += \(readWeight) * float(inputRow[j]);
+                    }
+                }
+                logit = simd_sum(logit);
+                if (tiisg == 0) {
+        \(routingStore)
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(softmaxPreparation)
+
+            if (tid == 0u) {
+                float selectedWeightSum = 0.0f;
+                uint selectedExperts[8];
+                float selectedWeights[8];
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float bestScore = -INFINITY;
+                    uint bestExpert = 0u;
+                    for (uint expertIndex = 0; expertIndex < expertCount; expertIndex++) {
+                        bool alreadySelected = false;
+                        for (uint prev = 0; prev < k; prev++) {
+                            alreadySelected = alreadySelected || selectedExperts[prev] == expertIndex;
+                        }
+                        const float score = alreadySelected ? -INFINITY : routingScores[expertIndex];
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestExpert = expertIndex;
+                        }
+                    }
+                    const float routingWeight = routingWeights[bestExpert];
+                    selectedExperts[k] = bestExpert;
+                    selectedWeights[k] = routingWeight;
+                    selectedWeightSum += routingWeight;
+                }
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float weight = selectedWeights[k];
+                    if (normalizeRoutingWeights != 0u) {
+                        weight = weight / (selectedWeightSum + 1.0e-6f);
+                    }
+                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedWeightScratch[k] = weight * routedScalingFactor;
+                }
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEQuantizedRouterScores(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        gateKind: MoEGateKind
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let weightsPerBlock = weightFormat.weightsPerBlock
+        let bytesPerBlock = weightFormat.bytesPerBlock
+        let readWeight = quantizedPerWeightExpression(weightFormat)
+        let routingStore: String
+        switch gateKind {
+        case .sigmoidTopK:
+            routingStore = """
+                const float weight = 1.0f / (1.0f + exp(-logit));
+                routingWeightsScratch[expert] = weight;
+                routingScoresScratch[expert] = useExpertBias != 0u
+                    ? weight + expertBias[expert]
+                    : weight;
+            """
+        case .topK:
+            routingStore = """
+                routingWeightsScratch[expert] = logit;
+                routingScoresScratch[expert] = useExpertBias != 0u ? expertBias[expert] : 0.0f;
+            """
+        case .custom:
+            preconditionFailure("Sparse MoE generation does not support custom routing gates")
+        }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const uchar* routerWeight       [[buffer(1)]],
+            device const float* expertBias         [[buffer(2)]],
+            device float* moeScratch               [[buffer(3)]],
+            constant uint& inputDimension          [[buffer(4)]],
+            constant uint& expertCount             [[buffer(5)]],
+            constant uint& expertsPerToken         [[buffer(6)]],
+            constant uint& normalizeRoutingWeights [[buffer(7)]],
+            constant float& routedScalingFactor    [[buffer(8)]],
+            constant uint& useExpertBias           [[buffer(9)]],
+            constant uint& sequenceLength          [[buffer(10)]],
+            constant uint& inputRowStride          [[buffer(11)]],
+            constant uint& scratchRowStride        [[buffer(12)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]]
+        ) {
+            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            const uint maxExperts = 128u;
+            const uint seqPos = gid.y;
+            const uint expert = gid.x;
+            if (seqPos >= sequenceLength || expert >= expertCount || expertCount > maxExperts) {
+                return;
+            }
+
+            const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device float* routingWeightsScratch = scratchRow + 2u * expertsPerToken;
+            device float* routingScoresScratch = routingWeightsScratch + maxExperts;
+
+            float logit = 0.0f;
+            device const uchar* routerRow = routerWeight + expert * blocksPerRow * BYTES_PER_BLOCK;
+            for (uint blockIndex = 0; blockIndex < blocksPerRow; blockIndex++) {
+                device const uchar* block = routerRow + blockIndex * BYTES_PER_BLOCK;
+                float scale = float(*(device const half*)(block));
+                float zero = float(*(device const half*)(block + 2));
+                device const uchar* qs = block + 4;
+                for (uint q = tiisg; q < WEIGHTS_PER_BLOCK; q += SIMD_WIDTH) {
+                    const uint j = blockIndex * WEIGHTS_PER_BLOCK + q;
+                    logit += \(readWeight) * float(inputRow[j]);
+                }
+            }
+            logit = simd_sum(logit);
+            if (tiisg == 0) {
+        \(routingStore)
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEQuantizedGateUp(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let weightsPerBlock = weightFormat.weightsPerBlock
+        let bytesPerBlock = weightFormat.bytesPerBlock
+        let readWeight = quantizedPerWeightExpression(weightFormat)
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const uchar* expertGateUpWeight [[buffer(1)]],
+            device float* moeScratch               [[buffer(2)]],
+            constant uint& inputDimension          [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& inputRowStride          [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            const uint seqPos = gid.y;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint flat = gid.x * simdgroupsPerThreadgroup + sgitg;
+            if (seqPos >= sequenceLength) {
+                return;
+            }
+            const uint k = flat / intermediateDimension;
+            const uint m = flat - k * intermediateDimension;
+            if (k >= expertsPerToken || m >= intermediateDimension) {
+                return;
+            }
+
+            const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+            const uint bytesPerRow = blocksPerRow * BYTES_PER_BLOCK;
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device float* selectedExpertScratch = scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+            device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            const uint expert = uint(selectedExpertScratch[k]);
+            const float routeWeight = selectedWeightScratch[k];
+            device const uchar* gateBase = expertGateUpWeight
+                + expert * (2u * intermediateDimension * bytesPerRow);
+            device const uchar* upBase = gateBase + intermediateDimension * bytesPerRow;
+            device const uchar* gateRow = gateBase + m * bytesPerRow;
+            device const uchar* upRow = upBase + m * bytesPerRow;
+
+            float gate = 0.0f;
+            float up = 0.0f;
+            for (uint blockIndex = 0; blockIndex < blocksPerRow; blockIndex++) {
+                device const uchar* gateBlock = gateRow + blockIndex * BYTES_PER_BLOCK;
+                device const uchar* upBlock = upRow + blockIndex * BYTES_PER_BLOCK;
+                float scale = float(*(device const half*)(gateBlock));
+                float zero = float(*(device const half*)(gateBlock + 2));
+                device const uchar* qs = gateBlock + 4;
+                for (uint q = tiisg; q < WEIGHTS_PER_BLOCK; q += SIMD_WIDTH) {
+                    const uint j = blockIndex * WEIGHTS_PER_BLOCK + q;
+                    gate += \(readWeight) * float(inputRow[j]);
+                }
+                scale = float(*(device const half*)(upBlock));
+                zero = float(*(device const half*)(upBlock + 2));
+                qs = upBlock + 4;
+                for (uint q = tiisg; q < WEIGHTS_PER_BLOCK; q += SIMD_WIDTH) {
+                    const uint j = blockIndex * WEIGHTS_PER_BLOCK + q;
+                    up += \(readWeight) * float(inputRow[j]);
+                }
+            }
+            gate = simd_sum(gate);
+            up = simd_sum(up);
+            if (tiisg == 0) {
+                activationScratch[k * intermediateDimension + m] =
+                    gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEQuantizedDown(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let weightsPerBlock = weightFormat.weightsPerBlock
+        let bytesPerBlock = weightFormat.bytesPerBlock
+        let readWeight = quantizedPerWeightExpression(weightFormat)
+        let storedOutput = bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue("total", weightFormat: .float16)
+            : "total"
+
+        return """
+        kernel void \(name)(
+            device const float* moeScratch          [[buffer(0)]],
+            device const uchar* expertDownWeight   [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            constant uint& outputDimension         [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+            const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || row >= outputDimension) {
+                return;
+            }
+
+            const uint blocksPerRow = intermediateDimension / WEIGHTS_PER_BLOCK;
+            const uint bytesPerRow = blocksPerRow * BYTES_PER_BLOCK;
+            device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device const float* selectedExpertScratch = scratchRow;
+            device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            float total = 0.0f;
+            for (uint k = 0; k < expertsPerToken; k++) {
+                const uint expert = uint(selectedExpertScratch[k]);
+                device const uchar* downRow = expertDownWeight
+                    + expert * (outputDimension * bytesPerRow)
+                    + row * bytesPerRow;
+                device const float* activatedRow = activationScratch + k * intermediateDimension;
+                float partial = 0.0f;
+                for (uint blockIndex = 0; blockIndex < blocksPerRow; blockIndex++) {
+                    device const uchar* block = downRow + blockIndex * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    for (uint q = tiisg; q < WEIGHTS_PER_BLOCK; q += SIMD_WIDTH) {
+                        const uint m = blockIndex * WEIGHTS_PER_BLOCK + q;
+                        partial += \(readWeight) * activatedRow[m];
+                    }
+                }
+                total += simd_sum(partial);
+            }
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
+            }
+        }
+        """
+    }
+
+    private static func quantizedPerWeightExpression(_ weightFormat: WeightFormat) -> String {
+        guard let expression = weightFormat.perWeightReadExpression(
+            blocksVar: "qs",
+            weightIndexVar: "q"
+        ) else {
+            fatalError(
+                "Sparse MoE quantized generation requires perWeightReadExpression for \(weightFormat.schemeIdentifier)"
+            )
+        }
+        return expression
     }
 
     private static func generateSparseMoEGateUpSplit2(

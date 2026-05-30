@@ -450,6 +450,53 @@ struct LFM25A1BRealBundleTests {
         #expect(timing.decodeStepCount > 0)
     }
 
+    @Test("MLX 8-bit Sparse MoE route loads and reports direct Q8 kernels", .timeLimit(.minutes(10)))
+    func mlx8BitSparseMoERouteLoadsAndReportsDirectQ8Kernels() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BMLX8BitModelDirectoryOrSkip() else {
+            return
+        }
+
+        let loader = ModelBundleLoader()
+        let container = try await loader.load(directory: localModelDirectory)
+        let context = try LanguageModelContext(container)
+        let prepared = try await context.prepare(ModelInput(chat: [
+            .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+        ]))
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+        let timing = try context.debugRawGenerationTiming(
+            prompt: executable,
+            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 8)
+        )
+        let histogram = Dictionary(
+            uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
+        )
+
+        print(String(
+            format: "[LFM2.5 8B-A1B MLX 8-bit decode timing] tokens=%d prefill=%.3fs wall=%.3fs gpu=%.3fs wall_tok_s=%.1f gpu_tok_s=%.1f steps=%d barriers=%d host_logit_reads=%d",
+            timing.tokenIDs.count,
+            timing.prefillSeconds,
+            timing.decodeWallSeconds,
+            timing.decodeGPUSeconds,
+            timing.decodeWallTokensPerSecond,
+            timing.decodeGPUTokensPerSecond,
+            timing.decodeStepCount,
+            timing.decodeBarrierCount,
+            timing.hostSamplingLogitReadCount
+        ))
+        print("[LFM2.5 8B-A1B MLX 8-bit kernel histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+        print("[LFM2.5 8B-A1B MLX 8-bit token ids] \(timing.tokenIDs)")
+        print("[LFM2.5 8B-A1B MLX 8-bit text] \(context.decode(timing.tokenIDs, skipSpecialTokens: false))")
+
+        #expect(container.configuration.name.lowercased() == "lfm2_moe")
+        #expect(timing.tokenIDs.count == 8)
+        #expect(histogram["sparse_moe_q8_g64_router_parallel"] == 22)
+        #expect(histogram["sparse_moe_q8_g64_gate_up"] == 22)
+        #expect(histogram["sparse_moe_q8_g64_down"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
+        #expect(timing.hostSamplingLogitReadCount == 0)
+    }
+
     @Test("Production Sparse MoE route uses A1B optimized kernels", .timeLimit(.minutes(10)))
     func productionSparseMoERouteUsesA1BOptimizedKernels() async throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {

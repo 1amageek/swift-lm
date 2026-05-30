@@ -111,6 +111,56 @@ struct MetalSourceGeneratorTests {
         }
     }
 
+    @Test("Generated Sparse MoE compiles for direct Q8 decode and prefill")
+    func sparseMoEQ8Compiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let cases: [(MetalSourceGenerator.BufferPrecision, String)] = [
+            (.float16, "decode"),
+            (.float32, "prefill"),
+        ]
+        for (precision, label) in cases {
+            let name = "sparse_moe_\(label)_q8_g64"
+            let source = MetalSourceGenerator.commonHeader + "\n\n"
+                + MetalSourceGenerator.generateSparseMoE(
+                    name: name,
+                    bufferPrecision: precision,
+                    weightFormat: WeightFormats.quantized8Bit(groupSize: 64),
+                    gateKind: .sigmoidTopK
+                )
+            let options = MTLCompileOptions()
+            options.languageVersion = .version4_0
+            let library = try device.makeLibrary(source: source, options: options)
+            #expect(library.makeFunction(name: "\(name)_router_parallel") != nil, "Failed to compile \(name)_router_parallel")
+            #expect(library.makeFunction(name: "\(name)_router_scores") != nil, "Failed to compile \(name)_router_scores")
+            #expect(library.makeFunction(name: "\(name)_router_select") != nil, "Failed to compile \(name)_router_select")
+            #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
+            #expect(library.makeFunction(name: "\(name)_down") != nil, "Failed to compile \(name)_down")
+        }
+    }
+
+    @Test("Sparse MoE kernel names describe quantized weights")
+    func sparseMoEQuantizedKernelNameDescribesFormat() {
+        let fragment = SparseMoEFragment(
+            expertCount: 32,
+            expertsPerToken: 4,
+            gateKind: .sigmoidTopK,
+            inputDimension: 2_048,
+            outputDimension: 2_048,
+            intermediateDimension: 1_792,
+            normalizeRoutingWeights: true,
+            routedScalingFactor: 1.0,
+            useExpertBias: true
+        )
+        let name = fragment.kernelName(
+            context: KernelContext(
+                bufferPrecision: .float16,
+                weightFormat: WeightFormats.quantized8Bit(groupSize: 64)
+            )
+        )
+        #expect(name == "sparse_moe_q8_g64")
+    }
+
     @Test("Sparse MoE monolithic route is diagnostic-only")
     func sparseMoEMonolithicRouteIsDiagnosticOnly() {
         let legacyKey = "SWIFTLM_SPARSE_MOE_MONOLITHIC"
