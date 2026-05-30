@@ -270,6 +270,49 @@ struct LoadTests {
         #expect(!tensorNames.contains("model.layers.2.feed_forward.experts.0.w1.weight"))
     }
 
+    @Test("LFM2.5 8B-A1B profile contract is explicit")
+    func lfm25_8B_A1B_ProfileContractIsExplicit() throws {
+        let config = Self.lfm25_8B_A1B_Config
+        let layerTypes = try #require(config.layerTypes)
+
+        #expect(config.hiddenSize == 2_048)
+        #expect(config.layerCount == 24)
+        #expect(config.intermediateSize == 7_168)
+        #expect(config.moeIntermediateSize == 1_792)
+        #expect(config.expertCount == 32)
+        #expect(config.expertsPerToken == 4)
+        #expect(config.numDenseLayers == 2)
+        #expect(config.moeNormalizeRoutingWeights == true)
+        #expect(config.moeUseExpertBias == true)
+        #expect(config.moeRoutedScalingFactor == 1.0)
+        #expect(config.convLCache == 3)
+        #expect(config.tiedEmbeddings == true)
+
+        let fullAttentionLayers = layerTypes.enumerated()
+            .filter { $0.element == "full_attention" }
+            .map(\.offset)
+        let convLayers = layerTypes.enumerated()
+            .filter { $0.element == "conv" }
+            .map(\.offset)
+
+        #expect(fullAttentionLayers == [2, 6, 10, 14, 18, 21])
+        #expect(convLayers.count == 18)
+        #expect(Self.lfm25_8B_A1B_MoELayerCount == 22)
+
+        let graph = try ModelGraph(LFM2(config: config))
+        let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
+        let tensorNames = collectTensorNames(in: resolved.rootRegion)
+        let gateUpBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.experts.gate_up_proj") }
+        let downBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.experts.down_proj") }
+        let routerBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.gate.weight") }
+        let biasBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.expert_bias") }
+
+        #expect(gateUpBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
+        #expect(downBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
+        #expect(routerBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
+        #expect(biasBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
+    }
+
     @Test("Resolve Gemma4 parameter bindings")
     func resolveGemma4Parameters() throws {
         let config = ModelConfig(
@@ -435,6 +478,8 @@ struct LoadTests {
         ],
         numDenseLayers: 2
     )
+
+    private static let lfm25_8B_A1B_MoELayerCount = 22
 
     private func findModelDirectoryOrSkip() throws -> URL? {
         guard let directory = try findModelDirectory() else {
