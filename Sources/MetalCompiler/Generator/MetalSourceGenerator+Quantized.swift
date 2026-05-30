@@ -594,6 +594,111 @@ public static func generateUnifiedQuantizedGEMV(
     """
 }
 
+public static func generateUnifiedQuantizedVocabGEMVPartialArgmax(
+    name: String,
+    format: any QuantizationFormat,
+    bufferPrecision: BufferPrecision,
+    tileElements: Int = 256
+) -> String {
+    precondition(
+        format.isQuantized,
+        "generateUnifiedQuantizedVocabGEMVPartialArgmax requires isQuantized=true; got \(format.schemeIdentifier)"
+    )
+
+    let bt = bufferPrecision.metalType
+    let weightsPerBlock = format.weightsPerBlock
+    let bytesPerBlock = format.bytesPerBlock
+
+    guard let readExpression = format.perWeightReadExpression(
+        blocksVar: "qs",
+        weightIndexVar: "k"
+    ) else {
+        fatalError(
+            "Format \(format.schemeIdentifier) did not provide perWeightReadExpression"
+        )
+    }
+
+    return """
+    kernel void \(name)(
+        device const \(bt)* input       [[buffer(0)]],
+        device const uchar* weight     [[buffer(1)]],
+        device \(bt)* output            [[buffer(2)]],
+        device float* partialValues     [[buffer(3)]],
+        device int* partialIndices      [[buffer(4)]],
+        constant uint& inputDimension  [[buffer(5)]],
+        constant uint& outputDimension [[buffer(6)]],
+        uint2 gid                      [[threadgroup_position_in_grid]],
+        uint tid                       [[thread_index_in_threadgroup]],
+        uint tiisg                     [[thread_index_in_simdgroup]],
+        uint sgitg                     [[simdgroup_index_in_threadgroup]],
+        uint2 tptg                     [[threads_per_threadgroup]]
+    ) {
+        const uint WEIGHTS_PER_BLOCK = \(weightsPerBlock);
+        const uint BYTES_PER_BLOCK = \(bytesPerBlock);
+        const uint THREADS_PER_THREADGROUP = tptg.x;
+        const uint rowsPerThreadgroup = THREADS_PER_THREADGROUP / SIMD_WIDTH;
+        const uint TILE_ELEMENTS = \(tileElements);
+        const uint row = gid.x * rowsPerThreadgroup + sgitg;
+        const bool active = row < outputDimension;
+
+        const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
+        const uint safeRow = active ? row : 0;
+        device const uchar* rowBase = weight + safeRow * blocksPerRow * BYTES_PER_BLOCK;
+        threadgroup \(bt) inputTile[TILE_ELEMENTS];
+        threadgroup float rowValues[32];
+        threadgroup int rowIndices[32];
+        float sum = 0.0f;
+
+        for (uint base = 0; base < inputDimension; base += TILE_ELEMENTS) {
+            const uint tileCount = min(TILE_ELEMENTS, inputDimension - base);
+            for (uint j = tid; j < tileCount; j += THREADS_PER_THREADGROUP) {
+                inputTile[j] = input[base + j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint blockBase = base / WEIGHTS_PER_BLOCK;
+            const uint blockCount = tileCount / WEIGHTS_PER_BLOCK;
+            if (active) {
+                for (uint localBlock = 0; localBlock < blockCount; localBlock++) {
+                    device const uchar* block = rowBase + (blockBase + localBlock) * BYTES_PER_BLOCK;
+                    float scale = float(*(device const half*)(block));
+                    float zero = float(*(device const half*)(block + 2));
+                    device const uchar* qs = block + 4;
+                    const uint tileOffset = localBlock * WEIGHTS_PER_BLOCK;
+                    for (uint k = tiisg; k < WEIGHTS_PER_BLOCK; k += SIMD_WIDTH) {
+                        sum += \(readExpression) * float(inputTile[tileOffset + k]);
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        sum = simd_sum(sum);
+        if (active && tiisg == 0) {
+            output[row] = \(bt)(sum);
+        }
+        if (tiisg == 0) {
+            rowValues[sgitg] = active ? sum : -HUGE_VALF;
+            rowIndices[sgitg] = active ? int(row) : 0;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            float bestValue = -HUGE_VALF;
+            int bestIndex = 0;
+            for (uint i = 0; i < rowsPerThreadgroup; i++) {
+                if (rowValues[i] > bestValue) {
+                    bestValue = rowValues[i];
+                    bestIndex = rowIndices[i];
+                }
+            }
+            partialValues[gid.x] = bestValue;
+            partialIndices[gid.x] = bestIndex;
+        }
+    }
+    """
+}
+
 /// Generate a sequence GEMV kernel for packed quantized weights.
 ///
 /// The reduction contract matches decode GEMV for each row-token pair: one SIMD

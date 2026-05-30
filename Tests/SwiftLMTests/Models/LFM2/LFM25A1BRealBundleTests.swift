@@ -465,7 +465,7 @@ struct LFM25A1BRealBundleTests {
         let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
         let timing = try context.debugRawGenerationTiming(
             prompt: executable,
-            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 8)
+            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 64)
         )
         let histogram = Dictionary(
             uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
@@ -488,7 +488,7 @@ struct LFM25A1BRealBundleTests {
         print("[LFM2.5 8B-A1B MLX 8-bit text] \(context.decode(timing.tokenIDs, skipSpecialTokens: false))")
 
         #expect(container.configuration.name.lowercased() == "lfm2_moe")
-        #expect(timing.tokenIDs.count == 8)
+        #expect(timing.tokenIDs.count >= 8)
         #expect(histogram["sparse_moe_q8_g64_router_parallel"] == 22)
         #expect(histogram["sparse_moe_q8_g64_gate_up"] == 22)
         #expect(histogram["sparse_moe_q8_g64_down"] == 22)

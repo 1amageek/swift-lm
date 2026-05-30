@@ -138,8 +138,26 @@ struct MetalKernelSourceCatalog {
                         named: quantizedKernelName,
                         weightFormat: weightFormat,
                         bufferPrecision: bufferPrecision
-                       ) {
+                        ) {
                         sources.append(source)
+                    }
+                    if !bufferPrecision.isPrefillSequencePrecision,
+                       isOutput,
+                       projection.outputDimension > projection.inputDimension,
+                       let format = weightFormat.quantizationFormat {
+                        let partialArgmaxKernelName = "\(quantizedKernelName)_argmax_partial"
+                        if generatedNames.insert(partialArgmaxKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateUnifiedQuantizedVocabGEMVPartialArgmax(
+                                name: partialArgmaxKernelName,
+                                format: format,
+                                bufferPrecision: bufferPrecision
+                            ))
+                        }
+                        let partialReduceKernelName = "argmax_partial_reduce"
+                        if generatedNames.insert(partialReduceKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateArgmaxPartialReduce(
+                                name: partialReduceKernelName))
+                        }
                     }
                     // Q4+float32: also generate dequant + BF16 MPP GEMM below.
                     // Other quantized formats: skip the rest (decode GEMV only).

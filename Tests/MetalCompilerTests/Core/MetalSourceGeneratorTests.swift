@@ -2979,6 +2979,27 @@ struct MetalSourceGeneratorTests {
         }
     }
 
+    @Test("Unified quantized vocab GEMV partial argmax compiles for Q8")
+    func unifiedQuantizedVocabGEMVPartialArgmaxCompilesForQ8() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let kernelName = "test_gemv_q8_g64_argmax_partial"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateUnifiedQuantizedVocabGEMVPartialArgmax(
+                name: kernelName,
+                format: AffineQ8Group64Format(),
+                bufferPrecision: .float16
+            )
+            + "\n\n"
+            + MetalSourceGenerator.generateArgmaxPartialReduce(name: "test_argmax_partial_reduce")
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        #expect(library.makeFunction(name: kernelName) != nil)
+        #expect(library.makeFunction(name: "test_argmax_partial_reduce") != nil)
+    }
+
     @Test("Unified quantized GEMV emits MLX-compatible Q3 bit extraction")
     func unifiedQuantizedGEMVQ3EmitsMLXBitPattern() throws {
         let formats: [any QuantizationFormat] = [
