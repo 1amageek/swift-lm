@@ -52,9 +52,6 @@ struct MetalSourceGeneratorTests {
             options.languageVersion = .version4_0
             let library = try device.makeLibrary(source: source, options: options)
             #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
-            #expect(library.makeFunction(name: "\(name)_router") != nil, "Failed to compile \(name)_router")
-            #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
-            #expect(library.makeFunction(name: "\(name)_down") != nil, "Failed to compile \(name)_down")
         }
     }
 

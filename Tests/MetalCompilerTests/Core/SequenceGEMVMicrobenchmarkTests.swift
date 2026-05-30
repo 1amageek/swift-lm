@@ -215,7 +215,7 @@ struct SequenceGEMVMicrobenchmarkTests {
         let csv = try String(contentsOf: artifact, encoding: .utf8)
         #expect(csv.contains("routePromotionAdmission,requiredProfileRouteGate,readinessPrerequisite"))
         #expect(csv.contains("candidate-single-gemv-default-route,experimental-route-observed,requires-full-profile-route-gate"))
-        #expect(csv.contains("reject-cross-sequence-threshold,,,microbench-rejected"))
+        #expect(csv.contains("reject-cross-sequence-threshold,,microbench-rejected"))
     }
 
     @Test("BF16 batched sequence GEMV route admissions require production sequence wins")

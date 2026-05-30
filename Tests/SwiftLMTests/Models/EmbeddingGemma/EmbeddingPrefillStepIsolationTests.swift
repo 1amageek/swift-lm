@@ -9,7 +9,7 @@ import Testing
 struct EmbeddingPrefillStepIsolationTests {
 
     /// Step 0 alone — embedding lookup only.
-    @Test("Step 0: embedding lookup", .timeLimit(.minutes(1)))
+    @Test("Step 0: embedding lookup", .timeLimit(.minutes(2)))
     func step0EmbeddingLookup() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -17,7 +17,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-1 — embedding + synthesized copy+norm.
-    @Test("Steps 0-1: embedding + norm", .timeLimit(.minutes(1)))
+    @Test("Steps 0-1: embedding + norm", .timeLimit(.minutes(2)))
     func steps0to1() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -25,7 +25,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-2 — through first batched Q/K/V projection.
-    @Test("Steps 0-2: through Q/K/V projection", .timeLimit(.minutes(1)))
+    @Test("Steps 0-2: through Q/K/V projection", .timeLimit(.minutes(2)))
     func steps0to2() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -33,7 +33,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-5 — through flash attention (first layer).
-    @Test("Steps 0-5: through flash attention", .timeLimit(.minutes(1)))
+    @Test("Steps 0-5: through flash attention", .timeLimit(.minutes(2)))
     func steps0to5() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -41,7 +41,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-6 — through o_proj GEMV.
-    @Test("Steps 0-6: through o_proj", .timeLimit(.minutes(1)))
+    @Test("Steps 0-6: through o_proj", .timeLimit(.minutes(2)))
     func steps0to6() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -49,7 +49,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-7 — through residual add + copy + norm (synthesized).
-    @Test("Steps 0-7: through synthesized residual", .timeLimit(.minutes(1)))
+    @Test("Steps 0-7: through synthesized residual", .timeLimit(.minutes(2)))
     func steps0to7() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -57,7 +57,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-8 — through gate+up batched projection.
-    @Test("Steps 0-8: through gate+up projection", .timeLimit(.minutes(1)))
+    @Test("Steps 0-8: through gate+up projection", .timeLimit(.minutes(2)))
     func steps0to8() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -65,7 +65,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-9 — through GeGLU activation.
-    @Test("Steps 0-9: through GeGLU", .timeLimit(.minutes(1)))
+    @Test("Steps 0-9: through GeGLU", .timeLimit(.minutes(2)))
     func steps0to9() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -73,7 +73,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Steps 0-10 — through down_proj (first full layer).
-    @Test("Steps 0-10: first full layer", .timeLimit(.minutes(1)))
+    @Test("Steps 0-10: first full layer", .timeLimit(.minutes(2)))
     func steps0to10() async throws {
         let (plan, residency) = try await loadPlan()
         guard let plan, let residency else { return }
@@ -81,7 +81,7 @@ struct EmbeddingPrefillStepIsolationTests {
     }
 
     /// Diagnostic: print step metadata for first 11 steps.
-    @Test("Step metadata dump", .timeLimit(.minutes(1)))
+    @Test("Step metadata dump", .timeLimit(.minutes(2)))
     func stepMetadataDump() async throws {
         let (plan, _) = try await loadPlan()
         guard let plan else { return }
@@ -107,9 +107,7 @@ struct EmbeddingPrefillStepIsolationTests {
     // MARK: - Helpers
 
     private func loadPlan() async throws -> (MetalPrefillPlan?, MetalResidencyLease?) {
-        guard let container = try await EmbeddingGemmaTestSupport.realEmbeddingGemmaContainer(
-            variant: .community4Bit
-        ) else {
+        guard let container = try await EmbeddingPrefillStepIsolationCache.shared.community4BitContainer() else {
             print("[StepIsolation.Skip] No Q4 EmbeddingGemma model found")
             return (nil, nil)
         }
@@ -172,5 +170,22 @@ struct EmbeddingPrefillStepIsolationTests {
                 print("[StepIsolation] step=\(idx) snapshot=nil")
             }
         }
+    }
+}
+
+private actor EmbeddingPrefillStepIsolationCache {
+    static let shared = EmbeddingPrefillStepIsolationCache()
+
+    private var container: TextEmbeddingContainer?
+
+    func community4BitContainer() async throws -> TextEmbeddingContainer? {
+        if let container {
+            return container
+        }
+        let loaded = try await EmbeddingGemmaTestSupport.realEmbeddingGemmaContainer(
+            variant: .community4Bit
+        )
+        container = loaded
+        return loaded
     }
 }

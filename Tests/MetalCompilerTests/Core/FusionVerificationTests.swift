@@ -422,19 +422,21 @@ struct FusionVerificationTests {
         // RMSNorm: output[i] = input[i] * rsqrt(mean(input^2) + eps) * weight[i]
         for s in 0..<seqLen {
             let rowStart = s * dim
+            let storedInput = (0..<dim).map {
+                Self.sequenceStored(inputData[rowStart + $0], weightFormat: WeightFormats.float16)
+            }
             // Copy: residual = input
             for i in 0..<dim {
-                let val = inputData[rowStart + i]
-                residualUnfused.contents().assumingMemoryBound(to: Float.self)[rowStart + i] = val
+                residualUnfused.contents().assumingMemoryBound(to: Float.self)[rowStart + i] = storedInput[i]
             }
             // Reduction (RMSNorm)
             var sumSq: Float = 0
-            for i in 0..<dim { sumSq += inputData[rowStart + i] * inputData[rowStart + i] }
+            for i in 0..<dim { sumSq += storedInput[i] * storedInput[i] }
             let rmsScale = 1.0 / sqrtf(sumSq / Float(dim) + epsilon)
             for i in 0..<dim {
                 let w = Float(weightData[i]) + weightBias
                 outputUnfused.contents().assumingMemoryBound(to: Float.self)[rowStart + i] =
-                    inputData[rowStart + i] * rmsScale * w
+                    Self.sequenceStored(storedInput[i] * rmsScale * w, weightFormat: WeightFormats.float16)
             }
         }
 
@@ -509,6 +511,13 @@ struct FusionVerificationTests {
         // Sequence length
         var seqLength = UInt32(seqLen)
         encoder.setBytes(&seqLength, length: 4, index: portIndex)
+        portIndex += 1
+
+        for port in synthesisResult.contract.ports where port.role.isBuffer {
+            var rowStride = UInt32(dim)
+            encoder.setBytes(&rowStride, length: 4, index: portIndex)
+            portIndex += 1
+        }
 
         // Dispatch per-row: one threadgroup per sequence position
         let simdWidth = pipeline.threadExecutionWidth
@@ -588,15 +597,22 @@ struct FusionVerificationTests {
             let base = s * dim
             // ResidualAdd: added = input + residual
             var added = [Float](repeating: 0, count: dim)
-            for i in 0..<dim { added[i] = inputData[base + i] + residualIn[base + i] }
+            for i in 0..<dim {
+                added[i] = Self.sequenceStored(inputData[base + i] + residualIn[base + i], weightFormat: WeightFormats.float16)
+            }
             // Copy: residualOut = added
-            for i in 0..<dim { refResidualOut[base + i] = added[i] }
+            for i in 0..<dim {
+                refResidualOut[base + i] = added[i]
+            }
             // Reduction (RMSNorm on added)
             var sumSq: Float = 0
             for i in 0..<dim { sumSq += added[i] * added[i] }
             let rmsScale = 1.0 / sqrtf(sumSq / Float(dim) + epsilon)
             for i in 0..<dim {
-                refOutput[base + i] = added[i] * rmsScale * (Float(weightData[i]) + weightBias)
+                refOutput[base + i] = Self.sequenceStored(
+                    added[i] * rmsScale * (Float(weightData[i]) + weightBias),
+                    weightFormat: WeightFormats.float16
+                )
             }
         }
 
@@ -660,6 +676,13 @@ struct FusionVerificationTests {
         encoder.setBytes(&wb, length: 4, index: portIndex); portIndex += 1
         var seqLength = UInt32(seqLen)
         encoder.setBytes(&seqLength, length: 4, index: portIndex)
+        portIndex += 1
+
+        for port in synthesisResult.contract.ports where port.role.isBuffer {
+            var rowStride = UInt32(dim)
+            encoder.setBytes(&rowStride, length: 4, index: portIndex)
+            portIndex += 1
+        }
 
         let simdWidth = pipeline.threadExecutionWidth
         let clamped = min(max(dim, 1), 1024)
@@ -773,13 +796,21 @@ struct FusionVerificationTests {
 
         for s in 0..<seqLen {
             let base = s * dim
-            for i in 0..<dim { refResidual[base + i] = inputData[base + i] }
+            let storedInput = (0..<dim).map {
+                Self.sequenceStored(inputData[base + $0], weightFormat: WeightFormats.bfloat16)
+            }
+            for i in 0..<dim {
+                refResidual[base + i] = storedInput[i]
+            }
             var sumSq: Float = 0
-            for i in 0..<dim { sumSq += inputData[base + i] * inputData[base + i] }
+            for i in 0..<dim { sumSq += storedInput[i] * storedInput[i] }
             let rmsScale = 1.0 / sqrtf(sumSq / Float(dim) + epsilon)
             for i in 0..<dim {
                 let w = Self.bf16ToFloat(weightDataBF16[i]) + weightBias
-                refOutput[base + i] = inputData[base + i] * rmsScale * w
+                refOutput[base + i] = Self.sequenceStored(
+                    storedInput[i] * rmsScale * w,
+                    weightFormat: WeightFormats.bfloat16
+                )
             }
         }
 
@@ -841,6 +872,13 @@ struct FusionVerificationTests {
         encoder.setBytes(&wb, length: 4, index: portIndex); portIndex += 1
         var seqLength = UInt32(seqLen)
         encoder.setBytes(&seqLength, length: 4, index: portIndex)
+        portIndex += 1
+
+        for port in synthesisResult.contract.ports where port.role.isBuffer {
+            var rowStride = UInt32(dim)
+            encoder.setBytes(&rowStride, length: 4, index: portIndex)
+            portIndex += 1
+        }
 
         let simdWidth = pipeline.threadExecutionWidth
         let clamped = min(max(dim, 1), 1024)
@@ -1183,6 +1221,16 @@ struct FusionVerificationTests {
     }
 
     // MARK: - BF16 Conversion Helpers
+
+    private static func sequenceStored(_ value: Float, weightFormat: WeightFormat) -> Float {
+        if weightFormat.isBFloat16 {
+            return bf16ToFloat(floatToBF16(value))
+        }
+        if weightFormat.isFloat32 {
+            return value
+        }
+        return Float(Float16(value))
+    }
 
     private static func floatToBF16(_ value: Float) -> UInt16 {
         let bits = value.bitPattern

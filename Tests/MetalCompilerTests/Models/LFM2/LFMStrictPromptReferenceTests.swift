@@ -30,7 +30,13 @@ struct LFMStrictPromptReferenceTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let env = try setupOrSkip()
+        let env: TestEnvironment
+        do {
+            env = try setupOrSkip()
+        } catch SetupError.noReference {
+            print("[Skip] Strict prompt reference not found. Run scripts/hf/dump_lfm2_reference.py before running reference-logit parity.")
+            return
+        }
         let tokens = try readInputTokens(env.ref)
         var model = env.model
 
@@ -119,7 +125,13 @@ struct LFMStrictPromptReferenceTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let env = try setupOrSkip()
+        let env: TestEnvironment
+        do {
+            env = try setupOrSkip()
+        } catch SetupError.noReference {
+            print("[Skip] Strict prompt reference not found. Run scripts/hf/dump_lfm2_reference.py before running reference-logit parity.")
+            return
+        }
         let tokens = try readInputTokens(env.ref)
         var model = env.model
 
@@ -148,7 +160,13 @@ struct LFMStrictPromptReferenceTests {
         let gpuLock = try GPUTestExclusion.acquire()
         defer { gpuLock.release() }
 
-        let env = try setupOrSkip()
+        let env: TestEnvironment
+        do {
+            env = try setupOrSkip()
+        } catch SetupError.noReference {
+            print("[Skip] Strict prompt reference not found. Run scripts/hf/dump_lfm2_reference.py before running reference-logit parity.")
+            return
+        }
         let tokens = try readInputTokens(env.ref)
         var model = env.model
         var inputToken = model.prefill(tokens: tokens)

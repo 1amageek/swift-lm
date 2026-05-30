@@ -20,19 +20,21 @@ struct KernelScaffoldTests {
         #expect(source.contains("weight [[buffer(1)]]"))
         #expect(source.contains("output_base [[buffer(2)]]"))
 
-        // Scalar layout: dimension(3), epsilon(4), weightBias(5), sequenceLength(6)
+        // Scalar layout: dimension(3), epsilon(4), weightBias(5), sequenceLength(6), row strides(7-8)
         #expect(source.contains("dimension        [[buffer(3)]]"))
         #expect(source.contains("epsilon       [[buffer(4)]]"))
         #expect(source.contains("weightBias       [[buffer(5)]]"))
         #expect(source.contains("sequenceLength   [[buffer(6)]]"))
+        #expect(source.contains("dataRowStride [[buffer(7)]]"))
+        #expect(source.contains("outputRowStride [[buffer(8)]]"))
 
         // Kernel function name
         #expect(source.contains("kernel void rms_norm_test_seq"))
 
         // Sequence mode: seqPos bounds check and row pointer computation
         #expect(source.contains("if (seqPos >= sequenceLength) return;"))
-        #expect(source.contains("data_base + seqPos * dimension"))
-        #expect(source.contains("output_base + seqPos * dimension"))
+        #expect(source.contains("data_base + seqPos * dataRowStride"))
+        #expect(source.contains("output_base + seqPos * outputRowStride"))
     }
 
     @Test("Scaffold sequence kernel has correct computation body")
