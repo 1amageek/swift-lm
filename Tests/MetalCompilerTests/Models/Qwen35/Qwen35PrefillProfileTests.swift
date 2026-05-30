@@ -81,6 +81,12 @@ struct Qwen35PrefillProfileTests {
         let targetGate: String
     }
 
+    private struct ReferenceGate {
+        let referenceName: String
+        let precisionContract: String
+        let referenceGate: String
+    }
+
     private struct RouteReadinessRow {
         let routeFamily: String
         let role: String
@@ -95,6 +101,7 @@ struct Qwen35PrefillProfileTests {
         let observedProfileSpeedMinimumPercent: Double?
         let observedProfileTargetGate: String?
         let observedProfileTargetReductionPercent: Double?
+        let observedReferenceGate: String?
         let observedPrecisionContract: String?
         let routeReadiness: String
     }
@@ -718,14 +725,14 @@ struct Qwen35PrefillProfileTests {
         )
         #expect(rows.first?.routeReadiness == "candidate-production-route")
 
-        let mppPrecisionRows = routeReadinessRows(
+        let missingReferenceRows = routeReadinessRows(
             candidates: [
                 RoutePromotionCandidate(
                     routeFamily: "batched_projection",
                     role: "mlp.gate_up",
                     variant: "compact_mpp",
                     microbenchAdmission: "candidate-batched-gemv-default-route",
-                    readinessPrerequisite: "requires-full-profile-target-gate",
+                    readinessPrerequisite: "requires-schema-v6-reference-and-full-profile-target-gate",
                     requiredProfileRouteGate: "experimental-route-observed"
                 ),
             ],
@@ -739,7 +746,37 @@ struct Qwen35PrefillProfileTests {
             ],
             profileTargetGates: try profileTargetGates(artifact: passingURL)
         )
-        #expect(mppPrecisionRows.first?.routeReadiness == "reject-production-precision-contract")
+        #expect(missingReferenceRows.first?.routeReadiness == "reject-missing-schema-v6-reference-gate")
+
+        let mppPrecisionRows = routeReadinessRows(
+            candidates: [
+                RoutePromotionCandidate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    variant: "compact_mpp",
+                    microbenchAdmission: "candidate-batched-gemv-default-route",
+                    readinessPrerequisite: "requires-schema-v6-reference-and-full-profile-target-gate",
+                    requiredProfileRouteGate: "experimental-route-observed"
+                ),
+            ],
+            profileGates: [
+                ProfileRouteGate(
+                    routeFamily: "batched_projection",
+                    role: "mlp.gate_up",
+                    routeGate: "experimental-route-observed",
+                    precisionContract: "mpp-reference-equivalent"
+                ),
+            ],
+            profileTargetGates: try profileTargetGates(artifact: passingURL),
+            referenceGates: [
+                ReferenceGate(
+                    referenceName: "qwen35-schema-v6-compact-mpp",
+                    precisionContract: "mpp-reference-equivalent",
+                    referenceGate: "pass"
+                ),
+            ]
+        )
+        #expect(mppPrecisionRows.first?.routeReadiness == "candidate-production-route")
 
         let failingURL = try writeFullProfileTargetGate(
             baselineTotalsByLength: [
@@ -888,7 +925,7 @@ struct Qwen35PrefillProfileTests {
         let url = try writeRouteReadiness(rows: rows, directory: directory)
         let csv = try String(contentsOf: url, encoding: .utf8)
 
-        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,readinessPrerequisite,requiredProfileRouteGate,requiredProfileThreadgroupWidth,observedProfileRouteGate,observedProfileThreadgroupWidth,observedProfileSpeedGate,observedProfileSpeedMinimumPercent,observedProfileTargetGate,observedProfileTargetReductionPercent,observedPrecisionContract,routeReadiness"))
+        #expect(csv.contains("routeFamily,role,variant,microbenchAdmission,readinessPrerequisite,requiredProfileRouteGate,requiredProfileThreadgroupWidth,observedProfileRouteGate,observedProfileThreadgroupWidth,observedProfileSpeedGate,observedProfileSpeedMinimumPercent,observedProfileTargetGate,observedProfileTargetReductionPercent,observedReferenceGate,observedPrecisionContract,routeReadiness"))
         #expect(csv.contains("single_projection,linear_attn.out_proj,rps2,candidate-single-gemv-default-route,requires-full-profile-route-gate,experimental-route-observed"))
         #expect(csv.contains("decode-equivalent,candidate-production-route"))
         #expect(csv.contains("single_projection,self_attn.o_proj,tile2,reject-cross-sequence-threshold"))
@@ -1005,6 +1042,8 @@ struct Qwen35PrefillProfileTests {
             .appendingPathComponent("qwen35-prefill-full-profile-speed-gate.csv")
         let targetGateArtifact = profileDirectory
             .appendingPathComponent("qwen35-prefill-50pct-target-gate.csv")
+        let referenceGateArtifact = profileDirectory
+            .appendingPathComponent("qwen35-reference-gate.csv")
 
         try requireArtifact(singleArtifact)
         try requireArtifact(batchedArtifact)
@@ -1020,15 +1059,23 @@ struct Qwen35PrefillProfileTests {
         )
         try assertRoutePromotionRolesAreProfileAligned(candidates)
 
+        try requireArtifact(targetGateArtifact)
+        try requireArtifact(referenceGateArtifact)
+        let profileGates = try profileRouteGates(artifact: routeGateArtifact)
+        let targetGates = try profileTargetGates(artifact: targetGateArtifact)
+        let referenceGates = try referenceGates(artifact: referenceGateArtifact)
+        #expect(!targetGates.isEmpty)
+        #expect(qwenPrefillTargetGate(in: targetGates) != nil)
+        #expect(qwenCompactMPPReferenceGate(in: referenceGates) != nil)
+
         let rows = routeReadinessRows(
             candidates: candidates,
-            profileGates: try profileRouteGates(artifact: routeGateArtifact),
+            profileGates: profileGates,
             profileSpeedGates: FileManager.default.fileExists(atPath: speedGateArtifact.path)
                 ? try profileSpeedGates(artifact: speedGateArtifact)
                 : [],
-            profileTargetGates: FileManager.default.fileExists(atPath: targetGateArtifact.path)
-                ? try profileTargetGates(artifact: targetGateArtifact)
-                : []
+            profileTargetGates: targetGates,
+            referenceGates: referenceGates
         )
         let output = try writeRouteReadiness(rows: rows, directory: profileDirectory)
         #expect(!rows.isEmpty)
@@ -1661,6 +1708,7 @@ struct Qwen35PrefillProfileTests {
                 "observedProfileSpeedMinimumPercent",
                 "observedProfileTargetGate",
                 "observedProfileTargetReductionPercent",
+                "observedReferenceGate",
                 "observedPrecisionContract",
                 "routeReadiness",
             ].joined(separator: ","),
@@ -1680,6 +1728,7 @@ struct Qwen35PrefillProfileTests {
                 row.observedProfileSpeedMinimumPercent.map { String(format: "%.3f", $0) } ?? "",
                 csvEscape(row.observedProfileTargetGate ?? ""),
                 row.observedProfileTargetReductionPercent.map { String(format: "%.3f", $0) } ?? "",
+                csvEscape(row.observedReferenceGate ?? ""),
                 csvEscape(row.observedPrecisionContract ?? ""),
                 csvEscape(row.routeReadiness),
             ].joined(separator: ","))
@@ -1799,11 +1848,22 @@ struct Qwen35PrefillProfileTests {
         }
     }
 
+    private func referenceGates(artifact: URL) throws -> [ReferenceGate] {
+        try parseCSV(artifact).map { row in
+            ReferenceGate(
+                referenceName: try requiredCSVValue("referenceName", in: row, artifact: artifact),
+                precisionContract: try requiredCSVValue("precisionContract", in: row, artifact: artifact),
+                referenceGate: try requiredCSVValue("referenceGate", in: row, artifact: artifact)
+            )
+        }
+    }
+
     private func routeReadinessRows(
         candidates: [RoutePromotionCandidate],
         profileGates: [ProfileRouteGate],
         profileSpeedGates: [ProfileSpeedGate] = [],
-        profileTargetGates: [ProfileTargetGate] = []
+        profileTargetGates: [ProfileTargetGate] = [],
+        referenceGates: [ReferenceGate] = []
     ) -> [RouteReadinessRow] {
         let candidateRows = candidates.map { candidate in
             let observedProfileGate = matchingProfileGate(for: candidate, in: profileGates)
@@ -1812,10 +1872,15 @@ struct Qwen35PrefillProfileTests {
                     && $0.role == candidate.role
                     && $0.variant == candidate.variant
             }
-            let observedTargetGate = profileTargetGates.first {
-                $0.targetName == "qwen35-prefill-total-50pct"
-            }
+            let observedTargetGate = qwenPrefillTargetGate(in: profileTargetGates)
             let observedPrecisionContract = observedPrecisionContract(for: candidate, in: profileGates)
+            let observedReferenceGate = qwenReferenceGate(
+                in: referenceGates,
+                precisionContract: observedPrecisionContract
+            )
+            let referencePrecisionAllowed = observedPrecisionContract == "mpp-reference-equivalent"
+                && observedTargetGate != nil
+                && observedReferenceGate?.referenceGate == "pass"
             return RouteReadinessRow(
                 routeFamily: candidate.routeFamily,
                 role: candidate.role,
@@ -1830,6 +1895,7 @@ struct Qwen35PrefillProfileTests {
                 observedProfileSpeedMinimumPercent: observedSpeedGate?.minimumSpeedupPercent,
                 observedProfileTargetGate: observedTargetGate?.targetGate,
                 observedProfileTargetReductionPercent: observedTargetGate?.targetReductionPercent,
+                observedReferenceGate: observedReferenceGate?.referenceGate,
                 observedPrecisionContract: observedPrecisionContract,
                 routeReadiness: routeReadiness(
                     microbenchAdmission: candidate.microbenchAdmission,
@@ -1842,7 +1908,9 @@ struct Qwen35PrefillProfileTests {
                     observedProfileSpeedMinimumPercent: observedSpeedGate?.minimumSpeedupPercent,
                     observedProfileTargetGate: observedTargetGate?.targetGate,
                     observedProfileTargetReductionPercent: observedTargetGate?.targetReductionPercent,
-                    observedPrecisionContract: observedPrecisionContract
+                    observedReferenceGate: observedReferenceGate?.referenceGate,
+                    observedPrecisionContract: observedPrecisionContract,
+                    allowReferencePrecisionContract: referencePrecisionAllowed
                 )
             )
         }
@@ -1865,11 +1933,35 @@ struct Qwen35PrefillProfileTests {
                 observedProfileSpeedMinimumPercent: nil,
                 observedProfileTargetGate: nil,
                 observedProfileTargetReductionPercent: nil,
+                observedReferenceGate: nil,
                 observedPrecisionContract: gate.precisionContract,
                 routeReadiness: "reject-production-precision-contract"
             )
         }
         return candidateRows + profileOnlyRows
+    }
+
+    private func qwenPrefillTargetGate(in gates: [ProfileTargetGate]) -> ProfileTargetGate? {
+        gates.first {
+            $0.targetName.trimmingCharacters(in: .whitespacesAndNewlines) == "qwen35-prefill-total-50pct"
+                && $0.targetGate.trimmingCharacters(in: .whitespacesAndNewlines) == "full-profile-target-observed"
+        }
+    }
+
+    private func qwenCompactMPPReferenceGate(in gates: [ReferenceGate]) -> ReferenceGate? {
+        gates.first {
+            $0.referenceName.trimmingCharacters(in: .whitespacesAndNewlines) == "qwen35-schema-v6-compact-mpp"
+                && $0.precisionContract.trimmingCharacters(in: .whitespacesAndNewlines) == "mpp-reference-equivalent"
+                && $0.referenceGate.trimmingCharacters(in: .whitespacesAndNewlines) == "pass"
+        }
+    }
+
+    private func qwenReferenceGate(
+        in gates: [ReferenceGate],
+        precisionContract: String?
+    ) -> ReferenceGate? {
+        guard precisionContract == "mpp-reference-equivalent" else { return nil }
+        return qwenCompactMPPReferenceGate(in: gates)
     }
 
     private func observedPrecisionContract(
@@ -1916,7 +2008,9 @@ struct Qwen35PrefillProfileTests {
         observedProfileSpeedMinimumPercent: Double?,
         observedProfileTargetGate: String?,
         observedProfileTargetReductionPercent: Double?,
-        observedPrecisionContract: String?
+        observedReferenceGate: String?,
+        observedPrecisionContract: String?,
+        allowReferencePrecisionContract: Bool = false
     ) -> String {
         guard microbenchAdmission.hasPrefix("candidate-") else {
             return "reject-microbench"
@@ -1948,7 +2042,16 @@ struct Qwen35PrefillProfileTests {
             }
             return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
         }
-        if readinessPrerequisite == "requires-full-profile-target-gate" {
+        if readinessPrerequisite == "requires-full-profile-target-gate"
+            || readinessPrerequisite == "requires-schema-v6-reference-and-full-profile-target-gate" {
+            if readinessPrerequisite == "requires-schema-v6-reference-and-full-profile-target-gate" {
+                guard let observedReferenceGate else {
+                    return "reject-missing-schema-v6-reference-gate"
+                }
+                guard observedReferenceGate == "pass" else {
+                    return "reject-schema-v6-reference-gate-not-passed"
+                }
+            }
             guard let observedProfileTargetGate else {
                 return "reject-missing-full-profile-target-gate"
             }
@@ -1959,15 +2062,27 @@ struct Qwen35PrefillProfileTests {
                   observedProfileTargetReductionPercent >= Self.productionTargetReductionPercent else {
                 return "reject-full-profile-target-gate-threshold"
             }
-            return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
+            return productionRouteReadiness(
+                observedPrecisionContract: observedPrecisionContract,
+                allowReferencePrecisionContract: allowReferencePrecisionContract
+            )
         }
         guard readinessPrerequisite == "requires-full-profile-route-gate" else {
             return "reject-microbench-prerequisite"
         }
-        return productionRouteReadiness(observedPrecisionContract: observedPrecisionContract)
+        return productionRouteReadiness(
+            observedPrecisionContract: observedPrecisionContract,
+            allowReferencePrecisionContract: allowReferencePrecisionContract
+        )
     }
 
-    private func productionRouteReadiness(observedPrecisionContract: String?) -> String {
+    private func productionRouteReadiness(
+        observedPrecisionContract: String?,
+        allowReferencePrecisionContract: Bool = false
+    ) -> String {
+        if allowReferencePrecisionContract, observedPrecisionContract == "mpp-reference-equivalent" {
+            return "candidate-production-route"
+        }
         guard observedPrecisionContract == nil || observedPrecisionContract == "decode-equivalent" else {
             return "reject-production-precision-contract"
         }
@@ -2100,7 +2215,10 @@ struct Qwen35PrefillProfileTests {
 
     private func parseCSV(_ url: URL) throws -> [[String: String]] {
         let csv = try String(contentsOf: url, encoding: .utf8)
-        let parsedRows = try csvRows(csv, artifact: url)
+        let normalizedCSV = csv
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let parsedRows = try csvRows(normalizedCSV, artifact: url)
         guard let header = parsedRows.first, !header.isEmpty else {
             throw RouteReadinessArtifactError.emptyCSV(url.path)
         }
@@ -2245,6 +2363,8 @@ struct Qwen35PrefillProfileTests {
             "SWIFTLM_PREFILL_SSM_QKPAR",
             "SWIFTLM_PREFILL_SSM_CACHED_PARAMS",
             "SWIFTLM_PREFILL_SSM_PARALLEL_STATE",
+            "SWIFTLM_PREFILL_SSM_PARALLEL_STATE_SHARED_RMS",
+            "SWIFTLM_PREFILL_SSM_PARALLEL_STATE_COALESCED",
             "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH",
         ]
         return !routeOverrideKeys.contains { environment[$0] != nil }

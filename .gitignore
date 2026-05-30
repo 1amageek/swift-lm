@@ -22,7 +22,11 @@ DerivedData/
 # Swift Package Manager
 .build/
 .swiftpm/
+.cache/
 Packages/
+
+# Python
+__pycache__/
 
 # CocoaPods
 Pods/

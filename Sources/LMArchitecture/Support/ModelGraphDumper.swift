@@ -208,7 +208,9 @@ public enum ModelGraphDumper {
         case let a as MoEAttributes:
             let expert = a.expertMLP
             return "moe(experts=\(a.expertCount), topK=\(a.expertsPerToken), " +
-                "gate=\(a.gateKind), mlp(in=\(expert.inputSize), inter=\(expert.intermediateSize), " +
+                "gate=\(a.gateKind), normalize=\(a.normalizeRoutingWeights), " +
+                "scale=\(formatFloat(a.routedScalingFactor)), expertBias=\(a.useExpertBias), " +
+                "mlp(in=\(expert.inputSize), inter=\(expert.intermediateSize), " +
                 "\(expert.activation), \(expert.gating)))"
 
         case let a as RMSNormAttributes:

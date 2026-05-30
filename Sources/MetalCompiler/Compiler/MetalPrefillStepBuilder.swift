@@ -2021,9 +2021,11 @@ private struct PrefillStepPlanner {
             min(SSMRecurrenceFragment.maxThreadgroupSize, desiredThreads),
             fusedPipeline.maxTotalThreadsPerThreadgroup
         )
+        let maximumThreads = min(SSMRecurrenceFragment.maxThreadgroupSize, fusedPipeline.maxTotalThreadsPerThreadgroup)
         let minimumActiveThreads = headsPerGroup * min(recurrence.valueHeadDimension, 256)
         let fusedThreads = try SSMRecurrenceFragment.prefillThreadgroupWidthOverride(
             defaultThreads: defaultThreads,
+            maximumThreads: maximumThreads,
             minimumActiveThreads: minimumActiveThreads,
             simdWidth: max(fusedPipeline.threadExecutionWidth, 1)
         )

@@ -38,6 +38,12 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMVariant(name: "cached_params_tg256", kernelName: "bench_ssm_recurrence_seq_bf16_f32_cached_params", threadgroupWidth: 256),
             SSMVariant(name: "cached_params_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_cached_params", threadgroupWidth: 384),
             SSMVariant(name: "parallel_state_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state", threadgroupWidth: 384),
+            SSMVariant(name: "parallel_state_tg512", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state", threadgroupWidth: 512),
+            SSMVariant(name: "parallel_state_tg768", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state", threadgroupWidth: 768),
+            SSMVariant(name: "parallel_state_tg1024", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state", threadgroupWidth: 1024),
+            SSMVariant(name: "parallel_state_shared_rms_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state_shared_rms", threadgroupWidth: 384),
+            SSMVariant(name: "parallel_state_shared_rms_tg512", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state_shared_rms", threadgroupWidth: 512),
+            SSMVariant(name: "parallel_state_coalesced_tg384", kernelName: "bench_ssm_recurrence_seq_bf16_f32_parallel_state_coalesced", threadgroupWidth: 384),
         ]
 
         var rows: [SSMResultRow] = []
@@ -93,6 +99,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
             SSMPhaseVariant(name: "state_recurrence_qkpar", kernelName: "bench_ssm_phase_state_recurrence_qkpar_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_cache32", kernelName: "bench_ssm_phase_state_recurrence_cache32_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_parallel_state", kernelName: "bench_ssm_phase_state_recurrence_parallel_state_f32", threadgroupWidth: 384),
+            SSMPhaseVariant(name: "state_recurrence_parallel_state_coalesced", kernelName: "bench_ssm_phase_state_recurrence_parallel_state_coalesced_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "state_recurrence_parallel_state_transposed", kernelName: "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "rms_gate", kernelName: "bench_ssm_phase_rms_gate_f32", threadgroupWidth: 384),
             SSMPhaseVariant(name: "rms_gate_parallel_reduce", kernelName: "bench_ssm_phase_rms_gate_parallel_reduce_f32", threadgroupWidth: 384),
@@ -125,10 +132,18 @@ struct SSMRecurrenceMicrobenchmarkTests {
         let artifact = try writePhaseCSV(rows: rows)
         let feasibilityRows = SSMStateCandidateFeasibilityFactory.makeRows()
         let feasibilityArtifact = try writeStateCandidateFeasibilityCSV(rows: feasibilityRows)
-        printPhaseReport(rows: rows, artifact: artifact, feasibilityArtifact: feasibilityArtifact)
+        let sequenceAlgorithmRows = SSMSequenceAlgorithmFeasibilityFactory.makeRows()
+        let sequenceAlgorithmArtifact = try writeSequenceAlgorithmFeasibilityCSV(rows: sequenceAlgorithmRows)
+        printPhaseReport(
+            rows: rows,
+            artifact: artifact,
+            feasibilityArtifact: feasibilityArtifact,
+            sequenceAlgorithmArtifact: sequenceAlgorithmArtifact
+        )
         #expect(rows.count == Self.sequenceLengths.count * phases.count)
         #expect(rows.allSatisfy { $0.outputChecksum.isFinite && $0.outputChecksum > 0 })
         #expect(feasibilityRows.count == SSMStateCandidateShape.allCases.count)
+        #expect(sequenceAlgorithmRows.count == SSMSequenceAlgorithmCandidate.allCases.count)
         #expect(rows.filter { $0.phase == "state_recurrence_cache32" }.allSatisfy {
             $0.phasePromotionAdmission == "reject-lane-parallelism-lost"
         })
@@ -156,6 +171,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
             "bench_ssm_phase_state_recurrence_qkpar_f32",
             "bench_ssm_phase_state_recurrence_cache32_f32",
             "bench_ssm_phase_state_recurrence_parallel_state_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_coalesced_f32",
             "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
         ] {
             let validation = try harness.validateStateRecurrencePhase(kernelName: kernelName, sequenceLength: 5)
@@ -297,6 +313,27 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(byShape[.cache64]?.bridgeAdmission == "reject-static-feasibility")
     }
 
+    @Test("SSM sequence algorithm feasibility blocks traffic-only shortcuts")
+    func ssmSequenceAlgorithmFeasibilityBlocksTrafficOnlyShortcuts() {
+        let rows = SSMSequenceAlgorithmFeasibilityFactory.makeRows()
+        let byCandidate = Dictionary(uniqueKeysWithValues: rows.map { ($0.candidate, $0) })
+        let baseline = byCandidate[.currentParallelState]
+        let temporalTile = byCandidate[.temporalTile2FullStateCache]
+        let lowRank = byCandidate[.lowRankCoefficientScan]
+        let chunkedAffine = byCandidate[.chunkedAffineScanTile4]
+
+        #expect(baseline?.admission == "baseline")
+        let temporalTileReduction = temporalTile?.estimatedStateTrafficReductionPercent ?? .nan
+        #expect(abs(temporalTileReduction - 66.666_666_666_666_67) < 0.000_001)
+        #expect(temporalTile?.admission == "reject-threadgroup-memory-limit")
+        #expect(lowRank?.admission == "reject-prefill-state-contract")
+        #expect(chunkedAffine?.supportsNonzeroInitialState == true)
+        #expect(chunkedAffine?.staticThreadgroupBytes == 17_932)
+        let chunkedAffineReduction = chunkedAffine?.estimatedStateTrafficReductionPercent ?? .nan
+        #expect(abs(chunkedAffineReduction - 83.333_333_333_333_34) < 0.000_001)
+        #expect(chunkedAffine?.admission == "candidate-kernel-prototype")
+    }
+
     @Test("SSM summary promotion admissions classify candidates")
     func ssmSummaryPromotionAdmissionsClassifyCandidates() {
         let base = makeSummaryFixture(sequenceLength: 128, variant: "base_tg384", averageGpuMicroseconds: 100.0)
@@ -364,6 +401,23 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(qkParallel?.routePromotionAdmission == "candidate-qkpar-default-route")
         #expect(qkParallel?.failingSequenceLengths == [])
         #expect(qkParallel?.thresholdShortfallPercent == 0.0)
+    }
+
+    @Test("SSM composite route promotion compares against incumbent parallel state")
+    func ssmCompositeRoutePromotionComparesAgainstIncumbentParallelState() {
+        let rows = [
+            makeSummaryFixture(sequenceLength: 64, variant: "parallel_state_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 64, variant: "parallel_state_shared_rms_tg384", averageGpuMicroseconds: 90.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "parallel_state_tg384", averageGpuMicroseconds: 100.0),
+            makeSummaryFixture(sequenceLength: 128, variant: "parallel_state_shared_rms_tg384", averageGpuMicroseconds: 99.0),
+        ]
+
+        let routeRows = summarizeRoutePromotions(rows: rows)
+        let composite = routeRows.first { $0.candidate == .parallelStateSharedRMS }
+
+        #expect(composite?.bestVariants == ["parallel_state_shared_rms_tg384", "parallel_state_shared_rms_tg384"])
+        #expect(composite?.failingSequenceLengths == [128])
+        #expect(composite?.routePromotionAdmission == "reject-cross-sequence-threshold")
     }
 
     @Test("SSM threadgroup policy admissions classify fixed and adaptive candidates")
@@ -597,7 +651,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         let requiredFiles = SSMArtifactManifest.requiredArtifacts.map(\.fileName)
         let optionalFiles = SSMArtifactManifest.optionalArtifacts.map(\.fileName)
 
-        #expect(requiredFiles.count == 8)
+        #expect(requiredFiles.count == 9)
         #expect(optionalFiles.count == 1)
         #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence.csv"))
         #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-summary.csv"))
@@ -607,7 +661,34 @@ struct SSMRecurrenceMicrobenchmarkTests {
         #expect(requiredFiles.contains("qwen35-bf16-ssm-recurrence-phase-stability.csv"))
         #expect(requiredFiles.contains("qwen35-bf16-ssm-state-candidate-feasibility.csv"))
         #expect(requiredFiles.contains("qwen35-bf16-ssm-state-candidate-bridge.csv"))
+        #expect(requiredFiles.contains("qwen35-bf16-ssm-sequence-algorithm-feasibility.csv"))
         #expect(optionalFiles.contains("qwen35-bf16-ssm-recurrence-phase-full-bridge.csv"))
+    }
+
+    @Test("SSM sequence algorithm feasibility artifact can be reconstructed when requested")
+    func ssmSequenceAlgorithmFeasibilityArtifactCanBeReconstructedWhenRequested() throws {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_VALIDATE_SSM_SEQUENCE_ALGORITHM_ARTIFACTS"] == "1" else {
+            return
+        }
+        let artifact = ssmMicrobenchmarkArtifactDirectory()
+            .appendingPathComponent("qwen35-bf16-ssm-sequence-algorithm-feasibility.csv")
+        try requireArtifact(artifact)
+
+        let rows = try readSequenceAlgorithmFeasibilityCSV(artifact)
+        let expectedRows = SSMSequenceAlgorithmFeasibilityFactory.makeRows()
+        let rowsByCandidate = Dictionary(uniqueKeysWithValues: rows.map { ($0.candidate, $0) })
+
+        #expect(rows.count == expectedRows.count)
+        for expected in expectedRows {
+            guard let actual = rowsByCandidate[expected.candidate] else {
+                Issue.record("Missing sequence algorithm row for \(expected.candidate.rawValue)")
+                continue
+            }
+            #expect(actual.temporalTileSize == expected.temporalTileSize)
+            #expect(actual.staticThreadgroupBytes == expected.staticThreadgroupBytes)
+            #expect(actual.estimatedStateGlobalBytesPerToken == expected.estimatedStateGlobalBytesPerToken)
+            #expect(actual.admission == expected.admission)
+        }
     }
 
     @Test("SSM artifact manifest files can be parsed when requested")
@@ -649,7 +730,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print("threadgroup policy artifact: \(threadgroupPolicyArtifact.path)")
         print("seq  variant       avg_us  us/token  grid   tg")
         for row in rows.sorted(by: rowSort) {
-            let variant = row.variant.padding(toLength: 16, withPad: " ", startingAt: 0)
+            let variant = row.variant.padding(toLength: 32, withPad: " ", startingAt: 0)
             let grid = "\(row.gridWidth)x\(row.gridHeight)".padding(toLength: 6, withPad: " ", startingAt: 0)
             print("  \(String(format: "%3d", row.sequenceLength))  \(variant) \(String(format: "%7.1f", row.averageGpuMicroseconds))  \(String(format: "%8.3f", row.microsecondsPerToken))  \(grid) \(row.threadgroupWidth)")
         }
@@ -657,8 +738,8 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print("=== BF16 SSM recurrence promotion decisions ===")
         print("seq  best             best_us  state_mb/tok  base             base_us  speedup  decision                     admission")
         for row in summaryRows.sorted(by: { $0.sequenceLength < $1.sequenceLength }) {
-            let bestVariant = row.bestVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
-            let baseVariant = row.bestBaseVariant.padding(toLength: 16, withPad: " ", startingAt: 0)
+            let bestVariant = row.bestVariant.padding(toLength: 32, withPad: " ", startingAt: 0)
+            let baseVariant = row.bestBaseVariant.padding(toLength: 32, withPad: " ", startingAt: 0)
             let decision = row.decision.padding(toLength: 28, withPad: " ", startingAt: 0)
             let stateMegabytes = Double(row.bestEstimatedStateTotalBytesPerToken) / 1_048_576.0
             print("  \(String(format: "%3d", row.sequenceLength))  \(bestVariant) \(String(format: "%7.1f", row.bestAverageGpuMicroseconds))  \(String(format: "%12.3f", stateMegabytes))  \(baseVariant) \(String(format: "%7.1f", row.bestBaseAverageGpuMicroseconds))  \(String(format: "%6.2f", row.speedupVsBestBasePercent))%  \(decision) \(row.promotionAdmission)")
@@ -667,7 +748,7 @@ struct SSMRecurrenceMicrobenchmarkTests {
         print("=== BF16 SSM recurrence route promotion admissions ===")
         print("candidate       pass/required  min_speedup  shortfall  failing_seq  admission")
         for row in routePromotionRows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
-            let candidate = row.candidate.rawValue.padding(toLength: 15, withPad: " ", startingAt: 0)
+            let candidate = row.candidate.rawValue.padding(toLength: 31, withPad: " ", startingAt: 0)
             let failingSequences = row.failingSequenceLengths.map(String.init).joined(separator: "|")
             print("  \(candidate) \(row.passingSequenceCount)/\(row.requiredSequenceCount)          \(String(format: "%7.2f", row.minimumSpeedupPercent))%  \(String(format: "%8.2f", row.thresholdShortfallPercent))%  \(failingSequences.padding(toLength: 11, withPad: " ", startingAt: 0))  \(row.routePromotionAdmission)")
         }
@@ -1066,11 +1147,53 @@ struct SSMRecurrenceMicrobenchmarkTests {
         return url
     }
 
-    private func printPhaseReport(rows: [SSMPhaseResultRow], artifact: URL, feasibilityArtifact: URL) {
+    private func writeSequenceAlgorithmFeasibilityCSV(rows: [SSMSequenceAlgorithmFeasibilityRow]) throws -> URL {
+        let directory = ssmMicrobenchmarkArtifactDirectory()
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let url = directory.appendingPathComponent("qwen35-bf16-ssm-sequence-algorithm-feasibility.csv")
+        var lines = [
+            [
+                "candidate",
+                "description",
+                "supportsNonzeroInitialState",
+                "temporalTileSize",
+                "staticThreadgroupBytes",
+                "threadgroupMemoryLimitBytes",
+                "estimatedStateGlobalBytesPerToken",
+                "baselineStateGlobalBytesPerToken",
+                "estimatedStateTrafficReductionPercent",
+                "admission",
+            ].joined(separator: ","),
+        ]
+        for row in rows.sorted(by: { $0.candidate.rawValue < $1.candidate.rawValue }) {
+            lines.append([
+                row.candidate.rawValue,
+                row.description,
+                String(row.supportsNonzeroInitialState),
+                String(row.temporalTileSize),
+                String(row.staticThreadgroupBytes),
+                String(row.threadgroupMemoryLimitBytes),
+                String(row.estimatedStateGlobalBytesPerToken),
+                String(row.baselineStateGlobalBytesPerToken),
+                String(format: "%.6f", row.estimatedStateTrafficReductionPercent),
+                row.admission,
+            ].joined(separator: ","))
+        }
+        try Data((lines.joined(separator: "\n") + "\n").utf8).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func printPhaseReport(
+        rows: [SSMPhaseResultRow],
+        artifact: URL,
+        feasibilityArtifact: URL,
+        sequenceAlgorithmArtifact: URL
+    ) {
         print()
         print("=== BF16 SSM recurrence phase-isolation microbench ===")
         print("artifact: \(artifact.path)")
         print("state candidate feasibility artifact: \(feasibilityArtifact.path)")
+        print("sequence algorithm feasibility artifact: \(sequenceAlgorithmArtifact.path)")
         print("seq  phase                      avg_us  us/token  full_%  active  lanes  stride  coalesced  state_mb/tok")
         for row in rows.sorted(by: phaseRowSort) {
             let phase = row.phase.padding(toLength: 25, withPad: " ", startingAt: 0)
@@ -1364,6 +1487,25 @@ struct SSMRecurrenceMicrobenchmarkTests {
         }
     }
 
+    private func readSequenceAlgorithmFeasibilityCSV(_ url: URL) throws -> [SSMSequenceAlgorithmFeasibilityRow] {
+        try parseSimpleCSV(url).map { row in
+            let candidateName = try requiredCSVValue("candidate", in: row, artifact: url)
+            guard let candidate = SSMSequenceAlgorithmCandidate(rawValue: candidateName) else {
+                throw SSMArtifactError.invalidValue(url.path, "candidate", candidateName)
+            }
+            return SSMSequenceAlgorithmFeasibilityRow(
+                candidate: candidate,
+                description: try requiredCSVValue("description", in: row, artifact: url),
+                supportsNonzeroInitialState: try boolCSVValue("supportsNonzeroInitialState", in: row, artifact: url),
+                temporalTileSize: try integerCSVValue("temporalTileSize", in: row, artifact: url),
+                staticThreadgroupBytes: try integerCSVValue("staticThreadgroupBytes", in: row, artifact: url),
+                threadgroupMemoryLimitBytes: try integerCSVValue("threadgroupMemoryLimitBytes", in: row, artifact: url),
+                estimatedStateGlobalBytesPerToken: try integerCSVValue("estimatedStateGlobalBytesPerToken", in: row, artifact: url),
+                baselineStateGlobalBytesPerToken: try integerCSVValue("baselineStateGlobalBytesPerToken", in: row, artifact: url)
+            )
+        }
+    }
+
     private func parseSimpleCSV(_ url: URL) throws -> [[String: String]] {
         let content = try String(contentsOf: url, encoding: .utf8)
         let lines = content.split(whereSeparator: \.isNewline).map(String.init)
@@ -1472,6 +1614,7 @@ private enum SSMArtifactManifest {
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-recurrence-phase-stability.csv", source: "phase-stability microbench"),
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-state-candidate-feasibility.csv", source: "static state-candidate feasibility"),
         SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-state-candidate-bridge.csv", source: "state-candidate feasibility/stability bridge"),
+        SSMArtifactManifestRow(fileName: "qwen35-bf16-ssm-sequence-algorithm-feasibility.csv", source: "static sequence-algorithm feasibility"),
     ]
 
     static let optionalArtifacts = [
@@ -1804,6 +1947,152 @@ private enum SSMStateCandidateBridgeFactory {
     }
 }
 
+private enum SSMSequenceAlgorithmCandidate: String, CaseIterable {
+    case currentParallelState = "current_parallel_state"
+    case temporalTile2FullStateCache = "temporal_tile2_full_state_cache"
+    case lowRankCoefficientScan = "low_rank_coefficient_scan"
+    case chunkedAffineScanTile4 = "chunked_affine_scan_tile4"
+
+    var description: String {
+        switch self {
+        case .currentParallelState:
+            return "current per-token parallel state recurrence"
+        case .temporalTile2FullStateCache:
+            return "two-token temporal tile with full recurrent state in threadgroup memory"
+        case .lowRankCoefficientScan:
+            return "sequence coefficient scan over K-basis updates"
+        case .chunkedAffineScanTile4:
+            return "four-token affine scan with streaming recurrent state and per-token partial outputs"
+        }
+    }
+
+    var supportsNonzeroInitialState: Bool {
+        switch self {
+        case .currentParallelState, .temporalTile2FullStateCache, .chunkedAffineScanTile4:
+            return true
+        case .lowRankCoefficientScan:
+            return false
+        }
+    }
+
+    var temporalTileSize: Int {
+        switch self {
+        case .currentParallelState, .lowRankCoefficientScan:
+            return 1
+        case .temporalTile2FullStateCache:
+            return 2
+        case .chunkedAffineScanTile4:
+            return 4
+        }
+    }
+}
+
+private struct SSMSequenceAlgorithmFeasibilityRow {
+    let candidate: SSMSequenceAlgorithmCandidate
+    let description: String
+    let supportsNonzeroInitialState: Bool
+    let temporalTileSize: Int
+    let staticThreadgroupBytes: Int
+    let threadgroupMemoryLimitBytes: Int
+    let estimatedStateGlobalBytesPerToken: Int
+    let baselineStateGlobalBytesPerToken: Int
+
+    var estimatedStateTrafficReductionPercent: Double {
+        let saved = Double(baselineStateGlobalBytesPerToken - estimatedStateGlobalBytesPerToken)
+        return saved / Double(baselineStateGlobalBytesPerToken) * 100.0
+    }
+
+    var admission: String {
+        if candidate == .currentParallelState {
+            return "baseline"
+        }
+        guard supportsNonzeroInitialState else {
+            return "reject-prefill-state-contract"
+        }
+        guard staticThreadgroupBytes <= threadgroupMemoryLimitBytes else {
+            return "reject-threadgroup-memory-limit"
+        }
+        guard estimatedStateTrafficReductionPercent >= SSMSequenceAlgorithmFeasibilityFactory.requiredTrafficReductionPercent else {
+            return "reject-state-traffic-target"
+        }
+        return "candidate-kernel-prototype"
+    }
+}
+
+private enum SSMSequenceAlgorithmFeasibilityFactory {
+    static let headCount = 16
+    static let keyDimension = 128
+    static let valueDimension = 128
+    static let threadgroupWidth = 384
+    static let threadgroupMemoryLimitBytes = 32_768
+    static let requiredTrafficReductionPercent = 50.0
+
+    static func makeRows() -> [SSMSequenceAlgorithmFeasibilityRow] {
+        SSMSequenceAlgorithmCandidate.allCases.map(makeRow)
+    }
+
+    private static func makeRow(candidate: SSMSequenceAlgorithmCandidate) -> SSMSequenceAlgorithmFeasibilityRow {
+        SSMSequenceAlgorithmFeasibilityRow(
+            candidate: candidate,
+            description: candidate.description,
+            supportsNonzeroInitialState: candidate.supportsNonzeroInitialState,
+            temporalTileSize: candidate.temporalTileSize,
+            staticThreadgroupBytes: staticThreadgroupBytes(candidate: candidate),
+            threadgroupMemoryLimitBytes: threadgroupMemoryLimitBytes,
+            estimatedStateGlobalBytesPerToken: estimatedStateGlobalBytesPerToken(candidate: candidate),
+            baselineStateGlobalBytesPerToken: baselineStateGlobalBytesPerToken
+        )
+    }
+
+    private static var stateBytesPerHead: Int {
+        keyDimension * valueDimension * MemoryLayout<Float>.stride
+    }
+
+    private static var baselineStateGlobalBytesPerToken: Int {
+        headCount * stateBytesPerHead * 3
+    }
+
+    private static func estimatedStateGlobalBytesPerToken(candidate: SSMSequenceAlgorithmCandidate) -> Int {
+        switch candidate {
+        case .currentParallelState:
+            return baselineStateGlobalBytesPerToken
+        case .temporalTile2FullStateCache:
+            return headCount * stateBytesPerHead * 2 / candidate.temporalTileSize
+        case .lowRankCoefficientScan:
+            return 0
+        case .chunkedAffineScanTile4:
+            return headCount * stateBytesPerHead * 2 / candidate.temporalTileSize
+        }
+    }
+
+    private static func staticThreadgroupBytes(candidate: SSMSequenceAlgorithmCandidate) -> Int {
+        let floatBytes = MemoryLayout<Float>.stride
+        let convSiluCacheBytes = threadgroupWidth * floatBytes
+        let scalarCacheBytes = 3 * floatBytes
+        let headsPerGroup = 4
+        let stateReductionLanes = max(1, threadgroupWidth / max(1, headsPerGroup * valueDimension))
+        switch candidate {
+        case .currentParallelState:
+            return convSiluCacheBytes + scalarCacheBytes
+        case .temporalTile2FullStateCache:
+            return convSiluCacheBytes + scalarCacheBytes + stateBytesPerHead
+        case .lowRankCoefficientScan:
+            return convSiluCacheBytes + scalarCacheBytes
+        case .chunkedAffineScanTile4:
+            let perTokenOutputPartialsBytes = headsPerGroup
+                * valueDimension
+                * candidate.temporalTileSize
+                * stateReductionLanes
+                * floatBytes
+            let perTokenDeltaBytes = headsPerGroup
+                * valueDimension
+                * candidate.temporalTileSize
+                * floatBytes
+            return convSiluCacheBytes + scalarCacheBytes + perTokenOutputPartialsBytes + perTokenDeltaBytes
+        }
+    }
+}
+
 private struct SSMPhaseStabilityRow {
     let sampleIndex: Int
     let sequenceLength: Int
@@ -1938,6 +2227,10 @@ private enum SSMPhaseFullBridgeFactory {
             return "state_recurrence_cached_params"
         case .parallelState:
             return "state_recurrence_parallel_state"
+        case .parallelStateSharedRMS:
+            return "state_recurrence_parallel_state_shared_rms"
+        case .parallelStateCoalesced:
+            return "state_recurrence_parallel_state_coalesced"
         }
     }
 }
@@ -1989,6 +2282,8 @@ private struct SSMSummaryRow {
 private enum SSMRoutePromotionCandidate: String, CaseIterable {
     case cachedParameters = "cached_params"
     case parallelState = "parallel_state"
+    case parallelStateSharedRMS = "parallel_state_shared_rms"
+    case parallelStateCoalesced = "parallel_state_coalesced"
     case prewriteDecay = "prewrite_decay"
     case qkParallel = "qkpar"
     case sharedRMS = "shared_rms"
@@ -1998,7 +2293,11 @@ private enum SSMRoutePromotionCandidate: String, CaseIterable {
         case .cachedParameters:
             return "cached_params_"
         case .parallelState:
-            return "parallel_state_"
+            return "parallel_state_tg"
+        case .parallelStateSharedRMS:
+            return "parallel_state_shared_rms_"
+        case .parallelStateCoalesced:
+            return "parallel_state_coalesced_"
         case .prewriteDecay:
             return "prewrite_"
         case .qkParallel:
@@ -2014,12 +2313,25 @@ private enum SSMRoutePromotionCandidate: String, CaseIterable {
             return "candidate-cached-params-default-route"
         case .parallelState:
             return "candidate-parallel-state-default-route"
+        case .parallelStateSharedRMS:
+            return "candidate-parallel-state-shared-rms-default-route"
+        case .parallelStateCoalesced:
+            return "candidate-parallel-state-coalesced-default-route"
         case .prewriteDecay:
             return "candidate-prewrite-decay-default-route"
         case .qkParallel:
             return "candidate-qkpar-default-route"
         case .sharedRMS:
             return "candidate-shared-rms-default-route"
+        }
+    }
+
+    var routeBaselinePrefix: String {
+        switch self {
+        case .parallelStateSharedRMS, .parallelStateCoalesced:
+            return SSMRoutePromotionCandidate.parallelState.variantPrefix
+        case .cachedParameters, .parallelState, .prewriteDecay, .qkParallel, .sharedRMS:
+            return "base_"
         }
     }
 }
@@ -2134,6 +2446,12 @@ private enum SSMSummaryFactory {
         if bestVariant.hasPrefix("qkpar_") {
             return "candidate-qkpar-full-kernel"
         }
+        if bestVariant.hasPrefix("parallel_state_coalesced_") {
+            return "candidate-parallel-state-coalesced-full-kernel"
+        }
+        if bestVariant.hasPrefix("parallel_state_shared_rms_") {
+            return "candidate-parallel-state-shared-rms-full-kernel"
+        }
         if bestVariant.hasPrefix("parallel_state_") {
             return "candidate-parallel-state-full-kernel"
         }
@@ -2235,7 +2553,7 @@ private enum SSMRoutePromotionFactory {
 
         for sequenceLength in productionSequenceLengths {
             let sequenceRows = rows.filter { $0.sequenceLength == sequenceLength }
-            let baseRows = sequenceRows.filter { $0.variant.hasPrefix("base_") }
+            let baseRows = sequenceRows.filter { $0.variant.hasPrefix(candidate.routeBaselinePrefix) }
             let candidateRows = sequenceRows.filter { $0.variant.hasPrefix(candidate.variantPrefix) }
             guard let bestBase = baseRows.min(by: averageSort),
                   let bestCandidate = candidateRows.min(by: averageSort) else {
@@ -2380,6 +2698,32 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 valueHeadDimension: 128,
                 parallelStateUpdate: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_parallel_state_shared_rms",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                shareRMSScale: true,
+                parallelStateUpdate: true
+            ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: "bench_ssm_recurrence_seq_bf16_f32_parallel_state_coalesced",
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: 2 * 16 * 128 + 16 * 128,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: 16,
+                groupCount: 16,
+                keyHeadDimension: 128,
+                valueHeadDimension: 128,
+                parallelStateUpdate: true,
+                coalescedStateThreadMapping: true
+            ),
             Self.generatePhaseConvSiluKernel(),
             Self.generatePhaseStateRecurrenceKernel(),
             Self.generatePhaseStateRecurrenceKernel(
@@ -2398,6 +2742,10 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 name: "bench_ssm_phase_state_recurrence_parallel_state_f32"
             ),
             Self.generatePhaseStateRecurrenceParallelStateKernel(
+                name: "bench_ssm_phase_state_recurrence_parallel_state_coalesced_f32",
+                coalescedThreadMapping: true
+            ),
+            Self.generatePhaseStateRecurrenceParallelStateKernel(
                 name: "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
                 transposedStateLayout: true
             ),
@@ -2414,12 +2762,15 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
             "bench_ssm_recurrence_seq_bf16_f32_qkpar",
             "bench_ssm_recurrence_seq_bf16_f32_cached_params",
             "bench_ssm_recurrence_seq_bf16_f32_parallel_state",
+            "bench_ssm_recurrence_seq_bf16_f32_parallel_state_shared_rms",
+            "bench_ssm_recurrence_seq_bf16_f32_parallel_state_coalesced",
             "bench_ssm_phase_conv_silu_bf16_f32",
             "bench_ssm_phase_state_recurrence_f32",
             "bench_ssm_phase_state_recurrence_d2_f32",
             "bench_ssm_phase_state_recurrence_qkpar_f32",
             "bench_ssm_phase_state_recurrence_cache32_f32",
             "bench_ssm_phase_state_recurrence_parallel_state_f32",
+            "bench_ssm_phase_state_recurrence_parallel_state_coalesced_f32",
             "bench_ssm_phase_state_recurrence_parallel_state_transposed_f32",
             "bench_ssm_phase_rms_gate_f32",
             "bench_ssm_phase_rms_gate_parallel_reduce_f32",
@@ -3010,7 +3361,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
 
     private static func generatePhaseStateRecurrenceParallelStateKernel(
         name: String,
-        transposedStateLayout: Bool = false
+        transposedStateLayout: Bool = false,
+        coalescedThreadMapping: Bool = false
     ) -> String {
         let stateRead = transposedStateLayout
             ? "state[d * dk + j]"
@@ -3018,6 +3370,15 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         let stateWrite = transposedStateLayout
             ? "state[d * dk + j]"
             : "state[j * dv + d]"
+        let stateThreadMapping = coalescedThreadMapping
+            ? """
+                    const uint lane = tid / dv;
+                    const uint d = tid - lane * dv;
+            """
+            : """
+                    const uint d = tid / stateLaneCount;
+                    const uint lane = tid - d * stateLaneCount;
+            """
         return """
         kernel void \(name)(
             device const float* convSilu [[buffer(0)]],
@@ -3109,8 +3470,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 const uint stateLaneCount = max(1u, tgSize / max(dv, 1u));
                 const uint stateActiveThreads = dv * stateLaneCount;
                 if (tid < stateActiveThreads) {
-                    const uint d = tid / stateLaneCount;
-                    const uint lane = tid - d * stateLaneCount;
+                    \(stateThreadMapping)
                     device float* state = recurrentState + headStart * dk * dv;
                     float decay = decayCache[0];
                     float kvmemRaw = 0.0f;
@@ -3144,8 +3504,7 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
                 threadgroup_barrier(mem_flags::mem_threadgroup);
 
                 if (tid < stateActiveThreads) {
-                    const uint d = tid / stateLaneCount;
-                    const uint lane = tid - d * stateLaneCount;
+                    \(stateThreadMapping)
                     device float* state = recurrentState + headStart * dk * dv;
                     float decay = decayCache[0];
                     float kInvDelta = kInvDeltaCache[d];
@@ -3548,12 +3907,8 @@ private struct SSMRecurrenceMicrobenchmarkHarness {
         requestedThreadgroupWidth: Int
     ) -> (grid: MTLSize, threadgroup: MTLSize) {
         let safeGroupCount = max(groupCount, 1)
-        let headsPerGroup = max(1, headCount / safeGroupCount)
-        let localDimension = 2 * keyDimension + headsPerGroup * valueDimension
-        let phase2Threads = headsPerGroup * min(valueDimension, 256)
-        let desiredThreads = max(localDimension, phase2Threads)
         let defaultThreads = min(
-            min(SSMRecurrenceFragment.maxThreadgroupSize, desiredThreads),
+            SSMRecurrenceFragment.maxThreadgroupSize,
             pipeline.maxTotalThreadsPerThreadgroup
         )
         let threads = min(max(requestedThreadgroupWidth, 1), defaultThreads)

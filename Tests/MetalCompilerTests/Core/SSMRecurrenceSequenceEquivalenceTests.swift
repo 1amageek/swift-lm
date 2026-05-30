@@ -29,6 +29,8 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let qkParallelSequenceKernelName = "ssm_recurrence_bf16_sequence_qkpar_equivalence"
         let cachedParametersSequenceKernelName = "ssm_recurrence_bf16_sequence_cached_params_equivalence"
         let parallelStateSequenceKernelName = "ssm_recurrence_bf16_sequence_parallel_state_equivalence"
+        let parallelStateSharedRMSSequenceKernelName = "ssm_recurrence_bf16_sequence_parallel_state_shared_rms_equivalence"
+        let coalescedParallelStateSequenceKernelName = "ssm_recurrence_bf16_sequence_parallel_state_coalesced_equivalence"
         let source = [
             MetalSourceGenerator.commonHeader,
             MetalSourceGenerator.generateSSMWeightIndependentHelpers(),
@@ -115,6 +117,32 @@ struct SSMRecurrenceSequenceEquivalenceTests {
                 valueHeadDimension: valueDimension,
                 parallelStateUpdate: true
             ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: parallelStateSharedRMSSequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                shareRMSScale: true,
+                parallelStateUpdate: true
+            ),
+            MetalSourceGenerator.generateSSMRecurrenceSequence(
+                name: coalescedParallelStateSequenceKernelName,
+                bufferPrecision: .float32,
+                weightFormat: .bfloat16,
+                convDimension: convDimension,
+                maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                headCount: headCount,
+                groupCount: groupCount,
+                keyHeadDimension: keyDimension,
+                valueHeadDimension: valueDimension,
+                parallelStateUpdate: true,
+                coalescedStateThreadMapping: true
+            ),
         ].joined(separator: "\n")
         let harness = try SequenceKernelEquivalenceHarness(device: device, source: source)
         let decodePipeline = try harness.pipeline(named: decodeKernelName)
@@ -124,6 +152,8 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         let qkParallelSequencePipeline = try harness.pipeline(named: qkParallelSequenceKernelName)
         let cachedParametersSequencePipeline = try harness.pipeline(named: cachedParametersSequenceKernelName)
         let parallelStateSequencePipeline = try harness.pipeline(named: parallelStateSequenceKernelName)
+        let parallelStateSharedRMSSequencePipeline = try harness.pipeline(named: parallelStateSharedRMSSequenceKernelName)
+        let coalescedParallelStateSequencePipeline = try harness.pipeline(named: coalescedParallelStateSequenceKernelName)
 
         let projectedQKV = roundedBFloat16Values(
             count: sequenceLength * convDimension,
@@ -302,6 +332,46 @@ struct SSMRecurrenceSequenceEquivalenceTests {
             convDimension: convDimension,
             outputDimension: outputDimension
         )
+        let parallelStateSharedRMSSequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: parallelStateSharedRMSSequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: outputDimension
+        )
+        let coalescedParallelStateSequence = try runSequenceSSMTrace(
+            harness: harness,
+            pipeline: coalescedParallelStateSequencePipeline,
+            projectedQKV: projectedQKV,
+            projectedZ: projectedZ,
+            projectedBeta: projectedBeta,
+            projectedAlpha: projectedAlpha,
+            convWeight: convWeight,
+            normWeight: normWeight,
+            dtBias: dtBias,
+            aLog: aLog,
+            headCount: headCount,
+            groupCount: groupCount,
+            keyDimension: keyDimension,
+            valueDimension: valueDimension,
+            convKernelSize: convKernelSize,
+            sequenceLength: sequenceLength,
+            convDimension: convDimension,
+            outputDimension: outputDimension
+        )
 
         let outputMismatch = harness.firstMismatch(
             expected: decode.output,
@@ -434,6 +504,50 @@ struct SSMRecurrenceSequenceEquivalenceTests {
         #expect(
             decode.convStateBits == parallelStateSequence.convStateBits,
             "Parallel-state SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(parallelStateSequence.convStateBits)"
+        )
+        let parallelStateSharedRMSOutputMismatch = harness.firstMismatch(
+            expected: decode.output,
+            actual: parallelStateSharedRMSSequence.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            parallelStateSharedRMSOutputMismatch == nil,
+            "Parallel-state shared-RMS SSM output drifted: \(String(describing: parallelStateSharedRMSOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: parallelStateSharedRMSSequence.output))"
+        )
+        let parallelStateSharedRMSRecurrentMismatch = harness.firstMismatch(
+            expected: decode.recurrentState,
+            actual: parallelStateSharedRMSSequence.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            parallelStateSharedRMSRecurrentMismatch == nil,
+            "Parallel-state shared-RMS SSM recurrent state drifted: \(String(describing: parallelStateSharedRMSRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: parallelStateSharedRMSSequence.recurrentState))"
+        )
+        #expect(
+            decode.convStateBits == parallelStateSharedRMSSequence.convStateBits,
+            "Parallel-state shared-RMS SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(parallelStateSharedRMSSequence.convStateBits)"
+        )
+        let coalescedParallelStateOutputMismatch = harness.firstMismatch(
+            expected: decode.output,
+            actual: coalescedParallelStateSequence.output,
+            tolerance: 0.000_01
+        )
+        #expect(
+            coalescedParallelStateOutputMismatch == nil,
+            "Coalesced parallel-state SSM output drifted: \(String(describing: coalescedParallelStateOutputMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.output, actual: coalescedParallelStateSequence.output))"
+        )
+        let coalescedParallelStateRecurrentMismatch = harness.firstMismatch(
+            expected: decode.recurrentState,
+            actual: coalescedParallelStateSequence.recurrentState,
+            tolerance: 0.000_01
+        )
+        #expect(
+            coalescedParallelStateRecurrentMismatch == nil,
+            "Coalesced parallel-state SSM recurrent state drifted: \(String(describing: coalescedParallelStateRecurrentMismatch)), maxError=\(harness.maxAbsoluteError(expected: decode.recurrentState, actual: coalescedParallelStateSequence.recurrentState))"
+        )
+        #expect(
+            decode.convStateBits == coalescedParallelStateSequence.convStateBits,
+            "Coalesced parallel-state SSM conv state drifted: decode=\(decode.convStateBits), sequence=\(coalescedParallelStateSequence.convStateBits)"
         )
 
         for threadgroupWidth in [128, 256] {

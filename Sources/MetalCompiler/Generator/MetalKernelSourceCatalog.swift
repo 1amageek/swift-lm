@@ -561,6 +561,50 @@ struct MetalKernelSourceCatalog {
                                     parallelStateUpdate: true))
                             }
                         }
+                        if SSMRecurrenceFragment.isParallelStateSharedRMSPrefillEnabled,
+                           bufferPrecision == .float32,
+                           weightFormat == .bfloat16 {
+                            let parallelStateSharedRMSSequenceKernelName = SSMRecurrenceFragment.parallelStateSharedRMSSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(parallelStateSharedRMSSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: parallelStateSharedRMSSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    shareRMSScale: true,
+                                    parallelStateUpdate: true))
+                            }
+                        }
+                        if SSMRecurrenceFragment.isCoalescedParallelStatePrefillEnabled,
+                           bufferPrecision == .float32,
+                           weightFormat == .bfloat16 {
+                            let coalescedParallelStateSequenceKernelName = SSMRecurrenceFragment.coalescedParallelStateSequenceKernelName(
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat
+                            )
+                            if generatedNames.insert(coalescedParallelStateSequenceKernelName).inserted {
+                                sources.append(MetalSourceGenerator.generateSSMRecurrenceSequence(
+                                    name: coalescedParallelStateSequenceKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat,
+                                    convDimension: ssmFragment.convDimension,
+                                    maxThreadgroupSize: SSMRecurrenceFragment.maxThreadgroupSize,
+                                    headCount: ssmFragment.headCount,
+                                    groupCount: ssmFragment.groupCount,
+                                    keyHeadDimension: ssmFragment.keyHeadDimension,
+                                    valueHeadDimension: ssmFragment.valueHeadDimension,
+                                    parallelStateUpdate: true,
+                                    coalescedStateThreadMapping: true))
+                            }
+                        }
                         if SSMRecurrenceFragment.isPrewriteDecayPrefillEnabled {
                             let prewriteDecaySequenceKernelName = SSMRecurrenceFragment.prewriteDecaySequenceKernelName(
                                 bufferPrecision: bufferPrecision,

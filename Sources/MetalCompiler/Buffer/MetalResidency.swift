@@ -116,7 +116,7 @@ struct MetalStableResidencyRegistry: @unchecked Sendable {
         let weightBuffers = Self.prune(
             compiledModel.stableWeightResidencyBuffers,
             excluding: runtimeBuffers,
-            queuePolicy: .gpuOwnedOnly
+            queuePolicy: .allBuffers
         )
         let supplementalBuffers = Self.prune(
             compiledModel.stableSupplementalResidencyBuffers,
@@ -235,7 +235,7 @@ struct MetalStableResidencyRegistry: @unchecked Sendable {
         let weightBuffers = prune(
             compiledModel.stableWeightResidencyBuffers,
             excluding: runtimeBuffers,
-            queuePolicy: .gpuOwnedOnly
+            queuePolicy: .allBuffers
         )
         let supplementalBuffers = prune(
             compiledModel.stableSupplementalResidencyBuffers,

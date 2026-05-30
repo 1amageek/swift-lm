@@ -40,7 +40,8 @@ struct MetalDispatchStepBuilder {
             let resolved = try resolveDispatch(entry)
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
-            if let sparseMoE = entry.fragment as? SparseMoEFragment {
+            if let sparseMoE = entry.fragment as? SparseMoEFragment,
+               sparseMoE.usesSplitRoute {
                 let splitSteps = try sparseMoE.splitDecodeSteps(
                     bindings: bindings,
                     pipelineCache: planBuildContext.pipelineCache,

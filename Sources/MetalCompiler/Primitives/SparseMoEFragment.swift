@@ -50,7 +50,11 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     }
 
     public var scratchElementsPerToken: Int {
-        expertsPerToken * (intermediateDimension + 2)
+        2 * expertsPerToken + 2 * 128 + expertsPerToken * intermediateDimension
+    }
+
+    var usesSplitRoute: Bool {
+        !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_DIAGNOSTIC_SPARSE_MOE_MONOLITHIC"])
     }
 
     public var weightSlots: [MetalWeightSlot] {
@@ -143,14 +147,32 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         }
         let moeScratch = moeScratchBinding.buffer
         let baseName = kernelName(context: kernelContext)
-        guard let routerPipeline = pipelineCache["\(baseName)_router"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_router")
+        guard let routerScoresPipeline = pipelineCache["\(baseName)_router_scores"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_router_scores")
+        }
+        guard let routerSelectPipeline = pipelineCache["\(baseName)_router_select"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_router_select")
+        }
+        guard let routerParallelPipeline = pipelineCache["\(baseName)_router_parallel"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_router_parallel")
         }
         guard let gateUpPipeline = pipelineCache["\(baseName)_gate_up"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up")
         }
+        guard let gateUpPacked4Pipeline = pipelineCache["\(baseName)_gate_up_packed4"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_packed4")
+        }
+        guard let gateUpSplit2Pipeline = pipelineCache["\(baseName)_gate_up_split2"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_split2")
+        }
         guard let downPipeline = pipelineCache["\(baseName)_down"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_down")
+        }
+        guard let downPacked4Pipeline = pipelineCache["\(baseName)_down_packed4"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_down_packed4")
+        }
+        guard let downSplit2Pipeline = pipelineCache["\(baseName)_down_split2"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_down_split2")
         }
 
         let routerBuffer = routerBinding.buffer
@@ -163,19 +185,65 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let biasOffset = biasBinding.offset
         let scratchRowStride = scratchElementsPerToken
 
-        let routerThreads = max(routerPipeline.threadExecutionWidth, 1)
-        let gateUpThreads = min(256, max(gateUpPipeline.threadExecutionWidth, 1) * 8)
+        let routerScoresThreads = max(routerScoresPipeline.threadExecutionWidth, 1)
+        let routerSelectThreads = max(routerSelectPipeline.threadExecutionWidth, 1)
+        let routerParallelSimdWidth = max(routerParallelPipeline.threadExecutionWidth, 1)
+        let routerParallelMaxSimdgroups = max(1, routerParallelPipeline.maxTotalThreadsPerThreadgroup / routerParallelSimdWidth)
+        let usesParallelRouter = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ROUTER_PARALLEL"])
+            && expertCount <= routerParallelMaxSimdgroups
+        let routerParallelThreads = expertCount * routerParallelSimdWidth
         let flatGateUpCount = expertsPerToken * intermediateDimension
-        let downSimdWidth = max(downPipeline.threadExecutionWidth, 1)
-        let downSimdgroups = max(1, min(32, downPipeline.maxTotalThreadsPerThreadgroup / downSimdWidth))
+        let usesPacked4 = kernelContext.weightFormat.isBFloat16
+            && inputDimension.isMultiple(of: 4)
+            && intermediateDimension.isMultiple(of: 4)
+            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
+        let usesGateUpSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
+        let selectedGateUpPipeline = usesGateUpSplit2
+            ? gateUpSplit2Pipeline
+            : (usesPacked4 ? gateUpPacked4Pipeline : gateUpPipeline)
+        let gateUpSimdWidth = max(selectedGateUpPipeline.threadExecutionWidth, 1)
+        let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
+            environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
+            defaultValue: 32,
+            simdWidth: gateUpSimdWidth,
+            pipeline: selectedGateUpPipeline
+        )
+        let gateUpSimdgroups = usesGateUpSplit2
+            ? max(2, requestedGateUpSimdgroups - requestedGateUpSimdgroups % 2)
+            : requestedGateUpSimdgroups
+        let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
+        let gateUpRowsPerThreadgroup = usesGateUpSplit2 ? max(1, gateUpSimdgroups / 2) : gateUpSimdgroups
+        let gateUpGridX = (flatGateUpCount + gateUpRowsPerThreadgroup - 1) / gateUpRowsPerThreadgroup
+        let gateUpThreadgroupMemoryLength = usesGateUpSplit2
+            ? gateUpRowsPerThreadgroup * 2 * 2 * MemoryLayout<Float>.stride
+            : 0
+        let usesDownSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
+        let selectedDownPipeline = usesDownSplit2
+            ? downSplit2Pipeline
+            : (usesPacked4 ? downPacked4Pipeline : downPipeline)
+        let downSimdWidth = max(selectedDownPipeline.threadExecutionWidth, 1)
+        let requestedDownSimdgroups = Self.resolvedSimdgroups(
+            environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
+            defaultValue: 32,
+            simdWidth: downSimdWidth,
+            pipeline: selectedDownPipeline
+        )
+        let downSimdgroups = usesDownSplit2
+            ? max(2, requestedDownSimdgroups - requestedDownSimdgroups % 2)
+            : requestedDownSimdgroups
         let downThreads = downSimdgroups * downSimdWidth
-        let downGridX = (outputDimension + downSimdgroups - 1) / downSimdgroups
+        let downRowsPerThreadgroup = usesDownSplit2 ? max(1, downSimdgroups / 2) : downSimdgroups
+        let downGridX = (outputDimension + downRowsPerThreadgroup - 1) / downRowsPerThreadgroup
+        let downThreadgroupMemoryLength = usesDownSplit2
+            ? downRowsPerThreadgroup * 2 * MemoryLayout<Float>.stride
+            : 0
 
-        return [
-            MetalDispatchStep(
-                pipeline: routerPipeline,
+        var steps: [MetalDispatchStep] = []
+        if usesParallelRouter {
+            steps.append(MetalDispatchStep(
+                pipeline: routerParallelPipeline,
                 gridSize: MTLSize(width: 1, height: 1, depth: 1),
-                threadgroupSize: MTLSize(width: routerThreads, height: 1, depth: 1),
+                threadgroupSize: MTLSize(width: routerParallelThreads, height: 1, depth: 1),
                 bufferBindings: [
                     (0, inputBinding.buffer, inputBinding.offset),
                     (1, routerBuffer, routerOffset),
@@ -205,13 +273,79 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: moeScratch, offset: 0)]
                 ),
                 metadata: .init(
-                    kernelName: "\(baseName)_router",
+                    kernelName: "\(baseName)_router_parallel",
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [3])
                 )
-            ),
-            MetalDispatchStep(
-                pipeline: gateUpPipeline,
-                gridSize: MTLSize(width: (flatGateUpCount + gateUpThreads - 1) / gateUpThreads, height: 1, depth: 1),
+            ))
+        } else {
+            steps.append(MetalDispatchStep(
+                pipeline: routerScoresPipeline,
+                gridSize: MTLSize(width: expertCount, height: 1, depth: 1),
+                threadgroupSize: MTLSize(width: routerScoresThreads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, inputBinding.buffer, inputBinding.offset),
+                    (1, routerBuffer, routerOffset),
+                    (2, biasBuffer, biasOffset),
+                    (3, moeScratch, 0),
+                ],
+                bytesBindings: Self.routerConstantBindings(
+                    inputDimension: inputDimension,
+                    expertCount: expertCount,
+                    expertsPerToken: expertsPerToken,
+                    normalizeRoutingWeights: normalizeRoutingWeights,
+                    routedScalingFactor: routedScalingFactor,
+                    useExpertBias: useExpertBias,
+                    sequenceLength: 1,
+                    inputRowStride: inputDimension,
+                    scratchRowStride: scratchRowStride,
+                    startingIndex: 4
+                ),
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                bufferAccesses: MetalBufferAccesses(
+                    readBuffers: [
+                        (buffer: inputBinding.buffer, offset: inputBinding.offset),
+                        (buffer: routerBuffer, offset: routerOffset),
+                        (buffer: biasBuffer, offset: biasOffset),
+                    ],
+                    writeBuffers: [(buffer: moeScratch, offset: 0)]
+                ),
+                metadata: .init(
+                    kernelName: "\(baseName)_router_scores",
+                    bufferAccessPattern: .init(reads: [0, 1, 2], writes: [3])
+                )
+            ))
+            steps.append(MetalDispatchStep(
+                pipeline: routerSelectPipeline,
+                gridSize: MTLSize(width: 1, height: 1, depth: 1),
+                threadgroupSize: MTLSize(width: routerSelectThreads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, moeScratch, 0),
+                ],
+                bytesBindings: Self.routerSelectConstantBindings(
+                    expertCount: expertCount,
+                    expertsPerToken: expertsPerToken,
+                    normalizeRoutingWeights: normalizeRoutingWeights,
+                    routedScalingFactor: routedScalingFactor,
+                    sequenceLength: 1,
+                    scratchRowStride: scratchRowStride,
+                    startingIndex: 1
+                ),
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                bufferAccesses: MetalBufferAccesses(
+                    readBuffers: [(buffer: moeScratch, offset: 0)],
+                    writeBuffers: [(buffer: moeScratch, offset: 0)]
+                ),
+                metadata: .init(
+                    kernelName: "\(baseName)_router_select",
+                    bufferAccessPattern: .init(reads: [0], writes: [0])
+                )
+            ))
+        }
+        steps.append(MetalDispatchStep(
+                pipeline: selectedGateUpPipeline,
+                gridSize: MTLSize(width: gateUpGridX, height: 1, depth: 1),
                 threadgroupSize: MTLSize(width: gateUpThreads, height: 1, depth: 1),
                 bufferBindings: [
                     (0, inputBinding.buffer, inputBinding.offset),
@@ -227,7 +361,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     scratchRowStride: scratchRowStride,
                     startingIndex: 3
                 ),
-                threadgroupMemoryLength: 0,
+                threadgroupMemoryLength: gateUpThreadgroupMemoryLength,
                 sync: .bufferBarrier,
                 bufferAccesses: MetalBufferAccesses(
                     readBuffers: [
@@ -238,12 +372,14 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: moeScratch, offset: 0)]
                 ),
                 metadata: .init(
-                    kernelName: "\(baseName)_gate_up",
+                    kernelName: usesGateUpSplit2
+                        ? "\(baseName)_gate_up_split2"
+                        : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"),
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [2])
                 )
-            ),
-            MetalDispatchStep(
-                pipeline: downPipeline,
+            ))
+        steps.append(MetalDispatchStep(
+                pipeline: selectedDownPipeline,
                 gridSize: MTLSize(width: downGridX, height: 1, depth: 1),
                 threadgroupSize: MTLSize(width: downThreads, height: 1, depth: 1),
                 bufferBindings: [
@@ -260,7 +396,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     scratchRowStride: scratchRowStride,
                     startingIndex: 3
                 ),
-                threadgroupMemoryLength: 0,
+                threadgroupMemoryLength: downThreadgroupMemoryLength,
                 sync: .bufferBarrier,
                 bufferAccesses: MetalBufferAccesses(
                     readBuffers: [
@@ -270,26 +406,45 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: outputBinding.buffer, offset: outputBinding.offset)]
                 ),
                 metadata: .init(
-                    kernelName: "\(baseName)_down",
+                    kernelName: usesDownSplit2
+                        ? "\(baseName)_down_split2"
+                        : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down"),
                     bufferAccessPattern: .init(reads: [0, 1], writes: [2])
                 )
-            ),
-        ]
+            ))
+        return steps
     }
 
     public func prefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
+        guard usesSplitRoute else {
+            return try monolithicPrefillSteps(context: context)
+        }
         guard let moeScratch = context.buffers.moeScratch else {
             throw MetalCompilerError.deviceSetupFailed("Sparse MoE split prefill requires moeScratch")
         }
         let kernelName = kernelName(context: context.kernelContext)
-        let routerPipeline = try context.getPipeline("\(kernelName)_router")
+        let routerScoresPipeline = try context.getPipeline("\(kernelName)_router_scores")
+        let routerSelectPipeline = try context.getPipeline("\(kernelName)_router_select")
         let gateUpPipeline = try context.getPipeline("\(kernelName)_gate_up")
         let downPipeline = try context.getPipeline("\(kernelName)_down")
-        let routerThreads = max(routerPipeline.threadExecutionWidth, 1)
-        let gateUpThreads = min(256, max(gateUpPipeline.threadExecutionWidth, 1) * 8)
+        let routerScoresThreads = max(routerScoresPipeline.threadExecutionWidth, 1)
+        let routerSelectThreads = max(routerSelectPipeline.threadExecutionWidth, 1)
         let flatGateUpCount = expertsPerToken * intermediateDimension
+        let gateUpSimdWidth = max(gateUpPipeline.threadExecutionWidth, 1)
+        let gateUpSimdgroups = Self.resolvedSimdgroups(
+            environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
+            defaultValue: 32,
+            simdWidth: gateUpSimdWidth,
+            pipeline: gateUpPipeline
+        )
+        let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
         let simdWidth = max(downPipeline.threadExecutionWidth, 1)
-        let simdgroups = max(1, min(32, downPipeline.maxTotalThreadsPerThreadgroup / simdWidth))
+        let simdgroups = Self.resolvedSimdgroups(
+            environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
+            defaultValue: 32,
+            simdWidth: simdWidth,
+            pipeline: downPipeline
+        )
         let threads = simdgroups * simdWidth
         let gridX = (outputDimension + simdgroups - 1) / simdgroups
         let (routerBuffer, routerOffset) = context.resolveWeight("router")
@@ -300,13 +455,14 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             : (routerBuffer, routerOffset)
 
         let scratchRowStride = scratchElementsPerToken
+        let inputRowStride = Self.inputRowStride(context: context)
 
         return FragmentPrefillSteps(
             steps: [
                 MetalPrefillStep(
-                    pipeline: routerPipeline,
-                    gridSize: MTLSize(width: context.maximumSequenceLength, height: 1, depth: 1),
-                    threadgroupSize: MTLSize(width: routerThreads, height: 1, depth: 1),
+                    pipeline: routerScoresPipeline,
+                    gridSize: MTLSize(width: expertCount, height: context.maximumSequenceLength, depth: 1),
+                    threadgroupSize: MTLSize(width: routerScoresThreads, height: 1, depth: 1),
                     bufferBindings: [
                         (0, context.currentInputBuffer, context.currentInputOffset),
                         (1, routerBuffer, routerOffset),
@@ -321,25 +477,52 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                         routedScalingFactor: routedScalingFactor,
                         useExpertBias: useExpertBias,
                         sequenceLength: context.maximumSequenceLength,
-                        inputRowStride: context.slotDimension,
+                        inputRowStride: inputRowStride,
                         scratchRowStride: scratchRowStride,
                         startingIndex: 4
                     ),
                     threadgroupMemoryLength: 0,
                     sync: .bufferBarrier,
                     mode: .batch,
-                    sequenceLengthPolicy: .bind(index: 10),
+                    sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 10),
                     positionBufferIndex: nil,
                     perPositionStrides: [:],
                     metadata: .init(
-                        kernelName: "\(kernelName)_router",
+                        kernelName: "\(kernelName)_router_scores",
                         bufferAccessPattern: .init(reads: [0, 1, 2], writes: [3])
+                    )
+                ),
+                MetalPrefillStep(
+                    pipeline: routerSelectPipeline,
+                    gridSize: MTLSize(width: context.maximumSequenceLength, height: 1, depth: 1),
+                    threadgroupSize: MTLSize(width: routerSelectThreads, height: 1, depth: 1),
+                    bufferBindings: [
+                        (0, moeScratch, 0),
+                    ],
+                    bytesBindings: Self.routerSelectConstantBindings(
+                        expertCount: expertCount,
+                        expertsPerToken: expertsPerToken,
+                        normalizeRoutingWeights: normalizeRoutingWeights,
+                        routedScalingFactor: routedScalingFactor,
+                        sequenceLength: context.maximumSequenceLength,
+                        scratchRowStride: scratchRowStride,
+                        startingIndex: 1
+                    ),
+                    threadgroupMemoryLength: 0,
+                    sync: .bufferBarrier,
+                    mode: .batch,
+                    sequenceLengthPolicy: .bind(index: 5),
+                    positionBufferIndex: nil,
+                    perPositionStrides: [:],
+                    metadata: .init(
+                        kernelName: "\(kernelName)_router_select",
+                        bufferAccessPattern: .init(reads: [0], writes: [0])
                     )
                 ),
                 MetalPrefillStep(
                     pipeline: gateUpPipeline,
                     gridSize: MTLSize(
-                        width: (flatGateUpCount + gateUpThreads - 1) / gateUpThreads,
+                        width: (flatGateUpCount + gateUpSimdgroups - 1) / gateUpSimdgroups,
                         height: context.maximumSequenceLength,
                         depth: 1
                     ),
@@ -354,7 +537,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                         intermediateDimension: intermediateDimension,
                         expertsPerToken: expertsPerToken,
                         sequenceLength: context.maximumSequenceLength,
-                        inputRowStride: context.slotDimension,
+                        inputRowStride: inputRowStride,
                         scratchRowStride: scratchRowStride,
                         startingIndex: 3
                     ),
@@ -418,6 +601,88 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         }
     }
 
+    private static func resolvedSimdgroups(
+        environmentKey: String,
+        defaultValue: Int,
+        simdWidth: Int,
+        pipeline: MTLComputePipelineState
+    ) -> Int {
+        let maxSupported = max(1, pipeline.maxTotalThreadsPerThreadgroup / max(simdWidth, 1))
+        let requested = ProcessInfo.processInfo.environment[environmentKey].flatMap(Int.init) ?? defaultValue
+        return max(1, min(requested, maxSupported))
+    }
+
+    private func monolithicPrefillSteps(context: PrefillBindingContext) throws -> FragmentPrefillSteps {
+        let kernelName = kernelName(context: context.kernelContext)
+        let pipeline = try context.getPipeline(kernelName)
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let simdgroups = max(1, min(32, pipeline.maxTotalThreadsPerThreadgroup / simdWidth))
+        let threads = simdgroups * simdWidth
+        let gridX = (outputDimension + simdgroups - 1) / simdgroups
+        let (routerBuffer, routerOffset) = context.resolveWeight("router")
+        let (gateUpBuffer, gateUpOffset) = context.resolveWeight("expert_gate_up_proj")
+        let (downBuffer, downOffset) = context.resolveWeight("expert_down_proj")
+        let (biasBuffer, biasOffset) = useExpertBias
+            ? context.resolveWeight("expert_bias")
+            : (routerBuffer, routerOffset)
+        let inputRowStride = Self.inputRowStride(context: context)
+
+        return FragmentPrefillSteps(
+            steps: [MetalPrefillStep(
+                pipeline: pipeline,
+                gridSize: MTLSize(width: gridX, height: context.maximumSequenceLength, depth: 1),
+                threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
+                bufferBindings: [
+                    (0, context.currentInputBuffer, context.currentInputOffset),
+                    (1, routerBuffer, routerOffset),
+                    (2, gateUpBuffer, gateUpOffset),
+                    (3, downBuffer, downOffset),
+                    (4, biasBuffer, biasOffset),
+                    (5, context.buffers.hidden, 0),
+                ],
+                bytesBindings: Self.constantBindings(
+                    inputDimension: inputDimension,
+                    outputDimension: outputDimension,
+                    intermediateDimension: intermediateDimension,
+                    expertCount: expertCount,
+                    expertsPerToken: expertsPerToken,
+                    normalizeRoutingWeights: normalizeRoutingWeights,
+                    routedScalingFactor: routedScalingFactor,
+                    useExpertBias: useExpertBias,
+                    sequenceLength: context.maximumSequenceLength,
+                    inputRowStride: inputRowStride,
+                    outputRowStride: outputDimension,
+                    startingIndex: 6
+                ),
+                threadgroupMemoryLength: 0,
+                sync: .bufferBarrier,
+                mode: .batch,
+                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 14),
+                positionBufferIndex: nil,
+                perPositionStrides: [:],
+                metadata: .init(
+                    kernelName: kernelName,
+                    bufferAccessPattern: .init(reads: [0, 1, 2, 3, 4], writes: [5])
+                )
+            )],
+            outputIsHidden: true,
+            resetsProjectionIndex: true
+        )
+    }
+
+    private static func isEnabled(_ value: String?) -> Bool {
+        guard let value else { return false }
+        return value == "1" || value.lowercased() == "true"
+    }
+
+    private static func inputRowStride(context: PrefillBindingContext) -> Int {
+        if context.currentInputBuffer === context.buffers.hidden {
+            return (context.buffers.hidden.length / max(context.maximumSequenceLength, 1))
+                / max(context.buffers.bufferPrecision.byteSize, 1)
+        }
+        return context.slotDimension
+    }
+
     private static func constantBindings(
         inputDimension: Int,
         outputDimension: Int,
@@ -476,6 +741,25 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             uint32Binding(startingIndex + 6, UInt32(sequenceLength)),
             uint32Binding(startingIndex + 7, UInt32(inputRowStride)),
             uint32Binding(startingIndex + 8, UInt32(scratchRowStride)),
+        ]
+    }
+
+    private static func routerSelectConstantBindings(
+        expertCount: Int,
+        expertsPerToken: Int,
+        normalizeRoutingWeights: Bool,
+        routedScalingFactor: Float,
+        sequenceLength: Int,
+        scratchRowStride: Int,
+        startingIndex: Int
+    ) -> [(index: Int, value: [UInt8])] {
+        [
+            uint32Binding(startingIndex + 0, UInt32(expertCount)),
+            uint32Binding(startingIndex + 1, UInt32(expertsPerToken)),
+            uint32Binding(startingIndex + 2, normalizeRoutingWeights ? 1 : 0),
+            floatBinding(startingIndex + 3, routedScalingFactor),
+            uint32Binding(startingIndex + 4, UInt32(sequenceLength)),
+            uint32Binding(startingIndex + 5, UInt32(scratchRowStride)),
         ]
     }
 

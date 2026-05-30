@@ -102,7 +102,48 @@ struct MetalSourceGeneratorTests {
             options.languageVersion = .version4_0
             let library = try device.makeLibrary(source: source, options: options)
             #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
+            #expect(library.makeFunction(name: "\(name)_router_parallel") != nil, "Failed to compile \(name)_router_parallel")
+            #expect(library.makeFunction(name: "\(name)_router_scores") != nil, "Failed to compile \(name)_router_scores")
+            #expect(library.makeFunction(name: "\(name)_router_select") != nil, "Failed to compile \(name)_router_select")
+            #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
+            #expect(library.makeFunction(name: "\(name)_gate_up_packed4") != nil, "Failed to compile \(name)_gate_up_packed4")
+            #expect(library.makeFunction(name: "\(name)_gate_up_split2") != nil, "Failed to compile \(name)_gate_up_split2")
+            #expect(library.makeFunction(name: "\(name)_down") != nil, "Failed to compile \(name)_down")
+            #expect(library.makeFunction(name: "\(name)_down_packed4") != nil, "Failed to compile \(name)_down_packed4")
+            #expect(library.makeFunction(name: "\(name)_down_split2") != nil, "Failed to compile \(name)_down_split2")
         }
+    }
+
+    @Test("Sparse MoE monolithic route is diagnostic-only")
+    func sparseMoEMonolithicRouteIsDiagnosticOnly() {
+        let legacyKey = "SWIFTLM_SPARSE_MOE_MONOLITHIC"
+        let diagnosticKey = "SWIFTLM_DIAGNOSTIC_SPARSE_MOE_MONOLITHIC"
+        let previousLegacy = ProcessInfo.processInfo.environment[legacyKey]
+        let previousDiagnostic = ProcessInfo.processInfo.environment[diagnosticKey]
+        defer {
+            restoreEnvironmentValue(previousLegacy, forKey: legacyKey)
+            restoreEnvironmentValue(previousDiagnostic, forKey: diagnosticKey)
+        }
+
+        restoreEnvironmentValue(nil, forKey: legacyKey)
+        restoreEnvironmentValue(nil, forKey: diagnosticKey)
+        let fragment = SparseMoEFragment(
+            expertCount: 32,
+            expertsPerToken: 4,
+            gateKind: .sigmoidTopK,
+            inputDimension: 2_048,
+            outputDimension: 2_048,
+            intermediateDimension: 1_792,
+            normalizeRoutingWeights: true,
+            routedScalingFactor: 1.0,
+            useExpertBias: true
+        )
+
+        #expect(fragment.usesSplitRoute)
+        setenv(legacyKey, "1", 1)
+        #expect(fragment.usesSplitRoute)
+        setenv(diagnosticKey, "1", 1)
+        #expect(!fragment.usesSplitRoute)
     }
 
     @Test("Generated Sparse MoE prefill matches CPU reference")
@@ -272,9 +313,10 @@ struct MetalSourceGeneratorTests {
         #expect(maxError < 0.0025, "Sparse MoE prefill drifted: maxError=\(maxError)")
 
         var splitOutput = [Float](repeating: -999.0, count: sequenceLength * outputRowStride)
+        let scratchRowStride = 2 * expertsPerToken + 2 * 128 + expertsPerToken * intermediateDimension
         var splitScratch = [Float](
             repeating: .zero,
-            count: sequenceLength * expertsPerToken * (intermediateDimension + 2)
+            count: sequenceLength * scratchRowStride
         )
         let splitOutputBuffer = try #require(device.makeBuffer(
             bytes: &splitOutput,
@@ -286,8 +328,11 @@ struct MetalSourceGeneratorTests {
             length: splitScratch.count * MemoryLayout<Float>.stride,
             options: .storageModeShared
         ))
-        let routerPipeline = try device.makeComputePipelineState(
-            function: try #require(library.makeFunction(name: "\(kernelName)_router"))
+        let routerScoresPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "\(kernelName)_router_scores"))
+        )
+        let routerSelectPipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "\(kernelName)_router_select"))
         )
         let gateUpPipeline = try device.makeComputePipelineState(
             function: try #require(library.makeFunction(name: "\(kernelName)_gate_up"))
@@ -298,8 +343,7 @@ struct MetalSourceGeneratorTests {
 
         let splitCommandBuffer = try #require(queue.makeCommandBuffer())
         let splitEncoder = try #require(splitCommandBuffer.makeComputeCommandEncoder())
-        let scratchRowStride = expertsPerToken * (intermediateDimension + 2)
-        splitEncoder.setComputePipelineState(routerPipeline)
+        splitEncoder.setComputePipelineState(routerScoresPipeline)
         splitEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
         splitEncoder.setBuffer(routerBuffer, offset: 0, index: 1)
         splitEncoder.setBuffer(expertBiasBuffer, offset: 0, index: 2)
@@ -314,11 +358,26 @@ struct MetalSourceGeneratorTests {
         splitEncoder.setBytes([UInt32(inputRowStride)], length: MemoryLayout<UInt32>.stride, index: 11)
         splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 12)
         splitEncoder.dispatchThreadgroups(
-            MTLSize(width: sequenceLength, height: 1, depth: 1),
-            threadsPerThreadgroup: MTLSize(width: routerPipeline.threadExecutionWidth, height: 1, depth: 1)
+            MTLSize(width: expertCount, height: sequenceLength, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: routerScoresPipeline.threadExecutionWidth, height: 1, depth: 1)
         )
 
-        let gateUpThreads = min(256, max(gateUpPipeline.threadExecutionWidth, 1) * 8)
+        splitEncoder.setComputePipelineState(routerSelectPipeline)
+        splitEncoder.setBuffer(splitScratchBuffer, offset: 0, index: 0)
+        splitEncoder.setBytes([UInt32(expertCount)], length: MemoryLayout<UInt32>.stride, index: 1)
+        splitEncoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 2)
+        splitEncoder.setBytes([normalizeRoutingWeights ? UInt32(1) : UInt32(0)], length: MemoryLayout<UInt32>.stride, index: 3)
+        splitEncoder.setBytes(&scale, length: MemoryLayout<Float>.stride, index: 4)
+        splitEncoder.setBytes([UInt32(sequenceLength)], length: MemoryLayout<UInt32>.stride, index: 5)
+        splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 6)
+        splitEncoder.dispatchThreadgroups(
+            MTLSize(width: sequenceLength, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: routerSelectPipeline.threadExecutionWidth, height: 1, depth: 1)
+        )
+
+        let gateUpSimdWidth = max(gateUpPipeline.threadExecutionWidth, 1)
+        let gateUpSimdgroups = max(1, min(32, gateUpPipeline.maxTotalThreadsPerThreadgroup / gateUpSimdWidth))
+        let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
         splitEncoder.setComputePipelineState(gateUpPipeline)
         splitEncoder.setBuffer(inputBuffer, offset: 0, index: 0)
         splitEncoder.setBuffer(gateUpBuffer, offset: 0, index: 1)
@@ -331,7 +390,7 @@ struct MetalSourceGeneratorTests {
         splitEncoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 8)
         splitEncoder.dispatchThreadgroups(
             MTLSize(
-                width: (expertsPerToken * intermediateDimension + gateUpThreads - 1) / gateUpThreads,
+                width: (expertsPerToken * intermediateDimension + gateUpSimdgroups - 1) / gateUpSimdgroups,
                 height: sequenceLength,
                 depth: 1
             ),
@@ -3990,5 +4049,13 @@ struct MetalSourceGeneratorTests {
             }
         }
         return result
+    }
+
+    private func restoreEnvironmentValue(_ value: String?, forKey key: String) {
+        if let value {
+            setenv(key, value, 1)
+        } else {
+            unsetenv(key)
+        }
     }
 }

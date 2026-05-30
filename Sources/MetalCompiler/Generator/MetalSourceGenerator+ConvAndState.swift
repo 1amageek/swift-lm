@@ -554,11 +554,16 @@ public static func generateSSMRecurrenceSequence(
     emitsPartitionOwnedPartialProjection: Bool = false,
     parallelQKReduction: Bool = false,
     cacheHeadParameters: Bool = false,
-    parallelStateUpdate: Bool = false
+    parallelStateUpdate: Bool = false,
+    coalescedStateThreadMapping: Bool = false
 ) -> String {
     precondition(
         !(emitsGroupOwnedPartialProjection && emitsPartitionOwnedPartialProjection),
         "SSM partial projection ownership modes are mutually exclusive"
+    )
+    precondition(
+        !coalescedStateThreadMapping || parallelStateUpdate,
+        "Coalesced state thread mapping requires parallel state update"
     )
     let bt = bufferPrecision.metalType
     let wt = weightFormat.bufferType
@@ -802,6 +807,15 @@ public static func generateSSMRecurrenceSequence(
                         float decay = exp(-exp(aLog[headIndex]) * stable_softplus(alpha + \(readWeight("dtBias[headIndex]"))));
                         float beta = stable_sigmoid(betaInput);
         """
+    let parallelStateThreadMapping = coalescedStateThreadMapping
+        ? """
+                        const uint lane = headLocalTid / dv;
+                        const uint d = headLocalTid - lane * dv;
+        """
+        : """
+                        const uint d = headLocalTid / stateLaneCount;
+                        const uint lane = headLocalTid - d * stateLaneCount;
+        """
 
     let stateRecurrencePhase = parallelStateUpdate
         ? """
@@ -820,8 +834,7 @@ public static func generateSSMRecurrenceSequence(
                     if (tid < stateActiveThreads) {
                         const uint localHead = tid / stateThreadsPerHead;
                         const uint headLocalTid = tid - localHead * stateThreadsPerHead;
-                        const uint d = headLocalTid / stateLaneCount;
-                        const uint lane = headLocalTid - d * stateLaneCount;
+                        \(parallelStateThreadMapping)
                         const uint headIndex = headStart + localHead;
                         device float* state = recurrentState + headIndex * dk * dv;
                         const uint qBase = 0u;
@@ -873,8 +886,7 @@ public static func generateSSMRecurrenceSequence(
                     if (tid < stateActiveThreads) {
                         const uint localHead = tid / stateThreadsPerHead;
                         const uint headLocalTid = tid - localHead * stateThreadsPerHead;
-                        const uint d = headLocalTid / stateLaneCount;
-                        const uint lane = headLocalTid - d * stateLaneCount;
+                        \(parallelStateThreadMapping)
                         const uint headIndex = headStart + localHead;
                         device float* state = recurrentState + headIndex * dk * dv;
                         const uint kBase = dk;

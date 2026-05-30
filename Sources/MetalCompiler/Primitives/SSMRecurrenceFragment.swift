@@ -124,6 +124,20 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         sequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_parallel_state"
     }
 
+    static func parallelStateSharedRMSSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        parallelStateSequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_shared_rms"
+    }
+
+    static func coalescedParallelStateSequenceKernelName(
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        parallelStateSequenceKernelName(bufferPrecision: bufferPrecision, weightFormat: weightFormat) + "_coalesced"
+    }
+
     static func groupOwnedPartialProjectionSequenceKernelName(
         bufferPrecision: BufferPrecision,
         weightFormat: WeightFormat
@@ -163,6 +177,14 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         return nil
     }
 
+    static var isCoalescedParallelStatePrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PARALLEL_STATE_COALESCED"] == "1"
+    }
+
+    static var isParallelStateSharedRMSPrefillEnabled: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PARALLEL_STATE_SHARED_RMS"] == "1"
+    }
+
     static func parallelStatePrefillOverride() throws -> Bool? {
         guard let raw = ProcessInfo.processInfo.environment["SWIFTLM_PREFILL_SSM_PARALLEL_STATE"] else {
             return nil
@@ -195,6 +217,7 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
 
     static func prefillThreadgroupWidthOverride(
         defaultThreads: Int,
+        maximumThreads: Int,
         minimumActiveThreads: Int,
         simdWidth: Int
     ) throws -> Int {
@@ -211,9 +234,9 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) is below required active threads \(minimumActiveThreads)"
             )
         }
-        guard requested <= defaultThreads else {
+        guard requested <= maximumThreads else {
             throw MetalCompilerError.deviceSetupFailed(
-                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) exceeds default threadgroup width \(defaultThreads)"
+                "SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH \(requested) exceeds maximum threadgroup width \(maximumThreads)"
             )
         }
         guard simdWidth <= 1 || requested % simdWidth == 0 else {
@@ -322,6 +345,8 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
         let prewriteDecayPrefillEnabled = Self.isPrewriteDecayPrefillEnabled
         let qkParallelPrefillEnabled = Self.isQKParallelPrefillEnabled
         let cachedParametersPrefillEnabled = Self.isCachedParametersPrefillEnabled
+        let parallelStateSharedRMSPrefillEnabled = Self.isParallelStateSharedRMSPrefillEnabled
+        let coalescedParallelStatePrefillEnabled = Self.isCoalescedParallelStatePrefillEnabled
         let parallelStateOverride = try Self.parallelStatePrefillOverride()
         let explicitParallelStatePrefillEnabled = parallelStateOverride == true
         let explicitVariantCount = [
@@ -329,13 +354,15 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             prewriteDecayPrefillEnabled,
             qkParallelPrefillEnabled,
             cachedParametersPrefillEnabled,
+            parallelStateSharedRMSPrefillEnabled,
+            coalescedParallelStatePrefillEnabled,
             explicitParallelStatePrefillEnabled,
         ]
             .filter { $0 }
             .count
         if explicitVariantCount > 1 {
             throw MetalCompilerError.deviceSetupFailed(
-                "SWIFTLM_PREFILL_SSM_SHARED_RMS, SWIFTLM_PREFILL_SSM_PREWRITE_DECAY, SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE are mutually exclusive"
+                "SWIFTLM_PREFILL_SSM_SHARED_RMS, SWIFTLM_PREFILL_SSM_PREWRITE_DECAY, SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, SWIFTLM_PREFILL_SSM_PARALLEL_STATE_SHARED_RMS, SWIFTLM_PREFILL_SSM_PARALLEL_STATE_COALESCED, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE are mutually exclusive"
             )
         }
         let defaultParallelStatePrefillEnabled = explicitVariantCount == 0
@@ -348,11 +375,15 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
                 valueHeadDimension: valueHeadDimension
             )
         let parallelStatePrefillEnabled = parallelStateOverride ?? defaultParallelStatePrefillEnabled
-        if qkParallelPrefillEnabled || cachedParametersPrefillEnabled || parallelStatePrefillEnabled {
+        if qkParallelPrefillEnabled
+            || cachedParametersPrefillEnabled
+            || parallelStateSharedRMSPrefillEnabled
+            || coalescedParallelStatePrefillEnabled
+            || parallelStatePrefillEnabled {
             guard context.kernelContext.bufferPrecision == .float32,
                   context.kernelContext.weightFormat == .bfloat16 else {
                 throw MetalCompilerError.deviceSetupFailed(
-                    "SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE currently support only BF16 weights with F32 sequence buffers"
+                    "SWIFTLM_PREFILL_SSM_QKPAR, SWIFTLM_PREFILL_SSM_CACHED_PARAMS, SWIFTLM_PREFILL_SSM_PARALLEL_STATE_SHARED_RMS, SWIFTLM_PREFILL_SSM_PARALLEL_STATE_COALESCED, and SWIFTLM_PREFILL_SSM_PARALLEL_STATE currently support only BF16 weights with F32 sequence buffers"
                 )
             }
         }
@@ -368,6 +399,16 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             )
         } else if cachedParametersPrefillEnabled {
             Self.cachedParametersSequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        } else if parallelStateSharedRMSPrefillEnabled {
+            Self.parallelStateSharedRMSSequenceKernelName(
+                bufferPrecision: context.kernelContext.bufferPrecision,
+                weightFormat: context.kernelContext.weightFormat
+            )
+        } else if coalescedParallelStatePrefillEnabled {
+            Self.coalescedParallelStateSequenceKernelName(
                 bufferPrecision: context.kernelContext.bufferPrecision,
                 weightFormat: context.kernelContext.weightFormat
             )
@@ -411,9 +452,11 @@ public struct SSMRecurrenceFragment: PrimitiveMetalKernelFragment {
             min(Self.maxThreadgroupSize, desiredThreads),
             pipeline.maxTotalThreadsPerThreadgroup
         )
+        let maximumThreads = min(Self.maxThreadgroupSize, pipeline.maxTotalThreadsPerThreadgroup)
         let minimumActiveThreads = headsPerGroup * min(valueHeadDimension, 256)
         let threads = try Self.prefillThreadgroupWidthOverride(
             defaultThreads: defaultThreads,
+            maximumThreads: maximumThreads,
             minimumActiveThreads: minimumActiveThreads,
             simdWidth: max(pipeline.threadExecutionWidth, 1)
         )

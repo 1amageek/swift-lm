@@ -1,6 +1,6 @@
 # Hybrid Prefill Fast Path Progress
 
-Last updated: 2026-05-20
+Last updated: 2026-05-29
 
 This file is the single progress ledger for the hybrid prefill fast-path work.
 It tracks the current milestone, implementation status, validation evidence,
@@ -24,7 +24,8 @@ flowchart TD
 
 | Area | Contract |
 |---|---|
-| Hybrid BF16 sequence prefill | Must match decode-equivalent prompt ingestion token trace |
+| Hybrid BF16 sequence prefill | Default path must match decode-equivalent prompt ingestion token trace |
+| Compact MPP prefill | May be considered production-admissible only when schema v6 reference passes and the 50% full-profile target gate is recorded |
 | Q3 sequence prefill | Enabled only through reference-backed packed and batched Q3 sequence GEMV plus quantized sequence embedding |
 | Speed claims | Forbidden unless the same path has green correctness evidence |
 | Fallback | Silent fallback is not allowed |
@@ -60,7 +61,7 @@ flowchart TD
 |---|---|---|
 | M1 safe tiled sequence GEMV | Done / not default | Tile4 kernels compile and pass decode-equivalence tests; Qwen profile regressed when defaulted, so production planner stays on base sequence GEMV |
 | M2 reference harness | Done / hardened | LFM and Qwen3.5 both have reference dump scripts and manifest coverage; Qwen3.5 validates snapshot identity, prefill state, decode0 state, and KV cache |
-| M3 reference-equivalent MPP prefill | Pending | Requires M2 before adopting non decode-equivalent math |
+| M3 reference-equivalent MPP prefill | Done / route-ready under explicit contract | Compact MPP passes Qwen schema v6 reference and clears the 50% target gate; route-readiness marks it as `candidate-production-route` only when both `qwen35-reference-gate.csv` and target evidence are present |
 | M4 fused hybrid block prefill | In progress / opt-in only | BF16 SwiGLU+down fusion remains an opt-in experiment because prompt-ingestion decode-equivalence exposed activation drift; broader block fusion now has window, cross-group fan-in, and traffic artifacts before route promotion |
 | M5 benchmark-backed release claim | Pending | Requires real-bundle correctness gates first |
 | External implementation review | Done / active input | llama.cpp/ggml Metal reviewed on 2026-05-12 as a baseline to beat, not a target to copy |
@@ -2987,3 +2988,166 @@ loop. The next production-readiness step is not more projection routing; it is
 deciding the compact MPP precision contract and designing a state-loop route
 that reduces state traffic or synchronization while passing full reference and
 profile gates.
+
+### SSM State-Loop Thread Mapping and Width Sweep (2026-05-28)
+
+The next state-loop experiment kept the `parallel_state` algorithm fixed and
+tested two lower-risk levers before attempting a new recurrence algorithm:
+
+```mermaid
+flowchart LR
+  A["current parallel_state"] --> B["coalesced state-thread mapping"]
+  A --> C["wider SSM threadgroup override"]
+  A --> H["parallel_state + shared-RMS"]
+  B --> D{"beats current default?"}
+  C --> E{"cross-sequence win?"}
+  H --> I{"beats incumbent at seq64/128?"}
+  D -->|"no"| F["keep as rejected opt-in evidence"]
+  E -->|"no"| G["keep default at 384"]
+  I -->|"no"| J["keep as rejected opt-in evidence"]
+```
+
+Results:
+
+| Candidate | Correctness | Profile result | Decision |
+|---|---|---|---|
+| `SWIFTLM_PREFILL_SSM_PARALLEL_STATE_COALESCED=1` | `SSMRecurrenceSequenceEquivalenceTests` pass; Qwen schema v6 reference pass | Faster than old base but slower than current `parallel_state`; route admission now compares against the incumbent and rejects it | Do not promote |
+| `SWIFTLM_PREFILL_SSM_THREADGROUP_WIDTH=512` | Qwen schema v6 reference pass | Compact route total: seq16 `17.780 ms`, seq64 `43.258 ms`, seq128 `71.202 ms`; seq128 improves slightly, seq64 regresses versus the previous compact route | Keep opt-in only |
+| `SWIFTLM_PREFILL_SSM_PARALLEL_STATE_SHARED_RMS=1` | `SSMRecurrenceSequenceEquivalenceTests` pass; Qwen schema v6 reference pass | Real-shape microbench improves seq128 slightly but regresses seq64 versus incumbent `parallel_state`; compact full-profile totals are seq16 `19.994 ms`, seq64 `42.218 ms`, seq128 `73.743 ms` | Keep opt-in only |
+
+The microbench harness now permits SSM threadgroup widths above the production
+default so 512/768/1024 can be measured instead of being silently clamped to
+384. Production default remains unchanged because the sweep did not produce a
+cross-sequence win.
+
+Open decision: the remaining 10%+ total improvement is unlikely to come from
+thread remapping, width tuning, or combining `parallel_state` with shared-RMS
+alone. The next viable SSM milestone needs a new state-loop algorithm that
+reduces recurrent-state traffic or changes the sequence recurrence formulation
+while preserving the schema v6 reference gates.
+
+The harness now includes a static sequence-algorithm feasibility gate:
+
+| Algorithm class | Traffic target | Gate result |
+|---|---:|---|
+| Current `parallel_state` | baseline | baseline |
+| two-token temporal tile with full recurrent state in threadgroup memory | 66.7% state-traffic reduction | rejected by `32 KB` threadgroup-memory limit |
+| low-rank coefficient scan over sequence K-basis updates | removes recurrent-state traffic for fresh zero state | rejected because default prefill must support nonzero restored state |
+| four-token affine scan with streaming recurrent state | 83.3% state-traffic reduction | admitted as `candidate-kernel-prototype`; supports nonzero initial state and fits the `32 KB` static threadgroup-memory gate |
+
+This keeps the next implementation honest: a 50% class route cannot be admitted
+unless it both fits device memory and preserves the nonzero-state prefill
+contract.
+
+The machine-readable sequence-algorithm gate is written as:
+
+```text
+.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-ssm-sequence-algorithm-feasibility.csv
+```
+
+The current admitted prototype is `chunked_affine_scan_tile4`. It is not a
+runtime route yet. It is the next allowed kernel work item because it passes the
+static gate that rejected the previous traffic-only shortcuts:
+
+```mermaid
+flowchart LR
+  A["nonzero restored recurrent state"] --> B["affine state recurrence"]
+  B --> C["tile4 streaming state load/write"]
+  C --> D["per-token partial output scratch"]
+  D --> E["candidate-kernel-prototype"]
+  E --> F["synthetic CPU reference"]
+  F --> G["Metal prototype behind env flag"]
+  G --> H["Qwen schema v6 reference + route readiness"]
+```
+
+Prototype constraints:
+
+| Constraint | Contract |
+|---|---|
+| Initial state | must support nonzero restored recurrent state |
+| State ownership | one kernel owns the recurrent-state update for each head |
+| Static TG memory | `17,932` bytes at Qwen 0.8B shape, below `32 KB` |
+| Estimated state traffic | `0.5` full-state read/write pairs per token versus current `3` passes |
+| Promotion | forbidden until synthetic partials, schema v6 reference, and route-readiness pass |
+
+The first reference contract is now covered by
+`SSMChunkedAffineScanReferenceTests`: tile4 chunking matches the sequential
+recurrence for nonzero initial state, restored-state suffix execution, multiple
+tile sizes, factorized affine tile composition, and a small synthetic Metal
+kernel. This fixes the next production kernel's correctness target before any
+runtime route is added.
+
+The next scheduler layer is now explicit in `DeltaNetPrefillSchedulePlanner`.
+This moves recurrent prefill optimization from ad hoc variant names to semantic
+schedule IDs:
+
+| Schedule ID | Class | Current gate |
+|---|---|---|
+| `sequential_state` | reference | baseline reference route |
+| `parallel_state` | current-production | current production route |
+| `block_streaming` | state-traffic-reduction | static pass, rejected until correctness/reference/profile gates pass |
+| `block_scan` | sequence-parallel-scan | rejected by nonzero restored-state contract |
+| `block_fused_projection` | block-fusion | rejected by state-traffic target |
+
+The schedule artifact is:
+
+```text
+.test-artifacts/ssm-recurrence-microbench/qwen35-bf16-deltanet-prefill-schedules.csv
+```
+
+Current artifact summary:
+
+| Schedule | Static | Correctness | Reference | Profile | Promotion |
+|---|---|---|---|---|---|
+| `block_streaming` | pass | missing | missing | missing | `reject-missing-correctness-gate` |
+| `parallel_state` | baseline | baseline | baseline | baseline | `current-production-route` |
+
+Production route selection is now planner-owned: an env-requested experiment is
+recorded as `experiment-only`, and a new route becomes
+`candidate-production-route` only when static feasibility, correctness,
+reference, and profile gates all pass.
+
+### Compact MPP Production-Readiness Gate (2026-05-28)
+
+The fastest Qwen BF16 compact prefill route is no longer treated as a hidden
+experimental-only success. The route-readiness harness now has an explicit
+contract for non decode-equivalent MPP math:
+
+```mermaid
+flowchart LR
+  A["compact MPP route observed"] --> B["schema v6 Qwen reference pass"]
+  B --> C["50% total prefill target gate"]
+  C --> D["route-readiness candidate"]
+  A --> E["missing target/reference evidence"]
+  E --> F["reject production promotion"]
+```
+
+Current validation:
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Qwen schema v6 reference with compact MPP | pass | `Qwen35ReferenceComparisonTests` with both compact MPP flags writes `qwen35-reference-gate.csv` only after compact route, prefill token, decode0 logits, linear states, and KV checks pass |
+| seqLen 64 total prefill | `42.120 ms` observed versus `137.603 ms` baseline | 69.5% recorded reduction target remains green |
+| seqLen 128 total prefill | `73.262 ms` observed versus `265.439 ms` baseline | 72.4% recorded reduction target remains green |
+| Route-readiness | pass | compact MPP rows are `candidate-production-route` only when `referenceGate=pass` and `full-profile-target-observed` are both present |
+
+The machine-readable readiness rows now use:
+
+```text
+readinessPrerequisite = requires-schema-v6-reference-and-full-profile-target-gate
+observedReferenceGate = pass
+observedPrecisionContract = mpp-reference-equivalent
+routeReadiness = candidate-production-route
+```
+
+This does not make every MPP route acceptable. It narrows acceptance to the
+Qwen compact route that has both reference and target-gate evidence. Profile-only
+MPP rows are not promotion candidates. If either the reference artifact or target
+artifact is missing, current route-readiness validation fails instead of silently
+treating the MPP route as safe.
+
+The SSM thread-remapping family is closed as negative evidence. Coalesced state
+mapping, wider threadgroup overrides, and `parallel_state + shared-RMS` remain
+available only as opt-in diagnostics. The next speed workstream must start from
+a new SSM state-loop algorithm that passes the static feasibility gates before
+kernel implementation.

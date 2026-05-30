@@ -139,37 +139,7 @@ struct Qwen35ReferenceComparisonTests {
 
         let env = try Self.setupOrSkip()
         let prefillPlan = try #require(env.model.prefillPlan)
-        let kernelNames = prefillPlan.steps.map { step in
-            step.metadata.kernelName ?? step.pipeline.label ?? ""
-        }
-        func hasCompactMPPWeight(_ tensorSuffix: String) -> Bool {
-            prefillPlan.steps.contains { step in
-                let kernelName = step.metadata.kernelName ?? step.pipeline.label ?? ""
-                let weightTensorName = step.metadata.weightTensorName ?? ""
-                return kernelName.hasPrefix("compact_mpp::")
-                    && weightTensorName.contains(tensorSuffix)
-            }
-        }
-
-        #expect(
-            kernelNames.contains { $0.hasPrefix("compact_mpp::batched_gemm") },
-            "Batched compact MPP route did not appear in Qwen35 prefill plan"
-        )
-        #expect(
-            kernelNames.contains { $0.hasPrefix("compact_mpp::gemm") },
-            "Single compact MPP route did not appear in Qwen35 prefill plan"
-        )
-        #expect(
-            kernelNames.contains { $0.hasPrefix("split_tail::batched_gemv") },
-            "Split-tail route did not appear in Qwen35 prefill plan"
-        )
-        #expect(
-            kernelNames.contains { $0.hasPrefix("scatter_compact_seq_outputs") },
-            "Compact scatter route did not appear in Qwen35 prefill plan"
-        )
-        #expect(hasCompactMPPWeight("mlp.down_proj.weight"))
-        #expect(hasCompactMPPWeight("self_attn.o_proj.weight"))
-        #expect(hasCompactMPPWeight("linear_attn.out_proj.weight"))
+        try Self.requireCompactMPPRoute(in: prefillPlan)
     }
 
     @Test("Prefill linear-attention block boundaries match HuggingFace reference")
@@ -411,12 +381,22 @@ struct Qwen35ReferenceComparisonTests {
         BenchmarkSupport.settleGPU()
 
         let env = try Self.setupOrSkip()
+        let compactMPPRequested = Self.compactMPPAggressiveRouteRequested()
+        if compactMPPRequested {
+            try Self.removeCompactMPPReferenceGate()
+            try Self.requireReferenceGate(
+                try Self.readRefInt32(env.ref, name: "ref.meta.schema_version") == 6,
+                "Qwen35 reference schema is not v6"
+            )
+            try Self.requireCompactMPPRoute(in: try #require(env.model.prefillPlan))
+        }
         for referenceCase in Self.referenceCases {
             var model = try Self.makeRuntimeIsolatedModel(from: env.model)
             model.resetState()
             let prefillToken = model.prefill(tokens: referenceCase.tokens)
             let metalToken = model.decodeSync(tokenID: prefillToken)
             let decodePrefix = "\(referenceCase.prefix).decode_0"
+            let refPrefillToken = try Self.readRefInt32(env.ref, name: "\(referenceCase.prefix).prefill.next_token")
             let refToken = try Self.readRefInt32(env.ref, name: "\(decodePrefix).next_token")
             let refLogits = try Self.readRefTensorAsFloats(env.ref, name: "\(decodePrefix).logits_last")
             let metalLogits = try Self.readBuffer(model.buffers.logits, precision: model.buffers.bufferPrecision)
@@ -426,9 +406,22 @@ struct Qwen35ReferenceComparisonTests {
 
             print("[Qwen35Ref] \(decodePrefix) Metal token=\(metalToken) top=\(metalTop.index), HF token=\(refToken) top=\(refTop.index), logits maxErr=\(String(format: "%.4f", logitsError))")
 
-            #expect(metalToken == refToken, "\(decodePrefix) next token drifted: Metal=\(metalToken) HF=\(refToken)")
-            #expect(metalTop.index == refTop.index, "\(decodePrefix) argmax drifted: Metal=\(metalTop.index) HF=\(refTop.index)")
-            #expect(logitsError < 1.0, "\(decodePrefix) logits drifted: maxErr=\(logitsError)")
+            try Self.requireReferenceGate(
+                prefillToken == refPrefillToken,
+                "\(referenceCase.prefix).prefill next token drifted: Metal=\(prefillToken) HF=\(refPrefillToken)"
+            )
+            try Self.requireReferenceGate(
+                metalToken == refToken,
+                "\(decodePrefix) next token drifted: Metal=\(metalToken) HF=\(refToken)"
+            )
+            try Self.requireReferenceGate(
+                metalTop.index == refTop.index,
+                "\(decodePrefix) argmax drifted: Metal=\(metalTop.index) HF=\(refTop.index)"
+            )
+            try Self.requireReferenceGate(
+                logitsError < 1.0,
+                "\(decodePrefix) logits drifted: maxErr=\(logitsError)"
+            )
 
             try Self.expectLinearStatesMatchReference(
                 model: model,
@@ -441,6 +434,9 @@ struct Qwen35ReferenceComparisonTests {
                 prefix: decodePrefix,
                 tokenCount: referenceCase.tokens.count + 1
             )
+        }
+        if compactMPPRequested {
+            try Self.writeCompactMPPReferenceGate()
         }
     }
 
@@ -588,6 +584,40 @@ struct Qwen35ReferenceComparisonTests {
     private static func makeRuntimeIsolatedModel(from model: MetalInferenceModel) throws -> MetalInferenceModel {
         let isolated = try model.compiledModel.makeRuntimeIsolatedCopy(device: model.device)
         return try MetalInferenceModel(compiledModel: isolated, device: model.device)
+    }
+
+    private static func requireCompactMPPRoute(in prefillPlan: MetalPrefillPlan) throws {
+        let kernelNames = prefillPlan.steps.map { step in
+            step.metadata.kernelName ?? step.pipeline.label ?? ""
+        }
+        func hasCompactMPPWeight(_ tensorSuffix: String) -> Bool {
+            prefillPlan.steps.contains { step in
+                let kernelName = step.metadata.kernelName ?? step.pipeline.label ?? ""
+                let weightTensorName = step.metadata.weightTensorName ?? ""
+                return kernelName.hasPrefix("compact_mpp::")
+                    && weightTensorName.contains(tensorSuffix)
+            }
+        }
+
+        try requireReferenceGate(
+            kernelNames.contains { $0.hasPrefix("compact_mpp::batched_gemm") },
+            "Batched compact MPP route did not appear in Qwen35 prefill plan"
+        )
+        try requireReferenceGate(
+            kernelNames.contains { $0.hasPrefix("compact_mpp::gemm") },
+            "Single compact MPP route did not appear in Qwen35 prefill plan"
+        )
+        try requireReferenceGate(
+            kernelNames.contains { $0.hasPrefix("split_tail::batched_gemv") },
+            "Split-tail route did not appear in Qwen35 prefill plan"
+        )
+        try requireReferenceGate(
+            kernelNames.contains { $0.hasPrefix("scatter_compact_seq_outputs") },
+            "Compact scatter route did not appear in Qwen35 prefill plan"
+        )
+        try requireReferenceGate(hasCompactMPPWeight("mlp.down_proj.weight"), "Missing compact MPP mlp.down_proj route")
+        try requireReferenceGate(hasCompactMPPWeight("self_attn.o_proj.weight"), "Missing compact MPP self_attn.o_proj route")
+        try requireReferenceGate(hasCompactMPPWeight("linear_attn.out_proj.weight"), "Missing compact MPP linear_attn.out_proj route")
     }
 
     private static func compactMPPAggressiveRouteRequested() -> Bool {
@@ -1170,6 +1200,48 @@ struct Qwen35ReferenceComparisonTests {
         return Array(SHA256.hash(data: data))
     }
 
+    private static func repositoryRoot() -> URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
+
+    private static func compactMPPReferenceGateArtifact() -> URL {
+        repositoryRoot()
+            .appendingPathComponent(".test-artifacts/prefill-profile", isDirectory: true)
+            .appendingPathComponent("qwen35-reference-gate.csv")
+    }
+
+    private static func removeCompactMPPReferenceGate() throws {
+        let url = compactMPPReferenceGateArtifact()
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        try FileManager.default.removeItem(at: url)
+    }
+
+    private static func writeCompactMPPReferenceGate() throws {
+        let url = compactMPPReferenceGateArtifact()
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let csv = """
+        referenceName,precisionContract,referenceGate
+        qwen35-schema-v6-compact-mpp,mpp-reference-equivalent,pass
+        """
+        try Data((csv + "\n").utf8).write(to: url, options: .atomic)
+        print("[Qwen35Ref] reference gate artifact: \(url.path)")
+    }
+
+    private static func requireReferenceGate(_ condition: Bool, _ message: @autoclosure () -> String) throws {
+        guard condition else {
+            let text = message()
+            throw SetupError.referenceGateFailed(text)
+        }
+    }
+
     private static func referenceLinearOrdinalCount(_ file: MetalWeightFile, prefix: String) -> Int {
         var count = 0
         while file.tensors["\(prefix).linear_ordinal_\(count).conv_state"] != nil {
@@ -1185,11 +1257,11 @@ struct Qwen35ReferenceComparisonTests {
     ) throws {
         guard let convState = model.buffers.convState else {
             Issue.record("Qwen35 decode plan did not allocate conv state")
-            return
+            throw SetupError.referenceGateFailed("Qwen35 decode plan did not allocate conv state")
         }
         guard let recurrentState = model.buffers.recurrentState else {
             Issue.record("Qwen35 decode plan did not allocate recurrent state")
-            return
+            throw SetupError.referenceGateFailed("Qwen35 decode plan did not allocate recurrent state")
         }
 
         let convDim = model.buffers.convStateDimension
@@ -1201,8 +1273,8 @@ struct Qwen35ReferenceComparisonTests {
         let metalConv = try readBuffer(convState, precision: .bfloat16)
         let metalRecurrent = try readBuffer(recurrentState, precision: .float32)
 
-        #expect(referenceLinearCount == convLayerCount)
-        #expect(referenceLinearCount == recurrentLayerCount)
+        try requireReferenceGate(referenceLinearCount == convLayerCount, "\(prefix) conv state layer count drifted")
+        try requireReferenceGate(referenceLinearCount == recurrentLayerCount, "\(prefix) recurrent state layer count drifted")
 
         for ordinal in 0..<min(referenceLinearCount, convLayerCount) {
             let refConv = try readRefTensorAsFloats(ref, name: "\(prefix).linear_ordinal_\(ordinal).conv_state")
@@ -1210,14 +1282,20 @@ struct Qwen35ReferenceComparisonTests {
             let conv = Array(metalConv[convBase..<(convBase + convDim * kernelSize)])
             let convError = maxAbsoluteError(conv, refConv)
             print("[Qwen35Ref] \(prefix).linear_ordinal_\(ordinal).conv_state maxErr=\(String(format: "%.4f", convError))")
-            #expect(convError < 1.25, "\(prefix).linear_ordinal_\(ordinal).conv_state drifted: maxErr=\(convError)")
+            try requireReferenceGate(
+                convError < 1.25,
+                "\(prefix).linear_ordinal_\(ordinal).conv_state drifted: maxErr=\(convError)"
+            )
 
             let refRecurrent = try readRefTensorAsFloats(ref, name: "\(prefix).linear_ordinal_\(ordinal).recurrent_state")
             let recurrentBase = ordinal * recurrentLayerValues
             let recurrent = Array(metalRecurrent[recurrentBase..<(recurrentBase + recurrentLayerValues)])
             let recurrentError = maxAbsoluteError(recurrent, refRecurrent)
             print("[Qwen35Ref] \(prefix).linear_ordinal_\(ordinal).recurrent_state maxErr=\(String(format: "%.4f", recurrentError))")
-            #expect(recurrentError < 0.75, "\(prefix).linear_ordinal_\(ordinal).recurrent_state drifted: maxErr=\(recurrentError)")
+            try requireReferenceGate(
+                recurrentError < 0.75,
+                "\(prefix).linear_ordinal_\(ordinal).recurrent_state drifted: maxErr=\(recurrentError)"
+            )
         }
     }
 
@@ -1229,13 +1307,13 @@ struct Qwen35ReferenceComparisonTests {
     ) throws {
         guard let cache = model.buffers.kvCache else {
             Issue.record("Qwen35 decode plan did not allocate KV cache")
-            return
+            throw SetupError.referenceGateFailed("Qwen35 decode plan did not allocate KV cache")
         }
 
         let keyPrecision = try denseKVPrecision(for: cache.specification.keyQuantizationScheme)
         let valuePrecision = try denseKVPrecision(for: cache.specification.valueQuantizationScheme)
         let attentionCount = referenceAttentionOrdinalCount(ref, prefix: prefix)
-        #expect(attentionCount == cache.specification.layerCount)
+        try requireReferenceGate(attentionCount == cache.specification.layerCount, "\(prefix) KV layer count drifted")
 
         for ordinal in 0..<min(attentionCount, cache.specification.layerCount) {
             let metalKeys = try readKVCacheLayer(
@@ -1248,7 +1326,10 @@ struct Qwen35ReferenceComparisonTests {
             let refKeys = try readRefTensorAsFloats(ref, name: "\(prefix).attn_ordinal_\(ordinal).keys")
             let keyError = maxAbsoluteError(metalKeys, refKeys)
             print("[Qwen35Ref] \(prefix).attn_ordinal_\(ordinal).keys maxErr=\(String(format: "%.4f", keyError))")
-            #expect(keyError < 1.0, "\(prefix).attn_ordinal_\(ordinal).keys drifted: maxErr=\(keyError)")
+            try requireReferenceGate(
+                keyError < 1.0,
+                "\(prefix).attn_ordinal_\(ordinal).keys drifted: maxErr=\(keyError)"
+            )
 
             let metalValues = try readKVCacheLayer(
                 cache: cache,
@@ -1260,7 +1341,10 @@ struct Qwen35ReferenceComparisonTests {
             let refValues = try readRefTensorAsFloats(ref, name: "\(prefix).attn_ordinal_\(ordinal).values")
             let valueError = maxAbsoluteError(metalValues, refValues)
             print("[Qwen35Ref] \(prefix).attn_ordinal_\(ordinal).values maxErr=\(String(format: "%.4f", valueError))")
-            #expect(valueError < 1.0, "\(prefix).attn_ordinal_\(ordinal).values drifted: maxErr=\(valueError)")
+            try requireReferenceGate(
+                valueError < 1.0,
+                "\(prefix).attn_ordinal_\(ordinal).values drifted: maxErr=\(valueError)"
+            )
         }
     }
 
@@ -1429,6 +1513,7 @@ struct Qwen35ReferenceComparisonTests {
         case metalReadbackFailed(String)
         case bufferRangeOutOfBounds(offset: Int, byteCount: Int, length: Int)
         case stepNotFound(String)
+        case referenceGateFailed(String)
     }
 }
 #endif

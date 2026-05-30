@@ -4,6 +4,8 @@ This document defines the minimum release gates for `swift-lm`.
 
 Latest captured evidence: [Production Readiness Evidence - 2026-05-05](releases/production-readiness-2026-05-05.md).
 Latest prefill artifact evidence: [Prefill Artifact Readiness Evidence - 2026-05-18](releases/prefill-artifact-readiness-2026-05-18.md).
+Latest LFM2.5 A1B evidence: [LFM2.5 8B-A1B Production Readiness Evidence - 2026-05-30](releases/lfm25-a1b-production-readiness-2026-05-30.md).
+LFM2.5 A1B focused runner: `scripts/benchmarks/run-lfm25-a1b-readiness.sh --timeout 120`.
 
 ## Goal
 
@@ -31,6 +33,32 @@ These suites must pass before a release:
 Required expectations:
 
 - LFM local smoke mentions `Tokyo` (`ReleaseSmokeOutputTests`)
+- LFM2.5 8B-A1B local real bundle loads from the HuggingFace cache, rejects
+  unsupported image input explicitly, emits a non-EOS greedy token, and matches
+  the HuggingFace 16-token greedy short trace for the strict capital chat prompt.
+- LFM2.5 8B-A1B prompt-state restore preserves the visible strict-capital
+  output token trace and returns `Tokyo`.
+- LFM2.5 8B-A1B Sparse MoE production routing uses the split route. The legacy
+  monolithic route is diagnostic-only and must not be used as correctness
+  oracle because it is not HuggingFace first-token equivalent on the current
+  A1B bundle.
+- LFM2.5 8B-A1B Sparse MoE routing uses the parallel expert router
+  (`router_scores` + `router_select`) and BF16 packed4 gate/up + down kernels
+  by default. The 64-token strict-capital decode timing gate must match the
+  HuggingFace token trace exactly, route through the packed4 kernels, and clear
+  78 wall-clock tok/s plus 80 GPU tok/s.
+- LFM2.5 8B-A1B default Sparse MoE routing stays bounded across short, chat,
+  and longer prompt lengths so the production route cannot silently regress to
+  diagnostic monolithic latency.
+- LFM2.5 8B-A1B default Sparse MoE routing stays bounded across
+  1/8/16/32/64-token decode sweeps, matches the regenerated HuggingFace
+  64-token strict-capital trace prefix at each checked length, and completes a
+  128-token-cap semantic decode with `</think>` and `Tokyo`.
+- LFM2.5 8B-A1B default Sparse MoE routing has a multi-prompt sustained gate:
+  strict-capital, largest-planet, and Japanese-translation prompts all preserve
+  their regenerated HuggingFace 16-token prefixes and reach the expected answer
+  content under a 64-token cap, with aggregate throughput kept above the
+  current 50 tok/s regression floor.
 - Gemma4 FP16 real bundle first non-empty chunk starts with `Tokyo` (`RotorQuantRealBundleBaselineTests`)
 - Qwen3.5 real bundle first non-empty chunk starts with `Tokyo`
 - RotorQuant Gemma4 full K+V paths (RotorQ8, RotorQ4) preserve the same short factual answer shape (`RotorQuantRealBundleFullTests`)

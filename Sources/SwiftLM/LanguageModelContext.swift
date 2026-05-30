@@ -31,6 +31,18 @@ import Jinja
 public final class LanguageModelContext: @unchecked Sendable {
     private static let promptStateSamplingTailLimit = 256
 
+    internal struct DebugRawGenerationTiming {
+        let tokenIDs: [Int]
+        let prefillSeconds: Double
+        let decodeWallSeconds: Double
+        let decodeGPUSeconds: Double
+        let decodeWallTokensPerSecond: Double
+        let decodeGPUTokensPerSecond: Double
+        let decodeStepCount: Int
+        let decodeBarrierCount: Int
+        let decodeKernelHistogram: [(kernelName: String, count: Int)]
+    }
+
     private var inferenceModel: MetalInferenceModel
     private let modelTokenizer: any Tokenizer
     private let modelConfiguration: ModelConfiguration
@@ -1570,6 +1582,96 @@ public final class LanguageModelContext: @unchecked Sendable {
             startsInsideReasoning: false,
             collectionMode: .raw
         )
+    }
+
+    internal func debugRawGenerationTiming(
+        prompt: ExecutablePrompt,
+        parameters: GenerationParameters
+    ) throws -> DebugRawGenerationTiming {
+        let resolvedParameters = resolvedGenerateParameters(parameters)
+        let prefillStart = CFAbsoluteTimeGetCurrent()
+        let prefillResult = try prefill(prompt: prompt)
+        let prefillSeconds = CFAbsoluteTimeGetCurrent() - prefillStart
+
+        var samplingState = makeInitialSamplingState(
+            promptTokenIDs: prompt.tokenIDs,
+            parameters: resolvedParameters
+        )
+        let firstToken = resolveSampledPrefillToken(
+            fallbackToken: prefillResult.firstToken,
+            parameters: resolvedParameters,
+            samplingState: &samplingState
+        )
+        let maxRequestedTokens = resolvedParameters.maxTokens ?? 1024
+        guard maxRequestedTokens > 0,
+              firstToken >= 0,
+              !modelConfiguration.eosTokenIds.contains(Int(firstToken)) else {
+            return DebugRawGenerationTiming(
+                tokenIDs: [],
+                prefillSeconds: prefillSeconds,
+                decodeWallSeconds: 0,
+                decodeGPUSeconds: 0,
+                decodeWallTokensPerSecond: 0,
+                decodeGPUTokensPerSecond: 0,
+                decodeStepCount: inferenceModel.decodePlan.steps.count,
+                decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
+                decodeKernelHistogram: debugDecodeKernelHistogram()
+            )
+        }
+
+        var generatedTokenIDs = [Int(firstToken)]
+        var nextTokenID = firstToken
+        let decodeWallStart = CFAbsoluteTimeGetCurrent()
+        var decodeGPUSeconds = 0.0
+
+        while generatedTokenIDs.count < maxRequestedTokens {
+            let timed = inferenceModel.decodeSyncTimed(
+                tokenID: nextTokenID,
+                ropePositionAxes: generationRoPEAxes(offset: prefillResult.ropePositionOffset)
+            )
+            decodeGPUSeconds += max(0, timed.gpuEndTime - timed.gpuStartTime)
+            let outputToken = resolveSampledDecodeToken(
+                fallbackToken: timed.token,
+                parameters: resolvedParameters,
+                samplingState: &samplingState
+            )
+            if outputToken < 0 || modelConfiguration.eosTokenIds.contains(Int(outputToken)) {
+                break
+            }
+            samplingState.record(Int(outputToken), maxContextSize: resolvedParameters.repetitionContextSize)
+            generatedTokenIDs.append(Int(outputToken))
+            nextTokenID = outputToken
+        }
+
+        let decodeWallSeconds = CFAbsoluteTimeGetCurrent() - decodeWallStart
+        let decodeTokenCount = max(generatedTokenIDs.count - 1, 0)
+        let decodeWallTPS = decodeWallSeconds > 0 ? Double(decodeTokenCount) / decodeWallSeconds : 0
+        let decodeGPUTPS = decodeGPUSeconds > 0 ? Double(decodeTokenCount) / decodeGPUSeconds : 0
+        return DebugRawGenerationTiming(
+            tokenIDs: generatedTokenIDs,
+            prefillSeconds: prefillSeconds,
+            decodeWallSeconds: decodeWallSeconds,
+            decodeGPUSeconds: decodeGPUSeconds,
+            decodeWallTokensPerSecond: decodeWallTPS,
+            decodeGPUTokensPerSecond: decodeGPUTPS,
+            decodeStepCount: inferenceModel.decodePlan.steps.count,
+            decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
+            decodeKernelHistogram: debugDecodeKernelHistogram()
+        )
+    }
+
+    private func debugDecodeKernelHistogram() -> [(kernelName: String, count: Int)] {
+        let counts = Dictionary(grouping: inferenceModel.decodePlan.steps) { step in
+            step.metadata.kernelName ?? step.pipeline.label ?? "(unlabeled)"
+        }.mapValues(\.count)
+        return counts
+            .map { (kernelName: $0.key, count: $0.value) }
+            .sorted {
+                if $0.count != $1.count {
+                    return $0.count > $1.count
+                }
+                return $0.kernelName < $1.kernelName
+            }
     }
 
     internal func debugPromptStateGenerationTrace(
