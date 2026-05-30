@@ -30,7 +30,7 @@ flowchart LR
 | M2 production route contract | done | Default route exposes 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
 | M3 expert projection optimization | done | Vectorized packed4 input/activation loads; packed8 remains opt-in after slower timing |
 | M4 dispatch / barrier reduction | done | Unsafe barrier elision can clear the speed target but fails trace parity; the family is closed |
-| M5 90 tok/s evidence | pending | BF16 micro-routes are exhausted; current active route is direct Q8 Sparse MoE for the MLX 8-bit A1B bundle |
+| M5 90 tok/s evidence | pending | Direct Q8 Sparse MoE for the MLX 8-bit A1B bundle is now loadable and route-gated, but the focused timing remains below the 90 wall tok/s gate |
 
 ## A1B Structural Contract
 
@@ -79,7 +79,7 @@ flowchart LR
 | MoE BF16 activation scratch | HF strict-capital trace pass | `82.0` wall tok/s / `85.8` GPU tok/s | Reject; reduced scratch bandwidth was outweighed by activation conversion and BF16 reload cost |
 | A1B static Sparse-MoE split kernels | HF strict-capital trace pass; route histogram switched to `_a1b` router/gate-up/down kernels | `82.6` wall tok/s / `86.5` GPU tok/s | Reject; removing runtime dimension checks did not reduce the dominant projection cost enough |
 | output-head partial argmax | HF strict-capital trace pass; opt-in route emits `gemv_vocab_bf16_argmax_partial` and `argmax_partial_reduce` | `82.6` wall tok/s / `86.3` GPU tok/s | Keep opt-in only; useful route contract for avoiding a full-logit argmax reread, but not enough for M5 |
-| direct Q8 Sparse MoE for MLX 8-bit A1B | Source-generation contract pass; incomplete HF snapshot now skips explicitly instead of producing partial STAF | real-bundle timing pending full download | Continue; this is the first M5 candidate that reduces dominant MoE weight bandwidth instead of only retuning BF16 kernels |
+| direct Q8 Sparse MoE for MLX 8-bit A1B | Source-generation contract pass; real bundle loads; route histogram requires 22 `sparse_moe_q8_g64_router_parallel`, 22 `sparse_moe_q8_g64_gate_up`, and 22 `sparse_moe_q8_g64_down`; BF16 production route and multi-prompt HF trace remain green | `86.0` wall tok/s / `90.3` GPU tok/s on the focused 8-token route gate | Keep as a supported MLX 8-bit loading and direct-Q8 route milestone; GPU work is near the M5 target, but wall timing does not clear the 90 wall tok/s gate, so the next lever must reduce dispatch/barrier cost or fuse work across existing Q8 steps |
 
 ## Decision Log
 
@@ -96,6 +96,7 @@ flowchart LR
 | 2026-05-31 | M5 | Rejected A1B static Sparse-MoE split kernels: exact trace stayed green, but timing remained at `82.6` wall tok/s / `86.5` GPU tok/s, so specialization alone is not the missing lever |
 | 2026-05-31 | M5 | Added an opt-in output-head partial argmax route; correctness and route assertions pass, but the timing remains below the 90 wall tok/s gate, so it is not a production default |
 | 2026-05-31 | M5 | Added direct Q8 Sparse MoE generation for the MLX 8-bit A1B bundle and a real-bundle gate that requires explicit `sparse_moe_q8_g64_*` kernels. The gate skips incomplete snapshots by checking every indexed safetensors shard before load, preventing partial STAF caches from being treated as valid evidence |
+| 2026-05-31 | M5 | Completed MLX 8-bit A1B STAF ingestion for dense FFN `gate_proj` / `up_proj` / `down_proj` names and bulk `switch_mlp` quantized expert tensors. Direct Q8 Sparse MoE now passes the real-bundle route gate at `86.0` wall tok/s / `90.3` GPU tok/s, but remains below the M5 wall-speed target |
 
 ## Rejected M3 Routes
 

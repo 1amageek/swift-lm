@@ -74,6 +74,30 @@ struct TensorNameCanonicalizerTests {
         }
     }
 
+    @Test("LFM2 MLX dense FFN names rewrite to HF w-names")
+    func lfm2MLXDenseFFNRewrite() {
+        let canonicalizer = TensorNameCanonicalizer.lfm2MLXToHuggingFace
+        #expect(canonicalizer.canonicalize("model.layers.0.feed_forward.gate_proj.weight")
+                == "model.layers.0.feed_forward.w1.weight")
+        #expect(canonicalizer.canonicalize("model.layers.0.feed_forward.up_proj.scales")
+                == "model.layers.0.feed_forward.w3.scales")
+        #expect(canonicalizer.canonicalize("model.layers.0.feed_forward.down_proj.biases")
+                == "model.layers.0.feed_forward.w2.biases")
+        #expect(canonicalizer.canonicalize("model.layers.2.feed_forward.switch_mlp.gate_proj.weight")
+                == "model.layers.2.feed_forward.switch_mlp.gate_proj.weight")
+    }
+
+    @Test("detect picks LFM2 MLX rule for switch MLP bundles")
+    func detectLFM2MLXConvention() {
+        let names: Set<String> = [
+            "model.layers.0.feed_forward.gate_proj.weight",
+            "model.layers.2.feed_forward.switch_mlp.gate_proj.weight",
+        ]
+        let canonicalizer = TensorNameCanonicalizer.detect(from: names)
+        #expect(canonicalizer.canonicalize("model.layers.0.feed_forward.gate_proj.weight")
+                == "model.layers.0.feed_forward.w1.weight")
+    }
+
     @Test("first matching rule wins")
     func firstMatchingRuleWins() {
         let canonicalizer = TensorNameCanonicalizer(rules: [

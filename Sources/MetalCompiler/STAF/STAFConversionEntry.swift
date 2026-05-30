@@ -48,6 +48,24 @@ struct STAFPackedMoEEntry: Sendable {
 
     let kind: Kind
     let experts: [STAFPackedMoEExpertSources]
+    let bulk: STAFPackedMoEBulkSources?
+
+    init(
+        kind: Kind,
+        experts: [STAFPackedMoEExpertSources] = [],
+        bulk: STAFPackedMoEBulkSources? = nil
+    ) {
+        self.kind = kind
+        self.experts = experts
+        self.bulk = bulk
+    }
+
+    var consumedTensorNames: [String] {
+        if let bulk {
+            return bulk.consumedTensorNames
+        }
+        return experts.flatMap { [$0.gate.name, $0.up.name, $0.down.name] }
+    }
 }
 
 struct STAFPackedMoEExpertSources: Sendable {
@@ -59,4 +77,40 @@ struct STAFPackedMoEExpertSources: Sendable {
 struct STAFPackedMoETensorSource: Sendable {
     let name: String
     let shardURL: URL
+    let info: SafetensorsTensorInfo?
+    let schemeIdentifier: QuantizationSchemeIdentifier?
+
+    init(
+        name: String,
+        shardURL: URL,
+        info: SafetensorsTensorInfo? = nil,
+        schemeIdentifier: QuantizationSchemeIdentifier? = nil
+    ) {
+        self.name = name
+        self.shardURL = shardURL
+        self.info = info
+        self.schemeIdentifier = schemeIdentifier
+    }
+}
+
+struct STAFPackedMoEBulkSources: Sendable {
+    let gate: STAFPackedMoETensorSource
+    let up: STAFPackedMoETensorSource
+    let down: STAFPackedMoETensorSource
+    let expertCount: Int
+    let intermediateDimension: Int
+    let outputDimension: Int
+
+    var consumedTensorNames: [String] {
+        [gate, up, down].flatMap { source in
+            let modulePath = source.name.hasSuffix(".weight")
+                ? String(source.name.dropLast(".weight".count))
+                : source.name
+            return [
+                source.name,
+                modulePath + ".scales",
+                modulePath + ".biases",
+            ]
+        }
+    }
 }

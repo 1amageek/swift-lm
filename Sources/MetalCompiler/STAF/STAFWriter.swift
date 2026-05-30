@@ -312,8 +312,8 @@ struct STAFWriter: Sendable {
             guard let format = QuantizationFormatRegistry.format(for: entry.schemeIdentifier) else {
                 return entry.info.shape.reduce(1, *) * 2
             }
-            let outputDimension = entry.info.shape[0]
-            let packedDimension = entry.info.shape.count >= 2 ? entry.info.shape[1] : 1
+            let outputDimension = entry.info.shape.dropLast().reduce(1, *)
+            let packedDimension = entry.info.shape.last ?? 1
             // Input dimension formula must match `STAFPayloadConverter.repackMLXQuantized`.
             // Non-aligned bit widths (3/5/6) require `(packedDim × 32) / bits` rather
             // than `packedDim × (32 / bits)`; the latter truncates and produces

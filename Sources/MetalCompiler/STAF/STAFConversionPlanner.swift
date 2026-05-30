@@ -30,11 +30,9 @@ struct STAFConversionPlanner: Sendable {
              shardURL: raw.shardURL)
         }
 
-        let packedMoEEntries = packedMoEEntries(in: allTensors)
+        let packedMoEEntries = try packedMoEEntries(in: allTensors, quantization: quantization)
         let consumedPackedMoETensors = Set(
-            packedMoEEntries.flatMap { entry in
-                entry.packedMoE?.experts.flatMap { [$0.gate.name, $0.up.name, $0.down.name] } ?? []
-            }
+            packedMoEEntries.flatMap { entry in entry.packedMoE?.consumedTensorNames ?? [] }
         )
         let consumedCompanions = consumedCompanions(in: allTensors)
         var entries: [STAFConversionEntry] = []
@@ -86,8 +84,9 @@ struct STAFConversionPlanner: Sendable {
     }
 
     private func packedMoEEntries(
-        in allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)]
-    ) -> [STAFConversionEntry] {
+        in allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)],
+        quantization: MLXQuantizationHint?
+    ) throws -> [STAFConversionEntry] {
         let expertPattern = #/^(.+\.feed_forward)\.experts\.(\d+)\.(w[123])\.weight$/#
         var groups: [String: [Int: [String: (sourceName: String, info: SafetensorsTensorInfo, shardURL: URL)]]] = [:]
         for tensor in allTensors {
@@ -185,6 +184,119 @@ struct STAFConversionPlanner: Sendable {
                 semanticRole: .moeExpertDown,
                 originalDType: .bfloat16,
                 packedMoE: STAFPackedMoEEntry(kind: .down, experts: experts)
+            ))
+        }
+        entries.append(contentsOf: try bulkSwitchMLPMoEEntries(in: allTensors, quantization: quantization))
+        return entries
+    }
+
+    private func bulkSwitchMLPMoEEntries(
+        in allTensors: [(name: String, sourceName: String, info: SafetensorsTensorInfo, shardIndex: Int, shardURL: URL)],
+        quantization: MLXQuantizationHint?
+    ) throws -> [STAFConversionEntry] {
+        let gateSuffix = ".switch_mlp.gate_proj.weight"
+        var entries: [STAFConversionEntry] = []
+        for gateTensor in allTensors where gateTensor.name.hasSuffix(gateSuffix) {
+            let prefix = String(gateTensor.name.dropLast(gateSuffix.count))
+            let upName = prefix + ".switch_mlp.up_proj.weight"
+            let downName = prefix + ".switch_mlp.down_proj.weight"
+            guard let upTensor = allTensors.first(where: { $0.name == upName }),
+                  let downTensor = allTensors.first(where: { $0.name == downName }) else {
+                continue
+            }
+            guard gateTensor.info.shape.count == 3,
+                  upTensor.info.shape == gateTensor.info.shape,
+                  downTensor.info.shape.count == 3 else {
+                continue
+            }
+
+            let expertCount = gateTensor.info.shape[0]
+            let intermediateDimension = gateTensor.info.shape[1]
+            let gatePackedDimension = gateTensor.info.shape[2]
+            let outputDimension = downTensor.info.shape[1]
+            let downPackedDimension = downTensor.info.shape[2]
+            let gateScheme = try determineScheme(
+                name: gateTensor.name,
+                info: gateTensor.info,
+                allTensors: allTensors,
+                quantization: quantization
+            )
+            let upScheme = try determineScheme(
+                name: upTensor.name,
+                info: upTensor.info,
+                allTensors: allTensors,
+                quantization: quantization
+            )
+            let downScheme = try determineScheme(
+                name: downTensor.name,
+                info: downTensor.info,
+                allTensors: allTensors,
+                quantization: quantization
+            )
+            guard gateScheme == upScheme, gateScheme == downScheme else {
+                continue
+            }
+
+            let bulk = STAFPackedMoEBulkSources(
+                gate: STAFPackedMoETensorSource(
+                    name: gateTensor.sourceName,
+                    shardURL: gateTensor.shardURL,
+                    info: gateTensor.info,
+                    schemeIdentifier: gateScheme
+                ),
+                up: STAFPackedMoETensorSource(
+                    name: upTensor.sourceName,
+                    shardURL: upTensor.shardURL,
+                    info: upTensor.info,
+                    schemeIdentifier: upScheme
+                ),
+                down: STAFPackedMoETensorSource(
+                    name: downTensor.sourceName,
+                    shardURL: downTensor.shardURL,
+                    info: downTensor.info,
+                    schemeIdentifier: downScheme
+                ),
+                expertCount: expertCount,
+                intermediateDimension: intermediateDimension,
+                outputDimension: outputDimension
+            )
+
+            let gateUpInfo = SafetensorsTensorInfo(
+                name: "\(prefix).experts.gate_up_proj",
+                dtype: gateTensor.info.dtype,
+                shape: [expertCount * 2 * intermediateDimension, gatePackedDimension],
+                dataOffset: 0,
+                byteCount: gateTensor.info.byteCount + upTensor.info.byteCount
+            )
+            entries.append(STAFConversionEntry(
+                name: gateUpInfo.name,
+                sourceName: gateUpInfo.name,
+                info: gateUpInfo,
+                shardIndex: gateTensor.shardIndex,
+                shardURL: gateTensor.shardURL,
+                schemeIdentifier: gateScheme,
+                semanticRole: .moeExpertGate,
+                originalDType: mapOriginalDType(gateTensor.info.dtype),
+                packedMoE: STAFPackedMoEEntry(kind: .gateUp, bulk: bulk)
+            ))
+
+            let downInfo = SafetensorsTensorInfo(
+                name: "\(prefix).experts.down_proj",
+                dtype: downTensor.info.dtype,
+                shape: [expertCount * outputDimension, downPackedDimension],
+                dataOffset: 0,
+                byteCount: downTensor.info.byteCount
+            )
+            entries.append(STAFConversionEntry(
+                name: downInfo.name,
+                sourceName: downInfo.name,
+                info: downInfo,
+                shardIndex: downTensor.shardIndex,
+                shardURL: downTensor.shardURL,
+                schemeIdentifier: downScheme,
+                semanticRole: .moeExpertDown,
+                originalDType: mapOriginalDType(downTensor.info.dtype),
+                packedMoE: STAFPackedMoEEntry(kind: .down, bulk: bulk)
             ))
         }
         return entries

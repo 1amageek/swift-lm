@@ -39,15 +39,20 @@ struct MetalDispatchStepBuilder {
         var entryCursor = 0
         while entryCursor < fusedEntries.count {
             let entry = fusedEntries[entryCursor]
-            let resolved = try resolveDispatch(entry)
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
             if let sparseMoE = entry.fragment as? SparseMoEFragment,
                sparseMoE.usesSplitRoute {
+                let weightFormat = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
+                    .resolve(forFragment: sparseMoE, entry: entry)
+                let sparseMoEKernelContext = KernelContext(
+                    bufferPrecision: planBuildContext.kernelContext.bufferPrecision,
+                    weightFormat: weightFormat
+                )
                 let splitSteps = try sparseMoE.splitDecodeSteps(
                     bindings: bindings,
                     pipelineCache: planBuildContext.pipelineCache,
-                    kernelContext: planBuildContext.kernelContext
+                    kernelContext: sparseMoEKernelContext
                 )
                 steps.append(contentsOf: splitSteps.map { step in
                     MetalDispatchStep(
@@ -66,6 +71,7 @@ struct MetalDispatchStepBuilder {
                 entryCursor += 1
                 continue
             }
+            let resolved = try resolveDispatch(entry)
             if let outputHeadSteps = try Self.makePartialArgmaxOutputHeadStepsIfEnabled(
                 entry: entry,
                 nextEntry: entryCursor + 1 < fusedEntries.count ? fusedEntries[entryCursor + 1] : nil,

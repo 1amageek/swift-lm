@@ -211,6 +211,10 @@ struct STAFPayloadConverter: Sendable {
     }
 
     private func packMoEPayload(_ packedMoE: STAFPackedMoEEntry) throws -> Data {
+        if let bulk = packedMoE.bulk {
+            return try packBulkMoEPayload(kind: packedMoE.kind, bulk: bulk)
+        }
+
         var output = Data()
         for expert in packedMoE.experts {
             switch packedMoE.kind {
@@ -237,6 +241,68 @@ struct STAFPayloadConverter: Sendable {
         return data
     }
 
+    private func packBulkMoEPayload(kind: STAFPackedMoEEntry.Kind, bulk: STAFPackedMoEBulkSources) throws -> Data {
+        switch kind {
+        case .gateUp:
+            let gateData = try repackPackedMoESource(bulk.gate)
+            let upData = try repackPackedMoESource(bulk.up)
+            guard let format = bulk.gate.schemeIdentifier.flatMap(QuantizationFormatRegistry.format(for:)) else {
+                throw STAFConversionError.inconsistentQuantizationShape(
+                    name: bulk.gate.name,
+                    reason: "bulk Sparse MoE gate source is missing a supported quantization scheme"
+                )
+            }
+            let inputDimension = bulk.gate.info?.shape.last.map { $0 * 32 / format.bits } ?? 0
+            let rowBytes = (inputDimension / format.groupSize) * format.bytesPerBlock
+            let rowsPerExpert = bulk.intermediateDimension
+            var output = Data()
+            output.reserveCapacity(gateData.count + upData.count)
+            for expert in 0..<bulk.expertCount {
+                let start = expert * rowsPerExpert * rowBytes
+                let end = start + rowsPerExpert * rowBytes
+                output.append(gateData[start..<end])
+                output.append(upData[start..<end])
+            }
+            return output
+        case .down:
+            return try repackPackedMoESource(bulk.down)
+        }
+    }
+
+    private func repackPackedMoESource(_ source: STAFPackedMoETensorSource) throws -> Data {
+        guard let info = source.info,
+              let schemeIdentifier = source.schemeIdentifier else {
+            throw STAFConversionError.inconsistentQuantizationShape(
+                name: source.name,
+                reason: "bulk Sparse MoE source is missing quantized tensor metadata"
+            )
+        }
+        let entry = STAFConversionEntry(
+            name: source.name,
+            sourceName: source.name,
+            info: info,
+            shardIndex: 0,
+            shardURL: source.shardURL,
+            schemeIdentifier: schemeIdentifier,
+            semanticRole: .moeExpertGate,
+            originalDType: Self.mapOriginalDType(info.dtype)
+        )
+        let tensorData = try loadRawTensorData(entry: entry)
+        return try repackMLXQuantized(entry: entry, weightData: tensorData)
+    }
+
+    private static func mapOriginalDType(_ dtype: SafetensorsDType) -> OriginalDType {
+        switch dtype {
+        case .float32: return .float32
+        case .float16: return .float16
+        case .bfloat16: return .bfloat16
+        case .int32: return .int32
+        case .int16: return .int16
+        case .int8: return .int8
+        default: return .unknown
+        }
+    }
+
     private func repackMLXQuantized(entry: STAFConversionEntry, weightData: Data) throws -> Data {
         // Companion tensors (`.scales`, `.biases`) are resolved against the
         // safetensors shard by their ON-DISK name, which may differ from the
@@ -258,8 +324,8 @@ struct STAFPayloadConverter: Sendable {
             throw STAFConversionError.unsupportedFormat(entry.schemeIdentifier.rawValue)
         }
 
-        let outputDimension = entry.info.shape[0]
-        let packedDimension = entry.info.shape.count >= 2 ? entry.info.shape[1] : 1
+        let outputDimension = entry.info.shape.dropLast().reduce(1, *)
+        let packedDimension = entry.info.shape.last ?? 1
         let bytesPerRow = packedDimension * MemoryLayout<UInt32>.size
         let inputDimension = bytesPerRow * 8 / format.bits
         let blocksPerRow = inputDimension / format.groupSize
