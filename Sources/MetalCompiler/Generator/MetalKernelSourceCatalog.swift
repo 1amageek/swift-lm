@@ -229,6 +229,18 @@ struct MetalKernelSourceCatalog {
                             name: name,
                             bufferPrecision: bufferPrecision,
                             weightFormat: weightFormat))
+                        let partialArgmaxKernelName = "\(name)_argmax_partial"
+                        if generatedNames.insert(partialArgmaxKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateVocabGEMVPartialArgmax(
+                                name: partialArgmaxKernelName,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat))
+                        }
+                        let partialReduceKernelName = "argmax_partial_reduce"
+                        if generatedNames.insert(partialReduceKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateArgmaxPartialReduce(
+                                name: partialReduceKernelName))
+                        }
                         let argumentKernelName = MetalKernelNameResolver.argumentTableVariantKernelName(for: name)
                         if generatedNames.insert(argumentKernelName).inserted {
                             sources.append(MetalSourceGenerator.generateVocabGEMVArgumentTableVariant(

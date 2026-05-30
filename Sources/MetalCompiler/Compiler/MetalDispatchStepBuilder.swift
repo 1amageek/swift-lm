@@ -36,7 +36,9 @@ struct MetalDispatchStepBuilder {
             accessPolicyResolver: accessPolicyResolver
         )
 
-        for entry in fusedEntries {
+        var entryCursor = 0
+        while entryCursor < fusedEntries.count {
+            let entry = fusedEntries[entryCursor]
             let resolved = try resolveDispatch(entry)
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
@@ -61,6 +63,28 @@ struct MetalDispatchStepBuilder {
                         )
                     )
                 })
+                entryCursor += 1
+                continue
+            }
+            if let outputHeadSteps = try Self.makePartialArgmaxOutputHeadStepsIfEnabled(
+                entry: entry,
+                nextEntry: entryCursor + 1 < fusedEntries.count ? fusedEntries[entryCursor + 1] : nil,
+                resolved: resolved,
+                bindings: bindings,
+                bufferSet: bufferSet,
+                hiddenSize: hiddenSize,
+                pipelineCache: planBuildContext.pipelineCache
+            ) {
+                Self.recordQuantizationEntries(
+                    for: entry,
+                    selectedKernelName: resolved.name,
+                    stafWeightStore: stafWeightStore,
+                    accessPolicyResolver: accessPolicyResolver,
+                    fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.schemeIdentifier,
+                    into: &quantizationEntries
+                )
+                steps.append(contentsOf: outputHeadSteps)
+                entryCursor += 2
                 continue
             }
             let writeIndices = routingPlanner.lastFragmentWriteBufferIndices
@@ -98,6 +122,7 @@ struct MetalDispatchStepBuilder {
                     bufferAccessPattern: bufferAccessPattern
                 )
             ))
+            entryCursor += 1
         }
 
         let residentSteps = try makeResidentConstantSteps(steps, allocator: constantAllocator)
@@ -125,6 +150,139 @@ struct MetalDispatchStepBuilder {
             ),
             supplementalResidencyBuffers: supplementalResidencyBuffers
         )
+    }
+
+    private static func makePartialArgmaxOutputHeadStepsIfEnabled(
+        entry: DispatchEntry,
+        nextEntry: DispatchEntry?,
+        resolved: (
+            name: String,
+            pipeline: MTLComputePipelineState,
+            config: (grid: MTLSize, threadgroup: MTLSize, sharedMemoryBytes: Int)
+        ),
+        bindings: (
+            buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
+            bytes: [(index: Int, value: [UInt8])]
+        ),
+        bufferSet: MetalBufferSet,
+        hiddenSize: Int,
+        pipelineCache: [String: MTLComputePipelineState]
+    ) throws -> [MetalDispatchStep]? {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] == "1",
+              let linear = entry.fragment as? LinearFragment,
+              linear.isOutput,
+              linear.inputDimension == hiddenSize,
+              linear.outputDimension > hiddenSize,
+              nextEntry?.fragment is ArgmaxFragment else {
+            return nil
+        }
+
+        let partialKernelName = "\(resolved.name)_argmax_partial"
+        guard let partialPipeline = pipelineCache[partialKernelName],
+              let reducePipeline = pipelineCache["argmax_partial_reduce"] else {
+            throw MetalCompilerError.kernelNotFound(partialKernelName)
+        }
+
+        let simdWidth = max(partialPipeline.threadExecutionWidth, 1)
+        let rowsPerThreadgroup = max(1, resolved.config.threadgroup.width / simdWidth)
+        let partialCount = max(1, (linear.outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup)
+        let partialValueBytes = partialCount * MemoryLayout<Float>.stride
+        let partialIndexOffset = ((partialValueBytes + 255) / 256) * 256
+        let partialIndexBytes = partialCount * MemoryLayout<Int32>.stride
+        guard bufferSet.scratch.length >= partialIndexOffset + partialIndexBytes else {
+            return nil
+        }
+
+        let inputBinding = try requiredBinding(index: 0, bindings: bindings.buffers, kernelName: partialKernelName)
+        let weightBinding = try requiredBinding(index: 1, bindings: bindings.buffers, kernelName: partialKernelName)
+        let outputBinding = try requiredBinding(index: 2, bindings: bindings.buffers, kernelName: partialKernelName)
+        let weightTensorName = primaryWeightTensorName(for: entry)
+
+        let reduceSimdWidth = max(reducePipeline.threadExecutionWidth, 1)
+        let clampedReduceThreads = min(max(partialCount, 1), reducePipeline.maxTotalThreadsPerThreadgroup)
+        let reduceThreads = max(
+            reduceSimdWidth,
+            ((clampedReduceThreads + reduceSimdWidth - 1) / reduceSimdWidth) * reduceSimdWidth
+        )
+
+        let partialStep = MetalDispatchStep(
+            pipeline: partialPipeline,
+            gridSize: resolved.config.grid,
+            threadgroupSize: resolved.config.threadgroup,
+            bufferBindings: [
+                (0, inputBinding.buffer, inputBinding.offset),
+                (1, weightBinding.buffer, weightBinding.offset),
+                (2, outputBinding.buffer, outputBinding.offset),
+                (3, bufferSet.scratch, 0),
+                (4, bufferSet.scratch, partialIndexOffset),
+            ],
+            bytesBindings: [
+                uint32Binding(5, UInt32(linear.inputDimension)),
+                uint32Binding(6, UInt32(linear.outputDimension)),
+            ],
+            threadgroupMemoryLength: resolved.config.sharedMemoryBytes,
+            sync: .bufferBarrier,
+            bufferAccesses: MetalBufferAccesses(
+                readBuffers: [
+                    (buffer: inputBinding.buffer, offset: inputBinding.offset),
+                    (buffer: weightBinding.buffer, offset: weightBinding.offset),
+                ],
+                writeBuffers: [
+                    (buffer: outputBinding.buffer, offset: outputBinding.offset),
+                    (buffer: bufferSet.scratch, offset: 0),
+                    (buffer: bufferSet.scratch, offset: partialIndexOffset),
+                ]
+            ),
+            metadata: MetalDispatchStepMetadata(
+                kernelName: partialKernelName,
+                entryIndex: entry.index,
+                layerIndex: entry.layerIndex,
+                weightTensorName: weightTensorName,
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2, 3, 4])
+            )
+        )
+
+        let reduceStep = MetalDispatchStep(
+            pipeline: reducePipeline,
+            gridSize: MTLSize(width: 1, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: reduceThreads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, bufferSet.scratch, 0),
+                (1, bufferSet.scratch, partialIndexOffset),
+                (2, bufferSet.tokenOut, 0),
+            ],
+            bytesBindings: [
+                uint32Binding(3, UInt32(partialCount)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            bufferAccesses: MetalBufferAccesses(
+                readBuffers: [
+                    (buffer: bufferSet.scratch, offset: 0),
+                    (buffer: bufferSet.scratch, offset: partialIndexOffset),
+                ],
+                writeBuffers: [(buffer: bufferSet.tokenOut, offset: 0)]
+            ),
+            metadata: MetalDispatchStepMetadata(
+                kernelName: "argmax_partial_reduce",
+                entryIndex: nextEntry?.index,
+                layerIndex: nextEntry?.layerIndex,
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2])
+            )
+        )
+
+        return [partialStep, reduceStep]
+    }
+
+    private static func requiredBinding(
+        index: Int,
+        bindings: [(index: Int, buffer: MTLBuffer, offset: Int)],
+        kernelName: String
+    ) throws -> (buffer: MTLBuffer, offset: Int) {
+        guard let binding = bindings.first(where: { $0.index == index }) else {
+            throw MetalCompilerError.deviceSetupFailed("\(kernelName) missing buffer binding \(index)")
+        }
+        return (binding.buffer, binding.offset)
     }
 
     private func makeResidentConstantSteps(

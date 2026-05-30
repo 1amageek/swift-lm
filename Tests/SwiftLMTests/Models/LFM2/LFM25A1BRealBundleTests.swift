@@ -439,6 +439,10 @@ struct LFM25A1BRealBundleTests {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed4" })
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
             }
+            if ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] == "1" {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "gemv_vocab_bf16_argmax_partial" })
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "argmax_partial_reduce" })
+            }
             #expect(timing.decodeWallTokensPerSecond > 78.0)
             #expect(timing.decodeGPUTokensPerSecond > 80.0)
             #expect(timing.hostSamplingLogitReadCount == 0)

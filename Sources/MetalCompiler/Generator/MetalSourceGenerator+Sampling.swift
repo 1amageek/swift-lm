@@ -1,4 +1,59 @@
 extension MetalSourceGenerator {
+    public static func generateArgmaxPartialReduce(name: String) -> String {
+        return """
+        kernel void \(name)(
+            device const float* partialValues [[buffer(0)]],
+            device const int* partialIndices  [[buffer(1)]],
+            device int* result                [[buffer(2)]],
+            constant uint& partialCount       [[buffer(3)]],
+            uint tid                          [[thread_index_in_threadgroup]],
+            uint threadgroupSize              [[threads_per_threadgroup]]
+        ) {
+            threadgroup float sharedValues[32];
+            threadgroup int sharedIndices[32];
+
+            float localMax = -HUGE_VALF;
+            int localIndex = 0;
+            for (uint i = tid; i < partialCount; i += threadgroupSize) {
+                const float value = partialValues[i];
+                if (value > localMax) {
+                    localMax = value;
+                    localIndex = partialIndices[i];
+                }
+            }
+
+            for (uint offset = SIMD_WIDTH / 2; offset > 0; offset >>= 1) {
+                float otherValue = simd_shuffle_down(localMax, offset);
+                int otherIndex = simd_shuffle_down(localIndex, offset);
+                if (otherValue > localMax) {
+                    localMax = otherValue;
+                    localIndex = otherIndex;
+                }
+            }
+
+            const uint simdIndex = tid / SIMD_WIDTH;
+            if (tid % SIMD_WIDTH == 0) {
+                sharedValues[simdIndex] = localMax;
+                sharedIndices[simdIndex] = localIndex;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float bestValue = -HUGE_VALF;
+                int bestIndex = 0;
+                const uint simdgroupCount = (threadgroupSize + SIMD_WIDTH - 1) / SIMD_WIDTH;
+                for (uint i = 0; i < simdgroupCount; i++) {
+                    if (sharedValues[i] > bestValue) {
+                        bestValue = sharedValues[i];
+                        bestIndex = sharedIndices[i];
+                    }
+                }
+                result[0] = bestIndex;
+            }
+        }
+        """
+    }
+
     public static func generateArgmaxArgumentTableVariant(
         name: String,
         argumentBufferIndex: Int,

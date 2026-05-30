@@ -1060,6 +1060,89 @@ extension MetalSourceGenerator {
         )
     }
 
+    /// Generate a vocab GEMV variant that also emits one max-logit candidate per
+    /// threadgroup. A following tiny reduce kernel can resolve greedy argmax
+    /// without rereading the full logits buffer.
+    public static func generateVocabGEMVPartialArgmax(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* weight             [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            device float* partialValues            [[buffer(3)]],
+            device int* partialIndices             [[buffer(4)]],
+            constant uint& inputDimension          [[buffer(5)]],
+            constant uint& outputDimension         [[buffer(6)]],
+            uint gid                               [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint threadsPerThreadgroup             [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint row = gid * rowsPerThreadgroup + sgitg;
+            const bool active = row < outputDimension;
+
+            threadgroup \(bt) inputTile[fixedInputDimension];
+            threadgroup float rowValues[32];
+            threadgroup int rowIndices[32];
+
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+                inputTile[j] = input[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sum = -HUGE_VALF;
+            if (active && inputDimension == fixedInputDimension) {
+                sum = 0.0f;
+                device const \(wt)* weightRow = weight + row * fixedInputDimension;
+                device const \(wt)* weightLane = weightRow + tiisg * 4u;
+                threadgroup const \(bt)* inputLane = inputTile + tiisg * 4u;
+                for (uint j = tiisg * 4u; j < fixedInputDimension; j += SIMD_WIDTH * 4u) {
+                    sum += \(readWeight("weightLane[0]")) * float(inputLane[0]);
+                    sum += \(readWeight("weightLane[1]")) * float(inputLane[1]);
+                    sum += \(readWeight("weightLane[2]")) * float(inputLane[2]);
+                    sum += \(readWeight("weightLane[3]")) * float(inputLane[3]);
+                    weightLane += SIMD_WIDTH * 4u;
+                    inputLane += SIMD_WIDTH * 4u;
+                }
+                sum = simd_sum(sum);
+                if (tiisg == 0) {
+                    output[row] = \(bt)(sum);
+                }
+            }
+
+            if (tiisg == 0) {
+                rowValues[sgitg] = sum;
+                rowIndices[sgitg] = active ? int(row) : 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float bestValue = -HUGE_VALF;
+                int bestIndex = 0;
+                for (uint i = 0; i < rowsPerThreadgroup; i++) {
+                    if (rowValues[i] > bestValue) {
+                        bestValue = rowValues[i];
+                        bestIndex = rowIndices[i];
+                    }
+                }
+                partialValues[gid] = bestValue;
+                partialIndices[gid] = bestIndex;
+            }
+        }
+        """
+    }
+
     /// Generate a GEMV kernel specialized for decode projections with inputDimension=2048.
     ///
     /// This family stages the full hidden vector once into threadgroup memory and reuses it
