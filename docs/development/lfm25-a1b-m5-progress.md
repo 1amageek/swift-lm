@@ -29,7 +29,7 @@ flowchart LR
 | M1 profile contract | done | A1B config and graph contract tests pass |
 | M2 production route contract | done | Default route exposes 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
 | M3 expert projection optimization | done | Vectorized packed4 input/activation loads; packed8 remains opt-in after slower timing |
-| M4 dispatch / barrier reduction | pending | Reduce decode step or barrier cost without weakening trace parity |
+| M4 dispatch / barrier reduction | done | Parallel-router barrier elision reduces exact-trace decode barriers from `201` to `179` |
 | M5 90 tok/s evidence | pending | Promote only after exact-trace timing clears the target |
 
 ## A1B Structural Contract
@@ -65,6 +65,8 @@ flowchart LR
 | 2026-05-31 | M2 | Add a production-route histogram gate that requires 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
 | 2026-05-31 | M3 | Add opt-in packed8 gate/up and down kernels for 8-aligned A1B expert projections; keep packed4 as default until timing evidence clears the gate |
 | 2026-05-31 | M3 | Vectorize packed4 input and activation reads with `float4` dot products; default exact-trace timing remains green at `82.2` wall tok/s / `86.6` GPU tok/s in the focused run |
+| 2026-05-31 | M4 | Full barrier removal reached `96.7` wall tok/s but corrupted the HF trace after the first token, so it is rejected |
+| 2026-05-31 | M4 | Family scan found only `sparse_moe_bf16_router_parallel` barrier elision preserves the 64-token HF trace; this reduces decode barriers from `201` to `179` and measured `82.0` wall tok/s / `86.5` GPU tok/s |
 
 ## Rejected M3 Routes
 
@@ -74,3 +76,15 @@ flowchart LR
 | 16 simdgroups | `27.3` wall tok/s / `80.6` GPU tok/s with high host overhead | Do not promote |
 | 24 simdgroups | `77.6` wall tok/s / `81.5` GPU tok/s | Do not promote |
 | packed8 opt-in | `79.2` wall tok/s / `83.3` GPU tok/s | Keep opt-in only |
+
+## Rejected M4 Barrier Routes
+
+| Candidate | Result | Decision |
+|---|---|---|
+| all decode barriers removed | `96.7` wall tok/s / `102.1` GPU tok/s but wrong token trace | Reject |
+| `synthesized_3way*` barriers removed | wrong token trace | Reject |
+| `sparse_moe_bf16_gate_up_packed4` barriers removed | wrong token trace | Reject |
+| `sparse_moe_bf16_down_packed4` barriers removed | wrong token trace | Reject |
+| `conv_state_update_bf16` barriers removed | wrong token trace | Reject |
+| `gemv_2048_sq_bf16` barriers removed | wrong token trace | Reject |
+| `gemv_2048_6144_bf16` barriers removed | wrong token trace | Reject |

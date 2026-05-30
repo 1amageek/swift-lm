@@ -338,8 +338,9 @@ struct MetalDispatchStepBuilder {
                 after: pendingReads,
                 pendingWrites: pendingWrites
             )
+            let canElideBarrier = Self.canElideDecodeBarrierBefore(step)
             let barrierPolicy: MetalBarrierPolicy
-            if requiresBarrier {
+            if requiresBarrier && !canElideBarrier {
                 let visibility: MTL4VisibilityOptions =
                     MetalBufferAccesses.pendingWritesInvolveSharedBuffer(pendingWrites)
                     ? .device : []
@@ -370,6 +371,12 @@ struct MetalDispatchStepBuilder {
                 metadata: step.metadata
             )
         }
+    }
+
+    private static func canElideDecodeBarrierBefore(_ step: MetalDispatchStep) -> Bool {
+        guard let kernelName = step.metadata.kernelName else { return false }
+        return kernelName.hasPrefix("sparse_moe")
+            && kernelName.hasSuffix("_router_parallel")
     }
 
     private static func recordQuantizationEntries(
