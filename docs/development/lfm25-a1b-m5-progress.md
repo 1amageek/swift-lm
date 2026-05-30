@@ -26,8 +26,8 @@ flowchart LR
 
 | Milestone | Status | Evidence |
 |---|---:|---|
-| M1 profile contract | in progress | A1B config and graph contract tests added |
-| M2 production route contract | pending | Default route must expose parallel router + packed4 kernels and reject diagnostic routing as production |
+| M1 profile contract | done | A1B config and graph contract tests pass |
+| M2 production route contract | done | Default route exposes 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
 | M3 expert projection optimization | pending | Optimize the `gate_up_packed4` / `down_packed4` dominant families |
 | M4 dispatch / barrier reduction | pending | Reduce decode step or barrier cost without weakening trace parity |
 | M5 90 tok/s evidence | pending | Promote only after exact-trace timing clears the target |
@@ -62,3 +62,4 @@ flowchart LR
 | Date | Milestone | Decision |
 |---|---|---|
 | 2026-05-31 | M1 | Fix the model-specific profile as a testable structural contract before adding more route variants |
+| 2026-05-31 | M2 | Add a production-route histogram gate that requires 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |

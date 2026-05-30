@@ -439,6 +439,46 @@ struct LFM25A1BRealBundleTests {
         #expect(timing.decodeStepCount > 0)
     }
 
+    @Test("Production Sparse MoE route uses A1B optimized kernels", .timeLimit(.minutes(10)))
+    func productionSparseMoERouteUsesA1BOptimizedKernels() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
+            return
+        }
+
+        let timing = try await withSparseMoEDefaultRoute {
+            try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
+                try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
+                    let loader = ModelBundleLoader()
+                    let container = try await loader.load(directory: localModelDirectory)
+                    let context = try LanguageModelContext(container)
+                    let prepared = try await context.prepare(ModelInput(chat: [
+                        .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                    ]))
+                    let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                    return try context.debugRawGenerationTiming(
+                        prompt: executable,
+                        parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 4)
+                    )
+                }
+            }
+        }
+
+        let histogram = Dictionary(
+            uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
+        )
+        print("[LFM2.5 8B-A1B production route histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+
+        #expect(Array(timing.tokenIDs.prefix(4)) == Array(Self.hfStrictCapital64TokenIDs.prefix(4)))
+        #expect(histogram["sparse_moe_bf16_router_parallel"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_router_scores"] == nil)
+        #expect(histogram["sparse_moe_bf16_router_select"] == nil)
+        #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
+        #expect(histogram["sparse_moe_bf16_down"] == nil)
+        #expect(timing.decodeStepCount <= 202)
+    }
+
     @Test("Real packed Sparse MoE kernel matches CPU reference", .timeLimit(.minutes(10)))
     func realPackedSparseMoEKernelMatchesCPUReference() throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
