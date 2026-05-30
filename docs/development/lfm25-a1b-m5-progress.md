@@ -81,6 +81,20 @@ flowchart LR
 | output-head partial argmax | HF strict-capital trace pass; opt-in route emits `gemv_vocab_bf16_argmax_partial` and `argmax_partial_reduce` | `82.6` wall tok/s / `86.3` GPU tok/s | Keep opt-in only; useful route contract for avoiding a full-logit argmax reread, but not enough for M5 |
 | direct Q8 Sparse MoE for MLX 8-bit A1B | Source-generation contract pass; real bundle loads; route histogram requires 22 `sparse_moe_q8_g64_router_parallel`, 22 `sparse_moe_q8_g64_gate_up`, and 22 `sparse_moe_q8_g64_down`; BF16 production route and multi-prompt HF trace remain green | `85.4` wall tok/s / `89.4` GPU tok/s on the focused 64-token route gate | Keep as a supported MLX 8-bit loading and direct-Q8 route milestone; it does not clear the M5 90 wall tok/s gate, so the next lever must reduce dispatch/barrier cost or fuse work across existing Q8 steps |
 | Q8 output-head partial argmax | Q8 partial kernel compiles; route gate passes with `argmax_partial_reduce` | `83.5` wall tok/s / `87.8` GPU tok/s | Reject; avoiding the full-logit argmax reread does not pay for the extra partial-reduce route on the Q8 bundle |
+| MTLSharedEvent completion wait | HF strict-capital trace pass under opt-in event wait | 64-token sweep `69.8` tok/s including prefill, matching the default route within noise | Reject; replacing commit feedback with event wait does not remove the remaining wall gap |
+| release-build focused timing | validation incomplete | timed out at the 120-second outer build/test gate | Do not use release-only evidence for M5; keep the debug focused gate as the comparable metric |
+| MTP / speculative decoding survey | LFM2.5 A1B and MLX 8-bit configs contain no MTP/draft-head metadata | not run | Not an M5 in-place kernel route; llama.cpp-style MTP requires a model with MTP heads or a separate draft model and should be treated as a new milestone |
+
+## Latest Profile
+
+| Gate | Result | Interpretation |
+|---|---:|---|
+| BF16 default 64-token decode timing | `85.8` wall tok/s / `89.8` GPU tok/s, `0.032s` host overhead, `202` steps, `201` barriers | GPU is already near 90 tok/s; wall target needs roughly `23ms` less over 64 tokens |
+| BF16 per-kernel profile total | `10654us` per token | A 6% total reduction is enough for the gate if it is real and trace-safe |
+| `sparse_moe_bf16_gate_up_packed4` | `3489us`, `32.7%` | Largest remaining GPU family |
+| `sparse_moe_bf16_down_packed4` | `1743us`, `16.4%` | Second MoE projection family |
+| `gemv_vocab_bf16` | `1339us`, `12.6%` | Output head remains material, but partial argmax did not improve wall timing |
+| `gemv_2048_6144_bf16` | `1277us`, `12.0%` | Dense FFN projection remains material |
 
 ## Decision Log
 
@@ -99,6 +113,8 @@ flowchart LR
 | 2026-05-31 | M5 | Added direct Q8 Sparse MoE generation for the MLX 8-bit A1B bundle and a real-bundle gate that requires explicit `sparse_moe_q8_g64_*` kernels. The gate skips incomplete snapshots by checking every indexed safetensors shard before load, preventing partial STAF caches from being treated as valid evidence |
 | 2026-05-31 | M5 | Completed MLX 8-bit A1B STAF ingestion for dense FFN `gate_proj` / `up_proj` / `down_proj` names and bulk `switch_mlp` quantized expert tensors. Direct Q8 Sparse MoE now passes the real-bundle route gate at `85.4` wall tok/s / `89.4` GPU tok/s on 64 generated tokens, but remains below the M5 wall-speed target |
 | 2026-05-31 | M5 | Rejected Q8 output-head partial argmax: it compiles and routes correctly, but the 64-token timing regressed to `83.5` wall tok/s / `87.8` GPU tok/s |
+| 2026-05-31 | M5 | Rejected MTLSharedEvent completion wait: the strict-capital route remains correct, but the 64-token sweep remains within noise of the default route |
+| 2026-05-31 | M5 | Checked the llama.cpp MTP direction against the local A1B bundles. The local configs expose no MTP/draft-head metadata, so MTP/speculative decoding is not an in-place M5 kernel route and requires a separate draft-model milestone |
 
 ## Rejected M3 Routes
 
