@@ -431,8 +431,13 @@ struct LFM25A1BRealBundleTests {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_parallel" })
                 #expect(timing.decodeStepCount <= 202)
             }
-            #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed4" })
-            #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
+            if ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"] == "1" {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed8" })
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed8" })
+            } else {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed4" })
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
+            }
             #expect(timing.decodeWallTokensPerSecond > 78.0)
             #expect(timing.decodeGPUTokensPerSecond > 80.0)
         }
@@ -477,6 +482,40 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
         #expect(histogram["sparse_moe_bf16_down"] == nil)
         #expect(timing.decodeStepCount <= 202)
+    }
+
+    @Test("Opt-in packed8 Sparse MoE projection route matches HF prefix", .timeLimit(.minutes(10)))
+    func optInPacked8SparseMoEProjectionRouteMatchesHFPrefix() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
+            return
+        }
+
+        let timing = try await withSparseMoEDefaultRoute {
+            try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_ENABLE_PACKED8", value: "1") {
+                let loader = ModelBundleLoader()
+                let container = try await loader.load(directory: localModelDirectory)
+                let context = try LanguageModelContext(container)
+                let prepared = try await context.prepare(ModelInput(chat: [
+                    .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                ]))
+                let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                return try context.debugRawGenerationTiming(
+                    prompt: executable,
+                    parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 8)
+                )
+            }
+        }
+
+        let histogram = Dictionary(
+            uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
+        )
+        print("[LFM2.5 8B-A1B packed8 route histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+
+        #expect(timing.tokenIDs == Array(Self.hfStrictCapital64TokenIDs.prefix(8)))
+        #expect(histogram["sparse_moe_bf16_gate_up_packed8"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_packed8"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
     }
 
     @Test("Real packed Sparse MoE kernel matches CPU reference", .timeLimit(.minutes(10)))

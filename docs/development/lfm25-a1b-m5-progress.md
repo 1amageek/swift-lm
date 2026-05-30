@@ -28,7 +28,7 @@ flowchart LR
 |---|---:|---|
 | M1 profile contract | done | A1B config and graph contract tests pass |
 | M2 production route contract | done | Default route exposes 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
-| M3 expert projection optimization | pending | Optimize the `gate_up_packed4` / `down_packed4` dominant families |
+| M3 expert projection optimization | done | Vectorized packed4 input/activation loads; packed8 remains opt-in after slower timing |
 | M4 dispatch / barrier reduction | pending | Reduce decode step or barrier cost without weakening trace parity |
 | M5 90 tok/s evidence | pending | Promote only after exact-trace timing clears the target |
 
@@ -63,3 +63,14 @@ flowchart LR
 |---|---|---|
 | 2026-05-31 | M1 | Fix the model-specific profile as a testable structural contract before adding more route variants |
 | 2026-05-31 | M2 | Add a production-route histogram gate that requires 22 parallel router, 22 packed gate/up, and 22 packed down decode steps |
+| 2026-05-31 | M3 | Add opt-in packed8 gate/up and down kernels for 8-aligned A1B expert projections; keep packed4 as default until timing evidence clears the gate |
+| 2026-05-31 | M3 | Vectorize packed4 input and activation reads with `float4` dot products; default exact-trace timing remains green at `82.2` wall tok/s / `86.6` GPU tok/s in the focused run |
+
+## Rejected M3 Routes
+
+| Candidate | Result | Decision |
+|---|---|---|
+| split2 gate/up + down | `63.8` wall tok/s / `66.7` GPU tok/s | Do not promote |
+| 16 simdgroups | `27.3` wall tok/s / `80.6` GPU tok/s with high host overhead | Do not promote |
+| 24 simdgroups | `77.6` wall tok/s / `81.5` GPU tok/s | Do not promote |
+| packed8 opt-in | `79.2` wall tok/s / `83.3` GPU tok/s | Keep opt-in only |

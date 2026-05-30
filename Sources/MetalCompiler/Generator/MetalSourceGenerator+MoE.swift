@@ -46,6 +46,11 @@ extension MetalSourceGenerator {
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
+            generateSparseMoEGateUpPacked8(
+                name: "\(name)_gate_up_packed8",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
             generateSparseMoEGateUpSplit2(
                 name: "\(name)_gate_up_split2",
                 bufferPrecision: bufferPrecision,
@@ -58,6 +63,11 @@ extension MetalSourceGenerator {
             ),
             generateSparseMoEDownPacked4(
                 name: "\(name)_down_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
+            generateSparseMoEDownPacked8(
+                name: "\(name)_down_packed8",
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
@@ -991,19 +1001,110 @@ extension MetalSourceGenerator {
             float gate = 0.0f;
             float up = 0.0f;
             uint j = tiisg * 4u;
+            device const \(bt)4* inputLane = (device const \(bt)4*)inputRow + tiisg;
             device const ushort4* gateLane = (device const ushort4*)gateRow + tiisg;
             device const ushort4* upLane = (device const ushort4*)upRow + tiisg;
             for (; j + 3u < inputDimension; j += SIMD_WIDTH * 4u) {
-                const float x0 = float(inputRow[j]);
-                const float x1 = float(inputRow[j + 1u]);
-                const float x2 = float(inputRow[j + 2u]);
-                const float x3 = float(inputRow[j + 3u]);
+                const float4 x = float4(inputLane[0]);
                 const float4 gateWeight = bf16x4_to_float4(gateLane[0]);
                 const float4 upWeight = bf16x4_to_float4(upLane[0]);
-                gate += gateWeight.x * x0 + gateWeight.y * x1 + gateWeight.z * x2 + gateWeight.w * x3;
-                up += upWeight.x * x0 + upWeight.y * x1 + upWeight.z * x2 + upWeight.w * x3;
+                gate += dot(gateWeight, x);
+                up += dot(upWeight, x);
+                inputLane += SIMD_WIDTH;
                 gateLane += SIMD_WIDTH;
                 upLane += SIMD_WIDTH;
+            }
+            for (; j < inputDimension; j++) {
+                const float x = float(inputRow[j]);
+                gate += bf16_to_float(gateRow[j]) * x;
+                up += bf16_to_float(upRow[j]) * x;
+            }
+            gate = simd_sum(gate);
+            up = simd_sum(up);
+            if (tiisg == 0) {
+                activationScratch[k * intermediateDimension + m] =
+                    gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEGateUpPacked8(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEGateUp(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* expertGateUpWeight [[buffer(1)]],
+            device float* moeScratch               [[buffer(2)]],
+            constant uint& inputDimension          [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& inputRowStride          [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint seqPos = gid.y;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint flat = gid.x * simdgroupsPerThreadgroup + sgitg;
+            if (seqPos >= sequenceLength) {
+                return;
+            }
+            const uint k = flat / intermediateDimension;
+            const uint m = flat - k * intermediateDimension;
+            if (k >= expertsPerToken || m >= intermediateDimension) {
+                return;
+            }
+
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device float* selectedExpertScratch = scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+            device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            const uint expert = uint(selectedExpertScratch[k]);
+            const float routeWeight = selectedWeightScratch[k];
+            device const \(wt)* gateBase = expertGateUpWeight
+                + expert * (2u * intermediateDimension * inputDimension);
+            device const \(wt)* upBase = gateBase + intermediateDimension * inputDimension;
+            device const \(wt)* gateRow = gateBase + m * inputDimension;
+            device const \(wt)* upRow = upBase + m * inputDimension;
+
+            float gate = 0.0f;
+            float up = 0.0f;
+            uint j = tiisg * 8u;
+            device const \(bt)4* inputLane = (device const \(bt)4*)inputRow + tiisg * 2u;
+            device const ushort4* gateLane = (device const ushort4*)gateRow + tiisg * 2u;
+            device const ushort4* upLane = (device const ushort4*)upRow + tiisg * 2u;
+            for (; j + 7u < inputDimension; j += SIMD_WIDTH * 8u) {
+                const float4 x0 = float4(inputLane[0]);
+                const float4 x1 = float4(inputLane[1]);
+                const float4 gateWeight0 = bf16x4_to_float4(gateLane[0]);
+                const float4 gateWeight1 = bf16x4_to_float4(gateLane[1]);
+                const float4 upWeight0 = bf16x4_to_float4(upLane[0]);
+                const float4 upWeight1 = bf16x4_to_float4(upLane[1]);
+                gate += dot(gateWeight0, x0) + dot(gateWeight1, x1);
+                up += dot(upWeight0, x0) + dot(upWeight1, x1);
+                inputLane += SIMD_WIDTH * 2u;
+                gateLane += SIMD_WIDTH * 2u;
+                upLane += SIMD_WIDTH * 2u;
             }
             for (; j < inputDimension; j++) {
                 const float x = float(inputRow[j]);
@@ -1152,13 +1253,88 @@ extension MetalSourceGenerator {
                 float partial = 0.0f;
                 uint m = tiisg * 4u;
                 device const ushort4* downLane = (device const ushort4*)downRow + tiisg;
+                device const float4* activatedLane = (device const float4*)activatedRow + tiisg;
                 for (; m + 3u < intermediateDimension; m += SIMD_WIDTH * 4u) {
                     const float4 weight = bf16x4_to_float4(downLane[0]);
-                    partial += weight.x * activatedRow[m]
-                        + weight.y * activatedRow[m + 1u]
-                        + weight.z * activatedRow[m + 2u]
-                        + weight.w * activatedRow[m + 3u];
+                    partial += dot(weight, activatedLane[0]);
                     downLane += SIMD_WIDTH;
+                    activatedLane += SIMD_WIDTH;
+                }
+                for (; m < intermediateDimension; m++) {
+                    partial += bf16_to_float(downRow[m]) * activatedRow[m];
+                }
+                total += simd_sum(partial);
+            }
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEDownPacked8(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEDown(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let storedOutput = bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue("total", weightFormat: weightFormat)
+            : "total"
+
+        return """
+        kernel void \(name)(
+            device const float* moeScratch          [[buffer(0)]],
+            device const \(wt)* expertDownWeight   [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            constant uint& outputDimension         [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || row >= outputDimension) {
+                return;
+            }
+
+            device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device const float* selectedExpertScratch = scratchRow;
+            device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            float total = 0.0f;
+            for (uint k = 0; k < expertsPerToken; k++) {
+                const uint expert = uint(selectedExpertScratch[k]);
+                device const \(wt)* downRow = expertDownWeight
+                    + expert * (outputDimension * intermediateDimension)
+                    + row * intermediateDimension;
+                device const float* activatedRow = activationScratch + k * intermediateDimension;
+                float partial = 0.0f;
+                uint m = tiisg * 8u;
+                device const ushort4* downLane = (device const ushort4*)downRow + tiisg * 2u;
+                device const float4* activatedLane = (device const float4*)activatedRow + tiisg * 2u;
+                for (; m + 7u < intermediateDimension; m += SIMD_WIDTH * 8u) {
+                    const float4 weight0 = bf16x4_to_float4(downLane[0]);
+                    const float4 weight1 = bf16x4_to_float4(downLane[1]);
+                    partial += dot(weight0, activatedLane[0]) + dot(weight1, activatedLane[1]);
+                    downLane += SIMD_WIDTH * 2u;
+                    activatedLane += SIMD_WIDTH * 2u;
                 }
                 for (; m < intermediateDimension; m++) {
                     partial += bf16_to_float(downRow[m]) * activatedRow[m];

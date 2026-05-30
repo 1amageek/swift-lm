@@ -162,6 +162,9 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         guard let gateUpPacked4Pipeline = pipelineCache["\(baseName)_gate_up_packed4"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_packed4")
         }
+        guard let gateUpPacked8Pipeline = pipelineCache["\(baseName)_gate_up_packed8"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_packed8")
+        }
         guard let gateUpSplit2Pipeline = pipelineCache["\(baseName)_gate_up_split2"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_gate_up_split2")
         }
@@ -170,6 +173,9 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         }
         guard let downPacked4Pipeline = pipelineCache["\(baseName)_down_packed4"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_down_packed4")
+        }
+        guard let downPacked8Pipeline = pipelineCache["\(baseName)_down_packed8"] else {
+            throw MetalCompilerError.kernelNotFound("\(baseName)_down_packed8")
         }
         guard let downSplit2Pipeline = pipelineCache["\(baseName)_down_split2"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_down_split2")
@@ -198,10 +204,14 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && inputDimension.isMultiple(of: 4)
             && intermediateDimension.isMultiple(of: 4)
             && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
+        let usesPacked8 = usesPacked4
+            && inputDimension.isMultiple(of: 8)
+            && intermediateDimension.isMultiple(of: 8)
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
         let usesGateUpSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
         let selectedGateUpPipeline = usesGateUpSplit2
             ? gateUpSplit2Pipeline
-            : (usesPacked4 ? gateUpPacked4Pipeline : gateUpPipeline)
+            : (usesPacked8 ? gateUpPacked8Pipeline : (usesPacked4 ? gateUpPacked4Pipeline : gateUpPipeline))
         let gateUpSimdWidth = max(selectedGateUpPipeline.threadExecutionWidth, 1)
         let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
@@ -221,7 +231,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let usesDownSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
         let selectedDownPipeline = usesDownSplit2
             ? downSplit2Pipeline
-            : (usesPacked4 ? downPacked4Pipeline : downPipeline)
+            : (usesPacked8 ? downPacked8Pipeline : (usesPacked4 ? downPacked4Pipeline : downPipeline))
         let downSimdWidth = max(selectedDownPipeline.threadExecutionWidth, 1)
         let requestedDownSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
@@ -375,7 +385,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                 metadata: .init(
                     kernelName: usesGateUpSplit2
                         ? "\(baseName)_gate_up_split2"
-                        : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"),
+                        : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up")),
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [2])
                 )
             ))
@@ -409,7 +419,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                 metadata: .init(
                     kernelName: usesDownSplit2
                         ? "\(baseName)_down_split2"
-                        : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down"),
+                        : (usesPacked8 ? "\(baseName)_down_packed8" : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down")),
                     bufferAccessPattern: .init(reads: [0, 1], writes: [2])
                 )
             ))
