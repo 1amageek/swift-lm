@@ -93,6 +93,7 @@ flowchart LR
 | Sparse MoE packed4 argbuf variant | source generation compiles; focused route remains exact | route did not switch to `_argbuf`; timing `81.4` wall tok/s / `85.6` GPU tok/s | Reject and revert; packed expert weights live at non-zero STAF offsets, and the current prepared argument-buffer allocator intentionally leaves those bindings unmaterialized |
 | prepared argument-buffer non-zero offsets | opt-in route materialized `_argbuf` kernels and reported `81.5` wall tok/s / `85.9` GPU tok/s | HF strict-capital trace failed after the first token and repeated token `3213` | Reject and revert; allowing non-zero STAF slice offsets in prepared argument buffers corrupts binding semantics and cannot be used as an M5 lever |
 | gate/up row2 packed4 input sharing | `swift build`, `MetalSourceGeneratorTests`, default route contract, and 64-token HF strict-capital trace pass under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW2=1` | `85.7` wall tok/s / `89.9` GPU tok/s | Keep opt-in only; sharing each input read across two gate/up rows is correct and modestly faster, but it does not clear the 90 wall tok/s M5 gate |
+| gate/up row4 packed4 input sharing | `swift build`, `MetalSourceGeneratorTests`, and 64-token HF strict-capital trace pass under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW4=1` | `79.9` wall tok/s / `87.7` GPU tok/s | Reject and revert; four-row input sharing increases register pressure enough to lose occupancy and erase the row2 gain |
 
 ## Latest Profile
 
@@ -127,6 +128,7 @@ flowchart LR
 | 2026-05-31 | M5 | Checked the llama.cpp MTP direction against the local A1B bundles. The local configs expose no MTP/draft-head metadata, so MTP/speculative decoding is not an in-place M5 kernel route and requires a separate draft-model milestone |
 | 2026-05-31 | M5 | Rejected host sampling history pruning and a specialized residual-add/copy/RMS synthesized kernel after focused timing. The refreshed profile contract now tracks MoE projection, residual boundary, and router as the combined primary route group |
 | 2026-05-31 | M5 | Added an opt-in gate/up row2 packed4 route that shares input reads across two intermediate rows. It is trace-safe and improves the focused route to `85.7` wall tok/s / `89.9` GPU tok/s, but remains below the 90 wall tok/s release gate |
+| 2026-05-31 | M5 | Rejected gate/up row4 packed4 input sharing after a trace-safe run regressed to `79.9` wall tok/s / `87.7` GPU tok/s. The row-sharing family is capped at row2 unless a different register-allocation strategy is introduced |
 
 ## Rejected M3 Routes
 
