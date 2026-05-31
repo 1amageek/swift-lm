@@ -101,6 +101,7 @@ flowchart LR
 | lightweight release executable benchmark | `lfm25-a1b-benchmark` validates the 64-token HF strict-capital trace before reporting wall timing and runs outside the full xctest product | baseline median `86.6` with samples `[86.9,86.6,86.4]`; row2 median `86.6` with samples `[87.0,86.6,86.6]` | Keep as the release measurement gate; release mode and row2 opt-in are not enough to clear M5, so the remaining work must reduce GPU decode work or safe per-token barriers |
 | release barrier histogram | `lfm25-a1b-benchmark` now reports top kernel families and top barrier-bearing kernel families from the same exact-trace release run | median `85.4`, top barrier families mirror top step families: residual `47`, square GEMV `24`, Sparse MoE down/gate/router `22` each, conv/dense `18` each | Keep as route evidence; barriers are not concentrated in one removable family, so future barrier work needs dependency-graph proof rather than another single-family elision |
 | warmup-separated release benchmark | `lfm25-a1b-benchmark --warmup 1 --iterations 3` excludes the first exact-trace decode run from the production median and reports it separately | warmup `[85.2]`, measured samples `[85.1,85.2,85.4]`, median `85.2` wall tok/s | Keep as the release gate contract; warmup contamination is not the M5 gap, and the next lever must reduce decode steps, barriers, or dominant projection work |
+| release barrier visibility histogram | `lfm25-a1b-benchmark` reports barrier visibility and unpatterned barrier families from the same exact-trace run | median `86.4`, barrier visibility `[execution:200,device:1,none:1]`, `unpatterned_barrier_kernels=[]` | Close shared-flush and conservative-pattern hypotheses; M5 needs dispatch-count reduction or a fused route that removes execution-order barriers |
 
 ## Latest Profile
 
@@ -115,6 +116,7 @@ flowchart LR
 | 2026-05-31 profile contract refresh | focused profiles observed MoE projection in the `34.1-49.0%` range, residual boundary in the `2.5-13.6%` range, and router in the `6.7-11.7%` range | M5 optimization should treat MoE projection, residual boundary, and router as the primary route group instead of assuming MoE projection alone stays above 40% |
 | 2026-05-31 release barrier histogram | top barrier-bearing families match top dispatch families: residual `47`, `gemv_2048_sq_bf16` `24`, Sparse MoE down/gate/router `22` each, conv/dense `18` each | M5 cannot be reached by guessing one barrier family; any barrier reduction must be backed by an explicit read/write dependency proof across the whole decode graph |
 | 2026-05-31 warmup-separated release gate | warmup `[85.2]`; measured `[85.1,85.2,85.4]`; median `85.2` wall tok/s | Excluding the first run did not reveal hidden release headroom; the remaining gap is in the steady-state decode route |
+| 2026-05-31 barrier visibility gate | release run reported `[execution:200,device:1,none:1]` and no unpatterned barrier kernels | The remaining barrier cost is order enforcement between dependent dispatches, not shared-memory flushing or missing access metadata |
 
 ## Release Benchmark Gate
 
@@ -131,6 +133,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | Timing scope | decode wall time from `debugRawGenerationWallTiming` |
 | M5 pass condition | `>= 90.0` wall tok/s |
 | Latest result | baseline median `85.2` wall tok/s after 1 warmup and 3 measured runs, so M5 remains open |
+| Latest barrier interpretation | `200` of `201` barriers are execution-only and every barrier has an access pattern |
 
 ## Decision Log
 
@@ -161,6 +164,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | 2026-05-31 | M5 | Added a lightweight `lfm25-a1b-benchmark` release executable. It removes the full xctest build bottleneck and verifies the exact 64-token HF trace before reporting timing. The gate now reports median as the production criterion. Release mode did not clear M5: baseline median was `86.6` wall tok/s, and row2 gate/up also measured `86.6` median wall tok/s |
 | 2026-05-31 | M5 | Extended the release benchmark to print kernel and barrier histograms. The latest exact-trace release run measured `85.4` median wall tok/s and showed barrier-bearing kernels are distributed across the full decode route, not isolated to one family |
 | 2026-05-31 | M5 | Separated warmup from measured release runs. The first warmup exact-trace decode measured `85.2` wall tok/s and the measured median remained `85.2` wall tok/s, so release warmup effects are not masking a 90 tok/s route |
+| 2026-05-31 | M5 | Added release barrier visibility and access-pattern diagnostics. The measured route has `200` execution-only barriers, `1` device-visibility barrier, and no unpatterned barrier kernels, so the next implementation should reduce dependent dispatches rather than chase shared-buffer visibility or conservative metadata gaps |
 
 ## Rejected M3 Routes
 

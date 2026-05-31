@@ -30,8 +30,12 @@ struct BenchmarkResult {
             .joined(separator: ",")
         let kernels = formatHistogram(best.decodeKernelHistogram, limit: 10)
         let barriers = formatHistogram(best.decodeBarrierKernelHistogram, limit: 10)
+        let barrierVisibility = best.decodeBarrierVisibilityHistogram
+            .map { "\($0.visibility):\($0.count)" }
+            .joined(separator: ",")
+        let unpatternedBarriers = formatHistogram(best.decodeUnpatternedBarrierKernelHistogram, limit: 10)
         return String(
-            format: "[LFM2.5 8B-A1B release benchmark] model=%@ tokens=%d warmup=%d iterations=%d best_wall=%.3fs best_wall_tok_s=%.1f median_wall_tok_s=%.1f prefill=%.3fs steps=%d barriers=%d host_logit_reads=%d warmup_wall_tok_s=[%@] all_wall_tok_s=[%@] kernels=[%@] barrier_kernels=[%@]",
+            format: "[LFM2.5 8B-A1B release benchmark] model=%@ tokens=%d warmup=%d iterations=%d best_wall=%.3fs best_wall_tok_s=%.1f median_wall_tok_s=%.1f prefill=%.3fs steps=%d barriers=%d host_logit_reads=%d warmup_wall_tok_s=[%@] all_wall_tok_s=[%@] kernels=[%@] barrier_kernels=[%@] barrier_visibility=[%@] unpatterned_barrier_kernels=[%@]",
             modelDirectory.path,
             maxTokens,
             warmupIterations,
@@ -46,7 +50,9 @@ struct BenchmarkResult {
             warmupValues,
             values,
             kernels,
-            barriers
+            barriers,
+            barrierVisibility,
+            unpatternedBarriers
         )
     }
 
