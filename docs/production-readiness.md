@@ -4,7 +4,7 @@ This document defines the minimum release gates for `swift-lm`.
 
 Latest captured evidence: [Production Readiness Evidence - 2026-05-05](releases/production-readiness-2026-05-05.md).
 Latest prefill artifact evidence: [Prefill Artifact Readiness Evidence - 2026-05-18](releases/prefill-artifact-readiness-2026-05-18.md).
-Latest LFM2.5 A1B evidence: [LFM2.5 8B-A1B Production Readiness Evidence - 2026-05-30](releases/lfm25-a1b-production-readiness-2026-05-30.md).
+Latest LFM2.5 A1B evidence: [LFM2.5 8B-A1B Production Readiness Evidence - 2026-05-31](releases/lfm25-a1b-production-readiness-2026-05-31.md).
 LFM2.5 A1B focused runner: `scripts/benchmarks/run-lfm25-a1b-readiness.sh --timeout 120`.
 
 ## Goal

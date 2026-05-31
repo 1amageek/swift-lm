@@ -16,8 +16,8 @@ flowchart LR
 | Field | Value |
 |---|---|
 | Model | `LiquidAI/LFM2.5-8B-A1B` |
-| Current release baseline | `0.8.7` |
-| Baseline evidence | `85.2` wall tok/s / `89.3` GPU tok/s on 64-token exact trace; lightweight release executable observed `85.2` median wall tok/s over 3 measured release runs after 1 warmup run |
+| Current release baseline | `0.9.0` |
+| Baseline evidence | ShortConv-fused default route uses `184` decode steps and `183` barriers; latest clean exact release rerun measured `86.4` median wall tok/s, while the opt-in dispatch-minimized route measured `87.2` median wall tok/s |
 | Target | `>= 90.0` wall tok/s on the same exact-trace decode timing gate |
 | Correctness gate | HF 64-token strict-capital trace remains exact |
 | Production route | split Sparse MoE with parallel router and BF16 packed4 expert projections |
