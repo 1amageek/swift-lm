@@ -91,6 +91,7 @@ flowchart LR
 | dedicated Metal 4 feedback queue | `swift build` pass | focused production wall gate crashed with `unexpected signal code 5` before timing output | Reject and revert; command queue feedback plumbing is not a safe M5 lever without lower-level Metal 4 lifecycle proof |
 | split2 Sparse MoE projection route | in-process env gate fired 22 `sparse_moe_bf16_gate_up_split2` and 22 `sparse_moe_bf16_down_split2`; HF strict-capital trace pass | `64.1` wall tok/s / `67.3` GPU tok/s | Reject and revert; splitting one row across two SIMDgroups adds reduction/shared-memory overhead and worsens the dominant MoE path |
 | Sparse MoE packed4 argbuf variant | source generation compiles; focused route remains exact | route did not switch to `_argbuf`; timing `81.4` wall tok/s / `85.6` GPU tok/s | Reject and revert; packed expert weights live at non-zero STAF offsets, and the current prepared argument-buffer allocator intentionally leaves those bindings unmaterialized |
+| prepared argument-buffer non-zero offsets | opt-in route materialized `_argbuf` kernels and reported `81.5` wall tok/s / `85.9` GPU tok/s | HF strict-capital trace failed after the first token and repeated token `3213` | Reject and revert; allowing non-zero STAF slice offsets in prepared argument buffers corrupts binding semantics and cannot be used as an M5 lever |
 
 ## Latest Profile
 
