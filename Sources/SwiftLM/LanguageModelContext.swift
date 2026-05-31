@@ -44,6 +44,8 @@ public final class LanguageModelContext: @unchecked Sendable {
         @_spi(Benchmark) public let decodeBarrierKernelHistogram: [(kernelName: String, count: Int)]
         @_spi(Benchmark) public let decodeBarrierVisibilityHistogram: [(visibility: String, count: Int)]
         @_spi(Benchmark) public let decodeUnpatternedBarrierKernelHistogram: [(kernelName: String, count: Int)]
+        @_spi(Benchmark) public let decodeKernelPairHistogram: [(pattern: String, count: Int)]
+        @_spi(Benchmark) public let decodeKernelTripleHistogram: [(pattern: String, count: Int)]
         @_spi(Benchmark) public let hostSamplingLogitReadCount: Int
     }
 
@@ -1648,6 +1650,8 @@ public final class LanguageModelContext: @unchecked Sendable {
                 decodeBarrierKernelHistogram: debugDecodeBarrierKernelHistogram(),
                 decodeBarrierVisibilityHistogram: debugDecodeBarrierVisibilityHistogram(),
                 decodeUnpatternedBarrierKernelHistogram: debugDecodeUnpatternedBarrierKernelHistogram(),
+                decodeKernelPairHistogram: debugDecodeKernelWindowHistogram(width: 2),
+                decodeKernelTripleHistogram: debugDecodeKernelWindowHistogram(width: 3),
                 hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
             )
         }
@@ -1702,6 +1706,8 @@ public final class LanguageModelContext: @unchecked Sendable {
             decodeBarrierKernelHistogram: debugDecodeBarrierKernelHistogram(),
             decodeBarrierVisibilityHistogram: debugDecodeBarrierVisibilityHistogram(),
             decodeUnpatternedBarrierKernelHistogram: debugDecodeUnpatternedBarrierKernelHistogram(),
+            decodeKernelPairHistogram: debugDecodeKernelWindowHistogram(width: 2),
+            decodeKernelTripleHistogram: debugDecodeKernelWindowHistogram(width: 3),
             hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
         )
     }
@@ -1774,6 +1780,26 @@ public final class LanguageModelContext: @unchecked Sendable {
                     return $0.count > $1.count
                 }
                 return $0.kernelName < $1.kernelName
+            }
+    }
+
+    private func debugDecodeKernelWindowHistogram(width: Int) -> [(pattern: String, count: Int)] {
+        let kernelNames = inferenceModel.decodePlan.steps.map { step in
+            step.metadata.kernelName ?? step.pipeline.label ?? "(unlabeled)"
+        }
+        guard width > 1, kernelNames.count >= width else { return [] }
+        var counts: [String: Int] = [:]
+        for start in 0...(kernelNames.count - width) {
+            let pattern = kernelNames[start..<(start + width)].joined(separator: " -> ")
+            counts[pattern, default: 0] += 1
+        }
+        return counts
+            .map { (pattern: $0.key, count: $0.value) }
+            .sorted {
+                if $0.count != $1.count {
+                    return $0.count > $1.count
+                }
+                return $0.pattern < $1.pattern
             }
     }
 
