@@ -97,6 +97,7 @@ flowchart LR
 | gate/up row2 production wall check | 64-token HF strict-capital trace pass using `debugRawGenerationWallTiming` under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW2=1` | `80.4` wall tok/s, `202` steps, `201` barriers | Keep as diagnostic; GPU timestamp feedback is not the sole M5 gap, and row2 should not be promoted based on timed-GPU runs alone |
 | row2 plus private decode logits | 64-token HF strict-capital trace pass under row2 plus private decode logits | `84.5` wall tok/s, `202` steps, `201` barriers | Reject and revert; private logits helps slightly but misses M5 and is unsafe for host sampling without a larger API/runtime contract |
 | release-build focused production wall retry | `swift test -c release --disable-sandbox --filter defaultSparseMoERouteReportsProductionDecodeWallTiming` | timed out with code `-1` while compiling test targets under the 120-second outer gate | Do not use as M5 evidence; release measurement requires a separate build-for-testing pipeline or smaller release benchmark target |
+| greedy multi-token command buffer | 64-token HF strict-capital trace pass after adding a `greedy_decode_roll_state` prototype and encoding 63 decode iterations into one Metal 4 command buffer | `85.6` wall tok/s, `202` steps, `201` barriers | Reject and revert; batching per-token submission/wait is correct but does not reduce the dominant GPU work, so M5 must target decode step count or projection math rather than host wait removal |
 
 ## Latest Profile
 
@@ -135,6 +136,7 @@ flowchart LR
 | 2026-05-31 | M5 | Added a row2 production-wall diagnostic gate. It passed correctness but reported only `80.4` wall tok/s, so row2 remains opt-in and M5 still requires a structural reduction in dispatches or dominant projection work |
 | 2026-05-31 | M5 | Rejected private decode logits as an M5 lever. The greedy trace stayed correct and reached `84.5` wall tok/s with row2, but the route remains below target and would require explicit host-sampling safeguards before it could be kept |
 | 2026-05-31 | M5 | Retried the focused release production-wall gate, but it timed out during release test-target compilation. M5 evidence remains tied to the focused debug/Metal timing gates until a lighter release benchmark target exists |
+| 2026-05-31 | M5 | Rejected greedy multi-token command-buffer batching. The prototype kept the 64-token HF trace exact and removed per-token completion waits, but still measured only `85.6` wall tok/s, confirming that the remaining gap is dominated by GPU decode work and barriers inside each token rather than CPU wait feedback alone |
 
 ## Rejected M3 Routes
 
