@@ -5,6 +5,7 @@ This document defines the minimum release gates for `swift-lm`.
 Latest captured evidence: [Production Readiness Evidence - 2026-05-05](releases/production-readiness-2026-05-05.md).
 Latest prefill artifact evidence: [Prefill Artifact Readiness Evidence - 2026-05-18](releases/prefill-artifact-readiness-2026-05-18.md).
 Latest LFM2.5 A1B evidence: [LFM2.5 8B-A1B Production Readiness Evidence - 2026-05-31](releases/lfm25-a1b-production-readiness-2026-05-31.md).
+Latest LFM2.5 A1B M5 decode optimization record: [LFM2.5 8B-A1B Decode Optimization Record](development/lfm25-a1b-m5-progress.md).
 LFM2.5 A1B focused runner: `scripts/benchmarks/run-lfm25-a1b-readiness.sh --timeout 120`.
 
 ## Goal
@@ -42,12 +43,13 @@ Required expectations:
   monolithic route is diagnostic-only and must not be used as correctness
   oracle because it is not HuggingFace first-token equivalent on the current
   A1B bundle.
-- LFM2.5 8B-A1B Sparse MoE routing uses the fused parallel expert router
-  (`sparse_moe_bf16_router_parallel`) and BF16 packed4 gate/up + down kernels
-  by default. The 64-token strict-capital decode timing gate must match the
-  HuggingFace token trace exactly, route through the parallel router and
-  packed4 kernels, stay at or below 202 decode steps, and clear 78 wall-clock
-  tok/s plus 80 GPU tok/s.
+- LFM2.5 8B-A1B Sparse MoE routing uses the fused residual/RMS/router kernel
+  (`residual_rms_router_parallel_bf16_sigmoid`), BF16 staged packed4 gate/up,
+  and BF16 packed4 down by default. The 64-token strict-capital greedy release
+  benchmark must also use the output-head partial argmax route, match the
+  HuggingFace token trace exactly, stay at or below 162 decode steps and 161
+  barriers, report `host_logit_reads=0`, and clear 90 median wall-clock tok/s
+  with `--require-m5`.
 - LFM2.5 8B-A1B default Sparse MoE routing stays bounded across short, chat,
   and longer prompt lengths so the production route cannot silently regress to
   diagnostic monolithic latency.
