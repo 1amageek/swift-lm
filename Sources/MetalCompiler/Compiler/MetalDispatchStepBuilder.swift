@@ -47,7 +47,10 @@ struct MetalDispatchStepBuilder {
                 inProjBindings: bindings,
                 routingPlanner: &routingPlanner,
                 pipelineCache: planBuildContext.pipelineCache,
-                kernelContext: planBuildContext.kernelContext
+                kernelContext: planBuildContext.kernelContext,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver,
+                fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.schemeIdentifier
             ) {
                 Self.recordQuantizationEntries(
                     for: entry,
@@ -211,7 +214,10 @@ struct MetalDispatchStepBuilder {
         ),
         routingPlanner: inout DecodeRoutingPlanner,
         pipelineCache: [String: MTLComputePipelineState],
-        kernelContext: KernelContext
+        kernelContext: KernelContext,
+        stafWeightStore: STAFWeightStore?,
+        accessPolicyResolver: ProjectionWeightAccessPolicyResolver,
+        fallbackSchemeIdentifier: QuantizationSchemeIdentifier
     ) throws -> MetalDispatchStep? {
         guard kernelContext.bufferPrecision == .bfloat16,
               kernelContext.weightFormat.isBFloat16,
@@ -222,6 +228,36 @@ struct MetalDispatchStepBuilder {
               let convEntry = nextEntry,
               let conv = convEntry.fragment as? Conv1dFragment,
               conv.dimension == 2048 else {
+            return nil
+        }
+        guard let compositeID = entry.compositeID,
+              convEntry.compositeID == compositeID,
+              entry.layerIndex == convEntry.layerIndex else {
+            return nil
+        }
+
+        let inProjDescriptor = resolveWeightDescriptor(
+            role: linear.field,
+            entry: entry,
+            executionPhase: .decode,
+            stafWeightStore: stafWeightStore,
+            accessPolicyResolver: accessPolicyResolver,
+            fallbackSchemeIdentifier: fallbackSchemeIdentifier
+        )
+        let convDescriptor = resolveWeightDescriptor(
+            role: "conv_weight",
+            entry: convEntry,
+            executionPhase: .decode,
+            stafWeightStore: stafWeightStore,
+            accessPolicyResolver: accessPolicyResolver,
+            fallbackSchemeIdentifier: fallbackSchemeIdentifier
+        )
+        guard !inProjDescriptor.usedFallback,
+              inProjDescriptor.schemeIdentifier == .bf16RowMajor,
+              inProjDescriptor.layout == .rowMajor,
+              !convDescriptor.usedFallback,
+              convDescriptor.schemeIdentifier == .bf16RowMajor,
+              convDescriptor.layout == .rowMajor else {
             return nil
         }
 

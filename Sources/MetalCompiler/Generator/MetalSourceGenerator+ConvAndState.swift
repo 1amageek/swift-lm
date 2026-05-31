@@ -167,9 +167,21 @@ public static func generateShortConvInProjUpdateBF16(name: String) -> String {
             threadgroup const bfloat4* inputLane = (threadgroup const bfloat4*)inputTile + tiisg;
             for (uint j = tiisg * 4u; j < fixedDimension; j += SIMD_WIDTH * 4u) {
                 const float4 value = float4(inputLane[0]);
-                bSum += dot(bf16x4_to_float4(bLane[0]), value);
-                cSum += dot(bf16x4_to_float4(cLane[0]), value);
-                xSum += dot(bf16x4_to_float4(xLane[0]), value);
+                const float4 bWeight = bf16x4_to_float4(bLane[0]);
+                const float4 cWeight = bf16x4_to_float4(cLane[0]);
+                const float4 xWeight = bf16x4_to_float4(xLane[0]);
+                bSum += bWeight[0] * value[0];
+                bSum += bWeight[1] * value[1];
+                bSum += bWeight[2] * value[2];
+                bSum += bWeight[3] * value[3];
+                cSum += cWeight[0] * value[0];
+                cSum += cWeight[1] * value[1];
+                cSum += cWeight[2] * value[2];
+                cSum += cWeight[3] * value[3];
+                xSum += xWeight[0] * value[0];
+                xSum += xWeight[1] * value[1];
+                xSum += xWeight[2] * value[2];
+                xSum += xWeight[3] * value[3];
                 bLane += SIMD_WIDTH;
                 cLane += SIMD_WIDTH;
                 xLane += SIMD_WIDTH;

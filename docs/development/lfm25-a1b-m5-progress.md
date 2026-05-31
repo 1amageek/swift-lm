@@ -129,6 +129,7 @@ flowchart LR
 | 2026-05-31 fused RMS/router rerun | baseline exact-trace release median `83.1`; fused exact-trace release median `64.1`, despite reducing decode steps from `202` to `180` | The fused route is a correctness-checked diagnostic, not a production default. The next fusion attempt should avoid staging the full normalized hidden vector in threadgroup memory |
 | 2026-05-31 ShortConv fusion gate | exact-trace release median `83.7`, best `85.2`, with `shortconv_inproj_update_bf16` replacing the 18 ShortConv in-projection and state-update pairs | This is the accepted default route improvement for the current checkpoint. The M5 gap remains because square GEMV, Sparse MoE projection, and output-head work still dominate the 184-step plan |
 | 2026-05-31 opt-in dispatch-minimized gate | exact-trace release median `85.6`, best `86.9`, under fused RMS/router, packed8 Sparse MoE, and partial output-head argmax | The 162-step route is the current best dispatch-count contract, but it is not enough to claim the 90 tok/s M5 goal |
+| 2026-05-31 ShortConv review hardening | exact-trace release rerun reports default median `86.4` and opt-in dispatch-minimized median `87.2`; the fused ShortConv kernel now has bit-exact unfused equivalence coverage and rejects cross-composite or non-row-major BF16 admission | The review fixes preserve the accepted route while closing the unsafe layout/composite gaps. M5 remains open because the best exact route is still below `90` wall tok/s |
 
 ## Release Benchmark Gate
 
@@ -144,9 +145,9 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | Correctness | exact 64-token HF trace before reporting timing |
 | Timing scope | decode wall time from `debugRawGenerationWallTiming` |
 | M5 pass condition | `>= 90.0` wall tok/s |
-| Latest result | baseline median `85.2` wall tok/s after 1 warmup and 3 measured runs, so M5 remains open |
-| Latest barrier interpretation | `200` of `201` barriers are execution-only and every barrier has an access pattern |
-| Latest dispatch interpretation | the decode plan has a 22-layer Sparse MoE repeated window; existing monolithic route fails trace parity, and the narrower RMS/router fusion is trace-safe but slower, so default remains the baseline route |
+| Latest result | default focused rerun median `86.4` wall tok/s and opt-in dispatch-minimized median `87.2` wall tok/s after 1 warmup and 1 measured run, so M5 remains open |
+| Latest barrier interpretation | default route has `183` barriers over `184` decode steps; opt-in dispatch-minimized route has `161` barriers over `162` decode steps |
+| Latest dispatch interpretation | ShortConv fusion is the accepted default dispatch reduction. The opt-in RMS/router + packed8 + partial-argmax route is exact-trace safe and smaller, but still below the 90 tok/s release gate |
 
 ## Decision Log
 
@@ -184,6 +185,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | 2026-05-31 | M5 | Added an opt-in fused residual/RMS/router decode route. It is exact-trace safe and reduces dispatches from `202` to `180`, but the focused release comparison did not improve wall throughput, so production default stays on the baseline route |
 | 2026-05-31 | M5 | Promoted a trace-gated ShortConv in-projection/state-update fusion for the LFM2.5 A1B decode shape. The production decode plan drops from `202` to `184` steps, with exact 64-token HF trace validation in the release benchmark |
 | 2026-05-31 | M5 | Rechecked the most aggressive exact route after cleanup: ShortConv fusion plus opt-in RMS/router, packed8 Sparse MoE, and partial output-head argmax reports `162` decode steps, but the latest clean release median is `85.6` tok/s, below the 90 tok/s completion gate |
+| 2026-05-31 | M5 | Hardened ShortConv fusion admission after review. The fused route now requires same composite/layer and confirmed BF16 row-major STAF accesses for both `in_proj` and `conv_weight`, with bit-exact kernel equivalence coverage against the unfused projection + conv-state route |
 
 ## Rejected M3 Routes
 
