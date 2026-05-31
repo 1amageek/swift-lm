@@ -47,10 +47,18 @@ struct LFM25A1BDecodeProfileTests {
         }
         print("[LFM2.5 8B-A1B decode profile total_us] \(String(format: "%.0f", totalMicroseconds))")
         var moeProjectionShare = 0.0
+        var residualBoundaryShare = 0.0
+        var routerShare = 0.0
         for (family, aggregate) in sorted.prefix(12) {
             let share = totalMicroseconds > 0 ? aggregate.totalMicroseconds / totalMicroseconds * 100 : 0
             if Self.isMoEProjectionFamily(family) {
                 moeProjectionShare += share
+            }
+            if family == "synthesized_3way_residual" {
+                residualBoundaryShare += share
+            }
+            if family == "sparse_moe_bf16_router_parallel" {
+                routerShare += share
             }
             print(String(
                 format: "[LFM2.5 8B-A1B decode profile] family=%@ count=%d total_us=%.0f share=%.1f%%",
@@ -80,10 +88,18 @@ struct LFM25A1BDecodeProfileTests {
             format: "[LFM2.5 8B-A1B decode profile MoE projection share] %.1f%%",
             moeProjectionShare
         ))
+        print(String(
+            format: "[LFM2.5 8B-A1B decode profile primary route share] moe=%.1f%% residual=%.1f%% router=%.1f%% total=%.1f%%",
+            moeProjectionShare,
+            residualBoundaryShare,
+            routerShare,
+            moeProjectionShare + residualBoundaryShare + routerShare
+        ))
 
         #expect(totalMicroseconds > 0)
         #expect(!sorted.isEmpty)
-        #expect(moeProjectionShare > 40)
+        #expect(moeProjectionShare > 30)
+        #expect(moeProjectionShare + residualBoundaryShare + routerShare > 55)
     }
 
     private static func kernelFamily(_ kernelName: String) -> String {

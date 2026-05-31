@@ -84,6 +84,8 @@ flowchart LR
 | MTLSharedEvent completion wait | HF strict-capital trace pass under opt-in event wait | 64-token sweep `69.8` tok/s including prefill, matching the default route within noise | Reject; replacing commit feedback with event wait does not remove the remaining wall gap |
 | release-build focused timing | validation incomplete | timed out at the 120-second outer build/test gate | Do not use release-only evidence for M5; keep the debug focused gate as the comparable metric |
 | MTP / speculative decoding survey | LFM2.5 A1B and MLX 8-bit configs contain no MTP/draft-head metadata | not run | Not an M5 in-place kernel route; llama.cpp-style MTP requires a model with MTP heads or a separate draft model and should be treated as a new milestone |
+| host sampling history pruning | `swift build` pass; strict-capital route still correct | `84.8` wall tok/s / `89.0` GPU tok/s after static env flag and no-penalty history pruning | Reject; the host-side history/env lookup path is not the missing M5 lever |
+| specialized residual-add/copy/RMS synthesized kernel | `FusionVerificationTests` pass | real-bundle gate regressed to `68.2` wall tok/s / `83.6` GPU tok/s | Reject and revert; the generic synthesized kernel's threadgroup intermediate remains faster than reading the residual/output path back from device memory |
 
 ## Latest Profile
 
@@ -95,6 +97,7 @@ flowchart LR
 | `sparse_moe_bf16_down_packed4` | `1743us`, `16.4%` | Second MoE projection family |
 | `gemv_vocab_bf16` | `1339us`, `12.6%` | Output head remains material, but partial argmax did not improve wall timing |
 | `gemv_2048_6144_bf16` | `1277us`, `12.0%` | Dense FFN projection remains material |
+| 2026-05-31 profile contract refresh | focused profiles observed MoE projection in the `34.1-49.0%` range, residual boundary in the `2.5-13.6%` range, and router in the `6.7-11.7%` range | M5 optimization should treat MoE projection, residual boundary, and router as the primary route group instead of assuming MoE projection alone stays above 40% |
 
 ## Decision Log
 
@@ -115,6 +118,7 @@ flowchart LR
 | 2026-05-31 | M5 | Rejected Q8 output-head partial argmax: it compiles and routes correctly, but the 64-token timing regressed to `83.5` wall tok/s / `87.8` GPU tok/s |
 | 2026-05-31 | M5 | Rejected MTLSharedEvent completion wait: the strict-capital route remains correct, but the 64-token sweep remains within noise of the default route |
 | 2026-05-31 | M5 | Checked the llama.cpp MTP direction against the local A1B bundles. The local configs expose no MTP/draft-head metadata, so MTP/speculative decoding is not an in-place M5 kernel route and requires a separate draft-model milestone |
+| 2026-05-31 | M5 | Rejected host sampling history pruning and a specialized residual-add/copy/RMS synthesized kernel after focused timing. The refreshed profile contract now tracks MoE projection, residual boundary, and router as the combined primary route group |
 
 ## Rejected M3 Routes
 
