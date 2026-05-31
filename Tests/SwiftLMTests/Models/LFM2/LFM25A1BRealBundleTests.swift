@@ -656,6 +656,51 @@ struct LFM25A1BRealBundleTests {
         #expect(timing.decodeWallTokensPerSecond > 78.0)
     }
 
+    @Test("Opt-in row2 gate-up Sparse MoE route reports production wall timing", .timeLimit(.minutes(10)))
+    func optInRow2GateUpSparseMoERouteReportsProductionWallTiming() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
+            return
+        }
+
+        let timing = try await withSparseMoEDefaultRoute {
+            try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_GATE_UP_ROW2", value: "1") {
+                let loader = ModelBundleLoader()
+                let container = try await loader.load(directory: localModelDirectory)
+                let context = try LanguageModelContext(container)
+                let prepared = try await context.prepare(ModelInput(chat: [
+                    .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                ]))
+                let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                return try context.debugRawGenerationWallTiming(
+                    prompt: executable,
+                    parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 64)
+                )
+            }
+        }
+
+        let histogram = Dictionary(
+            uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
+        )
+        print("[LFM2.5 8B-A1B row2 gate-up production wall histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+        print(String(
+            format: "[LFM2.5 8B-A1B row2 gate-up production wall timing] tokens=%d prefill=%.3fs wall=%.3fs wall_tok_s=%.1f steps=%d barriers=%d host_logit_reads=%d",
+            timing.tokenIDs.count,
+            timing.prefillSeconds,
+            timing.decodeWallSeconds,
+            timing.decodeWallTokensPerSecond,
+            timing.decodeStepCount,
+            timing.decodeBarrierCount,
+            timing.hostSamplingLogitReadCount
+        ))
+
+        #expect(timing.tokenIDs == Self.hfStrictCapital64TokenIDs)
+        #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
+        #expect(timing.decodeGPUTokensPerSecond == 0)
+        #expect(timing.hostSamplingLogitReadCount == 0)
+        #expect(timing.decodeWallTokensPerSecond > 78.0)
+    }
+
     @Test("Real packed Sparse MoE kernel matches CPU reference", .timeLimit(.minutes(10)))
     func realPackedSparseMoEKernelMatchesCPUReference() throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
