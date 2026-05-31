@@ -226,6 +226,252 @@ extension MetalSourceGenerator {
         """
     }
 
+    public static func generateVocabGEMVBlocked8x128ArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateVocabGEMVArgumentTableVariant(
+                name: name,
+                argumentBufferIndex: argumentBufferIndex,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const \(bt)* input [[id(0)]];
+            device const \(wt)* weight [[id(1)]];
+            device \(bt)* output [[id(2)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& inputDimension             [[buffer(3)]],
+            constant uint& outputDimension            [[buffer(4)]],
+            uint gid                                  [[threadgroup_position_in_grid]],
+            uint tid                                  [[thread_index_in_threadgroup]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint threadsPerThreadgroup                [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint rowsPerBlock = 8u;
+            const uint tileElements = 128u;
+            const uint tileCount = fixedInputDimension / tileElements;
+            const uint ushort4PerTile = tileElements / 4u;
+            const uint ushort4PerRowBlockTile = rowsPerBlock * ushort4PerTile;
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint row = gid * rowsPerThreadgroup + sgitg;
+            const bool active = row < outputDimension && inputDimension == fixedInputDimension;
+
+            threadgroup float inputTile[fixedInputDimension];
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+                inputTile[j] = float(args.input[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sum = 0.0f;
+            if (active) {
+                const uint rowBlock = row / rowsPerBlock;
+                const uint rowInBlock = row - rowBlock * rowsPerBlock;
+                device const ushort4* weightLane = (device const ushort4*)args.weight
+                    + rowBlock * tileCount * ushort4PerRowBlockTile
+                    + rowInBlock * ushort4PerTile
+                    + tiisg;
+                threadgroup const float4* inputLane = (threadgroup const float4*)inputTile + tiisg;
+                for (uint tile = 0; tile < tileCount; tile++) {
+                    sum += dot(bf16x4_to_float4(weightLane[0]), inputLane[0]);
+                    weightLane += ushort4PerRowBlockTile;
+                    inputLane += SIMD_WIDTH;
+                }
+            }
+            sum = simd_sum(sum);
+            if (active && tiisg == 0) {
+                args.output[row] = \(bt)(sum);
+            }
+        }
+        """
+    }
+
+    public static func generateVocabGEMVBlocked8x128PartialArgmaxArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateVocabGEMVPartialArgmaxArgumentTableVariant(
+                name: name,
+                argumentBufferIndex: argumentBufferIndex,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const \(bt)* input [[id(0)]];
+            device const \(wt)* weight [[id(1)]];
+            device float* partialValues [[id(2)]];
+            device int* partialIndices [[id(3)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& inputDimension             [[buffer(4)]],
+            constant uint& outputDimension            [[buffer(5)]],
+            uint gid                                  [[threadgroup_position_in_grid]],
+            uint tid                                  [[thread_index_in_threadgroup]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint threadsPerThreadgroup                [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint rowsPerBlock = 8u;
+            const uint tileElements = 128u;
+            const uint tileCount = fixedInputDimension / tileElements;
+            const uint ushort4PerTile = tileElements / 4u;
+            const uint ushort4PerRowBlockTile = rowsPerBlock * ushort4PerTile;
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint row = gid * rowsPerThreadgroup + sgitg;
+            const bool active = row < outputDimension && inputDimension == fixedInputDimension;
+
+            threadgroup float inputTile[fixedInputDimension];
+            threadgroup float rowValues[32];
+            threadgroup int rowIndices[32];
+
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+                inputTile[j] = float(args.input[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sum = -HUGE_VALF;
+            if (active) {
+                sum = 0.0f;
+                const uint rowBlock = row / rowsPerBlock;
+                const uint rowInBlock = row - rowBlock * rowsPerBlock;
+                device const ushort4* weightLane = (device const ushort4*)args.weight
+                    + rowBlock * tileCount * ushort4PerRowBlockTile
+                    + rowInBlock * ushort4PerTile
+                    + tiisg;
+                threadgroup const float4* inputLane = (threadgroup const float4*)inputTile + tiisg;
+                for (uint tile = 0; tile < tileCount; tile++) {
+                    sum += dot(bf16x4_to_float4(weightLane[0]), inputLane[0]);
+                    weightLane += ushort4PerRowBlockTile;
+                    inputLane += SIMD_WIDTH;
+                }
+                sum = simd_sum(sum);
+            }
+
+            if (tiisg == 0) {
+                rowValues[sgitg] = sum;
+                rowIndices[sgitg] = active ? int(row) : 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float bestValue = -HUGE_VALF;
+                int bestIndex = 0;
+                for (uint i = 0; i < rowsPerThreadgroup; i++) {
+                    if (rowValues[i] > bestValue) {
+                        bestValue = rowValues[i];
+                        bestIndex = rowIndices[i];
+                    }
+                }
+                args.partialValues[gid] = bestValue;
+                args.partialIndices[gid] = bestIndex;
+            }
+        }
+        """
+    }
+
+    public static func generateVocabGEMVPartialArgmaxArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let readWeight = { (expr: String) in weightFormat.readExpression(expr) }
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const \(bt)* input [[id(0)]];
+            device const \(wt)* weight [[id(1)]];
+            device float* partialValues [[id(2)]];
+            device int* partialIndices [[id(3)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& inputDimension             [[buffer(4)]],
+            constant uint& outputDimension            [[buffer(5)]],
+            uint gid                                  [[threadgroup_position_in_grid]],
+            uint tid                                  [[thread_index_in_threadgroup]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint threadsPerThreadgroup                [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+            const uint row = gid * rowsPerThreadgroup + sgitg;
+            const bool active = row < outputDimension;
+
+            threadgroup \(bt) inputTile[fixedInputDimension];
+            threadgroup float rowValues[32];
+            threadgroup int rowIndices[32];
+
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup) {
+                inputTile[j] = args.input[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            float sum = -HUGE_VALF;
+            if (active) {
+                sum = 0.0f;
+                device const \(wt)* rowWeight = args.weight + row * inputDimension;
+                for (uint j = tiisg; j < inputDimension; j += SIMD_WIDTH) {
+                    sum += \(readWeight("rowWeight[j]")) * float(inputTile[j]);
+                }
+                sum = simd_sum(sum);
+            }
+
+            if (tiisg == 0) {
+                rowValues[sgitg] = sum;
+                rowIndices[sgitg] = active ? int(row) : 0;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0) {
+                float bestValue = -HUGE_VALF;
+                int bestIndex = 0;
+                for (uint i = 0; i < rowsPerThreadgroup; i++) {
+                    if (rowValues[i] > bestValue) {
+                        bestValue = rowValues[i];
+                        bestIndex = rowIndices[i];
+                    }
+                }
+                args.partialValues[gid] = bestValue;
+                args.partialIndices[gid] = bestIndex;
+            }
+        }
+        """
+    }
+
     /// Generate a GEMV kernel specialized for decode projections with inputDimension=8192.
     ///
     /// This family keeps the tiled structure to preserve occupancy, but fixes the

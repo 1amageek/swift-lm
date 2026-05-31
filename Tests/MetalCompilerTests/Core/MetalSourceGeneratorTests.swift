@@ -100,10 +100,12 @@ struct MetalSourceGeneratorTests {
             let library = try device.makeLibrary(source: source, options: options)
             #expect(library.makeFunction(name: name) != nil, "Failed to compile \(name)")
             #expect(library.makeFunction(name: "\(name)_router_parallel") != nil, "Failed to compile \(name)_router_parallel")
+            #expect(library.makeFunction(name: "\(name)_router_parallel_staged_packed4") != nil, "Failed to compile \(name)_router_parallel_staged_packed4")
             #expect(library.makeFunction(name: "\(name)_router_scores") != nil, "Failed to compile \(name)_router_scores")
             #expect(library.makeFunction(name: "\(name)_router_select") != nil, "Failed to compile \(name)_router_select")
             #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
             #expect(library.makeFunction(name: "\(name)_gate_up_packed4") != nil, "Failed to compile \(name)_gate_up_packed4")
+            #expect(library.makeFunction(name: "\(name)_gate_up_staged_packed4") != nil, "Failed to compile \(name)_gate_up_staged_packed4")
             #expect(library.makeFunction(name: "\(name)_gate_up_packed8") != nil, "Failed to compile \(name)_gate_up_packed8")
             #expect(library.makeFunction(name: "\(name)_gate_up_row2_packed4") != nil, "Failed to compile \(name)_gate_up_row2_packed4")
             #expect(library.makeFunction(name: "\(name)_gate_up_split2") != nil, "Failed to compile \(name)_gate_up_split2")
@@ -112,6 +114,26 @@ struct MetalSourceGeneratorTests {
             #expect(library.makeFunction(name: "\(name)_down_packed8") != nil, "Failed to compile \(name)_down_packed8")
             #expect(library.makeFunction(name: "\(name)_down_split2") != nil, "Failed to compile \(name)_down_split2")
         }
+    }
+
+    @Test("Sparse MoE stores selected expert IDs as unsigned integers")
+    func sparseMoESelectedExpertIDsUseUnsignedScratch() {
+        let sparseSource = MetalSourceGenerator.generateSparseMoE(
+            name: "sparse_moe_id_contract",
+            bufferPrecision: .float16,
+            weightFormat: .bfloat16,
+            gateKind: .sigmoidTopK
+        )
+        let fusedRouterSource = MetalSourceGenerator.generateResidualRMSRouterParallelBF16(
+            name: "fused_rms_router_id_contract"
+        )
+        let source = sparseSource + "\n" + fusedRouterSource
+
+        #expect(source.contains("device uint* selectedExpertScratch = (device uint*)scratchRow;"))
+        #expect(source.contains("device const uint* selectedExpertScratch = (device const uint*)scratchRow;"))
+        #expect(source.contains("selectedExpertScratch[k] = selectedExperts[k];"))
+        #expect(!source.contains("selectedExpertScratch[k] = float(selectedExperts[k]);"))
+        #expect(!source.contains("uint(selectedExpertScratch[k])"))
     }
 
     @Test("Generated Sparse MoE compiles for direct Q8 decode and prefill")
@@ -3001,6 +3023,46 @@ struct MetalSourceGeneratorTests {
         let library = try device.makeLibrary(source: source, options: options)
         #expect(library.makeFunction(name: kernelName) != nil)
         #expect(library.makeFunction(name: "test_argmax_partial_reduce") != nil)
+    }
+
+    @Test("Blocked BF16 vocab GEMV partial argmax compiles")
+    func blockedBF16VocabGEMVPartialArgmaxCompiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let kernelName = "test_gemv_vocab_blocked8x128_bf16_argmax_partial"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateVocabGEMVBlocked8x128PartialArgmax(
+                name: kernelName,
+                bufferPrecision: .float16,
+                weightFormat: .bfloat16
+            )
+            + "\n\n"
+            + MetalSourceGenerator.generateArgmaxPartialReduce(name: "test_argmax_partial_reduce")
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        #expect(library.makeFunction(name: kernelName) != nil)
+        #expect(library.makeFunction(name: "test_argmax_partial_reduce") != nil)
+    }
+
+    @Test("Blocked BF16 vocab GEMV argument table variant compiles")
+    func blockedBF16VocabGEMVArgumentTableVariantCompiles() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let kernelName = "test_gemv_vocab_blocked8x128_bf16_argbuf"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateVocabGEMVBlocked8x128ArgumentTableVariant(
+                name: kernelName,
+                argumentBufferIndex: 30,
+                bufferPrecision: .float16,
+                weightFormat: .bfloat16
+            )
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        #expect(library.makeFunction(name: kernelName) != nil)
     }
 
     @Test("Unified quantized GEMV emits MLX-compatible Q3 bit extraction")

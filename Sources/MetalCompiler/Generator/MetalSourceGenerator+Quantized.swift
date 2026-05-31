@@ -622,11 +622,10 @@ public static func generateUnifiedQuantizedVocabGEMVPartialArgmax(
     kernel void \(name)(
         device const \(bt)* input       [[buffer(0)]],
         device const uchar* weight     [[buffer(1)]],
-        device \(bt)* output            [[buffer(2)]],
-        device float* partialValues     [[buffer(3)]],
-        device int* partialIndices      [[buffer(4)]],
-        constant uint& inputDimension  [[buffer(5)]],
-        constant uint& outputDimension [[buffer(6)]],
+        device float* partialValues     [[buffer(2)]],
+        device int* partialIndices      [[buffer(3)]],
+        constant uint& inputDimension  [[buffer(4)]],
+        constant uint& outputDimension [[buffer(5)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -674,9 +673,6 @@ public static func generateUnifiedQuantizedVocabGEMVPartialArgmax(
         }
 
         sum = simd_sum(sum);
-        if (active && tiisg == 0) {
-            output[row] = \(bt)(sum);
-        }
         if (tiisg == 0) {
             rowValues[sgitg] = active ? sum : -HUGE_VALF;
             rowIndices[sgitg] = active ? int(row) : 0;

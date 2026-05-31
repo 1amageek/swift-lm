@@ -1,3 +1,5 @@
+import Foundation
+
 struct MetalKernelNameResolver {
     let stafWeightStore: STAFWeightStore?
     let weightAccessPolicyOverride: ProjectionWeightAccessPolicyOverride?
@@ -107,6 +109,11 @@ struct MetalKernelNameResolver {
                     inputDimension: projection.inputDimension,
                     schemeIdentifier: tensorInfo.format.schemeIdentifier
                    ) {
+                    if family == .vocabDense,
+                       tensorInfo.format.schemeIdentifier == .bf16RowMajor,
+                       ProcessInfo.processInfo.environment["SWIFTLM_VOCAB_DISABLE_BLOCKED8X128"] != "1" {
+                        return "gemv_vocab_blocked8x128_bf16" + decodeSuffix
+                    }
                     let weightFormat: WeightFormat = tensorInfo.format.schemeIdentifier == .bf16RowMajor
                         ? WeightFormats.bfloat16
                         : (tensorInfo.format.schemeIdentifier == .fp32RowMajor ? WeightFormats.float32 : WeightFormats.float16)
@@ -154,6 +161,11 @@ struct MetalKernelNameResolver {
                 inputDimension: projection.inputDimension,
                 schemeIdentifier: isBF16 ? .bf16RowMajor : .fp16RowMajor
                ) {
+                if family == .vocabDense,
+                   isBF16,
+                   ProcessInfo.processInfo.environment["SWIFTLM_VOCAB_DISABLE_BLOCKED8X128"] != "1" {
+                    return "gemv_vocab_blocked8x128_bf16" + decodeSuffix
+                }
                 if let sourcePolicy = resolvedInput2048SourcePolicy(
                     for: projection,
                     entry: entry,

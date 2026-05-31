@@ -1,3 +1,4 @@
+import Foundation
 import Metal
 
 struct KernelWeightFormatResolver {
@@ -200,6 +201,10 @@ struct MetalKernelSourceCatalog {
                         let baseName = decodeFamily.kernelBaseName + sourcePolicy.weightLayoutPolicy.kernelNameSuffix
                         name = (effectiveWeightFormat == .bfloat16 ? baseName + "_bf16" : baseName)
                             + bufferPrecision.decodeKernelNameSuffix
+                    } else if decodeFamily == .vocabDense,
+                              effectiveWeightFormat == .bfloat16,
+                              ProcessInfo.processInfo.environment["SWIFTLM_VOCAB_DISABLE_BLOCKED8X128"] != "1" {
+                        name = "gemv_vocab_blocked8x128_bf16" + bufferPrecision.decodeKernelNameSuffix
                     } else {
                         name = (effectiveWeightFormat == .bfloat16
                             ? decodeFamily.kernelBaseName + "_bf16"
@@ -243,29 +248,75 @@ struct MetalKernelSourceCatalog {
                             weightFormat: effectiveWeightFormat,
                             tileElements: 256))
                     } else if decodeFamily == .vocabDense {
-                        sources.append(MetalSourceGenerator.generateVocabGEMV(
-                            name: name,
-                            bufferPrecision: bufferPrecision,
-                            weightFormat: weightFormat))
-                        let partialArgmaxKernelName = "\(name)_argmax_partial"
-                        if generatedNames.insert(partialArgmaxKernelName).inserted {
-                            sources.append(MetalSourceGenerator.generateVocabGEMVPartialArgmax(
-                                name: partialArgmaxKernelName,
+                        if name.contains("_blocked8x128") {
+                            sources.append(MetalSourceGenerator.generateVocabGEMVBlocked8x128(
+                                name: name,
                                 bufferPrecision: bufferPrecision,
                                 weightFormat: weightFormat))
+                        } else {
+                            sources.append(MetalSourceGenerator.generateVocabGEMV(
+                                name: name,
+                                bufferPrecision: bufferPrecision,
+                                weightFormat: weightFormat))
+                        }
+                        let partialArgmaxKernelName = "\(name)_argmax_partial"
+                        if generatedNames.insert(partialArgmaxKernelName).inserted {
+                            if name.contains("_blocked8x128") {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVBlocked8x128PartialArgmax(
+                                    name: partialArgmaxKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            } else {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVPartialArgmax(
+                                    name: partialArgmaxKernelName,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            }
+                        }
+                        let partialArgmaxArgumentKernelName =
+                            MetalKernelNameResolver.argumentTableVariantKernelName(for: partialArgmaxKernelName)
+                        if generatedNames.insert(partialArgmaxArgumentKernelName).inserted {
+                            if name.contains("_blocked8x128") {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVBlocked8x128PartialArgmaxArgumentTableVariant(
+                                    name: partialArgmaxArgumentKernelName,
+                                    argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            } else {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVPartialArgmaxArgumentTableVariant(
+                                    name: partialArgmaxArgumentKernelName,
+                                    argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            }
                         }
                         let partialReduceKernelName = "argmax_partial_reduce"
                         if generatedNames.insert(partialReduceKernelName).inserted {
                             sources.append(MetalSourceGenerator.generateArgmaxPartialReduce(
                                 name: partialReduceKernelName))
                         }
+                        let partialReduceArgumentKernelName =
+                            MetalKernelNameResolver.argumentTableVariantKernelName(for: partialReduceKernelName)
+                        if generatedNames.insert(partialReduceArgumentKernelName).inserted {
+                            sources.append(MetalSourceGenerator.generateArgmaxPartialReduceArgumentTableVariant(
+                                name: partialReduceArgumentKernelName,
+                                argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex))
+                        }
                         let argumentKernelName = MetalKernelNameResolver.argumentTableVariantKernelName(for: name)
                         if generatedNames.insert(argumentKernelName).inserted {
-                            sources.append(MetalSourceGenerator.generateVocabGEMVArgumentTableVariant(
-                                name: argumentKernelName,
-                                argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
-                                bufferPrecision: bufferPrecision,
-                                weightFormat: weightFormat))
+                            if name.contains("_blocked8x128") {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVBlocked8x128ArgumentTableVariant(
+                                    name: argumentKernelName,
+                                    argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            } else {
+                                sources.append(MetalSourceGenerator.generateVocabGEMVArgumentTableVariant(
+                                    name: argumentKernelName,
+                                    argumentBufferIndex: MetalInferenceCompiler.argumentTableBindingIndex,
+                                    bufferPrecision: bufferPrecision,
+                                    weightFormat: weightFormat))
+                            }
                         }
                     } else if decodeFamily == .input8192Tiled {
                         sources.append(MetalSourceGenerator.generateInput8192TiledGEMV(
@@ -423,7 +474,7 @@ struct MetalKernelSourceCatalog {
                     if !bufferPrecision.isPrefillSequencePrecision,
                        weightFormat == .bfloat16,
                        fragment is SparseMoEFragment,
-                       ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER"] == "1" {
+                       ProcessInfo.processInfo.environment["SWIFTLM_LFM25_DISABLE_FUSED_RMS_ROUTER"] != "1" {
                         let fusedRouterName = "residual_rms_router_parallel_bf16_sigmoid"
                         if generatedNames.insert(fusedRouterName).inserted {
                             sources.append(MetalSourceGenerator.generateResidualRMSRouterParallelBF16(

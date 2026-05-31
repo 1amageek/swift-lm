@@ -11,6 +11,8 @@ struct MetalSubmissionContext: @unchecked Sendable {
     let argumentTable: MTL4ArgumentTable
     private let allocators: [MTL4CommandAllocator]
     private let completionSemaphore: DispatchSemaphore
+    private let usesFreshSubmissionResources: Bool
+    private let usesFreshArgumentTable: Bool
     private var frameIndex: Int = 0
 
     static let maxInFlight = 2
@@ -20,12 +22,16 @@ struct MetalSubmissionContext: @unchecked Sendable {
         queue: MTL4CommandQueue,
         argumentTable: MTL4ArgumentTable,
         allocators: [MTL4CommandAllocator],
-        completionSemaphore: DispatchSemaphore
+        completionSemaphore: DispatchSemaphore,
+        usesFreshSubmissionResources: Bool,
+        usesFreshArgumentTable: Bool
     ) {
         self.queue = queue
         self.argumentTable = argumentTable
         self.allocators = allocators
         self.completionSemaphore = completionSemaphore
+        self.usesFreshSubmissionResources = usesFreshSubmissionResources
+        self.usesFreshArgumentTable = usesFreshArgumentTable
     }
 
     init(device: MTLDevice) throws {
@@ -53,6 +59,10 @@ struct MetalSubmissionContext: @unchecked Sendable {
             )
         }
         self.completionSemaphore = DispatchSemaphore(value: 0)
+
+        let environment = ProcessInfo.processInfo.environment
+        self.usesFreshSubmissionResources = environment["SWIFTLM_METAL_FRESH_SUBMISSION"] == "1"
+        self.usesFreshArgumentTable = environment["SWIFTLM_METAL_FRESH_ARGUMENT_TABLE"] == "1"
     }
 
     /// Submit a compute pass using Metal 4 APIs.
@@ -244,11 +254,10 @@ struct MetalSubmissionContext: @unchecked Sendable {
     var device: MTLDevice { queue.device }
 
     private func shouldUseFreshArgumentTable(waitUntilCompleted: Bool) -> Bool {
-        let environment = ProcessInfo.processInfo.environment
-        if environment["SWIFTLM_METAL_FRESH_SUBMISSION"] == "1" {
+        if usesFreshSubmissionResources {
             return true
         }
-        if environment["SWIFTLM_METAL_FRESH_ARGUMENT_TABLE"] == "1" {
+        if usesFreshArgumentTable {
             return true
         }
         // The shared argument table is safe only when this call waits for GPU
@@ -278,7 +287,9 @@ struct MetalSubmissionContext: @unchecked Sendable {
                 queue: queue,
                 argumentTable: argumentTable,
                 allocators: allocators,
-                completionSemaphore: DispatchSemaphore(value: 0)
+                completionSemaphore: DispatchSemaphore(value: 0),
+                usesFreshSubmissionResources: usesFreshSubmissionResources,
+                usesFreshArgumentTable: usesFreshArgumentTable
             )
         } catch {
             throw MetalCompilerError.deviceSetupFailed("Cannot create replay MTL4ArgumentTable")

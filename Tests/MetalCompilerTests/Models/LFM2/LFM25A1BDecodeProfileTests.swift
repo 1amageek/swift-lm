@@ -57,7 +57,9 @@ struct LFM25A1BDecodeProfileTests {
             if family == "synthesized_3way_residual" {
                 residualBoundaryShare += share
             }
-            if family == "sparse_moe_bf16_router_parallel" {
+            if family == "sparse_moe_bf16_router_parallel"
+                || family == "sparse_moe_bf16_router_parallel_staged_packed4"
+                || family == "residual_rms_router_parallel_bf16_sigmoid" {
                 routerShare += share
             }
             print(String(
@@ -115,6 +117,12 @@ struct LFM25A1BDecodeProfileTests {
         if kernelName.hasPrefix("synthesized_3way") {
             return "synthesized_3way_residual"
         }
+        if kernelName.hasPrefix("residual_rms_router_parallel_bf16") {
+            return "residual_rms_router_parallel_bf16_sigmoid"
+        }
+        if kernelName.hasPrefix("shortconv_inproj_update_bf16") {
+            return "shortconv_inproj_update_bf16"
+        }
         if kernelName.hasPrefix("conv_state_update") {
             return "conv_state_update_bf16"
         }
@@ -129,7 +137,9 @@ struct LFM25A1BDecodeProfileTests {
 
     private static func workEstimate(for family: String) -> WorkEstimate? {
         switch family {
-        case "sparse_moe_bf16_gate_up", "sparse_moe_bf16_gate_up_packed4":
+        case "sparse_moe_bf16_gate_up",
+             "sparse_moe_bf16_gate_up_packed4",
+             "sparse_moe_bf16_gate_up_staged_packed4":
             let operations = moeLayerCount
                 * expertsPerToken
                 * 2
@@ -156,6 +166,7 @@ struct LFM25A1BDecodeProfileTests {
     private static func isMoEProjectionFamily(_ family: String) -> Bool {
         family == "sparse_moe_bf16_gate_up"
             || family == "sparse_moe_bf16_gate_up_packed4"
+            || family == "sparse_moe_bf16_gate_up_staged_packed4"
             || family == "sparse_moe_bf16_down"
             || family == "sparse_moe_bf16_down_packed4"
     }

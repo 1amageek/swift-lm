@@ -248,8 +248,7 @@ struct DispatchHeuristics {
                 outputDimension: outputDimension,
                 inputDimension: inputDimension
             )
-            let preferredSimdgroups = family.preferredSimdgroups
-            let simdgroupCount = max(1, min(preferredSimdgroups, maxThreads / max(simdWidth, 1)))
+            let simdgroupCount = max(1, min(family.preferredSimdgroups, maxThreads / max(simdWidth, 1)))
             let rowsPerThreadgroup = simdgroupCount
             let threads = min(simdgroupCount * simdWidth, maxThreads)
             let groupCount = (outputDimension + rowsPerThreadgroup - 1) / rowsPerThreadgroup

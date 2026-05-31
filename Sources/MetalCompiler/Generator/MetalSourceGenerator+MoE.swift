@@ -41,6 +41,7 @@ extension MetalSourceGenerator {
             threadgroup float normPartials[32];
             threadgroup float routingWeights[128];
             threadgroup float routingScores[128];
+            threadgroup bfloat hiddenTile[fixedDimension];
 
             float sumSquared = 0.0f;
             for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
@@ -72,20 +73,26 @@ extension MetalSourceGenerator {
                 const float normed = float(residual[i])
                     * rmsScale
                     * (bf16_to_float(normWeight[i]) + weightBias);
-                hidden[i] = bfloat(normed);
+                const bfloat rounded = bfloat(normed);
+                hidden[i] = rounded;
+                hiddenTile[i] = rounded;
             }
-            threadgroup_barrier(mem_flags::mem_device);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
 
             const uint expert = sgitg;
             device float* scratchRow = moeScratch;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
 
             if (expert < expertCount) {
                 float logit = 0.0f;
                 device const uint16_t* routerRow = routerWeight + expert * fixedDimension;
-                for (uint j = tiisg; j < fixedDimension; j += SIMD_WIDTH) {
-                    logit += bf16_to_float(routerRow[j]) * float(hidden[j]);
+                threadgroup const bfloat4* hiddenLane = (threadgroup const bfloat4*)hiddenTile + tiisg;
+                device const ushort4* routerLane = (device const ushort4*)routerRow + tiisg;
+                for (uint j = tiisg * 4u; j < fixedDimension; j += SIMD_WIDTH * 4u) {
+                    logit += dot(bf16x4_to_float4(routerLane[0]), float4(hiddenLane[0]));
+                    routerLane += SIMD_WIDTH;
+                    hiddenLane += SIMD_WIDTH;
                 }
                 logit = simd_sum(logit);
                 if (tiisg == 0u) {
@@ -126,7 +133,155 @@ extension MetalSourceGenerator {
                     if (normalizeRoutingWeights != 0u) {
                         weight = weight / (selectedWeightSum + 1.0e-6f);
                     }
-                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedExpertScratch[k] = selectedExperts[k];
+                    selectedWeightScratch[k] = weight * routedScalingFactor;
+                }
+            }
+        }
+        """
+    }
+
+    public static func generateResidualRMSRouterParallelBF16ArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int
+    ) -> String {
+        let inputStructName = "\(name)_args"
+        return """
+        struct \(inputStructName) {
+            device const bfloat* input [[id(0)]];
+            device bfloat* residual [[id(1)]];
+            device const uint16_t* normWeight [[id(2)]];
+            device const uint16_t* routerWeight [[id(3)]];
+            device const float* expertBias [[id(4)]];
+            device bfloat* hidden [[id(5)]];
+            device float* moeScratch [[id(6)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& dimension                 [[buffer(7)]],
+            constant float& epsilon                  [[buffer(8)]],
+            constant float& weightBias               [[buffer(9)]],
+            constant uint& inputDimension            [[buffer(10)]],
+            constant uint& expertCount               [[buffer(11)]],
+            constant uint& expertsPerToken           [[buffer(12)]],
+            constant uint& normalizeRoutingWeights   [[buffer(13)]],
+            constant float& routedScalingFactor      [[buffer(14)]],
+            constant uint& useExpertBias             [[buffer(15)]],
+            constant uint& scratchRowStride          [[buffer(16)]],
+            uint tid                                 [[thread_index_in_threadgroup]],
+            uint tiisg                               [[thread_index_in_simdgroup]],
+            uint sgitg                               [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup              [[threads_per_threadgroup]]
+        ) {
+            const uint maxExperts = 128u;
+            const uint maxTopK = 8u;
+            const uint fixedDimension = 2048u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            if (dimension != fixedDimension
+                || inputDimension != fixedDimension
+                || expertCount > maxExperts
+                || expertsPerToken > maxTopK
+                || expertCount > simdgroupsPerThreadgroup) {
+                return;
+            }
+
+            threadgroup float normPartials[32];
+            threadgroup float routingWeights[128];
+            threadgroup float routingScores[128];
+            threadgroup bfloat hiddenTile[fixedDimension];
+
+            float sumSquared = 0.0f;
+            for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
+                bfloat boundary = bfloat(float(args.input[i]) + float(args.residual[i]));
+                args.residual[i] = boundary;
+                const float boundaryValue = float(boundary);
+                sumSquared += boundaryValue * boundaryValue;
+            }
+            sumSquared = simd_sum(sumSquared);
+
+            const uint simdIndex = tid / SIMD_WIDTH;
+            if (tiisg == 0u) {
+                normPartials[simdIndex] = sumSquared;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                float total = 0.0f;
+                const uint simdgroupCount = (threadsPerThreadgroup.x + SIMD_WIDTH - 1u) / SIMD_WIDTH;
+                for (uint index = 0; index < simdgroupCount; index++) {
+                    total += normPartials[index];
+                }
+                normPartials[0] = rsqrt(total / float(fixedDimension) + epsilon);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float rmsScale = normPartials[0];
+            for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
+                const float normed = float(args.residual[i])
+                    * rmsScale
+                    * (bf16_to_float(args.normWeight[i]) + weightBias);
+                const bfloat rounded = bfloat(normed);
+                args.hidden[i] = rounded;
+                hiddenTile[i] = rounded;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint expert = sgitg;
+            device float* scratchRow = args.moeScratch;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+            if (expert < expertCount) {
+                float logit = 0.0f;
+                device const uint16_t* routerRow = args.routerWeight + expert * fixedDimension;
+                threadgroup const bfloat4* hiddenLane = (threadgroup const bfloat4*)hiddenTile + tiisg;
+                device const ushort4* routerLane = (device const ushort4*)routerRow + tiisg;
+                for (uint j = tiisg * 4u; j < fixedDimension; j += SIMD_WIDTH * 4u) {
+                    logit += dot(bf16x4_to_float4(routerLane[0]), float4(hiddenLane[0]));
+                    routerLane += SIMD_WIDTH;
+                    hiddenLane += SIMD_WIDTH;
+                }
+                logit = simd_sum(logit);
+                if (tiisg == 0u) {
+                    const float weight = 1.0f / (1.0f + exp(-logit));
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = useExpertBias != 0u
+                        ? weight + args.expertBias[expert]
+                        : weight;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                float selectedWeightSum = 0.0f;
+                uint selectedExperts[8];
+                float selectedWeights[8];
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float bestScore = -INFINITY;
+                    uint bestExpert = 0u;
+                    for (uint expertIndex = 0; expertIndex < expertCount; expertIndex++) {
+                        bool alreadySelected = false;
+                        for (uint prev = 0; prev < k; prev++) {
+                            alreadySelected = alreadySelected || selectedExperts[prev] == expertIndex;
+                        }
+                        const float score = alreadySelected ? -INFINITY : routingScores[expertIndex];
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestExpert = expertIndex;
+                        }
+                    }
+                    const float routingWeight = routingWeights[bestExpert];
+                    selectedExperts[k] = bestExpert;
+                    selectedWeights[k] = routingWeight;
+                    selectedWeightSum += routingWeight;
+                }
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float weight = selectedWeights[k];
+                    if (normalizeRoutingWeights != 0u) {
+                        weight = weight / (selectedWeightSum + 1.0e-6f);
+                    }
+                    selectedExpertScratch[k] = selectedExperts[k];
                     selectedWeightScratch[k] = weight * routedScalingFactor;
                 }
             }
@@ -190,6 +345,12 @@ extension MetalSourceGenerator {
                 weightFormat: weightFormat,
                 gateKind: gateKind
             ),
+            generateSparseMoERouterParallelStagedPacked4(
+                name: "\(name)_router_parallel_staged_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat,
+                gateKind: gateKind
+            ),
             generateSparseMoERouterScores(
                 name: "\(name)_router_scores",
                 bufferPrecision: bufferPrecision,
@@ -207,6 +368,17 @@ extension MetalSourceGenerator {
             ),
             generateSparseMoEGateUpPacked4(
                 name: "\(name)_gate_up_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
+            generateSparseMoEGateUpStagedPacked4(
+                name: "\(name)_gate_up_staged_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
+            generateSparseMoEGateUpStagedPacked4ArgumentTableVariant(
+                name: "\(name)_gate_up_staged_packed4_argbuf",
+                argumentBufferIndex: 30,
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
@@ -232,6 +404,12 @@ extension MetalSourceGenerator {
             ),
             generateSparseMoEDownPacked4(
                 name: "\(name)_down_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
+            generateSparseMoEDownPacked4ArgumentTableVariant(
+                name: "\(name)_down_packed4_argbuf",
+                argumentBufferIndex: 30,
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
@@ -536,7 +714,7 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
 
             for (uint expert = 0; expert < expertCount; expert++) {
@@ -581,7 +759,7 @@ extension MetalSourceGenerator {
                     if (normalizeRoutingWeights != 0u) {
                         weight = weight / (selectedWeightSum + 1.0e-6f);
                     }
-                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedExpertScratch[k] = selectedExperts[k];
                     selectedWeightScratch[k] = weight * routedScalingFactor;
                 }
             }
@@ -689,7 +867,7 @@ extension MetalSourceGenerator {
             const uint expert = sgitg;
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
 
             if (expert < expertCount) {
@@ -734,7 +912,172 @@ extension MetalSourceGenerator {
                     if (normalizeRoutingWeights != 0u) {
                         weight = weight / (selectedWeightSum + 1.0e-6f);
                     }
-                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedExpertScratch[k] = selectedExperts[k];
+                    selectedWeightScratch[k] = weight * routedScalingFactor;
+                }
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoERouterParallelStagedPacked4(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat,
+        gateKind: MoEGateKind
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoERouterParallel(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat,
+                gateKind: gateKind
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let routingStore: String
+        let softmaxPreparation: String
+        switch gateKind {
+        case .sigmoidTopK:
+            routingStore = """
+                const float weight = 1.0f / (1.0f + exp(-logit));
+                routingWeights[expert] = weight;
+                routingScores[expert] = useExpertBias != 0u
+                    ? weight + expertBias[expert]
+                    : weight;
+            """
+            softmaxPreparation = ""
+        case .topK:
+            routingStore = """
+                routingWeights[expert] = logit;
+                routingScores[expert] = useExpertBias != 0u ? expertBias[expert] : 0.0f;
+            """
+            softmaxPreparation = """
+
+            if (tid == 0u) {
+                float maxLogit = -INFINITY;
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    maxLogit = max(maxLogit, routingWeights[expert]);
+                }
+                float weightSum = 0.0f;
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    const float scoreBias = routingScores[expert];
+                    const float weight = exp(routingWeights[expert] - maxLogit);
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = scoreBias;
+                    weightSum += weight;
+                }
+                for (uint expert = 0; expert < expertCount; expert++) {
+                    const float scoreBias = routingScores[expert];
+                    const float weight = routingWeights[expert] / weightSum;
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = weight + scoreBias;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            """
+        case .custom:
+            preconditionFailure("Sparse MoE generation does not support custom routing gates")
+        }
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* routerWeight       [[buffer(1)]],
+            device const float* expertBias         [[buffer(2)]],
+            device float* moeScratch               [[buffer(3)]],
+            constant uint& inputDimension          [[buffer(4)]],
+            constant uint& expertCount             [[buffer(5)]],
+            constant uint& expertsPerToken         [[buffer(6)]],
+            constant uint& normalizeRoutingWeights [[buffer(7)]],
+            constant float& routedScalingFactor    [[buffer(8)]],
+            constant uint& useExpertBias           [[buffer(9)]],
+            constant uint& sequenceLength          [[buffer(10)]],
+            constant uint& inputRowStride          [[buffer(11)]],
+            constant uint& scratchRowStride        [[buffer(12)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint maxExperts = 128u;
+            const uint maxTopK = 8u;
+            const uint fixedInputDimension = 2048u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint seqPos = gid.x;
+            if (seqPos >= sequenceLength
+                || inputDimension != fixedInputDimension
+                || expertCount > maxExperts
+                || expertsPerToken > maxTopK
+                || expertCount > simdgroupsPerThreadgroup) {
+                return;
+            }
+
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            threadgroup \(bt) inputTile[fixedInputDimension];
+            threadgroup float routingWeights[128];
+            threadgroup float routingScores[128];
+
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup.x) {
+                inputTile[j] = inputRow[j];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint expert = sgitg;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+            if (expert < expertCount) {
+                float logit = 0.0f;
+                device const \(wt)* routerRow = routerWeight + expert * fixedInputDimension;
+                threadgroup const \(bt)4* inputLane = (threadgroup const \(bt)4*)inputTile + tiisg;
+                device const ushort4* routerLane = (device const ushort4*)routerRow + tiisg;
+                for (uint j = tiisg * 4u; j < fixedInputDimension; j += SIMD_WIDTH * 4u) {
+                    logit += dot(bf16x4_to_float4(routerLane[0]), float4(inputLane[0]));
+                    routerLane += SIMD_WIDTH;
+                    inputLane += SIMD_WIDTH;
+                }
+                logit = simd_sum(logit);
+                if (tiisg == 0) {
+        \(routingStore)
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            \(softmaxPreparation)
+
+            if (tid == 0u) {
+                float selectedWeightSum = 0.0f;
+                uint selectedExperts[8];
+                float selectedWeights[8];
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float bestScore = -INFINITY;
+                    uint bestExpert = 0u;
+                    for (uint expertIndex = 0; expertIndex < expertCount; expertIndex++) {
+                        bool alreadySelected = false;
+                        for (uint prev = 0; prev < k; prev++) {
+                            alreadySelected = alreadySelected || selectedExperts[prev] == expertIndex;
+                        }
+                        const float score = alreadySelected ? -INFINITY : routingScores[expertIndex];
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestExpert = expertIndex;
+                        }
+                    }
+                    const float routingWeight = routingWeights[bestExpert];
+                    selectedExperts[k] = bestExpert;
+                    selectedWeights[k] = routingWeight;
+                    selectedWeightSum += routingWeight;
+                }
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float weight = selectedWeights[k];
+                    if (normalizeRoutingWeights != 0u) {
+                        weight = weight / (selectedWeightSum + 1.0e-6f);
+                    }
+                    selectedExpertScratch[k] = selectedExperts[k];
                     selectedWeightScratch[k] = weight * routedScalingFactor;
                 }
             }
@@ -873,7 +1216,7 @@ extension MetalSourceGenerator {
             }
 
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* routingWeightsScratch = scratchRow + 2u * expertsPerToken;
             device float* routingScoresScratch = routingWeightsScratch + maxExperts;
@@ -906,7 +1249,7 @@ extension MetalSourceGenerator {
                 if (normalizeRoutingWeights != 0u) {
                     weight = weight / (selectedWeightSum + 1.0e-6f);
                 }
-                selectedExpertScratch[k] = float(selectedExperts[k]);
+                selectedExpertScratch[k] = selectedExperts[k];
                 selectedWeightScratch[k] = weight * routedScalingFactor;
             }
         }
@@ -959,11 +1302,11 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert = uint(selectedExpertScratch[k]);
+            const uint expert = selectedExpertScratch[k];
             const float routeWeight = selectedWeightScratch[k];
             device const \(wt)* gateBase = expertGateUpWeight
                 + expert * (2u * intermediateDimension * inputDimension);
@@ -1031,12 +1374,12 @@ extension MetalSourceGenerator {
             }
 
             device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device const float* selectedExpertScratch = scratchRow;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
             device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
             float total = 0.0f;
             for (uint k = 0; k < expertsPerToken; k++) {
-                const uint expert = uint(selectedExpertScratch[k]);
+                const uint expert = selectedExpertScratch[k];
                 device const \(wt)* downRow = expertDownWeight
                     + expert * (outputDimension * intermediateDimension)
                     + row * intermediateDimension;
@@ -1150,7 +1493,7 @@ extension MetalSourceGenerator {
             const uint blocksPerRow = inputDimension / WEIGHTS_PER_BLOCK;
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
 
             if (expert < expertCount) {
@@ -1202,7 +1545,7 @@ extension MetalSourceGenerator {
                     if (normalizeRoutingWeights != 0u) {
                         weight = weight / (selectedWeightSum + 1.0e-6f);
                     }
-                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedExpertScratch[k] = selectedExperts[k];
                     selectedWeightScratch[k] = weight * routedScalingFactor;
                 }
             }
@@ -1336,11 +1679,11 @@ extension MetalSourceGenerator {
             const uint bytesPerRow = blocksPerRow * BYTES_PER_BLOCK;
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert = uint(selectedExpertScratch[k]);
+            const uint expert = selectedExpertScratch[k];
             const float routeWeight = selectedWeightScratch[k];
             device const uchar* gateBase = expertGateUpWeight
                 + expert * (2u * intermediateDimension * bytesPerRow);
@@ -1419,12 +1762,12 @@ extension MetalSourceGenerator {
             const uint blocksPerRow = intermediateDimension / WEIGHTS_PER_BLOCK;
             const uint bytesPerRow = blocksPerRow * BYTES_PER_BLOCK;
             device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device const float* selectedExpertScratch = scratchRow;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
             device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
             float total = 0.0f;
             for (uint k = 0; k < expertsPerToken; k++) {
-                const uint expert = uint(selectedExpertScratch[k]);
+                const uint expert = selectedExpertScratch[k];
                 device const uchar* downRow = expertDownWeight
                     + expert * (outputDimension * bytesPerRow)
                     + row * bytesPerRow;
@@ -1505,11 +1848,11 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert = uint(selectedExpertScratch[k]);
+            const uint expert = selectedExpertScratch[k];
             const float routeWeight = selectedWeightScratch[k];
             device const \(wt)* gateBase = expertGateUpWeight
                 + expert * (2u * intermediateDimension * inputDimension);
@@ -1592,11 +1935,11 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert = uint(selectedExpertScratch[k]);
+            const uint expert = selectedExpertScratch[k];
             const float routeWeight = selectedWeightScratch[k];
             device const \(wt)* gateBase = expertGateUpWeight
                 + expert * (2u * intermediateDimension * inputDimension);
@@ -1681,11 +2024,11 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert = uint(selectedExpertScratch[k]);
+            const uint expert = selectedExpertScratch[k];
             const float routeWeight = selectedWeightScratch[k];
             device const \(wt)* gateBase = expertGateUpWeight
                 + expert * (2u * intermediateDimension * inputDimension);
@@ -1720,6 +2063,198 @@ extension MetalSourceGenerator {
             gate = simd_sum(gate);
             up = simd_sum(up);
             if (tiisg == 0) {
+                activationScratch[k * intermediateDimension + m] =
+                    gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEGateUpStagedPacked4(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEGateUp(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* expertGateUpWeight [[buffer(1)]],
+            device float* moeScratch               [[buffer(2)]],
+            constant uint& inputDimension          [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& inputRowStride          [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || inputDimension != fixedInputDimension) {
+                return;
+            }
+
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            threadgroup float inputTile[fixedInputDimension];
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup.x) {
+                inputTile[j] = float(inputRow[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint flat = gid.x * simdgroupsPerThreadgroup + sgitg;
+            const uint k = flat / intermediateDimension;
+            const uint m = flat - k * intermediateDimension;
+            const bool active = k < expertsPerToken && m < intermediateDimension;
+
+            float gate = 0.0f;
+            float up = 0.0f;
+            float routeWeight = 0.0f;
+            if (active) {
+                device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+                device uint* selectedExpertScratch = (device uint*)scratchRow;
+                device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+                const uint expert = selectedExpertScratch[k];
+                routeWeight = selectedWeightScratch[k];
+                device const \(wt)* gateBase = expertGateUpWeight
+                    + expert * (2u * intermediateDimension * inputDimension);
+                device const \(wt)* upBase = gateBase + intermediateDimension * inputDimension;
+                device const \(wt)* gateRow = gateBase + m * inputDimension;
+                device const \(wt)* upRow = upBase + m * inputDimension;
+
+                threadgroup const float4* inputLane = (threadgroup const float4*)inputTile + tiisg;
+                device const ushort4* gateLane = (device const ushort4*)gateRow + tiisg;
+                device const ushort4* upLane = (device const ushort4*)upRow + tiisg;
+                for (uint j = tiisg * 4u; j < fixedInputDimension; j += SIMD_WIDTH * 4u) {
+                    const float4 x = inputLane[0];
+                    const float4 gateWeight = bf16x4_to_float4(gateLane[0]);
+                    const float4 upWeight = bf16x4_to_float4(upLane[0]);
+                    gate += dot(gateWeight, x);
+                    up += dot(upWeight, x);
+                    inputLane += SIMD_WIDTH;
+                    gateLane += SIMD_WIDTH;
+                    upLane += SIMD_WIDTH;
+                }
+            }
+
+            gate = simd_sum(gate);
+            up = simd_sum(up);
+            if (active && tiisg == 0) {
+                device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+                device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+                activationScratch[k * intermediateDimension + m] =
+                    gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEGateUpStagedPacked4ArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return ""
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const \(bt)* input [[id(0)]];
+            device const \(wt)* expertGateUpWeight [[id(1)]];
+            device float* moeScratch [[id(2)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& inputDimension             [[buffer(3)]],
+            constant uint& intermediateDimension      [[buffer(4)]],
+            constant uint& expertsPerToken            [[buffer(5)]],
+            constant uint& sequenceLength             [[buffer(6)]],
+            constant uint& inputRowStride             [[buffer(7)]],
+            constant uint& scratchRowStride           [[buffer(8)]],
+            uint2 gid                                 [[threadgroup_position_in_grid]],
+            uint tid                                  [[thread_index_in_threadgroup]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup               [[threads_per_threadgroup]]
+        ) {
+            const uint fixedInputDimension = 2048u;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || inputDimension != fixedInputDimension) {
+                return;
+            }
+
+            device const \(bt)* inputRow = args.input + seqPos * inputRowStride;
+            threadgroup float inputTile[fixedInputDimension];
+            for (uint j = tid; j < fixedInputDimension; j += threadsPerThreadgroup.x) {
+                inputTile[j] = float(inputRow[j]);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint flat = gid.x * simdgroupsPerThreadgroup + sgitg;
+            const uint k = flat / intermediateDimension;
+            const uint m = flat - k * intermediateDimension;
+            const bool active = k < expertsPerToken && m < intermediateDimension;
+
+            float gate = 0.0f;
+            float up = 0.0f;
+            float routeWeight = 0.0f;
+            if (active) {
+                device float* scratchRow = args.moeScratch + seqPos * scratchRowStride;
+                device uint* selectedExpertScratch = (device uint*)scratchRow;
+                device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+                const uint expert = selectedExpertScratch[k];
+                routeWeight = selectedWeightScratch[k];
+                device const \(wt)* gateBase = args.expertGateUpWeight
+                    + expert * (2u * intermediateDimension * inputDimension);
+                device const \(wt)* upBase = gateBase + intermediateDimension * inputDimension;
+                device const \(wt)* gateRow = gateBase + m * inputDimension;
+                device const \(wt)* upRow = upBase + m * inputDimension;
+
+                threadgroup const float4* inputLane = (threadgroup const float4*)inputTile + tiisg;
+                device const ushort4* gateLane = (device const ushort4*)gateRow + tiisg;
+                device const ushort4* upLane = (device const ushort4*)upRow + tiisg;
+                for (uint j = tiisg * 4u; j < fixedInputDimension; j += SIMD_WIDTH * 4u) {
+                    const float4 x = inputLane[0];
+                    const float4 gateWeight = bf16x4_to_float4(gateLane[0]);
+                    const float4 upWeight = bf16x4_to_float4(upLane[0]);
+                    gate += dot(gateWeight, x);
+                    up += dot(upWeight, x);
+                    inputLane += SIMD_WIDTH;
+                    gateLane += SIMD_WIDTH;
+                    upLane += SIMD_WIDTH;
+                }
+            }
+
+            gate = simd_sum(gate);
+            up = simd_sum(up);
+            if (active && tiisg == 0) {
+                device float* scratchRow = args.moeScratch + seqPos * scratchRowStride;
+                device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
                 activationScratch[k * intermediateDimension + m] =
                     gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
             }
@@ -1776,11 +2311,11 @@ extension MetalSourceGenerator {
 
             device const \(bt)* inputRow = input + seqPos * inputRowStride;
             device float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device float* selectedExpertScratch = scratchRow;
+            device uint* selectedExpertScratch = (device uint*)scratchRow;
             device float* selectedWeightScratch = scratchRow + expertsPerToken;
             device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
-            const uint expert0 = uint(selectedExpertScratch[k0]);
+            const uint expert0 = selectedExpertScratch[k0];
             const float routeWeight0 = selectedWeightScratch[k0];
             device const \(wt)* gateBase0 = expertGateUpWeight
                 + expert0 * (2u * intermediateDimension * inputDimension);
@@ -1788,7 +2323,7 @@ extension MetalSourceGenerator {
             device const \(wt)* gateRow0 = gateBase0 + m0 * inputDimension;
             device const \(wt)* upRow0 = upBase0 + m0 * inputDimension;
 
-            const uint expert1 = hasRow1 ? uint(selectedExpertScratch[k1]) : expert0;
+            const uint expert1 = hasRow1 ? selectedExpertScratch[k1] : expert0;
             const float routeWeight1 = hasRow1 ? selectedWeightScratch[k1] : routeWeight0;
             device const \(wt)* gateBase1 = expertGateUpWeight
                 + expert1 * (2u * intermediateDimension * inputDimension);
@@ -1889,12 +2424,12 @@ extension MetalSourceGenerator {
             }
 
             device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device const float* selectedExpertScratch = scratchRow;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
             device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
             float total = 0.0f;
             for (uint k = 0; k < expertsPerToken; k++) {
-                const uint expert = uint(selectedExpertScratch[k]);
+                const uint expert = selectedExpertScratch[k];
                 device const \(wt)* downRow = expertDownWeight
                     + expert * (outputDimension * intermediateDimension)
                     + row * intermediateDimension;
@@ -1964,12 +2499,12 @@ extension MetalSourceGenerator {
             }
 
             device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device const float* selectedExpertScratch = scratchRow;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
             device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
             float total = 0.0f;
             for (uint k = 0; k < expertsPerToken; k++) {
-                const uint expert = uint(selectedExpertScratch[k]);
+                const uint expert = selectedExpertScratch[k];
                 device const \(wt)* downRow = expertDownWeight
                     + expert * (outputDimension * intermediateDimension)
                     + row * intermediateDimension;
@@ -1991,6 +2526,83 @@ extension MetalSourceGenerator {
             }
             if (tiisg == 0) {
                 output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEDownPacked4ArgumentTableVariant(
+        name: String,
+        argumentBufferIndex: Int,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return ""
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let storedOutput = bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue("total", weightFormat: weightFormat)
+            : "total"
+        let inputStructName = "\(name)_args"
+
+        return """
+        struct \(inputStructName) {
+            device const float* moeScratch [[id(0)]];
+            device const \(wt)* expertDownWeight [[id(1)]];
+            device \(bt)* output [[id(2)]];
+        };
+
+        kernel void \(name)(
+            constant \(inputStructName)& args         [[buffer(\(argumentBufferIndex))]],
+            constant uint& outputDimension            [[buffer(3)]],
+            constant uint& intermediateDimension      [[buffer(4)]],
+            constant uint& expertsPerToken            [[buffer(5)]],
+            constant uint& sequenceLength             [[buffer(6)]],
+            constant uint& outputRowStride            [[buffer(7)]],
+            constant uint& scratchRowStride           [[buffer(8)]],
+            uint2 gid                                 [[threadgroup_position_in_grid]],
+            uint tiisg                                [[thread_index_in_simdgroup]],
+            uint sgitg                                [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup               [[threads_per_threadgroup]]
+        ) {
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || row >= outputDimension) {
+                return;
+            }
+
+            device const float* scratchRow = args.moeScratch + seqPos * scratchRowStride;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
+            device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            float total = 0.0f;
+            for (uint k = 0; k < expertsPerToken; k++) {
+                const uint expert = selectedExpertScratch[k];
+                device const \(wt)* downRow = args.expertDownWeight
+                    + expert * (outputDimension * intermediateDimension)
+                    + row * intermediateDimension;
+                device const float* activatedRow = activationScratch + k * intermediateDimension;
+                float partial = 0.0f;
+                uint m = tiisg * 4u;
+                device const ushort4* downLane = (device const ushort4*)downRow + tiisg;
+                device const float4* activatedLane = (device const float4*)activatedRow + tiisg;
+                for (; m + 3u < intermediateDimension; m += SIMD_WIDTH * 4u) {
+                    const float4 weight = bf16x4_to_float4(downLane[0]);
+                    partial += dot(weight, activatedLane[0]);
+                    downLane += SIMD_WIDTH;
+                    activatedLane += SIMD_WIDTH;
+                }
+                for (; m < intermediateDimension; m++) {
+                    partial += bf16_to_float(downRow[m]) * activatedRow[m];
+                }
+                total += simd_sum(partial);
+            }
+            if (tiisg == 0) {
+                args.output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
             }
         }
         """
@@ -2039,12 +2651,12 @@ extension MetalSourceGenerator {
             }
 
             device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
-            device const float* selectedExpertScratch = scratchRow;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
             device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
 
             float total = 0.0f;
             for (uint k = 0; k < expertsPerToken; k++) {
-                const uint expert = uint(selectedExpertScratch[k]);
+                const uint expert = selectedExpertScratch[k];
                 device const \(wt)* downRow = expertDownWeight
                     + expert * (outputDimension * intermediateDimension)
                     + row * intermediateDimension;

@@ -168,10 +168,6 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         guard let routerSelectPipeline = pipelineCache["\(baseName)_router_select"] else {
             throw MetalCompilerError.kernelNotFound("\(baseName)_router_select")
         }
-        guard let routerParallelPipeline = pipelineCache["\(baseName)_router_parallel"] else {
-            throw MetalCompilerError.kernelNotFound("\(baseName)_router_parallel")
-        }
-
         let routerBuffer = routerBinding.buffer
         let routerOffset = routerBinding.offset
         let gateUpBuffer = gateUpBinding.buffer
@@ -184,6 +180,16 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
 
         let routerScoresThreads = max(routerScoresPipeline.threadExecutionWidth, 1)
         let routerSelectThreads = max(routerSelectPipeline.threadExecutionWidth, 1)
+        let routerParallelName = kernelContext.weightFormat.isBFloat16
+            && inputDimension == 2_048
+            && expertCount == 32
+            && expertsPerToken == 4
+            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_STAGING"])
+            ? "\(baseName)_router_parallel_staged_packed4"
+            : "\(baseName)_router_parallel"
+        guard let routerParallelPipeline = pipelineCache[routerParallelName] else {
+            throw MetalCompilerError.kernelNotFound(routerParallelName)
+        }
         let routerParallelSimdWidth = max(routerParallelPipeline.threadExecutionWidth, 1)
         let routerParallelMaxSimdgroups = max(1, routerParallelPipeline.maxTotalThreadsPerThreadgroup / routerParallelSimdWidth)
         let disablesParallelRouter = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"])
@@ -200,9 +206,12 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             throw MetalCompilerError.kernelNotFound(projectionSelection.gateUpName)
         }
         let gateUpSimdWidth = max(selectedGateUpPipeline.threadExecutionWidth, 1)
+        let defaultGateUpSimdgroups = projectionSelection.gateUpName.hasSuffix("_gate_up_staged_packed4")
+            ? 8
+            : 32
         let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
-            defaultValue: 32,
+            defaultValue: defaultGateUpSimdgroups,
             simdWidth: gateUpSimdWidth,
             pipeline: selectedGateUpPipeline
         )
@@ -277,7 +286,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: moeScratch, offset: 0)]
                 ),
                 metadata: .init(
-                    kernelName: "\(baseName)_router_parallel",
+                    kernelName: routerParallelName,
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [3])
                 )
             ))
@@ -725,6 +734,16 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
         let usesDownSplit2 = usesExperimentalKernels
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
+        let usesGateUpStagedPacked4 = usesPacked4
+            && usesExperimentalKernels
+            && !usesPacked8
+            && !usesGateUpSplit2
+            && !usesGateUpRow2
+            && inputDimension == 2_048
+            && intermediateDimension == 1_792
+            && expertsPerToken == 4
+            && expertCount == 32
+            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_GATE_UP_STAGING"])
         let gateUpName = usesGateUpSplit2
             ? "\(baseName)_gate_up_split2"
             : (
@@ -733,7 +752,11 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     : (
                         usesPacked8
                             ? "\(baseName)_gate_up_packed8"
-                            : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up")
+                            : (
+                                usesGateUpStagedPacked4
+                                    ? "\(baseName)_gate_up_staged_packed4"
+                                    : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up")
+                            )
                     )
             )
         let downName = usesDownSplit2

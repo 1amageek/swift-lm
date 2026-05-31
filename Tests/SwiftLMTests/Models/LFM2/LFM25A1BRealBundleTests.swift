@@ -437,18 +437,24 @@ struct LFM25A1BRealBundleTests {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_select" })
                 #expect(timing.decodeStepCount <= 224)
             } else {
-                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_parallel" })
+                #expect(timing.decodeKernelHistogram.contains {
+                    $0.kernelName == "residual_rms_router_parallel_bf16_sigmoid"
+                        || $0.kernelName == "sparse_moe_bf16_router_parallel_staged_packed4"
+                })
                 #expect(timing.decodeStepCount <= 202)
             }
             if ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"] == "1" {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed8" })
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed8" })
             } else {
-                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up_packed4" })
+                let expectedGateUpKernel = ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_GATE_UP_STAGING"] == "1"
+                    ? "sparse_moe_bf16_gate_up_packed4"
+                    : "sparse_moe_bf16_gate_up_staged_packed4"
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == expectedGateUpKernel })
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
             }
-            if ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] == "1" {
-                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "gemv_vocab_bf16_argmax_partial" })
+            if ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] != "0" {
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName.hasSuffix("_argmax_partial") })
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "argmax_partial_reduce" })
             }
             if Self.enforcesSpeedGates {
@@ -544,6 +550,7 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_q8_g64_router_parallel"] == 22)
         #expect(histogram["sparse_moe_q8_g64_gate_up"] == 22)
         #expect(histogram["sparse_moe_q8_g64_down"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         #expect(timing.hostSamplingLogitReadCount == 0)
@@ -556,20 +563,22 @@ struct LFM25A1BRealBundleTests {
         }
 
         let timing = try await withSparseMoEDefaultRoute {
-            try await withEnvironmentValue("SWIFTLM_LFM25_FUSED_RMS_ROUTER", value: nil) {
-                try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
-                    try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
-                        let loader = ModelBundleLoader()
-                        let container = try await loader.load(directory: localModelDirectory)
-                        let context = try LanguageModelContext(container)
-                        let prepared = try await context.prepare(ModelInput(chat: [
-                            .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
-                        ]))
-                        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
-                        return try context.debugRawGenerationTiming(
-                            prompt: executable,
-                            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 4)
-                        )
+            try await withEnvironmentValue("SWIFTLM_LFM25_DISABLE_FUSED_RMS_ROUTER", value: nil) {
+                try await withEnvironmentValue("SWIFTLM_VOCAB_DISABLE_BLOCKED8X128", value: nil) {
+                    try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
+                        try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
+                            let loader = ModelBundleLoader()
+                            let container = try await loader.load(directory: localModelDirectory)
+                            let context = try LanguageModelContext(container)
+                            let prepared = try await context.prepare(ModelInput(chat: [
+                                .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                            ]))
+                            let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                            return try context.debugRawGenerationTiming(
+                                prompt: executable,
+                                parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 4)
+                            )
+                        }
                     }
                 }
             }
@@ -581,8 +590,11 @@ struct LFM25A1BRealBundleTests {
         print("[LFM2.5 8B-A1B production route histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
 
         #expect(Array(timing.tokenIDs.prefix(4)) == Array(Self.hfStrictCapital64TokenIDs.prefix(4)))
-        #expect(histogram["sparse_moe_bf16_router_parallel"] == 22)
-        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == 22)
+        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == 22)
+        #expect(histogram["sparse_moe_bf16_router_parallel_staged_packed4"] == nil)
+        #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_router_scores"] == nil)
         #expect(histogram["sparse_moe_bf16_router_select"] == nil)
@@ -590,19 +602,25 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_down"] == nil)
         #expect(histogram["shortconv_inproj_update_bf16"] == 18)
         #expect(histogram["gemv_2048_6144_bf16"] == nil)
+        if ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] != "0" {
+            #expect(histogram.keys.contains { $0.hasSuffix("_argmax_partial") })
+            #expect(histogram["argmax_partial_reduce"] != nil)
+            #expect(histogram["gemv_vocab_blocked8x128_bf16_argbuf"] == nil)
+        } else {
+            #expect(histogram["gemv_vocab_blocked8x128_bf16_argbuf"] != nil)
+        }
         #expect(histogram["conv_state_update_bf16"] == nil)
-        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == nil)
-        #expect(timing.decodeStepCount <= 184)
+        #expect(timing.decodeStepCount <= 162)
     }
 
-    @Test("Opt-in fused RMS/router route matches HF prefix", .timeLimit(.minutes(10)))
-    func optInFusedRMSRouterRouteMatchesHFPrefix() async throws {
+    @Test("Disabled fused RMS/router route falls back to staged router", .timeLimit(.minutes(10)))
+    func disabledFusedRMSRouterRouteFallsBackToStagedRouter() async throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
             return
         }
 
         let timing = try await withSparseMoEDefaultRoute {
-            try await withEnvironmentValue("SWIFTLM_LFM25_FUSED_RMS_ROUTER", value: "1") {
+            try await withEnvironmentValue("SWIFTLM_LFM25_DISABLE_FUSED_RMS_ROUTER", value: "1") {
                 try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
                     try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
                         let loader = ModelBundleLoader()
@@ -624,17 +642,19 @@ struct LFM25A1BRealBundleTests {
         let histogram = Dictionary(
             uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
         )
-        print("[LFM2.5 8B-A1B fused RMS/router route histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+        print("[LFM2.5 8B-A1B staged router fallback histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
 
         #expect(timing.tokenIDs == Array(Self.hfStrictCapital64TokenIDs.prefix(8)))
-        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == 22)
+        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == nil)
+        #expect(histogram["sparse_moe_bf16_router_parallel_staged_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
-        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
         #expect(histogram["shortconv_inproj_update_bf16"] == 18)
         #expect(histogram["gemv_2048_6144_bf16"] == nil)
         #expect(histogram["conv_state_update_bf16"] == nil)
-        #expect(timing.decodeStepCount <= 162)
+        #expect(timing.decodeStepCount <= 184)
     }
 
     @Test("Opt-in packed8 Sparse MoE projection route matches HF prefix", .timeLimit(.minutes(10)))
@@ -667,6 +687,7 @@ struct LFM25A1BRealBundleTests {
         #expect(timing.tokenIDs == Array(Self.hfStrictCapital64TokenIDs.prefix(8)))
         #expect(histogram["sparse_moe_bf16_gate_up_packed8"] == 22)
         #expect(histogram["sparse_moe_bf16_down_packed8"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         #expect(histogram["shortconv_inproj_update_bf16"] == 18)
@@ -712,6 +733,7 @@ struct LFM25A1BRealBundleTests {
 
         #expect(timing.tokenIDs == Self.hfStrictCapital64TokenIDs)
         #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
         if Self.enforcesSpeedGates {
@@ -758,6 +780,7 @@ struct LFM25A1BRealBundleTests {
 
         #expect(timing.tokenIDs == Self.hfStrictCapital64TokenIDs)
         #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(timing.decodeGPUTokensPerSecond == 0)
         #expect(timing.hostSamplingLogitReadCount == 0)
@@ -829,7 +852,7 @@ struct LFM25A1BRealBundleTests {
             function: try #require(library.makeFunction(name: "test_real_lfm25_a1b_sparse_moe_seq_bf16_router_select"))
         )
         let gateUpPipeline = try device.makeComputePipelineState(
-            function: try #require(library.makeFunction(name: "test_real_lfm25_a1b_sparse_moe_seq_bf16_gate_up_packed4"))
+            function: try #require(library.makeFunction(name: "test_real_lfm25_a1b_sparse_moe_seq_bf16_gate_up_staged_packed4"))
         )
         let downPipeline = try device.makeComputePipelineState(
             function: try #require(library.makeFunction(name: "test_real_lfm25_a1b_sparse_moe_seq_bf16_down_packed4"))

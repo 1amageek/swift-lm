@@ -148,9 +148,9 @@ public static func generateShortConvInProjUpdateBF16(name: String) -> String {
         const uint channel = gid * rowsPerThreadgroup + sgitg;
         const bool active = channel < dimension && dimension == fixedDimension;
 
-        threadgroup bfloat inputTile[fixedDimension];
+        threadgroup float inputTile[fixedDimension];
         for (uint j = tid; j < fixedDimension; j += threadsPerThreadgroup) {
-            inputTile[j] = input[j];
+            inputTile[j] = float(input[j]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -161,31 +161,25 @@ public static func generateShortConvInProjUpdateBF16(name: String) -> String {
             device const uint16_t* bRow = inProjWeight + channel * fixedDimension;
             device const uint16_t* cRow = inProjWeight + (fixedDimension + channel) * fixedDimension;
             device const uint16_t* xRow = inProjWeight + (2u * fixedDimension + channel) * fixedDimension;
-            device const ushort4* bLane = (device const ushort4*)bRow + tiisg;
-            device const ushort4* cLane = (device const ushort4*)cRow + tiisg;
-            device const ushort4* xLane = (device const ushort4*)xRow + tiisg;
-            threadgroup const bfloat4* inputLane = (threadgroup const bfloat4*)inputTile + tiisg;
-            for (uint j = tiisg * 4u; j < fixedDimension; j += SIMD_WIDTH * 4u) {
-                const float4 value = float4(inputLane[0]);
-                const float4 bWeight = bf16x4_to_float4(bLane[0]);
-                const float4 cWeight = bf16x4_to_float4(cLane[0]);
-                const float4 xWeight = bf16x4_to_float4(xLane[0]);
-                bSum += bWeight[0] * value[0];
-                bSum += bWeight[1] * value[1];
-                bSum += bWeight[2] * value[2];
-                bSum += bWeight[3] * value[3];
-                cSum += cWeight[0] * value[0];
-                cSum += cWeight[1] * value[1];
-                cSum += cWeight[2] * value[2];
-                cSum += cWeight[3] * value[3];
-                xSum += xWeight[0] * value[0];
-                xSum += xWeight[1] * value[1];
-                xSum += xWeight[2] * value[2];
-                xSum += xWeight[3] * value[3];
-                bLane += SIMD_WIDTH;
-                cLane += SIMD_WIDTH;
-                xLane += SIMD_WIDTH;
-                inputLane += SIMD_WIDTH;
+            device const ushort4* bLane = (device const ushort4*)bRow + tiisg * 2u;
+            device const ushort4* cLane = (device const ushort4*)cRow + tiisg * 2u;
+            device const ushort4* xLane = (device const ushort4*)xRow + tiisg * 2u;
+            threadgroup const float4* inputLane = (threadgroup const float4*)inputTile + tiisg * 2u;
+            #pragma unroll
+            for (uint j = tiisg * 8u; j < fixedDimension; j += SIMD_WIDTH * 8u) {
+                const float4 bWeight0 = bf16x4_to_float4(bLane[0]);
+                const float4 bWeight1 = bf16x4_to_float4(bLane[1]);
+                const float4 cWeight0 = bf16x4_to_float4(cLane[0]);
+                const float4 cWeight1 = bf16x4_to_float4(cLane[1]);
+                const float4 xWeight0 = bf16x4_to_float4(xLane[0]);
+                const float4 xWeight1 = bf16x4_to_float4(xLane[1]);
+                bSum += dot(bWeight0, inputLane[0]) + dot(bWeight1, inputLane[1]);
+                cSum += dot(cWeight0, inputLane[0]) + dot(cWeight1, inputLane[1]);
+                xSum += dot(xWeight0, inputLane[0]) + dot(xWeight1, inputLane[1]);
+                bLane += SIMD_WIDTH * 2u;
+                cLane += SIMD_WIDTH * 2u;
+                xLane += SIMD_WIDTH * 2u;
+                inputLane += SIMD_WIDTH * 2u;
             }
         }
 
@@ -200,6 +194,7 @@ public static func generateShortConvInProjUpdateBF16(name: String) -> String {
             const float bx = bValue * xValue;
 
             float convOut = 0.0f;
+            #pragma unroll
             for (uint k = 0; k + 1u < kernelSize; k++) {
                 const uint dst = k * fixedDimension + channel;
                 const uint src = (k + 1u) * fixedDimension + channel;

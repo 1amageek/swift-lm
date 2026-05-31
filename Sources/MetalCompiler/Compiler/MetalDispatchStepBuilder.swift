@@ -273,7 +273,7 @@ struct MetalDispatchStepBuilder {
         let convWeightBinding = try requiredBinding(index: 2, bindings: convBindings.buffers, kernelName: kernelName)
         let outputBinding = try requiredBinding(index: 3, bindings: convBindings.buffers, kernelName: kernelName)
         let simdWidth = max(pipeline.threadExecutionWidth, 1)
-        let simdgroups = max(1, min(16, pipeline.maxTotalThreadsPerThreadgroup / simdWidth))
+        let simdgroups = max(1, min(32, pipeline.maxTotalThreadsPerThreadgroup / simdWidth))
         let threads = simdgroups * simdWidth
         let gridX = (conv.dimension + simdgroups - 1) / simdgroups
 
@@ -332,7 +332,7 @@ struct MetalDispatchStepBuilder {
         hiddenSize: Int,
         pipelineCache: [String: MTLComputePipelineState]
     ) throws -> [MetalDispatchStep]? {
-        guard ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] == "1",
+        guard ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] != "0",
               let linear = entry.fragment as? LinearFragment,
               linear.isOutput,
               linear.inputDimension == hiddenSize,
@@ -359,7 +359,6 @@ struct MetalDispatchStepBuilder {
 
         let inputBinding = try requiredBinding(index: 0, bindings: bindings.buffers, kernelName: partialKernelName)
         let weightBinding = try requiredBinding(index: 1, bindings: bindings.buffers, kernelName: partialKernelName)
-        let outputBinding = try requiredBinding(index: 2, bindings: bindings.buffers, kernelName: partialKernelName)
         let weightTensorName = primaryWeightTensorName(for: entry)
 
         let reduceSimdWidth = max(reducePipeline.threadExecutionWidth, 1)
@@ -376,13 +375,12 @@ struct MetalDispatchStepBuilder {
             bufferBindings: [
                 (0, inputBinding.buffer, inputBinding.offset),
                 (1, weightBinding.buffer, weightBinding.offset),
-                (2, outputBinding.buffer, outputBinding.offset),
-                (3, bufferSet.scratch, 0),
-                (4, bufferSet.scratch, partialIndexOffset),
+                (2, bufferSet.scratch, 0),
+                (3, bufferSet.scratch, partialIndexOffset),
             ],
             bytesBindings: [
-                uint32Binding(5, UInt32(linear.inputDimension)),
-                uint32Binding(6, UInt32(linear.outputDimension)),
+                uint32Binding(4, UInt32(linear.inputDimension)),
+                uint32Binding(5, UInt32(linear.outputDimension)),
             ],
             threadgroupMemoryLength: resolved.config.sharedMemoryBytes,
             sync: .bufferBarrier,
@@ -392,7 +390,6 @@ struct MetalDispatchStepBuilder {
                     (buffer: weightBinding.buffer, offset: weightBinding.offset),
                 ],
                 writeBuffers: [
-                    (buffer: outputBinding.buffer, offset: outputBinding.offset),
                     (buffer: bufferSet.scratch, offset: 0),
                     (buffer: bufferSet.scratch, offset: partialIndexOffset),
                 ]
@@ -402,7 +399,7 @@ struct MetalDispatchStepBuilder {
                 entryIndex: entry.index,
                 layerIndex: entry.layerIndex,
                 weightTensorName: weightTensorName,
-                bufferAccessPattern: .init(reads: [0, 1], writes: [2, 3, 4])
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2, 3])
             )
         )
 
@@ -451,7 +448,7 @@ struct MetalDispatchStepBuilder {
         stafWeightStore: STAFWeightStore?,
         accessPolicyResolver: ProjectionWeightAccessPolicyResolver
     ) throws -> [MetalDispatchStep]? {
-        guard ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER"] == "1" else {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_LFM25_DISABLE_FUSED_RMS_ROUTER"] != "1" else {
             return nil
         }
         let shouldTrace = ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER_TRACE"] == "1"
@@ -537,13 +534,16 @@ struct MetalDispatchStepBuilder {
             bufferPrecision: kernelContext.bufferPrecision,
             weightFormat: sparseMoEWeightFormat
         )
+        let sparseMoEBaseName = sparseMoE.kernelName(context: sparseMoEKernelContext)
         let splitSteps = try sparseMoE.splitDecodeSteps(
             bindings: nextBindings,
             pipelineCache: pipelineCache,
             kernelContext: sparseMoEKernelContext
         )
+        let splitRouterName = splitSteps.first?.metadata.kernelName
         guard splitSteps.count == 3,
-              splitSteps[0].metadata.kernelName?.hasSuffix("_router_parallel") == true else {
+              (splitRouterName == "\(sparseMoEBaseName)_router_parallel"
+                || splitRouterName == "\(sparseMoEBaseName)_router_parallel_staged_packed4") else {
             return nil
         }
         let routerBinding = try requiredBinding(index: 1, bindings: nextBindings.buffers, kernelName: fusedKernelName)
@@ -1034,7 +1034,14 @@ struct MetalDispatchStepBuilder {
             switch kernelName {
             case "embedding_lookup", "embedding_lookup_bf16":
                 return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
+            case "argmax_partial_reduce":
+                return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
             default:
+                if kernelName.hasPrefix("sparse_moe")
+                    && (kernelName.hasSuffix("_gate_up_staged_packed4")
+                        || kernelName.hasSuffix("_down_packed4")) {
+                    return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
+                }
                 if kernelName.hasPrefix("gemv_2048_sq")
                     || kernelName.hasPrefix("gemv_2048_6144")
                     || kernelName == "gemv_8192_tiled"
@@ -1043,6 +1050,7 @@ struct MetalDispatchStepBuilder {
                     || kernelName == "gemv_bf16"
                     || kernelName == "gemv_vocab"
                     || kernelName == "gemv_vocab_bf16"
+                    || kernelName == "gemv_vocab_blocked8x128_bf16"
                 {
                     return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
                 }
@@ -1057,6 +1065,8 @@ struct MetalDispatchStepBuilder {
             }
         case [0, 1, 2, 3]:
             switch kernelName {
+            case let name where name.hasSuffix("_argmax_partial"):
+                return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
             case let name where name.hasPrefix("fused_copy_rms_norm"):
                 return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
             case let name where name.hasPrefix("fused_residual_add_copy_rms_norm"):
@@ -1093,6 +1103,14 @@ struct MetalDispatchStepBuilder {
             if table.layout.indices == [0, 1, 2, 3, 4, 5, 6, 7, 8] {
                 switch kernelName {
                 case "batched_gemv4", "batched_gemv4_bf16":
+                    return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
+                default:
+                    return nil
+                }
+            }
+            if table.layout.indices == [0, 1, 2, 3, 4, 5, 6] {
+                switch kernelName {
+                case "residual_rms_router_parallel_bf16_sigmoid":
                     return MetalKernelNameResolver.argumentTableVariantKernelName(for: kernelName)
                 default:
                     return nil

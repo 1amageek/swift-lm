@@ -1,3 +1,4 @@
+import Foundation
 import LMIR
 
 struct ProjectionWeightAccessPolicyResolver: Sendable {
@@ -40,11 +41,6 @@ struct ProjectionWeightAccessPolicyResolver: Sendable {
         guard executionPhase == .decode else {
             return .canonicalRowMajor
         }
-        guard let projection = entry.fragment as? LinearFragment,
-              projection.field == role else {
-            return .canonicalRowMajor
-        }
-
         let schemeIdentifier = stafWeightStore
             .tensor(for: binding.tensorName)?
             .format
@@ -58,12 +54,21 @@ struct ProjectionWeightAccessPolicyResolver: Sendable {
             : .float16
 
         let layoutPolicy: Input2048WeightLayoutPolicy?
-        if projection.inputDimension == 2_048 && projection.outputDimension == 2_048 {
-            layoutPolicy = Input2048GEMVSourcePolicy.square(weightFormat: weightFormat).weightLayoutPolicy
-        } else if projection.inputDimension == 2_048 && projection.outputDimension == 6_144 {
-            layoutPolicy = Input2048GEMVSourcePolicy.expanded6144(weightFormat: weightFormat).weightLayoutPolicy
-        } else if projection.inputDimension == 2_048 && projection.outputDimension == 8_192 {
-            layoutPolicy = Input2048GEMVSourcePolicy.expanded8192(weightFormat: weightFormat).weightLayoutPolicy
+        if let projection = entry.fragment as? LinearFragment, projection.field == role {
+            if projection.inputDimension == 2_048 && projection.outputDimension == 2_048 {
+                layoutPolicy = Input2048GEMVSourcePolicy.square(weightFormat: weightFormat).weightLayoutPolicy
+            } else if projection.inputDimension == 2_048 && projection.outputDimension == 6_144 {
+                layoutPolicy = Input2048GEMVSourcePolicy.expanded6144(weightFormat: weightFormat).weightLayoutPolicy
+            } else if projection.inputDimension == 2_048 && projection.outputDimension == 8_192 {
+                layoutPolicy = Input2048GEMVSourcePolicy.expanded8192(weightFormat: weightFormat).weightLayoutPolicy
+            } else if projection.inputDimension == 2_048,
+                      projection.outputDimension >= 65_536,
+                      schemeIdentifier == .bf16RowMajor,
+                      ProcessInfo.processInfo.environment["SWIFTLM_VOCAB_DISABLE_BLOCKED8X128"] != "1" {
+                layoutPolicy = .blockedRows8Tiles128
+            } else {
+                layoutPolicy = nil
+            }
         } else {
             layoutPolicy = nil
         }

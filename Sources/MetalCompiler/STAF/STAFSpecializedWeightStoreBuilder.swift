@@ -38,23 +38,22 @@ struct STAFSpecializedWeightStoreBuilder {
         var seen: Set<STAFSpecializedWeightKey> = []
 
         for entry in entries {
-            guard let linear = entry.fragment as? LinearFragment,
-                  let binding = entry.parameterBindings.first(where: { $0.role == linear.field }) else {
-                continue
-            }
-            let request = accessPolicyResolver.accessRequest(
-                for: entry,
-                role: linear.field,
-                binding: binding,
-                executionPhase: .decode,
-                stafWeightStore: store
-            )
-            let key = STAFSpecializedWeightKey(
-                tensorName: binding.tensorName,
-                layout: request.preferredLayout
-            )
-            if seen.insert(key).inserted {
-                requests.append(request)
+            if let linear = entry.fragment as? LinearFragment,
+               let binding = entry.parameterBindings.first(where: { $0.role == linear.field }) {
+                let request = accessPolicyResolver.accessRequest(
+                    for: entry,
+                    role: linear.field,
+                    binding: binding,
+                    executionPhase: .decode,
+                    stafWeightStore: store
+                )
+                let key = STAFSpecializedWeightKey(
+                    tensorName: binding.tensorName,
+                    layout: request.preferredLayout
+                )
+                if seen.insert(key).inserted {
+                    requests.append(request)
+                }
             }
         }
 
@@ -102,11 +101,11 @@ struct STAFSpecializedWeightStoreBuilder {
             throw MetalCompilerError.deviceSetupFailed("Unsupported tensor rank for specialized layout: \(tensorName)")
         }
 
-        let outputDimension = entry.shape[0]
-        let inputDimension = entry.shape[1]
+        let inputDimension = entry.shape[entry.shape.count - 1]
         let tileElements = 128
         let elementSize = MemoryLayout<UInt16>.size
-        let totalElements = outputDimension * inputDimension
+        let totalElements = entry.shape.reduce(1, *)
+        let outputDimension = totalElements / inputDimension
         let totalBytes = totalElements * elementSize
 
         guard outputDimension.isMultiple(of: rowsPerBlock),
