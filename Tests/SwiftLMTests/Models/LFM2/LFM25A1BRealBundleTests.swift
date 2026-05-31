@@ -450,6 +450,46 @@ struct LFM25A1BRealBundleTests {
         #expect(timing.decodeStepCount > 0)
     }
 
+    @Test("Default Sparse MoE route reports production decode wall timing", .timeLimit(.minutes(10)))
+    func defaultSparseMoERouteReportsProductionDecodeWallTiming() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
+            return
+        }
+
+        let loader = ModelBundleLoader()
+        let container = try await loader.load(directory: localModelDirectory)
+        let context = try LanguageModelContext(container)
+        let prepared = try await context.prepare(ModelInput(chat: [
+            .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+        ]))
+        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+        let timing = try context.debugRawGenerationWallTiming(
+            prompt: executable,
+            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 64)
+        )
+        let hostOverheadSeconds = max(0, timing.decodeWallSeconds - timing.decodeGPUSeconds)
+
+        print(String(
+            format: "[LFM2.5 8B-A1B production wall timing] tokens=%d prefill=%.3fs wall=%.3fs gpu=%.3fs wall_tok_s=%.1f gpu_tok_s=%.1f host_overhead=%.3fs steps=%d barriers=%d host_logit_reads=%d",
+            timing.tokenIDs.count,
+            timing.prefillSeconds,
+            timing.decodeWallSeconds,
+            timing.decodeGPUSeconds,
+            timing.decodeWallTokensPerSecond,
+            timing.decodeGPUTokensPerSecond,
+            hostOverheadSeconds,
+            timing.decodeStepCount,
+            timing.decodeBarrierCount,
+            timing.hostSamplingLogitReadCount
+        ))
+        print("[LFM2.5 8B-A1B production wall histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+
+        #expect(timing.tokenIDs == Self.hfStrictCapital64TokenIDs)
+        #expect(timing.decodeWallTokensPerSecond > 78.0)
+        #expect(timing.decodeGPUTokensPerSecond == 0)
+        #expect(timing.hostSamplingLogitReadCount == 0)
+    }
+
     @Test("MLX 8-bit Sparse MoE route loads and reports direct Q8 kernels", .timeLimit(.minutes(10)))
     func mlx8BitSparseMoERouteLoadsAndReportsDirectQ8Kernels() async throws {
         guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BMLX8BitModelDirectoryOrSkip() else {

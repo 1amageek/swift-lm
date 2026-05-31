@@ -1590,6 +1590,29 @@ public final class LanguageModelContext: @unchecked Sendable {
         prompt: ExecutablePrompt,
         parameters: GenerationParameters
     ) throws -> DebugRawGenerationTiming {
+        try debugRawGenerationTiming(
+            prompt: prompt,
+            parameters: parameters,
+            measuresGPUTime: true
+        )
+    }
+
+    internal func debugRawGenerationWallTiming(
+        prompt: ExecutablePrompt,
+        parameters: GenerationParameters
+    ) throws -> DebugRawGenerationTiming {
+        try debugRawGenerationTiming(
+            prompt: prompt,
+            parameters: parameters,
+            measuresGPUTime: false
+        )
+    }
+
+    private func debugRawGenerationTiming(
+        prompt: ExecutablePrompt,
+        parameters: GenerationParameters,
+        measuresGPUTime: Bool
+    ) throws -> DebugRawGenerationTiming {
         let resolvedParameters = resolvedGenerateParameters(parameters)
         debugHostSamplingLogitReadCount = 0
         let prefillStart = CFAbsoluteTimeGetCurrent()
@@ -1629,13 +1652,22 @@ public final class LanguageModelContext: @unchecked Sendable {
         var decodeGPUSeconds = 0.0
 
         while generatedTokenIDs.count < maxRequestedTokens {
-            let timed = inferenceModel.decodeSyncTimed(
-                tokenID: nextTokenID,
-                ropePositionAxes: generationRoPEAxes(offset: prefillResult.ropePositionOffset)
-            )
-            decodeGPUSeconds += max(0, timed.gpuEndTime - timed.gpuStartTime)
+            let decodedToken: Int32
+            if measuresGPUTime {
+                let timed = inferenceModel.decodeSyncTimed(
+                    tokenID: nextTokenID,
+                    ropePositionAxes: generationRoPEAxes(offset: prefillResult.ropePositionOffset)
+                )
+                decodeGPUSeconds += max(0, timed.gpuEndTime - timed.gpuStartTime)
+                decodedToken = timed.token
+            } else {
+                decodedToken = inferenceModel.decodeSync(
+                    tokenID: nextTokenID,
+                    ropePositionAxes: generationRoPEAxes(offset: prefillResult.ropePositionOffset)
+                )
+            }
             let outputToken = resolveSampledDecodeToken(
-                fallbackToken: timed.token,
+                fallbackToken: decodedToken,
                 parameters: resolvedParameters,
                 samplingState: &samplingState
             )
