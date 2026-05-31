@@ -191,10 +191,16 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && inputDimension.isMultiple(of: 8)
             && intermediateDimension.isMultiple(of: 8)
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
+        let usesGateUpRow2 = usesPacked4
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
         let usesGateUpSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
         let selectedGateUpName = usesGateUpSplit2
             ? "\(baseName)_gate_up_split2"
-            : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"))
+            : (
+                usesGateUpRow2
+                    ? "\(baseName)_gate_up_row2_packed4"
+                    : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"))
+            )
         guard let selectedGateUpPipeline = pipelineCache[selectedGateUpName] else {
             throw MetalCompilerError.kernelNotFound(selectedGateUpName)
         }
@@ -210,7 +216,10 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             : requestedGateUpSimdgroups
         let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
         let gateUpRowsPerThreadgroup = usesGateUpSplit2 ? max(1, gateUpSimdgroups / 2) : gateUpSimdgroups
-        let gateUpGridX = (flatGateUpCount + gateUpRowsPerThreadgroup - 1) / gateUpRowsPerThreadgroup
+        let gateUpEffectiveRowsPerThreadgroup = usesGateUpRow2
+            ? gateUpRowsPerThreadgroup * 2
+            : gateUpRowsPerThreadgroup
+        let gateUpGridX = (flatGateUpCount + gateUpEffectiveRowsPerThreadgroup - 1) / gateUpEffectiveRowsPerThreadgroup
         let gateUpThreadgroupMemoryLength = usesGateUpSplit2
             ? gateUpRowsPerThreadgroup * 2 * 2 * MemoryLayout<Float>.stride
             : 0

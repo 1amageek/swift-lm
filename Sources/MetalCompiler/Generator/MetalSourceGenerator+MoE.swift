@@ -77,6 +77,11 @@ extension MetalSourceGenerator {
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
+            generateSparseMoEGateUpRow2Packed4(
+                name: "\(name)_gate_up_row2_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
             generateSparseMoEGateUpPacked8(
                 name: "\(name)_gate_up_packed8",
                 bufferPrecision: bufferPrecision,
@@ -1584,6 +1589,124 @@ extension MetalSourceGenerator {
             if (tiisg == 0) {
                 activationScratch[k * intermediateDimension + m] =
                     gate * (1.0f / (1.0f + exp(-gate))) * up * routeWeight;
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEGateUpRow2Packed4(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEGateUp(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+
+        return """
+        kernel void \(name)(
+            device const \(bt)* input              [[buffer(0)]],
+            device const \(wt)* expertGateUpWeight [[buffer(1)]],
+            device float* moeScratch               [[buffer(2)]],
+            constant uint& inputDimension          [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& inputRowStride          [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint seqPos = gid.y;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint baseFlat = (gid.x * simdgroupsPerThreadgroup + sgitg) * 2u;
+            const uint totalRows = expertsPerToken * intermediateDimension;
+            if (seqPos >= sequenceLength || baseFlat >= totalRows) {
+                return;
+            }
+
+            const uint k0 = baseFlat / intermediateDimension;
+            const uint m0 = baseFlat - k0 * intermediateDimension;
+            const uint flat1 = baseFlat + 1u;
+            const bool hasRow1 = flat1 < totalRows;
+            const uint k1 = hasRow1 ? flat1 / intermediateDimension : k0;
+            const uint m1 = hasRow1 ? flat1 - k1 * intermediateDimension : m0;
+
+            device const \(bt)* inputRow = input + seqPos * inputRowStride;
+            device float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device float* selectedExpertScratch = scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+            device float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            const uint expert0 = uint(selectedExpertScratch[k0]);
+            const float routeWeight0 = selectedWeightScratch[k0];
+            device const \(wt)* gateBase0 = expertGateUpWeight
+                + expert0 * (2u * intermediateDimension * inputDimension);
+            device const \(wt)* upBase0 = gateBase0 + intermediateDimension * inputDimension;
+            device const \(wt)* gateRow0 = gateBase0 + m0 * inputDimension;
+            device const \(wt)* upRow0 = upBase0 + m0 * inputDimension;
+
+            const uint expert1 = hasRow1 ? uint(selectedExpertScratch[k1]) : expert0;
+            const float routeWeight1 = hasRow1 ? selectedWeightScratch[k1] : routeWeight0;
+            device const \(wt)* gateBase1 = expertGateUpWeight
+                + expert1 * (2u * intermediateDimension * inputDimension);
+            device const \(wt)* upBase1 = gateBase1 + intermediateDimension * inputDimension;
+            device const \(wt)* gateRow1 = gateBase1 + m1 * inputDimension;
+            device const \(wt)* upRow1 = upBase1 + m1 * inputDimension;
+
+            float gate0 = 0.0f;
+            float up0 = 0.0f;
+            float gate1 = 0.0f;
+            float up1 = 0.0f;
+            uint j = tiisg * 4u;
+            device const \(bt)4* inputLane = (device const \(bt)4*)inputRow + tiisg;
+            device const ushort4* gateLane0 = (device const ushort4*)gateRow0 + tiisg;
+            device const ushort4* upLane0 = (device const ushort4*)upRow0 + tiisg;
+            device const ushort4* gateLane1 = (device const ushort4*)gateRow1 + tiisg;
+            device const ushort4* upLane1 = (device const ushort4*)upRow1 + tiisg;
+            for (; j + 3u < inputDimension; j += SIMD_WIDTH * 4u) {
+                const float4 x = float4(inputLane[0]);
+                gate0 += dot(bf16x4_to_float4(gateLane0[0]), x);
+                up0 += dot(bf16x4_to_float4(upLane0[0]), x);
+                if (hasRow1) {
+                    gate1 += dot(bf16x4_to_float4(gateLane1[0]), x);
+                    up1 += dot(bf16x4_to_float4(upLane1[0]), x);
+                }
+                inputLane += SIMD_WIDTH;
+                gateLane0 += SIMD_WIDTH;
+                upLane0 += SIMD_WIDTH;
+                gateLane1 += SIMD_WIDTH;
+                upLane1 += SIMD_WIDTH;
+            }
+            for (; j < inputDimension; j++) {
+                const float x = float(inputRow[j]);
+                gate0 += bf16_to_float(gateRow0[j]) * x;
+                up0 += bf16_to_float(upRow0[j]) * x;
+                if (hasRow1) {
+                    gate1 += bf16_to_float(gateRow1[j]) * x;
+                    up1 += bf16_to_float(upRow1[j]) * x;
+                }
+            }
+            gate0 = simd_sum(gate0);
+            up0 = simd_sum(up0);
+            gate1 = simd_sum(gate1);
+            up1 = simd_sum(up1);
+            if (tiisg == 0) {
+                activationScratch[k0 * intermediateDimension + m0] =
+                    gate0 * (1.0f / (1.0f + exp(-gate0))) * up0 * routeWeight0;
+                if (hasRow1) {
+                    activationScratch[k1 * intermediateDimension + m1] =
+                        gate1 * (1.0f / (1.0f + exp(-gate1))) * up1 * routeWeight1;
+                }
             }
         }
         """
