@@ -8,8 +8,8 @@ struct LFM25A1BBenchmarkRunner {
             let options = try BenchmarkOptions(arguments: Array(CommandLine.arguments.dropFirst()))
             let result = try await run(options: options)
             print(result.report)
-            if options.requiresM5Gate, result.bestWallTokensPerSecond < 90.0 {
-                throw BenchmarkError.m5GateFailed(result.bestWallTokensPerSecond)
+            if options.requiresM5Gate, result.medianWallTokensPerSecond < 90.0 {
+                throw BenchmarkError.m5GateFailed(result.medianWallTokensPerSecond)
             }
         } catch {
             FileHandle.standardError.write(Data("error: \(error)\n".utf8))

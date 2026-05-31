@@ -17,7 +17,7 @@ flowchart LR
 |---|---|
 | Model | `LiquidAI/LFM2.5-8B-A1B` |
 | Current release baseline | `0.8.7` |
-| Baseline evidence | `85.2` wall tok/s / `89.3` GPU tok/s on 64-token exact trace; lightweight release executable observed best `87.9` single-run and `85.4` best-of-3 |
+| Baseline evidence | `85.2` wall tok/s / `89.3` GPU tok/s on 64-token exact trace; lightweight release executable observed `86.6` median wall tok/s over 3 release runs |
 | Target | `>= 90.0` wall tok/s on the same exact-trace decode timing gate |
 | Correctness gate | HF 64-token strict-capital trace remains exact |
 | Production route | split Sparse MoE with parallel router and BF16 packed4 expert projections |
@@ -92,13 +92,13 @@ flowchart LR
 | split2 Sparse MoE projection route | in-process env gate fired 22 `sparse_moe_bf16_gate_up_split2` and 22 `sparse_moe_bf16_down_split2`; HF strict-capital trace pass | `64.1` wall tok/s / `67.3` GPU tok/s | Reject and revert; splitting one row across two SIMDgroups adds reduction/shared-memory overhead and worsens the dominant MoE path |
 | Sparse MoE packed4 argbuf variant | source generation compiles; focused route remains exact | route did not switch to `_argbuf`; timing `81.4` wall tok/s / `85.6` GPU tok/s | Reject and revert; packed expert weights live at non-zero STAF offsets, and the current prepared argument-buffer allocator intentionally leaves those bindings unmaterialized |
 | prepared argument-buffer non-zero offsets | opt-in route materialized `_argbuf` kernels and reported `81.5` wall tok/s / `85.9` GPU tok/s | HF strict-capital trace failed after the first token and repeated token `3213` | Reject and revert; allowing non-zero STAF slice offsets in prepared argument buffers corrupts binding semantics and cannot be used as an M5 lever |
-| gate/up row2 packed4 input sharing | `swift build`, `MetalSourceGeneratorTests`, default route contract, and 64-token HF strict-capital trace pass under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW2=1` | `85.7` wall tok/s / `89.9` GPU tok/s | Keep opt-in only; sharing each input read across two gate/up rows is correct and modestly faster, but it does not clear the 90 wall tok/s M5 gate |
+| gate/up row2 packed4 input sharing | `swift build`, `MetalSourceGeneratorTests`, default route contract, and 64-token HF strict-capital trace pass under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW2=1` | debug timed `85.7` wall tok/s / `89.9` GPU tok/s; release median `86.6` wall tok/s | Keep opt-in only; sharing each input read across two gate/up rows is correct but does not improve the release median or clear the 90 wall tok/s M5 gate |
 | gate/up row4 packed4 input sharing | `swift build`, `MetalSourceGeneratorTests`, and 64-token HF strict-capital trace pass under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW4=1` | `79.9` wall tok/s / `87.7` GPU tok/s | Reject and revert; four-row input sharing increases register pressure enough to lose occupancy and erase the row2 gain |
 | gate/up row2 production wall check | 64-token HF strict-capital trace pass using `debugRawGenerationWallTiming` under `SWIFTLM_SPARSE_MOE_GATE_UP_ROW2=1` | `80.4` wall tok/s, `202` steps, `201` barriers | Keep as diagnostic; GPU timestamp feedback is not the sole M5 gap, and row2 should not be promoted based on timed-GPU runs alone |
 | row2 plus private decode logits | 64-token HF strict-capital trace pass under row2 plus private decode logits | `84.5` wall tok/s, `202` steps, `201` barriers | Reject and revert; private logits helps slightly but misses M5 and is unsafe for host sampling without a larger API/runtime contract |
 | release-build focused production wall retry | `swift test -c release --disable-sandbox --filter defaultSparseMoERouteReportsProductionDecodeWallTiming` | timed out with code `-1` while compiling test targets under the 120-second outer gate | Do not use as M5 evidence; release measurement requires a separate build-for-testing pipeline or smaller release benchmark target |
 | greedy multi-token command buffer | 64-token HF strict-capital trace pass after adding a `greedy_decode_roll_state` prototype and encoding 63 decode iterations into one Metal 4 command buffer | `85.6` wall tok/s, `202` steps, `201` barriers | Reject and revert; batching per-token submission/wait is correct but does not reduce the dominant GPU work, so M5 must target decode step count or projection math rather than host wait removal |
-| lightweight release executable benchmark | `lfm25-a1b-benchmark` validates the 64-token HF strict-capital trace before reporting wall timing and runs outside the full xctest product | single-run `87.9` wall tok/s; best-of-3 `85.4` with samples `[85.4,85.1,84.7]` | Keep as the release measurement gate; release mode is not enough to clear M5, so the remaining work must reduce GPU decode work or safe per-token barriers |
+| lightweight release executable benchmark | `lfm25-a1b-benchmark` validates the 64-token HF strict-capital trace before reporting wall timing and runs outside the full xctest product | baseline median `86.6` with samples `[86.9,86.6,86.4]`; row2 median `86.6` with samples `[87.0,86.6,86.6]` | Keep as the release measurement gate; release mode and row2 opt-in are not enough to clear M5, so the remaining work must reduce GPU decode work or safe per-token barriers |
 
 ## Latest Profile
 
@@ -126,7 +126,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | Correctness | exact 64-token HF trace before reporting timing |
 | Timing scope | decode wall time from `debugRawGenerationWallTiming` |
 | M5 pass condition | `>= 90.0` wall tok/s |
-| Latest result | best-of-3 `85.4` wall tok/s, so M5 remains open |
+| Latest result | baseline median `86.6` wall tok/s and row2 median `86.6` wall tok/s, so M5 remains open |
 
 ## Decision Log
 
@@ -154,7 +154,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | 2026-05-31 | M5 | Rejected private decode logits as an M5 lever. The greedy trace stayed correct and reached `84.5` wall tok/s with row2, but the route remains below target and would require explicit host-sampling safeguards before it could be kept |
 | 2026-05-31 | M5 | Retried the focused release production-wall gate, but it timed out during release test-target compilation. M5 evidence remains tied to the focused debug/Metal timing gates until a lighter release benchmark target exists |
 | 2026-05-31 | M5 | Rejected greedy multi-token command-buffer batching. The prototype kept the 64-token HF trace exact and removed per-token completion waits, but still measured only `85.6` wall tok/s, confirming that the remaining gap is dominated by GPU decode work and barriers inside each token rather than CPU wait feedback alone |
-| 2026-05-31 | M5 | Added a lightweight `lfm25-a1b-benchmark` release executable. It removes the full xctest build bottleneck and verifies the exact 64-token HF trace before reporting timing. Release mode did not clear the gate: the best single run was `87.9` wall tok/s and best-of-3 was `85.4` wall tok/s |
+| 2026-05-31 | M5 | Added a lightweight `lfm25-a1b-benchmark` release executable. It removes the full xctest build bottleneck and verifies the exact 64-token HF trace before reporting timing. The gate now reports median as the production criterion. Release mode did not clear M5: baseline median was `86.6` wall tok/s, and row2 gate/up also measured `86.6` median wall tok/s |
 
 ## Rejected M3 Routes
 
