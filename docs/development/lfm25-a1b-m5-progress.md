@@ -99,6 +99,7 @@ flowchart LR
 | release-build focused production wall retry | `swift test -c release --disable-sandbox --filter defaultSparseMoERouteReportsProductionDecodeWallTiming` | timed out with code `-1` while compiling test targets under the 120-second outer gate | Do not use as M5 evidence; release measurement requires a separate build-for-testing pipeline or smaller release benchmark target |
 | greedy multi-token command buffer | 64-token HF strict-capital trace pass after adding a `greedy_decode_roll_state` prototype and encoding 63 decode iterations into one Metal 4 command buffer | `85.6` wall tok/s, `202` steps, `201` barriers | Reject and revert; batching per-token submission/wait is correct but does not reduce the dominant GPU work, so M5 must target decode step count or projection math rather than host wait removal |
 | lightweight release executable benchmark | `lfm25-a1b-benchmark` validates the 64-token HF strict-capital trace before reporting wall timing and runs outside the full xctest product | baseline median `86.6` with samples `[86.9,86.6,86.4]`; row2 median `86.6` with samples `[87.0,86.6,86.6]` | Keep as the release measurement gate; release mode and row2 opt-in are not enough to clear M5, so the remaining work must reduce GPU decode work or safe per-token barriers |
+| release barrier histogram | `lfm25-a1b-benchmark` now reports top kernel families and top barrier-bearing kernel families from the same exact-trace release run | median `85.4`, top barrier families mirror top step families: residual `47`, square GEMV `24`, Sparse MoE down/gate/router `22` each, conv/dense `18` each | Keep as route evidence; barriers are not concentrated in one removable family, so future barrier work needs dependency-graph proof rather than another single-family elision |
 
 ## Latest Profile
 
@@ -111,6 +112,7 @@ flowchart LR
 | `gemv_vocab_bf16` | `1339us`, `12.6%` | Output head remains material, but partial argmax did not improve wall timing |
 | `gemv_2048_6144_bf16` | `1277us`, `12.0%` | Dense FFN projection remains material |
 | 2026-05-31 profile contract refresh | focused profiles observed MoE projection in the `34.1-49.0%` range, residual boundary in the `2.5-13.6%` range, and router in the `6.7-11.7%` range | M5 optimization should treat MoE projection, residual boundary, and router as the primary route group instead of assuming MoE projection alone stays above 40% |
+| 2026-05-31 release barrier histogram | top barrier-bearing families match top dispatch families: residual `47`, `gemv_2048_sq_bf16` `24`, Sparse MoE down/gate/router `22` each, conv/dense `18` each | M5 cannot be reached by guessing one barrier family; any barrier reduction must be backed by an explicit read/write dependency proof across the whole decode graph |
 
 ## Release Benchmark Gate
 
@@ -155,6 +157,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | 2026-05-31 | M5 | Retried the focused release production-wall gate, but it timed out during release test-target compilation. M5 evidence remains tied to the focused debug/Metal timing gates until a lighter release benchmark target exists |
 | 2026-05-31 | M5 | Rejected greedy multi-token command-buffer batching. The prototype kept the 64-token HF trace exact and removed per-token completion waits, but still measured only `85.6` wall tok/s, confirming that the remaining gap is dominated by GPU decode work and barriers inside each token rather than CPU wait feedback alone |
 | 2026-05-31 | M5 | Added a lightweight `lfm25-a1b-benchmark` release executable. It removes the full xctest build bottleneck and verifies the exact 64-token HF trace before reporting timing. The gate now reports median as the production criterion. Release mode did not clear M5: baseline median was `86.6` wall tok/s, and row2 gate/up also measured `86.6` median wall tok/s |
+| 2026-05-31 | M5 | Extended the release benchmark to print kernel and barrier histograms. The latest exact-trace release run measured `85.4` median wall tok/s and showed barrier-bearing kernels are distributed across the full decode route, not isolated to one family |
 
 ## Rejected M3 Routes
 

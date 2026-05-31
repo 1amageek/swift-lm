@@ -41,6 +41,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         @_spi(Benchmark) public let decodeStepCount: Int
         @_spi(Benchmark) public let decodeBarrierCount: Int
         @_spi(Benchmark) public let decodeKernelHistogram: [(kernelName: String, count: Int)]
+        @_spi(Benchmark) public let decodeBarrierKernelHistogram: [(kernelName: String, count: Int)]
         @_spi(Benchmark) public let hostSamplingLogitReadCount: Int
     }
 
@@ -1642,6 +1643,7 @@ public final class LanguageModelContext: @unchecked Sendable {
                 decodeStepCount: inferenceModel.decodePlan.steps.count,
                 decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
                 decodeKernelHistogram: debugDecodeKernelHistogram(),
+                decodeBarrierKernelHistogram: debugDecodeBarrierKernelHistogram(),
                 hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
             )
         }
@@ -1693,12 +1695,28 @@ public final class LanguageModelContext: @unchecked Sendable {
             decodeStepCount: inferenceModel.decodePlan.steps.count,
             decodeBarrierCount: inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }.count,
             decodeKernelHistogram: debugDecodeKernelHistogram(),
+            decodeBarrierKernelHistogram: debugDecodeBarrierKernelHistogram(),
             hostSamplingLogitReadCount: debugHostSamplingLogitReadCount
         )
     }
 
     private func debugDecodeKernelHistogram() -> [(kernelName: String, count: Int)] {
         let counts = Dictionary(grouping: inferenceModel.decodePlan.steps) { step in
+            step.metadata.kernelName ?? step.pipeline.label ?? "(unlabeled)"
+        }.mapValues(\.count)
+        return counts
+            .map { (kernelName: $0.key, count: $0.value) }
+            .sorted {
+                if $0.count != $1.count {
+                    return $0.count > $1.count
+                }
+                return $0.kernelName < $1.kernelName
+            }
+    }
+
+    private func debugDecodeBarrierKernelHistogram() -> [(kernelName: String, count: Int)] {
+        let barrierSteps = inferenceModel.decodePlan.steps.filter { $0.barrierPolicy.isBarrier }
+        let counts = Dictionary(grouping: barrierSteps) { step in
             step.metadata.kernelName ?? step.pipeline.label ?? "(unlabeled)"
         }.mapValues(\.count)
         return counts

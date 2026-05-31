@@ -23,8 +23,10 @@ struct BenchmarkResult {
         let values = allWallTokensPerSecond
             .map { String(format: "%.1f", $0) }
             .joined(separator: ",")
+        let kernels = formatHistogram(best.decodeKernelHistogram, limit: 10)
+        let barriers = formatHistogram(best.decodeBarrierKernelHistogram, limit: 10)
         return String(
-            format: "[LFM2.5 8B-A1B release benchmark] model=%@ tokens=%d iterations=%d best_wall=%.3fs best_wall_tok_s=%.1f median_wall_tok_s=%.1f prefill=%.3fs steps=%d barriers=%d host_logit_reads=%d all_wall_tok_s=[%@]",
+            format: "[LFM2.5 8B-A1B release benchmark] model=%@ tokens=%d iterations=%d best_wall=%.3fs best_wall_tok_s=%.1f median_wall_tok_s=%.1f prefill=%.3fs steps=%d barriers=%d host_logit_reads=%d all_wall_tok_s=[%@] kernels=[%@] barrier_kernels=[%@]",
             modelDirectory.path,
             maxTokens,
             iterations,
@@ -35,7 +37,18 @@ struct BenchmarkResult {
             best.decodeStepCount,
             best.decodeBarrierCount,
             best.hostSamplingLogitReadCount,
-            values
+            values,
+            kernels,
+            barriers
         )
+    }
+
+    private func formatHistogram(
+        _ histogram: [(kernelName: String, count: Int)],
+        limit: Int
+    ) -> String {
+        histogram.prefix(limit)
+            .map { "\($0.kernelName):\($0.count)" }
+            .joined(separator: ",")
     }
 }
