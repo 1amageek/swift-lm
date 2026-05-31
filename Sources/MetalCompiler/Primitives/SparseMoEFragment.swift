@@ -2,6 +2,14 @@ import Metal
 import LMIR
 
 public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
+    private struct ProjectionKernelSelection {
+        let gateUpName: String
+        let downName: String
+        let usesGateUpRow2: Bool
+        let usesGateUpSplit2: Bool
+        let usesDownSplit2: Bool
+    }
+
     public let expertCount: Int
     public let expertsPerToken: Int
     public let gateKind: MoEGateKind
@@ -183,26 +191,13 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && expertCount <= routerParallelMaxSimdgroups
         let routerParallelThreads = expertCount * routerParallelSimdWidth
         let flatGateUpCount = expertsPerToken * intermediateDimension
-        let usesPacked4 = kernelContext.weightFormat.isBFloat16
-            && inputDimension.isMultiple(of: 4)
-            && intermediateDimension.isMultiple(of: 4)
-            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
-        let usesPacked8 = usesPacked4
-            && inputDimension.isMultiple(of: 8)
-            && intermediateDimension.isMultiple(of: 8)
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
-        let usesGateUpRow2 = usesPacked4
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
-        let usesGateUpSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
-        let selectedGateUpName = usesGateUpSplit2
-            ? "\(baseName)_gate_up_split2"
-            : (
-                usesGateUpRow2
-                    ? "\(baseName)_gate_up_row2_packed4"
-                    : (usesPacked8 ? "\(baseName)_gate_up_packed8" : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up"))
-            )
-        guard let selectedGateUpPipeline = pipelineCache[selectedGateUpName] else {
-            throw MetalCompilerError.kernelNotFound(selectedGateUpName)
+        let projectionSelection = projectionKernelSelection(
+            baseName: baseName,
+            weightFormat: kernelContext.weightFormat,
+            usesExperimentalKernels: true
+        )
+        guard let selectedGateUpPipeline = pipelineCache[projectionSelection.gateUpName] else {
+            throw MetalCompilerError.kernelNotFound(projectionSelection.gateUpName)
         }
         let gateUpSimdWidth = max(selectedGateUpPipeline.threadExecutionWidth, 1)
         let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
@@ -211,24 +206,22 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             simdWidth: gateUpSimdWidth,
             pipeline: selectedGateUpPipeline
         )
-        let gateUpSimdgroups = usesGateUpSplit2
+        let gateUpSimdgroups = projectionSelection.usesGateUpSplit2
             ? max(2, requestedGateUpSimdgroups - requestedGateUpSimdgroups % 2)
             : requestedGateUpSimdgroups
         let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
-        let gateUpRowsPerThreadgroup = usesGateUpSplit2 ? max(1, gateUpSimdgroups / 2) : gateUpSimdgroups
-        let gateUpEffectiveRowsPerThreadgroup = usesGateUpRow2
+        let gateUpRowsPerThreadgroup = projectionSelection.usesGateUpSplit2
+            ? max(1, gateUpSimdgroups / 2)
+            : gateUpSimdgroups
+        let gateUpEffectiveRowsPerThreadgroup = projectionSelection.usesGateUpRow2
             ? gateUpRowsPerThreadgroup * 2
             : gateUpRowsPerThreadgroup
         let gateUpGridX = (flatGateUpCount + gateUpEffectiveRowsPerThreadgroup - 1) / gateUpEffectiveRowsPerThreadgroup
-        let gateUpThreadgroupMemoryLength = usesGateUpSplit2
+        let gateUpThreadgroupMemoryLength = projectionSelection.usesGateUpSplit2
             ? gateUpRowsPerThreadgroup * 2 * 2 * MemoryLayout<Float>.stride
             : 0
-        let usesDownSplit2 = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
-        let selectedDownName = usesDownSplit2
-            ? "\(baseName)_down_split2"
-            : (usesPacked8 ? "\(baseName)_down_packed8" : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down"))
-        guard let selectedDownPipeline = pipelineCache[selectedDownName] else {
-            throw MetalCompilerError.kernelNotFound(selectedDownName)
+        guard let selectedDownPipeline = pipelineCache[projectionSelection.downName] else {
+            throw MetalCompilerError.kernelNotFound(projectionSelection.downName)
         }
         let downSimdWidth = max(selectedDownPipeline.threadExecutionWidth, 1)
         let requestedDownSimdgroups = Self.resolvedSimdgroups(
@@ -237,13 +230,15 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             simdWidth: downSimdWidth,
             pipeline: selectedDownPipeline
         )
-        let downSimdgroups = usesDownSplit2
+        let downSimdgroups = projectionSelection.usesDownSplit2
             ? max(2, requestedDownSimdgroups - requestedDownSimdgroups % 2)
             : requestedDownSimdgroups
         let downThreads = downSimdgroups * downSimdWidth
-        let downRowsPerThreadgroup = usesDownSplit2 ? max(1, downSimdgroups / 2) : downSimdgroups
+        let downRowsPerThreadgroup = projectionSelection.usesDownSplit2
+            ? max(1, downSimdgroups / 2)
+            : downSimdgroups
         let downGridX = (outputDimension + downRowsPerThreadgroup - 1) / downRowsPerThreadgroup
-        let downThreadgroupMemoryLength = usesDownSplit2
+        let downThreadgroupMemoryLength = projectionSelection.usesDownSplit2
             ? downRowsPerThreadgroup * 2 * MemoryLayout<Float>.stride
             : 0
 
@@ -381,7 +376,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: moeScratch, offset: 0)]
                 ),
                 metadata: .init(
-                    kernelName: selectedGateUpName,
+                    kernelName: projectionSelection.gateUpName,
                     bufferAccessPattern: .init(reads: [0, 1, 2], writes: [2])
                 )
             ))
@@ -413,7 +408,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     writeBuffers: [(buffer: outputBinding.buffer, offset: outputBinding.offset)]
                 ),
                 metadata: .init(
-                    kernelName: selectedDownName,
+                    kernelName: projectionSelection.downName,
                     bufferAccessPattern: .init(reads: [0, 1], writes: [2])
                 )
             ))
@@ -428,30 +423,57 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             throw MetalCompilerError.deviceSetupFailed("Sparse MoE split prefill requires moeScratch")
         }
         let kernelName = kernelName(context: context.kernelContext)
+        let projectionSelection = projectionKernelSelection(
+            baseName: kernelName,
+            weightFormat: context.kernelContext.weightFormat,
+            usesExperimentalKernels: false
+        )
         let routerScoresPipeline = try context.getPipeline("\(kernelName)_router_scores")
         let routerSelectPipeline = try context.getPipeline("\(kernelName)_router_select")
-        let gateUpPipeline = try context.getPipeline("\(kernelName)_gate_up")
-        let downPipeline = try context.getPipeline("\(kernelName)_down")
+        let gateUpPipeline = try context.getPipeline(projectionSelection.gateUpName)
+        let downPipeline = try context.getPipeline(projectionSelection.downName)
         let routerScoresThreads = max(routerScoresPipeline.threadExecutionWidth, 1)
         let routerSelectThreads = max(routerSelectPipeline.threadExecutionWidth, 1)
         let flatGateUpCount = expertsPerToken * intermediateDimension
         let gateUpSimdWidth = max(gateUpPipeline.threadExecutionWidth, 1)
-        let gateUpSimdgroups = Self.resolvedSimdgroups(
+        let requestedGateUpSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_GATE_UP_SIMDGROUPS",
             defaultValue: 32,
             simdWidth: gateUpSimdWidth,
             pipeline: gateUpPipeline
         )
+        let gateUpSimdgroups = projectionSelection.usesGateUpSplit2
+            ? max(2, requestedGateUpSimdgroups - requestedGateUpSimdgroups % 2)
+            : requestedGateUpSimdgroups
         let gateUpThreads = gateUpSimdgroups * gateUpSimdWidth
+        let gateUpRowsPerThreadgroup = projectionSelection.usesGateUpSplit2
+            ? max(1, gateUpSimdgroups / 2)
+            : gateUpSimdgroups
+        let gateUpEffectiveRowsPerThreadgroup = projectionSelection.usesGateUpRow2
+            ? gateUpRowsPerThreadgroup * 2
+            : gateUpRowsPerThreadgroup
+        let gateUpGridX = (flatGateUpCount + gateUpEffectiveRowsPerThreadgroup - 1) / gateUpEffectiveRowsPerThreadgroup
+        let gateUpThreadgroupMemoryLength = projectionSelection.usesGateUpSplit2
+            ? gateUpRowsPerThreadgroup * 2 * 2 * MemoryLayout<Float>.stride
+            : 0
         let simdWidth = max(downPipeline.threadExecutionWidth, 1)
-        let simdgroups = Self.resolvedSimdgroups(
+        let requestedSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
             defaultValue: 32,
             simdWidth: simdWidth,
             pipeline: downPipeline
         )
+        let simdgroups = projectionSelection.usesDownSplit2
+            ? max(2, requestedSimdgroups - requestedSimdgroups % 2)
+            : requestedSimdgroups
         let threads = simdgroups * simdWidth
-        let gridX = (outputDimension + simdgroups - 1) / simdgroups
+        let downRowsPerThreadgroup = projectionSelection.usesDownSplit2
+            ? max(1, simdgroups / 2)
+            : simdgroups
+        let gridX = (outputDimension + downRowsPerThreadgroup - 1) / downRowsPerThreadgroup
+        let downThreadgroupMemoryLength = projectionSelection.usesDownSplit2
+            ? downRowsPerThreadgroup * 2 * MemoryLayout<Float>.stride
+            : 0
         let (routerBuffer, routerOffset) = context.resolveWeight("router")
         let (gateUpBuffer, gateUpOffset) = context.resolveWeight("expert_gate_up_proj")
         let (downBuffer, downOffset) = context.resolveWeight("expert_down_proj")
@@ -527,7 +549,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                 MetalPrefillStep(
                     pipeline: gateUpPipeline,
                     gridSize: MTLSize(
-                        width: (flatGateUpCount + gateUpSimdgroups - 1) / gateUpSimdgroups,
+                        width: gateUpGridX,
                         height: context.maximumSequenceLength,
                         depth: 1
                     ),
@@ -546,14 +568,14 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                         scratchRowStride: scratchRowStride,
                         startingIndex: 3
                     ),
-                    threadgroupMemoryLength: 0,
+                    threadgroupMemoryLength: gateUpThreadgroupMemoryLength,
                     sync: .bufferBarrier,
                     mode: .batch,
                     sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
                     positionBufferIndex: nil,
                     perPositionStrides: [:],
                     metadata: .init(
-                        kernelName: "\(kernelName)_gate_up",
+                        kernelName: projectionSelection.gateUpName,
                         bufferAccessPattern: .init(reads: [0, 1, 2], writes: [2])
                     )
                 ),
@@ -561,31 +583,32 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
                     pipeline: downPipeline,
                     gridSize: MTLSize(width: gridX, height: context.maximumSequenceLength, depth: 1),
                     threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
-                bufferBindings: [
-                    (0, moeScratch, 0),
-                    (1, downBuffer, downOffset),
-                    (2, context.buffers.hidden, 0),
-                ],
-                bytesBindings: Self.downConstantBindings(
-                    outputDimension: outputDimension,
-                    intermediateDimension: intermediateDimension,
-                    expertsPerToken: expertsPerToken,
-                    sequenceLength: context.maximumSequenceLength,
-                    outputRowStride: outputDimension,
-                    scratchRowStride: scratchRowStride,
-                    startingIndex: 3
-                ),
-                threadgroupMemoryLength: 0,
-                sync: .bufferBarrier,
-                mode: .batch,
-                sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
-                positionBufferIndex: nil,
-                perPositionStrides: [:],
-                metadata: .init(
-                    kernelName: "\(kernelName)_down",
-                    bufferAccessPattern: .init(reads: [0, 1], writes: [2])
+                    bufferBindings: [
+                        (0, moeScratch, 0),
+                        (1, downBuffer, downOffset),
+                        (2, context.buffers.hidden, 0),
+                    ],
+                    bytesBindings: Self.downConstantBindings(
+                        outputDimension: outputDimension,
+                        intermediateDimension: intermediateDimension,
+                        expertsPerToken: expertsPerToken,
+                        sequenceLength: context.maximumSequenceLength,
+                        outputRowStride: outputDimension,
+                        scratchRowStride: scratchRowStride,
+                        startingIndex: 3
+                    ),
+                    threadgroupMemoryLength: downThreadgroupMemoryLength,
+                    sync: .bufferBarrier,
+                    mode: .batch,
+                    sequenceLengthPolicy: .bindAndAdjustGridHeight(index: 6),
+                    positionBufferIndex: nil,
+                    perPositionStrides: [:],
+                    metadata: .init(
+                        kernelName: projectionSelection.downName,
+                        bufferAccessPattern: .init(reads: [0, 1], writes: [2])
+                    )
                 )
-            )],
+            ],
             outputIsHidden: true,
             resetsProjectionIndex: true
         )
@@ -678,6 +701,56 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     private static func isEnabled(_ value: String?) -> Bool {
         guard let value else { return false }
         return value == "1" || value.lowercased() == "true"
+    }
+
+    private func projectionKernelSelection(
+        baseName: String,
+        weightFormat: WeightFormat,
+        usesExperimentalKernels: Bool
+    ) -> ProjectionKernelSelection {
+        let usesPacked4 = weightFormat.isBFloat16
+            && inputDimension.isMultiple(of: 4)
+            && intermediateDimension.isMultiple(of: 4)
+            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
+        let usesPacked8 = usesPacked4
+            && inputDimension.isMultiple(of: 8)
+            && intermediateDimension.isMultiple(of: 8)
+            && usesExperimentalKernels
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
+        let usesGateUpSplit2 = usesExperimentalKernels
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
+        let usesGateUpRow2 = usesPacked4
+            && usesExperimentalKernels
+            && !usesGateUpSplit2
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
+        let usesDownSplit2 = usesExperimentalKernels
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
+        let gateUpName = usesGateUpSplit2
+            ? "\(baseName)_gate_up_split2"
+            : (
+                usesGateUpRow2
+                    ? "\(baseName)_gate_up_row2_packed4"
+                    : (
+                        usesPacked8
+                            ? "\(baseName)_gate_up_packed8"
+                            : (usesPacked4 ? "\(baseName)_gate_up_packed4" : "\(baseName)_gate_up")
+                    )
+            )
+        let downName = usesDownSplit2
+            ? "\(baseName)_down_split2"
+            : (
+                usesPacked8
+                    ? "\(baseName)_down_packed8"
+                    : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down")
+            )
+
+        return ProjectionKernelSelection(
+            gateUpName: gateUpName,
+            downName: downName,
+            usesGateUpRow2: usesGateUpRow2,
+            usesGateUpSplit2: usesGateUpSplit2,
+            usesDownSplit2: usesDownSplit2
+        )
     }
 
     private static func inputRowStride(context: PrefillBindingContext) -> Int {

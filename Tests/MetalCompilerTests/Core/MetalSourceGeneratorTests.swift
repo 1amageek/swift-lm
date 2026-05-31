@@ -104,9 +104,12 @@ struct MetalSourceGeneratorTests {
             #expect(library.makeFunction(name: "\(name)_router_select") != nil, "Failed to compile \(name)_router_select")
             #expect(library.makeFunction(name: "\(name)_gate_up") != nil, "Failed to compile \(name)_gate_up")
             #expect(library.makeFunction(name: "\(name)_gate_up_packed4") != nil, "Failed to compile \(name)_gate_up_packed4")
+            #expect(library.makeFunction(name: "\(name)_gate_up_packed8") != nil, "Failed to compile \(name)_gate_up_packed8")
+            #expect(library.makeFunction(name: "\(name)_gate_up_row2_packed4") != nil, "Failed to compile \(name)_gate_up_row2_packed4")
             #expect(library.makeFunction(name: "\(name)_gate_up_split2") != nil, "Failed to compile \(name)_gate_up_split2")
             #expect(library.makeFunction(name: "\(name)_down") != nil, "Failed to compile \(name)_down")
             #expect(library.makeFunction(name: "\(name)_down_packed4") != nil, "Failed to compile \(name)_down_packed4")
+            #expect(library.makeFunction(name: "\(name)_down_packed8") != nil, "Failed to compile \(name)_down_packed8")
             #expect(library.makeFunction(name: "\(name)_down_split2") != nil, "Failed to compile \(name)_down_split2")
         }
     }

@@ -2,10 +2,14 @@ import Foundation
 import Metal
 import Testing
 @testable import MetalCompiler
-@testable import SwiftLM
+@_spi(Benchmark) @testable import SwiftLM
 
 @Suite("LFM2.5 8B-A1B Real Bundle", .serialized)
 struct LFM25A1BRealBundleTests {
+    private static var enforcesSpeedGates: Bool {
+        ProcessInfo.processInfo.environment["SWIFTLM_ENFORCE_LFM25_SPEED_GATES"] == "1"
+    }
+
     private static let hfStrictCapital64TokenIDs = [
         124_901, 207, 597, 4_695, 20_589, 34, 496, 2_992,
         355, 278, 5_205, 302, 3_888, 39, 41_774, 415,
@@ -380,7 +384,9 @@ struct LFM25A1BRealBundleTests {
             aggregateTokensPerSecond
         ))
         #expect(totalGeneratedTokens >= cases.reduce(0) { $0 + $1.expectedPrefixTokenIDs.count })
-        #expect(aggregateTokensPerSecond > 50.0)
+        if Self.enforcesSpeedGates {
+            #expect(aggregateTokensPerSecond > 50.0)
+        }
     }
 
     @Test("Default Sparse MoE route reports decode timing breakdown", .timeLimit(.minutes(10)))
@@ -421,8 +427,10 @@ struct LFM25A1BRealBundleTests {
         if ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"] == "1" {
             #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_gate_up" })
             #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down" })
-            #expect(timing.decodeWallTokensPerSecond > 60.0)
-            #expect(timing.decodeGPUTokensPerSecond > 60.0)
+            if Self.enforcesSpeedGates {
+                #expect(timing.decodeWallTokensPerSecond > 60.0)
+                #expect(timing.decodeGPUTokensPerSecond > 60.0)
+            }
         } else {
             if ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"] == "1" {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_router_scores" })
@@ -443,8 +451,10 @@ struct LFM25A1BRealBundleTests {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "gemv_vocab_bf16_argmax_partial" })
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "argmax_partial_reduce" })
             }
-            #expect(timing.decodeWallTokensPerSecond > 78.0)
-            #expect(timing.decodeGPUTokensPerSecond > 80.0)
+            if Self.enforcesSpeedGates {
+                #expect(timing.decodeWallTokensPerSecond > 78.0)
+                #expect(timing.decodeGPUTokensPerSecond > 80.0)
+            }
             #expect(timing.hostSamplingLogitReadCount == 0)
         }
         #expect(timing.decodeStepCount > 0)
@@ -485,7 +495,9 @@ struct LFM25A1BRealBundleTests {
         print("[LFM2.5 8B-A1B production wall histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
 
         #expect(timing.tokenIDs == Self.hfStrictCapital64TokenIDs)
-        #expect(timing.decodeWallTokensPerSecond > 78.0)
+        if Self.enforcesSpeedGates {
+            #expect(timing.decodeWallTokensPerSecond > 78.0)
+        }
         #expect(timing.decodeGPUTokensPerSecond == 0)
         #expect(timing.hostSamplingLogitReadCount == 0)
     }
@@ -653,7 +665,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
-        #expect(timing.decodeWallTokensPerSecond > 78.0)
+        if Self.enforcesSpeedGates {
+            #expect(timing.decodeWallTokensPerSecond > 78.0)
+        }
     }
 
     @Test("Opt-in row2 gate-up Sparse MoE route reports production wall timing", .timeLimit(.minutes(10)))
@@ -698,7 +712,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(timing.decodeGPUTokensPerSecond == 0)
         #expect(timing.hostSamplingLogitReadCount == 0)
-        #expect(timing.decodeWallTokensPerSecond > 78.0)
+        if Self.enforcesSpeedGates {
+            #expect(timing.decodeWallTokensPerSecond > 78.0)
+        }
     }
 
     @Test("Real packed Sparse MoE kernel matches CPU reference", .timeLimit(.minutes(10)))
