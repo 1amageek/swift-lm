@@ -86,6 +86,7 @@ flowchart LR
 | MTP / speculative decoding survey | LFM2.5 A1B and MLX 8-bit configs contain no MTP/draft-head metadata | not run | Not an M5 in-place kernel route; llama.cpp-style MTP requires a model with MTP heads or a separate draft model and should be treated as a new milestone |
 | host sampling history pruning | `swift build` pass; strict-capital route still correct | `84.8` wall tok/s / `89.0` GPU tok/s after static env flag and no-penalty history pruning | Reject; the host-side history/env lookup path is not the missing M5 lever |
 | specialized residual-add/copy/RMS synthesized kernel | `FusionVerificationTests` pass | real-bundle gate regressed to `68.2` wall tok/s / `83.6` GPU tok/s | Reject and revert; the generic synthesized kernel's threadgroup intermediate remains faster than reading the residual/output path back from device memory |
+| greedy output-head argmax-only route | Dedicated in-process env gate fired `gemv_vocab_bf16_argmax_only` and `argmax_partial_reduce`; HF strict-capital trace pass | `85.3` wall tok/s / `89.3` GPU tok/s | Reject and revert; below M5, and omitting the full logits vector is only valid for greedy execution, not the general decode contract |
 
 ## Latest Profile
 
