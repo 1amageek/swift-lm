@@ -97,6 +97,7 @@ extension MetalSourceGenerator {
         sources.append(generatePerHeadRMSNorm(name: "per_head_rms_norm", bufferPrecision: decode, isSequence: false))
         sources.append(generateReductionArgumentTableVariant(name: "rms_norm_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .float16))
         sources.append(generateReductionArgumentTableVariant(name: "rms_norm_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16))
+        sources.append(generateResidualRMSRouterParallelBF16(name: "residual_rms_router_parallel_bf16_sigmoid"))
         sources.append(generateRoPE(name: "rope", bufferPrecision: decode))
         sources.append(generateRoPEArgumentTableVariant(name: "rope_argbuf", argumentBufferIndex: 30, bufferPrecision: decode))
         sources.append(generateConvStateUpdate(name: "conv_state_update_bf16", bufferPrecision: decode, weightFormat: .bfloat16))

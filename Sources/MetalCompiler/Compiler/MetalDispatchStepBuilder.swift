@@ -41,6 +41,20 @@ struct MetalDispatchStepBuilder {
             let entry = fusedEntries[entryCursor]
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
+            if let fusedResidualRouterSteps = try Self.makeFusedResidualRMSRouterStepsIfEnabled(
+                entry: entry,
+                nextEntry: entryCursor + 1 < fusedEntries.count ? fusedEntries[entryCursor + 1] : nil,
+                synthesizedBindings: bindings,
+                routingPlanner: &routingPlanner,
+                pipelineCache: planBuildContext.pipelineCache,
+                kernelContext: planBuildContext.kernelContext,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver
+            ) {
+                steps.append(contentsOf: fusedResidualRouterSteps)
+                entryCursor += 2
+                continue
+            }
             if let sparseMoE = entry.fragment as? SparseMoEFragment,
                sparseMoE.usesSplitRoute {
                 let weightFormat = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
@@ -278,6 +292,185 @@ struct MetalDispatchStepBuilder {
         )
 
         return [partialStep, reduceStep]
+    }
+
+    private static func makeFusedResidualRMSRouterStepsIfEnabled(
+        entry: DispatchEntry,
+        nextEntry: DispatchEntry?,
+        synthesizedBindings: (
+            buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
+            bytes: [(index: Int, value: [UInt8])]
+        ),
+        routingPlanner: inout DecodeRoutingPlanner,
+        pipelineCache: [String: MTLComputePipelineState],
+        kernelContext: KernelContext,
+        stafWeightStore: STAFWeightStore?,
+        accessPolicyResolver: ProjectionWeightAccessPolicyResolver
+    ) throws -> [MetalDispatchStep]? {
+        guard ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER"] == "1" else {
+            return nil
+        }
+        let shouldTrace = ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER_TRACE"] == "1"
+        func trace(_ message: String) {
+            if shouldTrace {
+                print("[FusedRMSRouter] \(message)")
+            }
+        }
+        guard let synthesized = entry.fragment as? SynthesizedFragment else {
+            return nil
+        }
+        guard let sparseMoEEntry = nextEntry,
+              let sparseMoE = sparseMoEEntry.fragment as? SparseMoEFragment else {
+            return nil
+        }
+        guard kernelContext.bufferPrecision == .bfloat16 else {
+            trace("skip precision=\(kernelContext.bufferPrecision)")
+            return nil
+        }
+        guard sparseMoE.usesSplitRoute else {
+            trace("skip unsplit sparse moe")
+            return nil
+        }
+        guard sparseMoE.inputDimension == 2048,
+              sparseMoE.outputDimension == 2048,
+              sparseMoE.expertCount == 32,
+              sparseMoE.expertsPerToken == 4,
+              sparseMoE.intermediateDimension == 1792 else {
+            trace("skip shape input=\(sparseMoE.inputDimension) output=\(sparseMoE.outputDimension) experts=\(sparseMoE.expertCount) topK=\(sparseMoE.expertsPerToken) intermediate=\(sparseMoE.intermediateDimension)")
+            return nil
+        }
+        let synthesizedKernelName = synthesized.kernelName(
+            context: KernelContext(bufferPrecision: .float16, weightFormat: WeightFormats.bfloat16)
+        )
+        guard synthesizedKernelName == "synthesized_3way_residualadd_copy_reduction_4p_row2048_f16_wbf16" else {
+            trace("skip synthesized=\(synthesizedKernelName)")
+            return nil
+        }
+        guard let reduction = synthesized.fragments.compactMap({ $0 as? Reduction }).last,
+              reduction.dimension == 2048,
+              reduction.withScale else {
+            trace("skip reduction")
+            return nil
+        }
+
+        let sparseMoEWeightFormat = KernelWeightFormatResolver(stafWeightStore: stafWeightStore)
+            .resolve(forFragment: sparseMoE, entry: sparseMoEEntry)
+        guard sparseMoEWeightFormat.isBFloat16 else {
+            trace("skip sparse weight=\(sparseMoEWeightFormat.schemeIdentifier)")
+            return nil
+        }
+        trace("admit layer=\(entry.layerIndex.map(String.init) ?? "-")")
+
+        let fusedKernelName = "residual_rms_router_parallel_bf16_sigmoid"
+        guard let fusedPipeline = pipelineCache[fusedKernelName] else {
+            throw MetalCompilerError.kernelNotFound(fusedKernelName)
+        }
+        let simdWidth = max(fusedPipeline.threadExecutionWidth, 1)
+        let threads = sparseMoE.expertCount * simdWidth
+        guard threads <= fusedPipeline.maxTotalThreadsPerThreadgroup else {
+            return nil
+        }
+
+        let inputBinding = try requiredBinding(
+            index: 0,
+            bindings: synthesizedBindings.buffers,
+            kernelName: fusedKernelName
+        )
+        let residualBinding = try requiredBinding(
+            index: 1,
+            bindings: synthesizedBindings.buffers,
+            kernelName: fusedKernelName
+        )
+        let normWeightResolver = WeightResolver(
+            entry: entry,
+            stafWeightStore: stafWeightStore,
+            executionPhase: .decode,
+            accessPolicyResolver: accessPolicyResolver
+        )
+        let normWeightBinding = normWeightResolver.resolve(role: reduction.weightRole)
+        let nextBindings = routingPlanner.bindings(for: sparseMoEEntry)
+        let sparseMoEKernelContext = KernelContext(
+            bufferPrecision: kernelContext.bufferPrecision,
+            weightFormat: sparseMoEWeightFormat
+        )
+        let splitSteps = try sparseMoE.splitDecodeSteps(
+            bindings: nextBindings,
+            pipelineCache: pipelineCache,
+            kernelContext: sparseMoEKernelContext
+        )
+        guard splitSteps.count == 3,
+              splitSteps[0].metadata.kernelName?.hasSuffix("_router_parallel") == true else {
+            return nil
+        }
+        let routerBinding = try requiredBinding(index: 1, bindings: nextBindings.buffers, kernelName: fusedKernelName)
+        let biasBinding = try requiredBinding(index: 4, bindings: nextBindings.buffers, kernelName: fusedKernelName)
+        let hiddenBinding = try requiredBinding(index: 5, bindings: nextBindings.buffers, kernelName: fusedKernelName)
+        let moeScratchBinding = try requiredBinding(index: 6, bindings: nextBindings.buffers, kernelName: fusedKernelName)
+
+        let fusedStep = MetalDispatchStep(
+            pipeline: fusedPipeline,
+            gridSize: MTLSize(width: 1, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, inputBinding.buffer, inputBinding.offset),
+                (1, residualBinding.buffer, residualBinding.offset),
+                (2, normWeightBinding.0, normWeightBinding.1),
+                (3, routerBinding.buffer, routerBinding.offset),
+                (4, biasBinding.buffer, biasBinding.offset),
+                (5, hiddenBinding.buffer, hiddenBinding.offset),
+                (6, moeScratchBinding.buffer, moeScratchBinding.offset),
+            ],
+            bytesBindings: [
+                uint32Binding(7, UInt32(reduction.dimension)),
+                floatBinding(8, reduction.epsilon),
+                floatBinding(9, reduction.weightBias),
+                uint32Binding(10, UInt32(sparseMoE.inputDimension)),
+                uint32Binding(11, UInt32(sparseMoE.expertCount)),
+                uint32Binding(12, UInt32(sparseMoE.expertsPerToken)),
+                uint32Binding(13, sparseMoE.normalizeRoutingWeights ? 1 : 0),
+                floatBinding(14, sparseMoE.routedScalingFactor),
+                uint32Binding(15, sparseMoE.useExpertBias ? 1 : 0),
+                uint32Binding(16, UInt32(sparseMoE.scratchElementsPerToken)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            bufferAccesses: MetalBufferAccesses(
+                readBuffers: [
+                    (buffer: inputBinding.buffer, offset: inputBinding.offset),
+                    (buffer: residualBinding.buffer, offset: residualBinding.offset),
+                    (buffer: normWeightBinding.0, offset: normWeightBinding.1),
+                    (buffer: routerBinding.buffer, offset: routerBinding.offset),
+                    (buffer: biasBinding.buffer, offset: biasBinding.offset),
+                ],
+                writeBuffers: [
+                    (buffer: residualBinding.buffer, offset: residualBinding.offset),
+                    (buffer: hiddenBinding.buffer, offset: hiddenBinding.offset),
+                    (buffer: moeScratchBinding.buffer, offset: moeScratchBinding.offset),
+                ]
+            ),
+            metadata: MetalDispatchStepMetadata(
+                kernelName: fusedKernelName,
+                entryIndex: entry.index,
+                layerIndex: entry.layerIndex,
+                weightTensorName: primaryWeightTensorName(for: entry),
+                bufferAccessPattern: .init(reads: [0, 1, 2, 3, 4], writes: [1, 5, 6])
+            )
+        )
+
+        return [fusedStep] + splitSteps.dropFirst().map { step in
+            MetalDispatchStep(
+                descriptor: step.descriptor,
+                bindings: step.bindings,
+                bufferAccesses: step.bufferAccesses,
+                metadata: MetalDispatchStepMetadata(
+                    kernelName: step.metadata.kernelName,
+                    entryIndex: sparseMoEEntry.index,
+                    layerIndex: sparseMoEEntry.layerIndex,
+                    weightTensorName: step.metadata.weightTensorName,
+                    bufferAccessPattern: step.metadata.bufferAccessPattern
+                )
+            )
+        }
     }
 
     private static func requiredBinding(

@@ -120,6 +120,7 @@ flowchart LR
 | 2026-05-31 warmup-separated release gate | warmup `[85.2]`; measured `[85.1,85.2,85.4]`; median `85.2` wall tok/s | Excluding the first run did not reveal hidden release headroom; the remaining gap is in the steady-state decode route |
 | 2026-05-31 barrier visibility gate | release run reported `[execution:200,device:1,none:1]` and no unpatterned barrier kernels | The remaining barrier cost is order enforcement between dependent dispatches, not shared-memory flushing or missing access metadata |
 | 2026-05-31 adjacency gate | repeated patterns show `sparse_moe_bf16_router_parallel -> sparse_moe_bf16_gate_up_packed4 -> sparse_moe_bf16_down_packed4` `22x` and `synthesized_3way_residualadd_copy_reduction_4p_row2048_f16_wbf16 -> sparse_moe_bf16_router_parallel -> sparse_moe_bf16_gate_up_packed4` `22x` | The next M5 implementation should target a trace-gated `rms/residual + router` fusion that preserves the normalized hidden output for gate/up |
+| 2026-05-31 fused RMS/router gate | `SWIFTLM_LFM25_FUSED_RMS_ROUTER=1` reduced the decode route from `202` to `180` steps and replaced `22` router dispatches with `residual_rms_router_parallel_bf16_sigmoid`, but measured `38.1` median wall tok/s in the same noisy release window where default measured `41.3` | The narrow fusion is trace-safe and useful as an opt-in diagnostic, but it is not the current production best and must not be defaulted |
 
 ## Release Benchmark Gate
 
@@ -137,7 +138,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | M5 pass condition | `>= 90.0` wall tok/s |
 | Latest result | baseline median `85.2` wall tok/s after 1 warmup and 3 measured runs, so M5 remains open |
 | Latest barrier interpretation | `200` of `201` barriers are execution-only and every barrier has an access pattern |
-| Latest dispatch interpretation | the decode plan has a 22-layer Sparse MoE repeated window; existing monolithic route fails trace parity, so use a narrower boundary fusion |
+| Latest dispatch interpretation | the decode plan has a 22-layer Sparse MoE repeated window; existing monolithic route fails trace parity, and the narrower RMS/router fusion is trace-safe but slower, so default remains the baseline route |
 
 ## Decision Log
 
@@ -170,6 +171,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 | 2026-05-31 | M5 | Separated warmup from measured release runs. The first warmup exact-trace decode measured `85.2` wall tok/s and the measured median remained `85.2` wall tok/s, so release warmup effects are not masking a 90 tok/s route |
 | 2026-05-31 | M5 | Added release barrier visibility and access-pattern diagnostics. The measured route has `200` execution-only barriers, `1` device-visibility barrier, and no unpatterned barrier kernels, so the next implementation should reduce dependent dispatches rather than chase shared-buffer visibility or conservative metadata gaps |
 | 2026-05-31 | M5 | Added decode adjacency histograms to the release benchmark. The dominant repeated windows are the Sparse MoE block boundary and the internal router/gate/down chain. The existing monolithic Sparse MoE diagnostic route fails the exact HF trace, so M5 should proceed with a narrower `rms/residual + router` fusion candidate |
+| 2026-05-31 | M5 | Added an opt-in fused residual/RMS/router decode route. It is exact-trace safe and reduces dispatches from `202` to `180`, but the focused release comparison did not improve wall throughput, so production default stays on the baseline route |
 
 ## Rejected M3 Routes
 

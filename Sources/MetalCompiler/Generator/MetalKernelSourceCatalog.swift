@@ -411,6 +411,16 @@ struct MetalKernelSourceCatalog {
                             ssmConvSiluWeightFormats.append(weightFormat)
                         }
                     }
+                    if !bufferPrecision.isPrefillSequencePrecision,
+                       weightFormat == .bfloat16,
+                       fragment is SparseMoEFragment,
+                       ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER"] == "1" {
+                        let fusedRouterName = "residual_rms_router_parallel_bf16_sigmoid"
+                        if generatedNames.insert(fusedRouterName).inserted {
+                            sources.append(MetalSourceGenerator.generateResidualRMSRouterParallelBF16(
+                                name: fusedRouterName))
+                        }
+                    }
                     // Fused RoPE+flash_attn: prefill path still needs the standalone rope_seq kernel.
                     if let flashFragment = fragment as? FlashAttentionFragment, flashFragment.hasInlineRoPE {
                         let ropeF32 = "rope_seq_f32"

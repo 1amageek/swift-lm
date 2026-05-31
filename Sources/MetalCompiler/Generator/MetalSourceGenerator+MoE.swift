@@ -1,6 +1,143 @@
 import LMIR
 
 extension MetalSourceGenerator {
+    public static func generateResidualRMSRouterParallelBF16(name: String) -> String {
+        """
+        kernel void \(name)(
+            device const bfloat* input              [[buffer(0)]],
+            device bfloat* residual                [[buffer(1)]],
+            device const uint16_t* normWeight       [[buffer(2)]],
+            device const uint16_t* routerWeight     [[buffer(3)]],
+            device const float* expertBias          [[buffer(4)]],
+            device bfloat* hidden                  [[buffer(5)]],
+            device float* moeScratch               [[buffer(6)]],
+            constant uint& dimension               [[buffer(7)]],
+            constant float& epsilon                [[buffer(8)]],
+            constant float& weightBias             [[buffer(9)]],
+            constant uint& inputDimension          [[buffer(10)]],
+            constant uint& expertCount             [[buffer(11)]],
+            constant uint& expertsPerToken         [[buffer(12)]],
+            constant uint& normalizeRoutingWeights [[buffer(13)]],
+            constant float& routedScalingFactor    [[buffer(14)]],
+            constant uint& useExpertBias           [[buffer(15)]],
+            constant uint& scratchRowStride        [[buffer(16)]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            const uint maxExperts = 128u;
+            const uint maxTopK = 8u;
+            const uint fixedDimension = 2048u;
+            const uint simdgroupsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            if (dimension != fixedDimension
+                || inputDimension != fixedDimension
+                || expertCount > maxExperts
+                || expertsPerToken > maxTopK
+                || expertCount > simdgroupsPerThreadgroup) {
+                return;
+            }
+
+            threadgroup float normPartials[32];
+            threadgroup bfloat normalized[2048];
+            threadgroup float routingWeights[128];
+            threadgroup float routingScores[128];
+
+            float sumSquared = 0.0f;
+            for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
+                bfloat boundary = bfloat(float(input[i]) + float(residual[i]));
+                residual[i] = boundary;
+                const float boundaryValue = float(boundary);
+                sumSquared += boundaryValue * boundaryValue;
+                normalized[i] = boundary;
+            }
+            sumSquared = simd_sum(sumSquared);
+
+            const uint simdIndex = tid / SIMD_WIDTH;
+            if (tiisg == 0u) {
+                normPartials[simdIndex] = sumSquared;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                float total = 0.0f;
+                const uint simdgroupCount = (threadsPerThreadgroup.x + SIMD_WIDTH - 1u) / SIMD_WIDTH;
+                for (uint index = 0; index < simdgroupCount; index++) {
+                    total += normPartials[index];
+                }
+                normPartials[0] = rsqrt(total / float(fixedDimension) + epsilon);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const float rmsScale = normPartials[0];
+            for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
+                const float normed = float(normalized[i])
+                    * rmsScale
+                    * (bf16_to_float(normWeight[i]) + weightBias);
+                const bfloat stored = bfloat(normed);
+                hidden[i] = stored;
+                normalized[i] = stored;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint expert = sgitg;
+            device float* scratchRow = moeScratch;
+            device float* selectedExpertScratch = scratchRow;
+            device float* selectedWeightScratch = scratchRow + expertsPerToken;
+
+            if (expert < expertCount) {
+                float logit = 0.0f;
+                device const uint16_t* routerRow = routerWeight + expert * fixedDimension;
+                for (uint j = tiisg; j < fixedDimension; j += SIMD_WIDTH) {
+                    logit += bf16_to_float(routerRow[j]) * float(normalized[j]);
+                }
+                logit = simd_sum(logit);
+                if (tiisg == 0u) {
+                    const float weight = 1.0f / (1.0f + exp(-logit));
+                    routingWeights[expert] = weight;
+                    routingScores[expert] = useExpertBias != 0u
+                        ? weight + expertBias[expert]
+                        : weight;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            if (tid == 0u) {
+                float selectedWeightSum = 0.0f;
+                uint selectedExperts[8];
+                float selectedWeights[8];
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float bestScore = -INFINITY;
+                    uint bestExpert = 0u;
+                    for (uint expertIndex = 0; expertIndex < expertCount; expertIndex++) {
+                        bool alreadySelected = false;
+                        for (uint prev = 0; prev < k; prev++) {
+                            alreadySelected = alreadySelected || selectedExperts[prev] == expertIndex;
+                        }
+                        const float score = alreadySelected ? -INFINITY : routingScores[expertIndex];
+                        if (score > bestScore) {
+                            bestScore = score;
+                            bestExpert = expertIndex;
+                        }
+                    }
+                    const float routingWeight = routingWeights[bestExpert];
+                    selectedExperts[k] = bestExpert;
+                    selectedWeights[k] = routingWeight;
+                    selectedWeightSum += routingWeight;
+                }
+                for (uint k = 0; k < expertsPerToken; k++) {
+                    float weight = selectedWeights[k];
+                    if (normalizeRoutingWeights != 0u) {
+                        weight = weight / (selectedWeightSum + 1.0e-6f);
+                    }
+                    selectedExpertScratch[k] = float(selectedExperts[k]);
+                    selectedWeightScratch[k] = weight * routedScalingFactor;
+                }
+            }
+        }
+        """
+    }
+
     public static func generateSparseMoE(
         name: String,
         bufferPrecision: BufferPrecision,
