@@ -31,17 +31,17 @@ import Jinja
 public final class LanguageModelContext: @unchecked Sendable {
     private static let promptStateSamplingTailLimit = 256
 
-    internal struct DebugRawGenerationTiming {
-        let tokenIDs: [Int]
-        let prefillSeconds: Double
-        let decodeWallSeconds: Double
-        let decodeGPUSeconds: Double
-        let decodeWallTokensPerSecond: Double
-        let decodeGPUTokensPerSecond: Double
-        let decodeStepCount: Int
-        let decodeBarrierCount: Int
-        let decodeKernelHistogram: [(kernelName: String, count: Int)]
-        let hostSamplingLogitReadCount: Int
+    @_spi(Benchmark) public struct DebugRawGenerationTiming {
+        @_spi(Benchmark) public let tokenIDs: [Int]
+        @_spi(Benchmark) public let prefillSeconds: Double
+        @_spi(Benchmark) public let decodeWallSeconds: Double
+        @_spi(Benchmark) public let decodeGPUSeconds: Double
+        @_spi(Benchmark) public let decodeWallTokensPerSecond: Double
+        @_spi(Benchmark) public let decodeGPUTokensPerSecond: Double
+        @_spi(Benchmark) public let decodeStepCount: Int
+        @_spi(Benchmark) public let decodeBarrierCount: Int
+        @_spi(Benchmark) public let decodeKernelHistogram: [(kernelName: String, count: Int)]
+        @_spi(Benchmark) public let hostSamplingLogitReadCount: Int
     }
 
     private var inferenceModel: MetalInferenceModel
@@ -1597,7 +1597,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
     }
 
-    internal func debugRawGenerationWallTiming(
+    @_spi(Benchmark) public func debugRawGenerationWallTiming(
         prompt: ExecutablePrompt,
         parameters: GenerationParameters
     ) throws -> DebugRawGenerationTiming {

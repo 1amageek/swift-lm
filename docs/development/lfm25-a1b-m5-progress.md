@@ -17,7 +17,7 @@ flowchart LR
 |---|---|
 | Model | `LiquidAI/LFM2.5-8B-A1B` |
 | Current release baseline | `0.8.7` |
-| Baseline evidence | `85.2` wall tok/s / `89.3` GPU tok/s on 64-token exact trace |
+| Baseline evidence | `85.2` wall tok/s / `89.3` GPU tok/s on 64-token exact trace; lightweight release executable observed best `87.9` single-run and `85.4` best-of-3 |
 | Target | `>= 90.0` wall tok/s on the same exact-trace decode timing gate |
 | Correctness gate | HF 64-token strict-capital trace remains exact |
 | Production route | split Sparse MoE with parallel router and BF16 packed4 expert projections |
@@ -98,6 +98,7 @@ flowchart LR
 | row2 plus private decode logits | 64-token HF strict-capital trace pass under row2 plus private decode logits | `84.5` wall tok/s, `202` steps, `201` barriers | Reject and revert; private logits helps slightly but misses M5 and is unsafe for host sampling without a larger API/runtime contract |
 | release-build focused production wall retry | `swift test -c release --disable-sandbox --filter defaultSparseMoERouteReportsProductionDecodeWallTiming` | timed out with code `-1` while compiling test targets under the 120-second outer gate | Do not use as M5 evidence; release measurement requires a separate build-for-testing pipeline or smaller release benchmark target |
 | greedy multi-token command buffer | 64-token HF strict-capital trace pass after adding a `greedy_decode_roll_state` prototype and encoding 63 decode iterations into one Metal 4 command buffer | `85.6` wall tok/s, `202` steps, `201` barriers | Reject and revert; batching per-token submission/wait is correct but does not reduce the dominant GPU work, so M5 must target decode step count or projection math rather than host wait removal |
+| lightweight release executable benchmark | `lfm25-a1b-benchmark` validates the 64-token HF strict-capital trace before reporting wall timing and runs outside the full xctest product | single-run `87.9` wall tok/s; best-of-3 `85.4` with samples `[85.4,85.1,84.7]` | Keep as the release measurement gate; release mode is not enough to clear M5, so the remaining work must reduce GPU decode work or safe per-token barriers |
 
 ## Latest Profile
 
@@ -110,6 +111,22 @@ flowchart LR
 | `gemv_vocab_bf16` | `1339us`, `12.6%` | Output head remains material, but partial argmax did not improve wall timing |
 | `gemv_2048_6144_bf16` | `1277us`, `12.0%` | Dense FFN projection remains material |
 | 2026-05-31 profile contract refresh | focused profiles observed MoE projection in the `34.1-49.0%` range, residual boundary in the `2.5-13.6%` range, and router in the `6.7-11.7%` range | M5 optimization should treat MoE projection, residual boundary, and router as the primary route group instead of assuming MoE projection alone stays above 40% |
+
+## Release Benchmark Gate
+
+```bash
+perl -e 'alarm shift; exec @ARGV' 120 \
+  swift run -c release lfm25-a1b-benchmark --iterations 3
+```
+
+| Contract | Value |
+|---|---|
+| Input bundle | HF cache snapshot for `LiquidAI/LFM2.5-8B-A1B` |
+| Prompt | strict-capital chat prompt |
+| Correctness | exact 64-token HF trace before reporting timing |
+| Timing scope | decode wall time from `debugRawGenerationWallTiming` |
+| M5 pass condition | `>= 90.0` wall tok/s |
+| Latest result | best-of-3 `85.4` wall tok/s, so M5 remains open |
 
 ## Decision Log
 
@@ -137,6 +154,7 @@ flowchart LR
 | 2026-05-31 | M5 | Rejected private decode logits as an M5 lever. The greedy trace stayed correct and reached `84.5` wall tok/s with row2, but the route remains below target and would require explicit host-sampling safeguards before it could be kept |
 | 2026-05-31 | M5 | Retried the focused release production-wall gate, but it timed out during release test-target compilation. M5 evidence remains tied to the focused debug/Metal timing gates until a lighter release benchmark target exists |
 | 2026-05-31 | M5 | Rejected greedy multi-token command-buffer batching. The prototype kept the 64-token HF trace exact and removed per-token completion waits, but still measured only `85.6` wall tok/s, confirming that the remaining gap is dominated by GPU decode work and barriers inside each token rather than CPU wait feedback alone |
+| 2026-05-31 | M5 | Added a lightweight `lfm25-a1b-benchmark` release executable. It removes the full xctest build bottleneck and verifies the exact 64-token HF trace before reporting timing. Release mode did not clear the gate: the best single run was `87.9` wall tok/s and best-of-3 was `85.4` wall tok/s |
 
 ## Rejected M3 Routes
 

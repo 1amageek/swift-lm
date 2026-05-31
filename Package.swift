@@ -16,6 +16,7 @@ let package = Package(
         .library(name: "ModelDeclarations", targets: ["ModelDeclarations"]),
         .library(name: "MetalCompiler", targets: ["MetalCompiler"]),
         .library(name: "SwiftLM", targets: ["SwiftLM"]),
+        .executable(name: "lfm25-a1b-benchmark", targets: ["LFM25A1BBenchmark"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.4.1"),
@@ -60,6 +61,10 @@ let package = Package(
             swiftSettings: [
                 .define("ACCELERATE_NEW_LAPACK"),
             ] + metalProbeSwiftSettings
+        ),
+        .executableTarget(
+            name: "LFM25A1BBenchmark",
+            dependencies: ["SwiftLM"]
         ),
         .testTarget(name: "MetalCompilerTests", dependencies: [
             "MetalCompiler", "LMArchitecture", "ModelDeclarations", "SwiftLM",
