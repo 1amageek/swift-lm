@@ -60,6 +60,7 @@ public final class LanguageModelContext: @unchecked Sendable {
     private let thinkingTagPolicy: ThinkingTagPolicy?
     private let visionRuntime: QwenVisionRuntime?
     private let gemma4Runtime: Gemma4Runtime?
+    private let specialTokenIDsToSuppress: Set<Int>
     private var debugHostSamplingLogitReadCount = 0
 
     public convenience init(_ container: LanguageModelContainer) throws {
@@ -130,6 +131,10 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         self.visionRuntime = visionRuntime
         self.gemma4Runtime = gemma4Runtime
+        self.specialTokenIDsToSuppress = Self.makeSpecialTokenIDsToSuppress(
+            tokenizer: tokenizer,
+            configuration: configuration
+        )
     }
 
     private static func makeRuntimeIsolatedInferenceModel(
@@ -672,7 +677,7 @@ public final class LanguageModelContext: @unchecked Sendable {
                 break
             }
 
-            samplingState.record(Int(outputToken), maxContextSize: parameters.repetitionContextSize)
+            samplingState.record(Int(outputToken), parameters: parameters)
             recordGeneratedToken(outputToken)
             nextTokenID = outputToken
             let visibleTokenCount = visibleText.isEmpty
@@ -1010,7 +1015,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let streamingSamplingState = initialSamplingState.withRecordedFirstToken(
             firstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         let startsInsideReasoning = startsGenerationInsideReasoning(
             promptTokenIDs: prompt.tokenIDs,
@@ -1047,9 +1052,10 @@ public final class LanguageModelContext: @unchecked Sendable {
             throw LanguageModelContextError.promptSnapshotRestoreFailed(String(describing: error))
         }
         let restoreTime = CFAbsoluteTimeGetCurrent() - restoreStart
-        var initialSamplingState = GenerationSamplingState(
-            rngState: promptSnapshot.samplingSeed,
-            recentTokenIDs: Array(promptSnapshot.promptTokenTail.suffix(resolvedParameters.repetitionContextSize))
+        var initialSamplingState = Self.makeSamplingState(
+            seed: promptSnapshot.samplingSeed,
+            tokenTail: promptSnapshot.promptTokenTail,
+            parameters: resolvedParameters
         )
         let firstToken = resolveSampledPromptStateToken(
             fallbackToken: promptSnapshot.metalState.firstToken,
@@ -1059,7 +1065,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let streamingSamplingState = initialSamplingState.withRecordedFirstToken(
             firstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         let startsInsideReasoning = startsGenerationInsideReasoning(
             promptTokenIDs: promptSnapshot.promptTokenTail,
@@ -1514,7 +1520,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let streamingSamplingState = samplingState.withRecordedFirstToken(
             firstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         return try collectGeneratedTokenIDs(
             firstToken: firstToken,
@@ -1535,9 +1541,10 @@ public final class LanguageModelContext: @unchecked Sendable {
     ) throws -> [Int] {
         let resolvedParameters = resolvedGenerateParameters(parameters)
         try inferenceModel.restore(promptState: promptState.metalState)
-        var samplingState = GenerationSamplingState(
-            rngState: promptState.samplingSeed,
-            recentTokenIDs: Array(promptState.promptTokenTail.suffix(resolvedParameters.repetitionContextSize))
+        var samplingState = Self.makeSamplingState(
+            seed: promptState.samplingSeed,
+            tokenTail: promptState.promptTokenTail,
+            parameters: resolvedParameters
         )
         let firstToken = resolveSampledPromptStateToken(
             fallbackToken: promptState.metalState.firstToken,
@@ -1547,7 +1554,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let streamingSamplingState = samplingState.withRecordedFirstToken(
             firstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         return try collectGeneratedTokenIDs(
             firstToken: firstToken,
@@ -1579,7 +1586,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let streamingSamplingState = samplingState.withRecordedFirstToken(
             firstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         return try collectGeneratedTokenIDs(
             firstToken: firstToken,
@@ -1656,8 +1663,13 @@ public final class LanguageModelContext: @unchecked Sendable {
             )
         }
 
-        var generatedTokenIDs = [Int(firstToken)]
+        var generatedTokenIDs: [Int] = []
+        generatedTokenIDs.reserveCapacity(maxRequestedTokens)
+        generatedTokenIDs.append(Int(firstToken))
         var nextTokenID = firstToken
+        let canUseGreedyDecodeFastPath =
+            resolvedParameters.temperature == 0
+            && !resolvedParameters.requiresRecentTokenHistory
         let decodeWallStart = CFAbsoluteTimeGetCurrent()
         var decodeGPUSeconds = 0.0
 
@@ -1676,15 +1688,21 @@ public final class LanguageModelContext: @unchecked Sendable {
                     ropePositionAxes: generationRoPEAxes(offset: prefillResult.ropePositionOffset)
                 )
             }
-            let outputToken = resolveSampledDecodeToken(
-                fallbackToken: decodedToken,
-                parameters: resolvedParameters,
-                samplingState: &samplingState
-            )
+            let outputToken: Int32
+            if canUseGreedyDecodeFastPath,
+               !specialTokenIDsToSuppress.contains(Int(decodedToken)) {
+                outputToken = decodedToken
+            } else {
+                outputToken = resolveSampledDecodeToken(
+                    fallbackToken: decodedToken,
+                    parameters: resolvedParameters,
+                    samplingState: &samplingState
+                )
+            }
             if outputToken < 0 || modelConfiguration.eosTokenIds.contains(Int(outputToken)) {
                 break
             }
-            samplingState.record(Int(outputToken), maxContextSize: resolvedParameters.repetitionContextSize)
+            samplingState.record(Int(outputToken), parameters: resolvedParameters)
             generatedTokenIDs.append(Int(outputToken))
             nextTokenID = outputToken
         }
@@ -1827,7 +1845,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let directStreamingSamplingState = directInitialSamplingState.withRecordedFirstToken(
             directFirstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         let directBoundary = debugCurrentDecodeBoundaryState(
             firstToken: directFirstToken,
@@ -1846,9 +1864,10 @@ public final class LanguageModelContext: @unchecked Sendable {
         resetState()
         let promptState = try promptSnapshot(for: prompt)
         try inferenceModel.restore(promptState: promptState.metalState)
-        var restoredInitialSamplingState = GenerationSamplingState(
-            rngState: promptState.samplingSeed,
-            recentTokenIDs: Array(promptState.promptTokenTail.suffix(resolvedParameters.repetitionContextSize))
+        var restoredInitialSamplingState = Self.makeSamplingState(
+            seed: promptState.samplingSeed,
+            tokenTail: promptState.promptTokenTail,
+            parameters: resolvedParameters
         )
         let restoredFirstToken = resolveSampledPromptStateToken(
             fallbackToken: promptState.metalState.firstToken,
@@ -1858,7 +1877,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         )
         let restoredStreamingSamplingState = restoredInitialSamplingState.withRecordedFirstToken(
             restoredFirstToken,
-            maxContextSize: resolvedParameters.repetitionContextSize
+            parameters: resolvedParameters
         )
         let restoredBoundary = debugCurrentDecodeBoundaryState(
             firstToken: restoredFirstToken,
@@ -1940,9 +1959,10 @@ public final class LanguageModelContext: @unchecked Sendable {
         resetState()
         let promptState = try promptSnapshot(for: prompt)
         try inferenceModel.restore(promptState: promptState.metalState)
-        var restoredSamplingState = GenerationSamplingState(
-            rngState: promptState.samplingSeed,
-            recentTokenIDs: Array(promptState.promptTokenTail.suffix(resolvedParameters.repetitionContextSize))
+        var restoredSamplingState = Self.makeSamplingState(
+            seed: promptState.samplingSeed,
+            tokenTail: promptState.promptTokenTail,
+            parameters: resolvedParameters
         )
         let restoredRecentTokenIDs = restoredSamplingState.recentTokenIDs
         let restoredTopLogits = debugCurrentSamplingTopLogits(
@@ -2393,10 +2413,22 @@ public final class LanguageModelContext: @unchecked Sendable {
         promptTokenIDs: [Int],
         parameters: GenerationParameters
     ) -> GenerationSamplingState {
-        GenerationSamplingState(
-            rngState: samplingSeed(for: promptTokenIDs),
-            recentTokenIDs: Array(promptTokenIDs.suffix(parameters.repetitionContextSize))
+        Self.makeSamplingState(
+            seed: samplingSeed(for: promptTokenIDs),
+            tokenTail: promptTokenIDs,
+            parameters: parameters
         )
+    }
+
+    private static func makeSamplingState(
+        seed: UInt64,
+        tokenTail: [Int],
+        parameters: GenerationParameters
+    ) -> GenerationSamplingState {
+        let recentTokenIDs = parameters.requiresRecentTokenHistory
+            ? Array(tokenTail.suffix(parameters.repetitionContextSize))
+            : []
+        return GenerationSamplingState(rngState: seed, recentTokenIDs: recentTokenIDs)
     }
 
     private func resolvedGenerateParameters(_ parameters: GenerationParameters) -> GenerationParameters {
@@ -2524,10 +2556,7 @@ public final class LanguageModelContext: @unchecked Sendable {
         parameters: GenerationParameters,
         samplingState: inout GenerationSamplingState
     ) -> Int32 {
-        if ProcessInfo.processInfo.environment["SWIFTLM_DISABLE_HOST_SAMPLING"] == "1" {
-            return fallbackToken
-        }
-        let suppressedTokenIDs = specialTokensToSuppress
+        let suppressedTokenIDs = specialTokenIDsToSuppress
         let needsGreedyRepair = suppressedTokenIDs.contains(Int(fallbackToken))
         let requiresHostLogitPostprocessing = finalLogitSoftcapping.map { $0 > 0 } ?? false
         let requiresHostLogitMutation =
@@ -2537,6 +2566,12 @@ public final class LanguageModelContext: @unchecked Sendable {
         let canTrustGreedyFallbackThroughSoftcap =
             parameters.temperature == 0
             && !requiresHostLogitMutation
+        if canTrustGreedyFallbackThroughSoftcap {
+            return fallbackToken
+        }
+        if ProcessInfo.processInfo.environment["SWIFTLM_DISABLE_HOST_SAMPLING"] == "1" {
+            return fallbackToken
+        }
         let shouldSampleOnHost =
             parameters.temperature > 0
             || requiresHostLogitMutation
@@ -2745,7 +2780,7 @@ public final class LanguageModelContext: @unchecked Sendable {
             }
 
             tokenCount += 1
-            samplingState.record(Int(outputToken), maxContextSize: parameters.repetitionContextSize)
+            samplingState.record(Int(outputToken), parameters: parameters)
             nextTokenID = outputToken
         }
 
@@ -2769,7 +2804,7 @@ public final class LanguageModelContext: @unchecked Sendable {
             vocabularySize: resolvedVocabularySize,
             precision: precision
         )
-        applySuppressedTokenMask(specialTokensToSuppress, to: &logits)
+        applySuppressedTokenMask(specialTokenIDsToSuppress, to: &logits)
         applyPresencePenalty(
             to: &logits,
             recentTokenIDs: recentTokenIDs,
@@ -2852,14 +2887,17 @@ public final class LanguageModelContext: @unchecked Sendable {
         return entries
     }
 
-    private var specialTokensToSuppress: Set<Int> {
+    private static func makeSpecialTokenIDsToSuppress(
+        tokenizer: any Tokenizer,
+        configuration: ModelConfiguration
+    ) -> Set<Int> {
         var tokenIDs = Set<Int>()
-        let specialTokens = ["<pad>", modelTokenizer.bosToken]
+        let specialTokens = ["<pad>", tokenizer.bosToken]
         for token in specialTokens {
-            guard let token, let tokenID = modelTokenizer.convertTokenToId(token) else { continue }
+            guard let token, let tokenID = tokenizer.convertTokenToId(token) else { continue }
             tokenIDs.insert(tokenID)
         }
-        return tokenIDs.subtracting(modelConfiguration.eosTokenIds)
+        return tokenIDs.subtracting(configuration.eosTokenIds)
     }
 
     private func samplingSeed(for tokenIDs: [Int]) -> UInt64 {
@@ -3007,7 +3045,7 @@ public final class LanguageModelContext: @unchecked Sendable {
             if outputToken < 0 || self.modelConfiguration.eosTokenIds.contains(Int(outputToken)) {
                 break
             }
-            samplingState.record(Int(outputToken), maxContextSize: parameters.repetitionContextSize)
+            samplingState.record(Int(outputToken), parameters: parameters)
             appendGeneratedToken(outputToken)
             nextTokenID = outputToken
         }
@@ -3449,10 +3487,17 @@ private struct GenerationSamplingState {
     let rngState: UInt64
     let recentTokenIDs: [Int]
 
-    func withRecordedFirstToken(_ tokenID: Int32, maxContextSize: Int) -> GenerationSamplingState {
+    func withRecordedFirstToken(_ tokenID: Int32, parameters: GenerationParameters) -> GenerationSamplingState {
         var copy = self
-        copy.record(Int(tokenID), maxContextSize: maxContextSize)
+        copy.record(Int(tokenID), parameters: parameters)
         return copy
+    }
+
+    mutating func record(_ tokenID: Int, parameters: GenerationParameters) {
+        guard parameters.requiresRecentTokenHistory else {
+            return
+        }
+        record(tokenID, maxContextSize: parameters.repetitionContextSize)
     }
 
     mutating func record(_ tokenID: Int, maxContextSize: Int) {
@@ -3471,6 +3516,10 @@ private struct GenerationSamplingState {
 }
 
 private extension GenerationParameters {
+    var requiresRecentTokenHistory: Bool {
+        repetitionPenalty != nil || presencePenalty != nil
+    }
+
     var usesLibraryDefaults: Bool {
         temperature == 0.6
             && topP == 1.0

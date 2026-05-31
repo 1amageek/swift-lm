@@ -588,8 +588,11 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_router_select"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
         #expect(histogram["sparse_moe_bf16_down"] == nil)
+        #expect(histogram["shortconv_inproj_update_bf16"] == 18)
+        #expect(histogram["gemv_2048_6144_bf16"] == nil)
+        #expect(histogram["conv_state_update_bf16"] == nil)
         #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == nil)
-        #expect(timing.decodeStepCount <= 202)
+        #expect(timing.decodeStepCount <= 184)
     }
 
     @Test("Opt-in fused RMS/router route matches HF prefix", .timeLimit(.minutes(10)))
@@ -628,7 +631,10 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
-        #expect(timing.decodeStepCount <= 180)
+        #expect(histogram["shortconv_inproj_update_bf16"] == 18)
+        #expect(histogram["gemv_2048_6144_bf16"] == nil)
+        #expect(histogram["conv_state_update_bf16"] == nil)
+        #expect(timing.decodeStepCount <= 162)
     }
 
     @Test("Opt-in packed8 Sparse MoE projection route matches HF prefix", .timeLimit(.minutes(10)))
@@ -663,6 +669,7 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_down_packed8"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
+        #expect(histogram["shortconv_inproj_update_bf16"] == 18)
     }
 
     @Test("Opt-in row2 gate-up Sparse MoE route matches HF trace", .timeLimit(.minutes(10)))

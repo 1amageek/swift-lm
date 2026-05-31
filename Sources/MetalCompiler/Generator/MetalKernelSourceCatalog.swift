@@ -413,6 +413,15 @@ struct MetalKernelSourceCatalog {
                     }
                     if !bufferPrecision.isPrefillSequencePrecision,
                        weightFormat == .bfloat16,
+                       fragment is Conv1dFragment {
+                        let fusedShortConvName = "shortconv_inproj_update_bf16"
+                        if generatedNames.insert(fusedShortConvName).inserted {
+                            sources.append(MetalSourceGenerator.generateShortConvInProjUpdateBF16(
+                                name: fusedShortConvName))
+                        }
+                    }
+                    if !bufferPrecision.isPrefillSequencePrecision,
+                       weightFormat == .bfloat16,
                        fragment is SparseMoEFragment,
                        ProcessInfo.processInfo.environment["SWIFTLM_LFM25_FUSED_RMS_ROUTER"] == "1" {
                         let fusedRouterName = "residual_rms_router_parallel_bf16_sigmoid"

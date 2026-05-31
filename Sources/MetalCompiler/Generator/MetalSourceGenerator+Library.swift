@@ -102,6 +102,7 @@ extension MetalSourceGenerator {
         sources.append(generateRoPEArgumentTableVariant(name: "rope_argbuf", argumentBufferIndex: 30, bufferPrecision: decode))
         sources.append(generateConvStateUpdate(name: "conv_state_update_bf16", bufferPrecision: decode, weightFormat: .bfloat16))
         sources.append(generateConvStateUpdateArgumentTableVariant(name: "conv_state_update_bf16_argbuf", argumentBufferIndex: 30, bufferPrecision: decode, weightFormat: .bfloat16))
+        sources.append(generateShortConvInProjUpdateBF16(name: "shortconv_inproj_update_bf16"))
 
         // === Prefill kernels (F32 buffers, sequence) ===
         sources.append(generateReduction(name: "rms_norm_seq_f32_inplace", dimension: 0, epsilon: 0, bufferPrecision: prefill, weightFormat: .float16))

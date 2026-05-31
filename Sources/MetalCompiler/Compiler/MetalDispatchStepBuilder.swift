@@ -41,6 +41,36 @@ struct MetalDispatchStepBuilder {
             let entry = fusedEntries[entryCursor]
             routingPlanner.lastFragmentWriteBufferIndices = nil
             let bindings = routingPlanner.bindings(for: entry)
+            if let fusedShortConvStep = try Self.makeFusedShortConvInProjStepIfEligible(
+                entry: entry,
+                nextEntry: entryCursor + 1 < fusedEntries.count ? fusedEntries[entryCursor + 1] : nil,
+                inProjBindings: bindings,
+                routingPlanner: &routingPlanner,
+                pipelineCache: planBuildContext.pipelineCache,
+                kernelContext: planBuildContext.kernelContext
+            ) {
+                Self.recordQuantizationEntries(
+                    for: entry,
+                    selectedKernelName: fusedShortConvStep.metadata.kernelName ?? "shortconv_inproj_update_bf16",
+                    stafWeightStore: stafWeightStore,
+                    accessPolicyResolver: accessPolicyResolver,
+                    fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.schemeIdentifier,
+                    into: &quantizationEntries
+                )
+                if entryCursor + 1 < fusedEntries.count {
+                    Self.recordQuantizationEntries(
+                        for: fusedEntries[entryCursor + 1],
+                        selectedKernelName: fusedShortConvStep.metadata.kernelName ?? "shortconv_inproj_update_bf16",
+                        stafWeightStore: stafWeightStore,
+                        accessPolicyResolver: accessPolicyResolver,
+                        fallbackSchemeIdentifier: planBuildContext.compileContext.weightFormat.schemeIdentifier,
+                        into: &quantizationEntries
+                    )
+                }
+                steps.append(fusedShortConvStep)
+                entryCursor += 2
+                continue
+            }
             if let fusedResidualRouterSteps = try Self.makeFusedResidualRMSRouterStepsIfEnabled(
                 entry: entry,
                 nextEntry: entryCursor + 1 < fusedEntries.count ? fusedEntries[entryCursor + 1] : nil,
@@ -169,6 +199,84 @@ struct MetalDispatchStepBuilder {
                 entries: quantizationEntries
             ),
             supplementalResidencyBuffers: supplementalResidencyBuffers
+        )
+    }
+
+    private static func makeFusedShortConvInProjStepIfEligible(
+        entry: DispatchEntry,
+        nextEntry: DispatchEntry?,
+        inProjBindings: (
+            buffers: [(index: Int, buffer: MTLBuffer, offset: Int)],
+            bytes: [(index: Int, value: [UInt8])]
+        ),
+        routingPlanner: inout DecodeRoutingPlanner,
+        pipelineCache: [String: MTLComputePipelineState],
+        kernelContext: KernelContext
+    ) throws -> MetalDispatchStep? {
+        guard kernelContext.bufferPrecision == .bfloat16,
+              kernelContext.weightFormat.isBFloat16,
+              let linear = entry.fragment as? LinearFragment,
+              linear.field == "in_proj",
+              linear.inputDimension == 2048,
+              linear.outputDimension == 6144,
+              let convEntry = nextEntry,
+              let conv = convEntry.fragment as? Conv1dFragment,
+              conv.dimension == 2048 else {
+            return nil
+        }
+
+        let kernelName = "shortconv_inproj_update_bf16"
+        guard let pipeline = pipelineCache[kernelName] else {
+            throw MetalCompilerError.kernelNotFound(kernelName)
+        }
+
+        let convBindings = routingPlanner.bindings(for: convEntry)
+        let inputBinding = try requiredBinding(index: 0, bindings: inProjBindings.buffers, kernelName: kernelName)
+        let inProjWeightBinding = try requiredBinding(index: 1, bindings: inProjBindings.buffers, kernelName: kernelName)
+        let convStateBinding = try requiredBinding(index: 0, bindings: convBindings.buffers, kernelName: kernelName)
+        let convWeightBinding = try requiredBinding(index: 2, bindings: convBindings.buffers, kernelName: kernelName)
+        let outputBinding = try requiredBinding(index: 3, bindings: convBindings.buffers, kernelName: kernelName)
+        let simdWidth = max(pipeline.threadExecutionWidth, 1)
+        let simdgroups = max(1, min(16, pipeline.maxTotalThreadsPerThreadgroup / simdWidth))
+        let threads = simdgroups * simdWidth
+        let gridX = (conv.dimension + simdgroups - 1) / simdgroups
+
+        return MetalDispatchStep(
+            pipeline: pipeline,
+            gridSize: MTLSize(width: gridX, height: 1, depth: 1),
+            threadgroupSize: MTLSize(width: threads, height: 1, depth: 1),
+            bufferBindings: [
+                (0, inputBinding.buffer, inputBinding.offset),
+                (1, inProjWeightBinding.buffer, inProjWeightBinding.offset),
+                (2, convStateBinding.buffer, convStateBinding.offset),
+                (3, convWeightBinding.buffer, convWeightBinding.offset),
+                (4, outputBinding.buffer, outputBinding.offset),
+            ],
+            bytesBindings: [
+                uint32Binding(5, UInt32(conv.dimension)),
+                uint32Binding(6, UInt32(conv.kernelSize)),
+            ],
+            threadgroupMemoryLength: 0,
+            sync: .bufferBarrier,
+            bufferAccesses: MetalBufferAccesses(
+                readBuffers: [
+                    (buffer: inputBinding.buffer, offset: inputBinding.offset),
+                    (buffer: inProjWeightBinding.buffer, offset: inProjWeightBinding.offset),
+                    (buffer: convStateBinding.buffer, offset: convStateBinding.offset),
+                    (buffer: convWeightBinding.buffer, offset: convWeightBinding.offset),
+                ],
+                writeBuffers: [
+                    (buffer: convStateBinding.buffer, offset: convStateBinding.offset),
+                    (buffer: outputBinding.buffer, offset: outputBinding.offset),
+                ]
+            ),
+            metadata: MetalDispatchStepMetadata(
+                kernelName: kernelName,
+                entryIndex: entry.index,
+                layerIndex: entry.layerIndex,
+                weightTensorName: primaryWeightTensorName(for: entry),
+                bufferAccessPattern: .init(reads: [0, 1, 2, 3], writes: [2, 4])
+            )
         )
     }
 

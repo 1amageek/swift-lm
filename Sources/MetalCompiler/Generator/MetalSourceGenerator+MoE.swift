@@ -39,7 +39,6 @@ extension MetalSourceGenerator {
             }
 
             threadgroup float normPartials[32];
-            threadgroup bfloat normalized[2048];
             threadgroup float routingWeights[128];
             threadgroup float routingScores[128];
 
@@ -49,7 +48,6 @@ extension MetalSourceGenerator {
                 residual[i] = boundary;
                 const float boundaryValue = float(boundary);
                 sumSquared += boundaryValue * boundaryValue;
-                normalized[i] = boundary;
             }
             sumSquared = simd_sum(sumSquared);
 
@@ -71,14 +69,12 @@ extension MetalSourceGenerator {
 
             const float rmsScale = normPartials[0];
             for (uint i = tid; i < fixedDimension; i += threadsPerThreadgroup.x) {
-                const float normed = float(normalized[i])
+                const float normed = float(residual[i])
                     * rmsScale
                     * (bf16_to_float(normWeight[i]) + weightBias);
-                const bfloat stored = bfloat(normed);
-                hidden[i] = stored;
-                normalized[i] = stored;
+                hidden[i] = bfloat(normed);
             }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+            threadgroup_barrier(mem_flags::mem_device);
 
             const uint expert = sgitg;
             device float* scratchRow = moeScratch;
@@ -89,7 +85,7 @@ extension MetalSourceGenerator {
                 float logit = 0.0f;
                 device const uint16_t* routerRow = routerWeight + expert * fixedDimension;
                 for (uint j = tiisg; j < fixedDimension; j += SIMD_WIDTH) {
-                    logit += bf16_to_float(routerRow[j]) * float(normalized[j]);
+                    logit += bf16_to_float(routerRow[j]) * float(hidden[j]);
                 }
                 logit = simd_sum(logit);
                 if (tiisg == 0u) {

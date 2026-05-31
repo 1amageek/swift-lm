@@ -10,6 +10,7 @@ struct MetalSubmissionContext: @unchecked Sendable {
     let queue: MTL4CommandQueue
     let argumentTable: MTL4ArgumentTable
     private let allocators: [MTL4CommandAllocator]
+    private let completionSemaphore: DispatchSemaphore
     private var frameIndex: Int = 0
 
     static let maxInFlight = 2
@@ -18,11 +19,13 @@ struct MetalSubmissionContext: @unchecked Sendable {
     private init(
         queue: MTL4CommandQueue,
         argumentTable: MTL4ArgumentTable,
-        allocators: [MTL4CommandAllocator]
+        allocators: [MTL4CommandAllocator],
+        completionSemaphore: DispatchSemaphore
     ) {
         self.queue = queue
         self.argumentTable = argumentTable
         self.allocators = allocators
+        self.completionSemaphore = completionSemaphore
     }
 
     init(device: MTLDevice) throws {
@@ -49,6 +52,7 @@ struct MetalSubmissionContext: @unchecked Sendable {
                 "Cannot create MTL4ArgumentTable: \(error)"
             )
         }
+        self.completionSemaphore = DispatchSemaphore(value: 0)
     }
 
     /// Submit a compute pass using Metal 4 APIs.
@@ -102,8 +106,8 @@ struct MetalSubmissionContext: @unchecked Sendable {
         commandBuffer.endCommandBuffer()
 
         if waitUntilCompleted {
-            let semaphore = DispatchSemaphore(value: 0)
             nonisolated(unsafe) var gpuError: NSError?
+            let semaphore = completionSemaphore
 
             let options = MTL4CommitOptions()
             options.addFeedbackHandler { feedback in
@@ -165,10 +169,10 @@ struct MetalSubmissionContext: @unchecked Sendable {
         encoder.endEncoding()
         commandBuffer.endCommandBuffer()
 
-        let semaphore = DispatchSemaphore(value: 0)
         nonisolated(unsafe) var gpuError: NSError?
         nonisolated(unsafe) var gpuStartTime: CFTimeInterval = 0
         nonisolated(unsafe) var gpuEndTime: CFTimeInterval = 0
+        let semaphore = completionSemaphore
 
         let options = MTL4CommitOptions()
         options.addFeedbackHandler { feedback in
@@ -273,7 +277,8 @@ struct MetalSubmissionContext: @unchecked Sendable {
             return MetalSubmissionContext(
                 queue: queue,
                 argumentTable: argumentTable,
-                allocators: allocators
+                allocators: allocators,
+                completionSemaphore: DispatchSemaphore(value: 0)
             )
         } catch {
             throw MetalCompilerError.deviceSetupFailed("Cannot create replay MTL4ArgumentTable")

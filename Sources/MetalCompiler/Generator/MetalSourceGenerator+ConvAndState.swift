@@ -120,6 +120,90 @@ public static func generateConvStateUpdateArgumentTableVariant(
     """
 }
 
+/// Generate a decode-only fused ShortConv input projection and state update.
+///
+/// This specializes the LFM2.5 A1B shape: hidden size 2048, BF16 weights, and
+/// BF16 decode buffers. It computes B/C/x for one channel in a single SIMDgroup,
+/// rounds those projection outputs through BF16 to preserve the unfused contract,
+/// updates the depthwise convolution state, and writes the gated convolution
+/// output consumed by the following out projection.
+public static func generateShortConvInProjUpdateBF16(name: String) -> String {
+    """
+    kernel void \(name)(
+        device const bfloat* input              [[buffer(0)]],
+        device const uint16_t* inProjWeight     [[buffer(1)]],
+        device uint16_t* convState              [[buffer(2)]],
+        device const uint16_t* convWeight       [[buffer(3)]],
+        device bfloat* output                  [[buffer(4)]],
+        constant uint& dimension                [[buffer(5)]],
+        constant uint& kernelSize               [[buffer(6)]],
+        uint gid                                [[threadgroup_position_in_grid]],
+        uint tid                                [[thread_index_in_threadgroup]],
+        uint tiisg                              [[thread_index_in_simdgroup]],
+        uint sgitg                              [[simdgroup_index_in_threadgroup]],
+        uint threadsPerThreadgroup              [[threads_per_threadgroup]]
+    ) {
+        const uint fixedDimension = 2048u;
+        const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup / SIMD_WIDTH);
+        const uint channel = gid * rowsPerThreadgroup + sgitg;
+        const bool active = channel < dimension && dimension == fixedDimension;
+
+        threadgroup bfloat inputTile[fixedDimension];
+        for (uint j = tid; j < fixedDimension; j += threadsPerThreadgroup) {
+            inputTile[j] = input[j];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float bSum = 0.0f;
+        float cSum = 0.0f;
+        float xSum = 0.0f;
+        if (active) {
+            device const uint16_t* bRow = inProjWeight + channel * fixedDimension;
+            device const uint16_t* cRow = inProjWeight + (fixedDimension + channel) * fixedDimension;
+            device const uint16_t* xRow = inProjWeight + (2u * fixedDimension + channel) * fixedDimension;
+            device const ushort4* bLane = (device const ushort4*)bRow + tiisg;
+            device const ushort4* cLane = (device const ushort4*)cRow + tiisg;
+            device const ushort4* xLane = (device const ushort4*)xRow + tiisg;
+            threadgroup const bfloat4* inputLane = (threadgroup const bfloat4*)inputTile + tiisg;
+            for (uint j = tiisg * 4u; j < fixedDimension; j += SIMD_WIDTH * 4u) {
+                const float4 value = float4(inputLane[0]);
+                bSum += dot(bf16x4_to_float4(bLane[0]), value);
+                cSum += dot(bf16x4_to_float4(cLane[0]), value);
+                xSum += dot(bf16x4_to_float4(xLane[0]), value);
+                bLane += SIMD_WIDTH;
+                cLane += SIMD_WIDTH;
+                xLane += SIMD_WIDTH;
+                inputLane += SIMD_WIDTH;
+            }
+        }
+
+        bSum = simd_sum(bSum);
+        cSum = simd_sum(cSum);
+        xSum = simd_sum(xSum);
+
+        if (active && tiisg == 0) {
+            const float bValue = float(bfloat(bSum));
+            const float cValue = float(bfloat(cSum));
+            const float xValue = float(bfloat(xSum));
+            const float bx = bValue * xValue;
+
+            float convOut = 0.0f;
+            for (uint k = 0; k + 1u < kernelSize; k++) {
+                const uint dst = k * fixedDimension + channel;
+                const uint src = (k + 1u) * fixedDimension + channel;
+                const uint16_t shifted = convState[src];
+                convState[dst] = shifted;
+                convOut += bf16_to_float(shifted) * bf16_to_float(convWeight[channel * kernelSize + k]);
+            }
+
+            convState[(kernelSize - 1u) * fixedDimension + channel] = float_to_bf16(bx);
+            convOut += bx * bf16_to_float(convWeight[channel * kernelSize + (kernelSize - 1u)]);
+            output[channel] = bfloat(cValue * convOut);
+        }
+    }
+    """
+}
+
 /// Generate conv1d_causal_seq kernel (prefill: temporal conv across positions).
 public static func generateConv1dCausalSeq(
     name: String,
