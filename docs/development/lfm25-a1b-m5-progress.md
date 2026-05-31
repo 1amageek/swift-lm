@@ -89,6 +89,7 @@ flowchart LR
 | greedy output-head argmax-only route | Dedicated in-process env gate fired `gemv_vocab_bf16_argmax_only` and `argmax_partial_reduce`; HF strict-capital trace pass | `85.3` wall tok/s / `89.3` GPU tok/s | Reject and revert; below M5, and omitting the full logits vector is only valid for greedy execution, not the general decode contract |
 | production wall-only timing harness | HF strict-capital trace pass using the production `decodeSync` path without GPU timing feedback | `85.4` wall tok/s, `202` steps, `201` barriers | Keep as diagnostic; M5 is not just timing feedback overhead, so the next lever must reduce real decode work or command submission cost |
 | dedicated Metal 4 feedback queue | `swift build` pass | focused production wall gate crashed with `unexpected signal code 5` before timing output | Reject and revert; command queue feedback plumbing is not a safe M5 lever without lower-level Metal 4 lifecycle proof |
+| split2 Sparse MoE projection route | in-process env gate fired 22 `sparse_moe_bf16_gate_up_split2` and 22 `sparse_moe_bf16_down_split2`; HF strict-capital trace pass | `64.1` wall tok/s / `67.3` GPU tok/s | Reject and revert; splitting one row across two SIMDgroups adds reduction/shared-memory overhead and worsens the dominant MoE path |
 
 ## Latest Profile
 
