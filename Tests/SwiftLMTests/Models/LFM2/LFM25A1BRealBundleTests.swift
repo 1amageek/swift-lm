@@ -556,19 +556,21 @@ struct LFM25A1BRealBundleTests {
         }
 
         let timing = try await withSparseMoEDefaultRoute {
-            try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
-                try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
-                    let loader = ModelBundleLoader()
-                    let container = try await loader.load(directory: localModelDirectory)
-                    let context = try LanguageModelContext(container)
-                    let prepared = try await context.prepare(ModelInput(chat: [
-                        .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
-                    ]))
-                    let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
-                    return try context.debugRawGenerationTiming(
-                        prompt: executable,
-                        parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 4)
-                    )
+            try await withEnvironmentValue("SWIFTLM_LFM25_FUSED_RMS_ROUTER", value: nil) {
+                try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
+                    try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
+                        let loader = ModelBundleLoader()
+                        let container = try await loader.load(directory: localModelDirectory)
+                        let context = try LanguageModelContext(container)
+                        let prepared = try await context.prepare(ModelInput(chat: [
+                            .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                        ]))
+                        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                        return try context.debugRawGenerationTiming(
+                            prompt: executable,
+                            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 4)
+                        )
+                    }
                 }
             }
         }
@@ -586,7 +588,47 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_router_select"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
         #expect(histogram["sparse_moe_bf16_down"] == nil)
+        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == nil)
         #expect(timing.decodeStepCount <= 202)
+    }
+
+    @Test("Opt-in fused RMS/router route matches HF prefix", .timeLimit(.minutes(10)))
+    func optInFusedRMSRouterRouteMatchesHFPrefix() async throws {
+        guard let localModelDirectory = ReleaseSmokeTestSupport.readableLFM25A1BModelDirectoryOrSkip() else {
+            return
+        }
+
+        let timing = try await withSparseMoEDefaultRoute {
+            try await withEnvironmentValue("SWIFTLM_LFM25_FUSED_RMS_ROUTER", value: "1") {
+                try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL", value: nil) {
+                    try await withEnvironmentValue("SWIFTLM_SPARSE_MOE_DISABLE_PACKED4", value: nil) {
+                        let loader = ModelBundleLoader()
+                        let container = try await loader.load(directory: localModelDirectory)
+                        let context = try LanguageModelContext(container)
+                        let prepared = try await context.prepare(ModelInput(chat: [
+                            .user([.text(RealOutputAssertionSupport.strictCapitalPrompt)])
+                        ]))
+                        let executable = try ExecutablePrompt(preparedPrompt: prepared, using: context)
+                        return try context.debugRawGenerationTiming(
+                            prompt: executable,
+                            parameters: RealOutputAssertionSupport.greedyParameters(maxTokens: 8)
+                        )
+                    }
+                }
+            }
+        }
+
+        let histogram = Dictionary(
+            uniqueKeysWithValues: timing.decodeKernelHistogram.map { ($0.kernelName, $0.count) }
+        )
+        print("[LFM2.5 8B-A1B fused RMS/router route histogram] \(timing.decodeKernelHistogram.prefix(12).map { "\($0.kernelName):\($0.count)" }.joined(separator: ", "))")
+
+        #expect(timing.tokenIDs == Array(Self.hfStrictCapital64TokenIDs.prefix(8)))
+        #expect(histogram["residual_rms_router_parallel_bf16_sigmoid"] == 22)
+        #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
+        #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
+        #expect(timing.decodeStepCount <= 180)
     }
 
     @Test("Opt-in packed8 Sparse MoE projection route matches HF prefix", .timeLimit(.minutes(10)))
