@@ -3,6 +3,7 @@ import Foundation
 struct BenchmarkOptions {
     let modelDirectory: URL?
     let maxTokens: Int
+    let warmupIterations: Int
     let iterations: Int
     let prompt: String
     let requiresM5Gate: Bool
@@ -10,6 +11,7 @@ struct BenchmarkOptions {
     init(arguments: [String]) throws {
         var modelDirectory: URL?
         var maxTokens = 64
+        var warmupIterations = 1
         var iterations = 1
         var prompt = "What is the capital of Japan? Answer with exactly one word."
         var requiresM5Gate = false
@@ -29,6 +31,13 @@ struct BenchmarkOptions {
                     throw BenchmarkError.invalidValue(argument, arguments[index])
                 }
                 maxTokens = value
+            case "--warmup":
+                index += 1
+                guard index < arguments.count else { throw BenchmarkError.missingValue(argument) }
+                guard let value = Int(arguments[index]), value >= 0 else {
+                    throw BenchmarkError.invalidValue(argument, arguments[index])
+                }
+                warmupIterations = value
             case "--iterations":
                 index += 1
                 guard index < arguments.count else { throw BenchmarkError.missingValue(argument) }
@@ -52,6 +61,7 @@ struct BenchmarkOptions {
 
         self.modelDirectory = modelDirectory
         self.maxTokens = maxTokens
+        self.warmupIterations = warmupIterations
         self.iterations = iterations
         self.prompt = prompt
         self.requiresM5Gate = requiresM5Gate

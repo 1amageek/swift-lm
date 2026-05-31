@@ -31,41 +31,71 @@ struct LFM25A1BBenchmarkRunner {
         let expectedTokenIDs = Array(Self.expectedStrictCapital64TokenIDs.prefix(options.maxTokens))
         let expectedText = context.decode(expectedTokenIDs, skipSpecialTokens: false)
 
-        var runs: [LanguageModelContext.DebugRawGenerationTiming] = []
-        runs.reserveCapacity(options.iterations)
-        for _ in 0..<options.iterations {
-            context.resetState()
-            let timing = try context.debugRawGenerationWallTiming(
-                prompt: executable,
-                parameters: GenerationParameters(
-                    maxTokens: options.maxTokens,
-                    streamChunkTokenCount: 1,
-                    temperature: 0
-                )
-            )
-            guard timing.tokenIDs == expectedTokenIDs else {
-                throw BenchmarkError.traceMismatch(
-                    expected: expectedTokenIDs,
-                    actual: timing.tokenIDs
-                )
-            }
-            let actualText = context.decode(timing.tokenIDs, skipSpecialTokens: false)
-            guard actualText == expectedText else {
-                throw BenchmarkError.textMismatch(expected: expectedText, actual: actualText)
-            }
-            runs.append(timing)
+        var warmups: [LanguageModelContext.DebugRawGenerationTiming] = []
+        warmups.reserveCapacity(options.warmupIterations)
+        for _ in 0..<options.warmupIterations {
+            warmups.append(try runOne(
+                context: context,
+                executable: executable,
+                expectedTokenIDs: expectedTokenIDs,
+                expectedText: expectedText,
+                options: options
+            ))
         }
 
-        guard let best = runs.max(by: { $0.decodeWallTokensPerSecond < $1.decodeWallTokensPerSecond }) else {
+        var measuredRuns: [LanguageModelContext.DebugRawGenerationTiming] = []
+        measuredRuns.reserveCapacity(options.iterations)
+        for _ in 0..<options.iterations {
+            measuredRuns.append(try runOne(
+                context: context,
+                executable: executable,
+                expectedTokenIDs: expectedTokenIDs,
+                expectedText: expectedText,
+                options: options
+            ))
+        }
+
+        guard let best = measuredRuns.max(by: { $0.decodeWallTokensPerSecond < $1.decodeWallTokensPerSecond }) else {
             throw BenchmarkError.noRuns
         }
         return BenchmarkResult(
             modelDirectory: modelDirectory,
             maxTokens: options.maxTokens,
+            warmupIterations: options.warmupIterations,
             iterations: options.iterations,
             best: best,
-            allWallTokensPerSecond: runs.map(\.decodeWallTokensPerSecond)
+            allWallTokensPerSecond: measuredRuns.map(\.decodeWallTokensPerSecond),
+            warmupWallTokensPerSecond: warmups.map(\.decodeWallTokensPerSecond)
         )
+    }
+
+    private static func runOne(
+        context: LanguageModelContext,
+        executable: ExecutablePrompt,
+        expectedTokenIDs: [Int],
+        expectedText: String,
+        options: BenchmarkOptions
+    ) throws -> LanguageModelContext.DebugRawGenerationTiming {
+        context.resetState()
+        let timing = try context.debugRawGenerationWallTiming(
+            prompt: executable,
+            parameters: GenerationParameters(
+                maxTokens: options.maxTokens,
+                streamChunkTokenCount: 1,
+                temperature: 0
+            )
+        )
+        guard timing.tokenIDs == expectedTokenIDs else {
+            throw BenchmarkError.traceMismatch(
+                expected: expectedTokenIDs,
+                actual: timing.tokenIDs
+            )
+        }
+        let actualText = context.decode(timing.tokenIDs, skipSpecialTokens: false)
+        guard actualText == expectedText else {
+            throw BenchmarkError.textMismatch(expected: expectedText, actual: actualText)
+        }
+        return timing
     }
 
     private static let expectedStrictCapital64TokenIDs = [

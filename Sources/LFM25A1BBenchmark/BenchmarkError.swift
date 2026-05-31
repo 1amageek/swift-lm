@@ -14,7 +14,7 @@ enum BenchmarkError: Error, CustomStringConvertible {
     var description: String {
         switch self {
         case .help:
-            return "usage: lfm25-a1b-benchmark [--model PATH] [--tokens 1...64] [--iterations N] [--require-m5]"
+            return "usage: lfm25-a1b-benchmark [--model PATH] [--tokens 1...64] [--warmup N] [--iterations N] [--require-m5]"
         case .missingValue(let argument):
             return "missing value for \(argument)"
         case .invalidValue(let argument, let value):
