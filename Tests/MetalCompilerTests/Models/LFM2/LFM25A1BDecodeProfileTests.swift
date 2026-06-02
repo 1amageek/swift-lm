@@ -149,7 +149,10 @@ struct LFM25A1BDecodeProfileTests {
                 bytes: Double(operations * bf16Bytes),
                 flops: Double(operations * flopsPerFMA)
             )
-        case "sparse_moe_bf16_down", "sparse_moe_bf16_down_packed4":
+        case "sparse_moe_bf16_down",
+             "sparse_moe_bf16_down_packed4",
+             "sparse_moe_bf16_down_blocked8x128_packed4",
+             "sparse_moe_bf16_down_blocked8x128_staged_act":
             let operations = moeLayerCount
                 * expertsPerToken
                 * hiddenDimension
@@ -169,6 +172,8 @@ struct LFM25A1BDecodeProfileTests {
             || family == "sparse_moe_bf16_gate_up_staged_packed4"
             || family == "sparse_moe_bf16_down"
             || family == "sparse_moe_bf16_down_packed4"
+            || family == "sparse_moe_bf16_down_blocked8x128_packed4"
+            || family == "sparse_moe_bf16_down_blocked8x128_staged_act"
     }
 
     private struct WorkEstimate {

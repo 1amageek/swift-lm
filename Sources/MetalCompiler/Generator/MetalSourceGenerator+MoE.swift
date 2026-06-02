@@ -407,6 +407,16 @@ extension MetalSourceGenerator {
                 bufferPrecision: bufferPrecision,
                 weightFormat: weightFormat
             ),
+            generateSparseMoEDownBlocked8x128Packed4(
+                name: "\(name)_down_blocked8x128_packed4",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
+            generateSparseMoEDownBlocked8x128StagedActivation(
+                name: "\(name)_down_blocked8x128_staged_act",
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            ),
             generateSparseMoEDownPacked4ArgumentTableVariant(
                 name: "\(name)_down_packed4_argbuf",
                 argumentBufferIndex: 30,
@@ -2525,6 +2535,193 @@ extension MetalSourceGenerator {
                 total += simd_sum(partial);
             }
             if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEDownBlocked8x128Packed4(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEDown(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let storedOutput = bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue("total", weightFormat: weightFormat)
+            : "total"
+
+        return """
+        kernel void \(name)(
+            device const float* moeScratch          [[buffer(0)]],
+            device const \(wt)* expertDownWeight   [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            constant uint& outputDimension         [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            constexpr uint layoutRowsPerBlock = 8u;
+            constexpr uint tileElements = 128u;
+
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength || row >= outputDimension) {
+                return;
+            }
+
+            device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
+            device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            const uint tileCount = (intermediateDimension + tileElements - 1u) / tileElements;
+            const uint rowBlockCount = outputDimension / layoutRowsPerBlock;
+            const uint rowBlock = row / layoutRowsPerBlock;
+            const uint rowLane = row - rowBlock * layoutRowsPerBlock;
+
+            float total = 0.0f;
+            for (uint k = 0; k < expertsPerToken; k++) {
+                const uint expert = selectedExpertScratch[k];
+                device const float* activatedRow = activationScratch + k * intermediateDimension;
+                float partial = 0.0f;
+                for (uint tile = 0; tile < tileCount; tile++) {
+                    const uint tileBase = tile * tileElements;
+                    const uint laneBase = tiisg * 4u;
+                    device const \(wt)* downTile = expertDownWeight
+                        + (((expert * rowBlockCount + rowBlock) * tileCount + tile)
+                            * layoutRowsPerBlock + rowLane) * tileElements;
+                    if (tileBase + laneBase + 3u < intermediateDimension) {
+                        device const ushort4* downLane = (device const ushort4*)downTile + tiisg;
+                        device const float4* activatedLane = (device const float4*)(activatedRow + tileBase) + tiisg;
+                        partial += dot(bf16x4_to_float4(downLane[0]), activatedLane[0]);
+                    } else {
+                        for (uint lane = laneBase; lane < tileElements; lane++) {
+                            const uint m = tileBase + lane;
+                            if (m < intermediateDimension) {
+                                partial += bf16_to_float(downTile[lane]) * activatedRow[m];
+                            }
+                        }
+                    }
+                }
+                total += simd_sum(partial);
+            }
+            if (tiisg == 0) {
+                output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
+            }
+        }
+        """
+    }
+
+    private static func generateSparseMoEDownBlocked8x128StagedActivation(
+        name: String,
+        bufferPrecision: BufferPrecision,
+        weightFormat: WeightFormat
+    ) -> String {
+        guard weightFormat.isBFloat16 else {
+            return generateSparseMoEDown(
+                name: name,
+                bufferPrecision: bufferPrecision,
+                weightFormat: weightFormat
+            )
+        }
+
+        let bt = bufferPrecision.metalType
+        let wt = weightFormat.bufferType
+        let storedOutput = bufferPrecision.isPrefillSequencePrecision
+            ? MetalSourceGenerator.sequenceStorageValue("total", weightFormat: weightFormat)
+            : "total"
+
+        return """
+        kernel void \(name)(
+            device const float* moeScratch          [[buffer(0)]],
+            device const \(wt)* expertDownWeight   [[buffer(1)]],
+            device \(bt)* output                   [[buffer(2)]],
+            constant uint& outputDimension         [[buffer(3)]],
+            constant uint& intermediateDimension   [[buffer(4)]],
+            constant uint& expertsPerToken         [[buffer(5)]],
+            constant uint& sequenceLength          [[buffer(6)]],
+            constant uint& outputRowStride         [[buffer(7)]],
+            constant uint& scratchRowStride        [[buffer(8)]],
+            uint2 gid                              [[threadgroup_position_in_grid]],
+            uint tid                               [[thread_index_in_threadgroup]],
+            uint tiisg                             [[thread_index_in_simdgroup]],
+            uint sgitg                             [[simdgroup_index_in_threadgroup]],
+            uint2 threadsPerThreadgroup            [[threads_per_threadgroup]]
+        ) {
+            constexpr uint layoutRowsPerBlock = 8u;
+            constexpr uint tileElements = 128u;
+            threadgroup float activationTile[tileElements];
+
+            const uint rowsPerThreadgroup = max(1u, threadsPerThreadgroup.x / SIMD_WIDTH);
+            const uint row = gid.x * rowsPerThreadgroup + sgitg;
+            const uint seqPos = gid.y;
+            if (seqPos >= sequenceLength) {
+                return;
+            }
+            const bool activeRow = row < outputDimension;
+
+            device const float* scratchRow = moeScratch + seqPos * scratchRowStride;
+            device const uint* selectedExpertScratch = (device const uint*)scratchRow;
+            device const float* activationScratch = scratchRow + 2u * expertsPerToken + 2u * 128u;
+
+            const uint tileCount = (intermediateDimension + tileElements - 1u) / tileElements;
+            const uint rowBlockCount = outputDimension / layoutRowsPerBlock;
+            const uint rowBlock = row / layoutRowsPerBlock;
+            const uint rowLane = row - rowBlock * layoutRowsPerBlock;
+            float total = 0.0f;
+
+            for (uint k = 0; k < expertsPerToken; k++) {
+                const uint expert = selectedExpertScratch[k];
+                device const float* activatedRow = activationScratch + k * intermediateDimension;
+                for (uint tile = 0; tile < tileCount; tile++) {
+                    const uint tileBase = tile * tileElements;
+                    for (uint loadIndex = tid; loadIndex < tileElements; loadIndex += threadsPerThreadgroup.x) {
+                        const uint m = tileBase + loadIndex;
+                        activationTile[loadIndex] = m < intermediateDimension ? activatedRow[m] : 0.0f;
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                    if (activeRow) {
+                        device const \(wt)* downTile = expertDownWeight
+                            + (((expert * rowBlockCount + rowBlock) * tileCount + tile)
+                                * layoutRowsPerBlock + rowLane) * tileElements;
+                        const uint laneBase = tiisg * 4u;
+                        float partial = 0.0f;
+                        if (tileBase + laneBase + 3u < intermediateDimension) {
+                            device const ushort4* downLane = (device const ushort4*)downTile + tiisg;
+                            threadgroup const float4* activationLane = (threadgroup const float4*)activationTile + tiisg;
+                            partial = dot(bf16x4_to_float4(downLane[0]), activationLane[0]);
+                        } else {
+                            for (uint lane = laneBase; lane < tileElements; lane++) {
+                                const uint m = tileBase + lane;
+                                if (m < intermediateDimension) {
+                                    partial += bf16_to_float(downTile[lane]) * activationTile[lane];
+                                }
+                            }
+                        }
+                        total += simd_sum(partial);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                }
+            }
+
+            if (activeRow && tiisg == 0) {
                 output[seqPos * outputRowStride + row] = \(bt)(\(storedOutput));
             }
         }

@@ -96,10 +96,16 @@ struct MetalDispatchStepBuilder {
                     bufferPrecision: planBuildContext.kernelContext.bufferPrecision,
                     weightFormat: weightFormat
                 )
+                let weightLayouts = Self.sparseMoEWeightLayoutSelection(
+                    for: entry,
+                    stafWeightStore: stafWeightStore,
+                    accessPolicyResolver: accessPolicyResolver
+                )
                 let splitSteps = try sparseMoE.splitDecodeSteps(
                     bindings: bindings,
                     pipelineCache: planBuildContext.pipelineCache,
-                    kernelContext: sparseMoEKernelContext
+                    kernelContext: sparseMoEKernelContext,
+                    weightLayouts: weightLayouts
                 )
                 steps.append(contentsOf: splitSteps.map { step in
                     MetalDispatchStep(
@@ -538,7 +544,12 @@ struct MetalDispatchStepBuilder {
         let splitSteps = try sparseMoE.splitDecodeSteps(
             bindings: nextBindings,
             pipelineCache: pipelineCache,
-            kernelContext: sparseMoEKernelContext
+            kernelContext: sparseMoEKernelContext,
+            weightLayouts: Self.sparseMoEWeightLayoutSelection(
+                for: sparseMoEEntry,
+                stafWeightStore: stafWeightStore,
+                accessPolicyResolver: accessPolicyResolver
+            )
         )
         let splitRouterName = splitSteps.first?.metadata.kernelName
         guard splitSteps.count == 3,
@@ -626,6 +637,35 @@ struct MetalDispatchStepBuilder {
             throw MetalCompilerError.deviceSetupFailed("\(kernelName) missing buffer binding \(index)")
         }
         return (binding.buffer, binding.offset)
+    }
+
+    private static func sparseMoEWeightLayoutSelection(
+        for entry: DispatchEntry,
+        stafWeightStore: STAFWeightStore?,
+        accessPolicyResolver: ProjectionWeightAccessPolicyResolver
+    ) -> SparseMoEFragment.WeightLayoutSelection {
+        guard let stafWeightStore else {
+            return .rowMajor
+        }
+
+        func resolvedLayout(for role: String) -> STAFWeightLayout {
+            guard let binding = entry.parameterBindings.first(where: { $0.role == role }) else {
+                return .rowMajor
+            }
+            let request = accessPolicyResolver.accessRequest(
+                for: entry,
+                role: role,
+                binding: binding,
+                executionPhase: .decode,
+                stafWeightStore: stafWeightStore
+            )
+            return stafWeightStore.resolvedBufferAccess(for: request)?.layout ?? .rowMajor
+        }
+
+        return SparseMoEFragment.WeightLayoutSelection(
+            gateUp: resolvedLayout(for: "expert_gate_up_proj"),
+            down: resolvedLayout(for: "expert_down_proj")
+        )
     }
 
     private func makeResidentConstantSteps(

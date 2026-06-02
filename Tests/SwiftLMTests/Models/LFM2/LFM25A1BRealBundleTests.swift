@@ -450,8 +450,11 @@ struct LFM25A1BRealBundleTests {
                 let expectedGateUpKernel = ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_GATE_UP_STAGING"] == "1"
                     ? "sparse_moe_bf16_gate_up_packed4"
                     : "sparse_moe_bf16_gate_up_staged_packed4"
+                let expectedDownKernel = ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_BLOCKED8X128"] == "1"
+                    ? "sparse_moe_bf16_down_packed4"
+                    : "sparse_moe_bf16_down_blocked8x128_packed4"
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName == expectedGateUpKernel })
-                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == "sparse_moe_bf16_down_packed4" })
+                #expect(timing.decodeKernelHistogram.contains { $0.kernelName == expectedDownKernel })
             }
             if ProcessInfo.processInfo.environment["SWIFTLM_OUTPUT_HEAD_PARTIAL_ARGMAX"] != "0" {
                 #expect(timing.decodeKernelHistogram.contains { $0.kernelName.hasSuffix("_argmax_partial") })
@@ -595,7 +598,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
-        #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_staged_act"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_router_scores"] == nil)
         #expect(histogram["sparse_moe_bf16_router_select"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up"] == nil)
@@ -650,7 +655,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_router_parallel"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
-        #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_staged_act"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         #expect(histogram["shortconv_inproj_update_bf16"] == 18)
         #expect(histogram["gemv_2048_6144_bf16"] == nil)
         #expect(histogram["conv_state_update_bf16"] == nil)
@@ -735,7 +742,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
-        #expect(histogram["sparse_moe_bf16_down_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_staged_act"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         if Self.enforcesSpeedGates {
             #expect(timing.decodeWallTokensPerSecond > 78.0)
         }
@@ -782,6 +791,9 @@ struct LFM25A1BRealBundleTests {
         #expect(histogram["sparse_moe_bf16_gate_up_row2_packed4"] == 22)
         #expect(histogram["sparse_moe_bf16_gate_up_staged_packed4"] == nil)
         #expect(histogram["sparse_moe_bf16_gate_up_packed4"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_packed4"] == 22)
+        #expect(histogram["sparse_moe_bf16_down_blocked8x128_staged_act"] == nil)
+        #expect(histogram["sparse_moe_bf16_down_packed4"] == nil)
         #expect(timing.decodeGPUTokensPerSecond == 0)
         #expect(timing.hostSamplingLogitReadCount == 0)
         if Self.enforcesSpeedGates {

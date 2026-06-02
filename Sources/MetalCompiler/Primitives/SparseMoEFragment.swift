@@ -2,12 +2,21 @@ import Metal
 import LMIR
 
 public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
+    struct WeightLayoutSelection: Sendable {
+        let gateUp: STAFWeightLayout
+        let down: STAFWeightLayout
+
+        static let rowMajor = WeightLayoutSelection(gateUp: .rowMajor, down: .rowMajor)
+    }
+
     private struct ProjectionKernelSelection {
         let gateUpName: String
         let downName: String
         let usesGateUpRow2: Bool
         let usesGateUpSplit2: Bool
         let usesDownSplit2: Bool
+        let usesDownBlocked8Packed4: Bool
+        let usesDownBlocked8StagedActivation: Bool
     }
 
     public let expertCount: Int
@@ -149,7 +158,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     func splitDecodeSteps(
         bindings: (buffers: [(index: Int, buffer: MTLBuffer, offset: Int)], bytes: [(index: Int, value: [UInt8])]),
         pipelineCache: [String: MTLComputePipelineState],
-        kernelContext: KernelContext
+        kernelContext: KernelContext,
+        weightLayouts: WeightLayoutSelection = .rowMajor
     ) throws -> [MetalDispatchStep] {
         guard let inputBinding = Self.binding(at: 0, in: bindings.buffers),
               let routerBinding = Self.binding(at: 1, in: bindings.buffers),
@@ -200,7 +210,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let projectionSelection = projectionKernelSelection(
             baseName: baseName,
             weightFormat: kernelContext.weightFormat,
-            usesExperimentalKernels: true
+            usesExperimentalKernels: true,
+            weightLayouts: weightLayouts
         )
         guard let selectedGateUpPipeline = pipelineCache[projectionSelection.gateUpName] else {
             throw MetalCompilerError.kernelNotFound(projectionSelection.gateUpName)
@@ -233,9 +244,10 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             throw MetalCompilerError.kernelNotFound(projectionSelection.downName)
         }
         let downSimdWidth = max(selectedDownPipeline.threadExecutionWidth, 1)
+        let defaultDownSimdgroups = projectionSelection.usesDownBlocked8StagedActivation ? 8 : 32
         let requestedDownSimdgroups = Self.resolvedSimdgroups(
             environmentKey: "SWIFTLM_SPARSE_MOE_DOWN_SIMDGROUPS",
-            defaultValue: 32,
+            defaultValue: defaultDownSimdgroups,
             simdWidth: downSimdWidth,
             pipeline: selectedDownPipeline
         )
@@ -247,9 +259,12 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             ? max(1, downSimdgroups / 2)
             : downSimdgroups
         let downGridX = (outputDimension + downRowsPerThreadgroup - 1) / downRowsPerThreadgroup
-        let downThreadgroupMemoryLength = projectionSelection.usesDownSplit2
-            ? downRowsPerThreadgroup * 2 * MemoryLayout<Float>.stride
-            : 0
+        let downThreadgroupMemoryLength: Int
+        if projectionSelection.usesDownSplit2 {
+            downThreadgroupMemoryLength = downRowsPerThreadgroup * 2 * MemoryLayout<Float>.stride
+        } else {
+            downThreadgroupMemoryLength = 0
+        }
 
         var steps: [MetalDispatchStep] = []
         if usesParallelRouter {
@@ -435,7 +450,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let projectionSelection = projectionKernelSelection(
             baseName: kernelName,
             weightFormat: context.kernelContext.weightFormat,
-            usesExperimentalKernels: false
+            usesExperimentalKernels: false,
+            weightLayouts: .rowMajor
         )
         let routerScoresPipeline = try context.getPipeline("\(kernelName)_router_scores")
         let routerSelectPipeline = try context.getPipeline("\(kernelName)_router_select")
@@ -715,7 +731,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     private func projectionKernelSelection(
         baseName: String,
         weightFormat: WeightFormat,
-        usesExperimentalKernels: Bool
+        usesExperimentalKernels: Bool,
+        weightLayouts: WeightLayoutSelection
     ) -> ProjectionKernelSelection {
         let usesPacked4 = weightFormat.isBFloat16
             && inputDimension.isMultiple(of: 4)
@@ -734,6 +751,19 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
         let usesDownSplit2 = usesExperimentalKernels
             && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
+        let usesDownBlocked8Packed4 = usesPacked4
+            && usesExperimentalKernels
+            && !usesPacked8
+            && !usesDownSplit2
+            && weightLayouts.down == .blockedRows8Tiles128
+            && inputDimension == 2_048
+            && outputDimension == 2_048
+            && intermediateDimension == 1_792
+            && expertsPerToken == 4
+            && expertCount == 32
+        let usesDownBlocked8StagedActivation = usesDownBlocked8Packed4
+            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_DOWN_STAGED_ACTIVATION"])
+            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_STAGED_ACTIVATION"])
         let usesGateUpStagedPacked4 = usesPacked4
             && usesExperimentalKernels
             && !usesPacked8
@@ -762,9 +792,17 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let downName = usesDownSplit2
             ? "\(baseName)_down_split2"
             : (
-                usesPacked8
-                    ? "\(baseName)_down_packed8"
-                    : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down")
+                usesDownBlocked8StagedActivation
+                    ? "\(baseName)_down_blocked8x128_staged_act"
+                    : (
+                        usesDownBlocked8Packed4
+                            ? "\(baseName)_down_blocked8x128_packed4"
+                            : (
+                                usesPacked8
+                                    ? "\(baseName)_down_packed8"
+                                    : (usesPacked4 ? "\(baseName)_down_packed4" : "\(baseName)_down")
+                            )
+                    )
             )
 
         return ProjectionKernelSelection(
@@ -772,7 +810,9 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             downName: downName,
             usesGateUpRow2: usesGateUpRow2,
             usesGateUpSplit2: usesGateUpSplit2,
-            usesDownSplit2: usesDownSplit2
+            usesDownSplit2: usesDownSplit2,
+            usesDownBlocked8Packed4: usesDownBlocked8Packed4,
+            usesDownBlocked8StagedActivation: usesDownBlocked8StagedActivation
         )
     }
 

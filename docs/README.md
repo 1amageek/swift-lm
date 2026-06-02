@@ -11,6 +11,7 @@ This directory keeps non-API documentation that does not need to live at the rep
 - `releases/0.4.0.md` — release notes for embedding request values and public API guide alignment
 - `releases/0.9.0.md` — release notes for the LFM2.5 A1B 90 tok/s decode route
 - `development/lfm25-a1b-m5-progress.md` — decision record for the LFM2.5 A1B decode optimization workstream
+- `design/lfm25-a1b-moe-layout-scratch.md` — design for the next LFM2.5 A1B MoE layout and scratch-traffic optimization track
 - `../Sources/SwiftLM/SwiftLM.docc/` — DocC catalog for API and guide documentation
 - `../AGENTS.md` — repository guidance for coding agents
 - `design/metal4.md` — forward-looking Metal 4 design notes

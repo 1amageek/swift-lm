@@ -1,4 +1,5 @@
 import Metal
+import LMIR
 
 struct STAFSpecializedWeightStoreBuilder {
     let device: MTLDevice
@@ -40,24 +41,59 @@ struct STAFSpecializedWeightStoreBuilder {
         for entry in entries {
             if let linear = entry.fragment as? LinearFragment,
                let binding = entry.parameterBindings.first(where: { $0.role == linear.field }) {
-                let request = accessPolicyResolver.accessRequest(
+                appendRequest(
                     for: entry,
                     role: linear.field,
                     binding: binding,
-                    executionPhase: .decode,
-                    stafWeightStore: store
+                    store: store,
+                    seen: &seen,
+                    requests: &requests
                 )
-                let key = STAFSpecializedWeightKey(
-                    tensorName: binding.tensorName,
-                    layout: request.preferredLayout
-                )
-                if seen.insert(key).inserted {
-                    requests.append(request)
+                continue
+            }
+
+            if entry.fragment is SparseMoEFragment {
+                for role in ["expert_gate_up_proj", "expert_down_proj"] {
+                    guard let binding = entry.parameterBindings.first(where: { $0.role == role }) else {
+                        continue
+                    }
+                    appendRequest(
+                        for: entry,
+                        role: role,
+                        binding: binding,
+                        store: store,
+                        seen: &seen,
+                        requests: &requests
+                    )
                 }
             }
         }
 
         return requests
+    }
+
+    private func appendRequest(
+        for entry: DispatchEntry,
+        role: String,
+        binding: ParameterBinding,
+        store: STAFWeightStore,
+        seen: inout Set<STAFSpecializedWeightKey>,
+        requests: inout [STAFWeightAccessRequest]
+    ) {
+        let request = accessPolicyResolver.accessRequest(
+            for: entry,
+            role: role,
+            binding: binding,
+            executionPhase: .decode,
+            stafWeightStore: store
+        )
+        let key = STAFSpecializedWeightKey(
+            tensorName: binding.tensorName,
+            layout: request.preferredLayout
+        )
+        if seen.insert(key).inserted {
+            requests.append(request)
+        }
     }
 
     func makeSpecializedAccess(

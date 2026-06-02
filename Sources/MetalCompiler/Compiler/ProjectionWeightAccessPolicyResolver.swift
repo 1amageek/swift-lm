@@ -69,6 +69,19 @@ struct ProjectionWeightAccessPolicyResolver: Sendable {
             } else {
                 layoutPolicy = nil
             }
+        } else if let sparseMoE = entry.fragment as? SparseMoEFragment,
+                  role == "expert_down_proj",
+                  sparseMoE.inputDimension == 2_048,
+                  sparseMoE.outputDimension == 2_048,
+                  sparseMoE.intermediateDimension == 1_792,
+                  sparseMoE.expertCount == 32,
+                  sparseMoE.expertsPerToken == 4,
+                  schemeIdentifier == .bf16RowMajor,
+                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"] != "1",
+                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"] != "1",
+                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"] != "1",
+                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_BLOCKED8X128"] != "1" {
+            layoutPolicy = .blockedRows8Tiles128
         } else {
             layoutPolicy = nil
         }
