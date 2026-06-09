@@ -44,7 +44,7 @@ options:
   --derived-data-path <path>
   --build-timeout <seconds>
   --test-timeout <seconds>
-  --suite <Target/Suite>
+  --suite <Target/SuiteOrCase>
   --skip-build
 EOF
       exit 0
@@ -66,9 +66,12 @@ if [ "${#custom_suites[@]}" -gt 0 ]; then
 else
   suites=(
     "SwiftLMTests/GenerationThroughputBenchmarkTests"
-    "SwiftLMTests/GenerationScalingBenchmarkTests"
-    "SwiftLMTests/GenerationScalingLongBenchmarkTests"
-    "SwiftLMTests/GenerationStreamingBenchmarkTests"
+    "SwiftLMTests/GenerationScalingBenchmarkTests/requestLevelScaling50()"
+    "SwiftLMTests/GenerationScalingBenchmarkTests/requestLevelScaling128()"
+    "SwiftLMTests/GenerationScalingBenchmarkTests/requestLevelScaling256()"
+    "SwiftLMTests/GenerationScalingLongBenchmarkTests/requestLevelScaling512()"
+    "SwiftLMTests/GenerationStreamingBenchmarkTests/streamChunkSizeComparison()"
+    "SwiftLMTests/GenerationStreamingBenchmarkTests/promptStateReuseComparison()"
   )
 fi
 
@@ -87,10 +90,33 @@ if [ -n "$derived_data_path" ]; then
   common_args+=(-derivedDataPath "$derived_data_path")
 fi
 
+known_test_targets=(
+  "MetalCompilerTests"
+  "ModelsTests"
+  "SwiftLMTests"
+)
+selected_target_names=" "
+for suite in "${suites[@]}"; do
+  target="${suite%%/*}"
+  if [[ "$selected_target_names" != *" $target "* ]]; then
+    selected_target_names+="$target "
+  fi
+done
+
+build_filter_args=()
+for suite in "${suites[@]}"; do
+  build_filter_args+=(-only-testing:"$suite")
+done
+for known_target in "${known_test_targets[@]}"; do
+  if [[ "$selected_target_names" != *" $known_target "* ]]; then
+    build_filter_args+=(-skip-testing:"$known_target")
+  fi
+done
+
 if [ "$skip_build" -ne 1 ]; then
   echo "[generation-benchmarks] build-for-testing"
   scripts/xcodebuild/test-timeout.sh "$build_timeout" -- \
-    xcodebuild build-for-testing "${common_args[@]}" \
+    xcodebuild build-for-testing "${common_args[@]}" "${build_filter_args[@]}" \
     | tee "${run_dir}/build.log"
 fi
 
