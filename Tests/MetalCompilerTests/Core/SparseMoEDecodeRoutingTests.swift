@@ -1,4 +1,3 @@
-import Darwin
 import Metal
 import Testing
 @testable import MetalCompiler
@@ -65,9 +64,19 @@ struct SparseMoEDecodeRoutingTests {
                 stafWeightStore: store
             )
         }
+        let packed8TrueRequest = withEnvironmentValue("SWIFTLM_SPARSE_MOE_ENABLE_PACKED8", value: "true") {
+            resolver.accessRequest(
+                for: entry,
+                role: "expert_down_proj",
+                binding: binding,
+                executionPhase: .decode,
+                stafWeightStore: store
+            )
+        }
 
         #expect(disabledRequest.preferredLayout == .rowMajor)
         #expect(packed8Request.preferredLayout == .rowMajor)
+        #expect(packed8TrueRequest.preferredLayout == .rowMajor)
     }
 
     @Test("Split decode uses blocked down only for resolved blocked layout")
@@ -147,6 +156,118 @@ struct SparseMoEDecodeRoutingTests {
 
         #expect(access.layout == .blockedRows8Tiles128)
         #expect(access.size == payloadBytes)
+    }
+
+    @Test("Blocked down kernel matches CPU dot product")
+    func blockedDownKernelMatchesCPUDotProduct() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            return
+        }
+        let tensorName = "tiny.expert_down_proj"
+        let outputDimension = 8
+        let intermediateDimension = 128
+        let expertCount = 2
+        let expertsPerToken = 2
+        let selectedExperts = [1, 0]
+        let scratchRowStride = 2 * expertsPerToken + 2 * 128 + expertsPerToken * intermediateDimension
+        let activationOffset = 2 * expertsPerToken + 2 * 128
+
+        let rowMajorPayload = (0..<(expertCount * outputDimension * intermediateDimension)).map { index in
+            let value = Float((index * 17) % 31 - 15) * 0.00390625
+            return BFloat16(value).bitPattern
+        }
+        let store = try makeStore(
+            device: device,
+            tensorName: tensorName,
+            shape: [expertCount, outputDimension, intermediateDimension],
+            payload: rowMajorPayload
+        )
+        let builder = STAFSpecializedWeightStoreBuilder(device: device)
+        let blockedAccess = try builder.makeBlockedRows8Tiles128Access(for: tensorName, store: store)
+
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateSparseMoE(
+                name: "test_sparse_moe_bf16",
+                bufferPrecision: .float32Decode,
+                weightFormat: .bfloat16,
+                gateKind: .sigmoidTopK
+            )
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let pipeline = try device.makeComputePipelineState(
+            function: try #require(library.makeFunction(name: "test_sparse_moe_bf16_down_blocked8x128_packed4"))
+        )
+
+        let scratchBuffer = try #require(device.makeBuffer(
+            length: scratchRowStride * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let selectedExpertPointer = scratchBuffer.contents().bindMemory(
+            to: UInt32.self,
+            capacity: scratchRowStride
+        )
+        for (index, expert) in selectedExperts.enumerated() {
+            selectedExpertPointer[index] = UInt32(expert)
+        }
+        let activationPointer = scratchBuffer.contents().bindMemory(
+            to: Float.self,
+            capacity: scratchRowStride
+        )
+        var activations = [Float](repeating: .zero, count: expertsPerToken * intermediateDimension)
+        for index in activations.indices {
+            activations[index] = Float((index * 11) % 37 - 18) * 0.0078125
+            activationPointer[activationOffset + index] = activations[index]
+        }
+        scratchBuffer.didModifyRange(0..<(scratchRowStride * MemoryLayout<Float>.stride))
+
+        let outputBuffer = try #require(device.makeBuffer(
+            length: outputDimension * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let queue = try #require(device.makeCommandQueue())
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        let downSimdWidth = max(pipeline.threadExecutionWidth, 1)
+        let downSimdgroups = max(1, min(32, pipeline.maxTotalThreadsPerThreadgroup / downSimdWidth))
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(scratchBuffer, offset: 0, index: 0)
+        encoder.setBuffer(blockedAccess.buffer, offset: blockedAccess.offset, index: 1)
+        encoder.setBuffer(outputBuffer, offset: 0, index: 2)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 3)
+        encoder.setBytes([UInt32(intermediateDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes([UInt32(expertsPerToken)], length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBytes([UInt32(1)], length: MemoryLayout<UInt32>.stride, index: 6)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 7)
+        encoder.setBytes([UInt32(scratchRowStride)], length: MemoryLayout<UInt32>.stride, index: 8)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: (outputDimension + downSimdgroups - 1) / downSimdgroups, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: downSimdgroups * downSimdWidth, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let actualPointer = outputBuffer.contents().bindMemory(to: Float.self, capacity: outputDimension)
+        let actual = (0..<outputDimension).map { actualPointer[$0] }
+        let expected = (0..<outputDimension).map { row in
+            selectedExperts.enumerated().reduce(Float.zero) { total, pair in
+                let (k, expert) = pair
+                let rowBase = (expert * outputDimension + row) * intermediateDimension
+                return total + (0..<intermediateDimension).reduce(Float.zero) { partial, middle in
+                    let weight = BFloat16(bitPattern: rowMajorPayload[rowBase + middle]).floatValue
+                    return partial + weight * activations[k * intermediateDimension + middle]
+                }
+            }
+        }
+        let maxError = zip(actual, expected).reduce(Float.zero) { partial, pair in
+            max(partial, abs(pair.0 - pair.1))
+        }
+
+        #expect(maxError < 0.001, "Blocked Sparse MoE down kernel drifted: maxError=\(maxError)")
     }
 
     private func makeDecodeKernelNames(
@@ -257,6 +378,43 @@ struct SparseMoEDecodeRoutingTests {
         )
     }
 
+    private func makeStore(
+        device: MTLDevice,
+        tensorName: String,
+        shape: [Int],
+        payload: [UInt16]
+    ) throws -> STAFWeightStore {
+        let payloadBytes = payload.count * MemoryLayout<UInt16>.stride
+        let buffer = try #require(device.makeBuffer(
+            length: max(payloadBytes, 1),
+            options: .storageModeShared
+        ))
+        payload.withUnsafeBufferPointer { payloadPointer in
+            guard let baseAddress = payloadPointer.baseAddress else { return }
+            buffer.contents()
+                .bindMemory(to: UInt16.self, capacity: payload.count)
+                .update(from: baseAddress, count: payload.count)
+        }
+        buffer.didModifyRange(0..<payloadBytes)
+        let entry = STAFTensorEntry(
+            name: tensorName,
+            payloadOffset: 0,
+            payloadSize: payloadBytes,
+            schemeIdentifier: .bf16RowMajor,
+            semanticRole: .moeExpertDown,
+            shape: shape,
+            blockSize: 0,
+            groupSize: 0,
+            bufferOffset: 0
+        )
+        return STAFWeightStore(
+            buffer: buffer,
+            entries: [tensorName: entry],
+            metadata: .empty,
+            specializedBufferAccesses: [:]
+        )
+    }
+
     private func makeBuffer(device: MTLDevice, length: Int) throws -> MTLBuffer {
         try #require(device.makeBuffer(length: max(length, 1), options: .storageModeShared))
     }
@@ -284,19 +442,6 @@ struct SparseMoEDecodeRoutingTests {
         value: String?,
         _ body: () throws -> T
     ) rethrows -> T {
-        let previous = ProcessInfo.processInfo.environment[key]
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
-        defer {
-            if let previous {
-                setenv(key, previous, 1)
-            } else {
-                unsetenv(key)
-            }
-        }
-        return try body()
+        try TestEnvironmentVariables.withValue(key, value: value, body)
     }
 }

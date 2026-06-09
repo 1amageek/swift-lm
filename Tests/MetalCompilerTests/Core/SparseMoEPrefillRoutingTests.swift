@@ -1,4 +1,3 @@
-import Darwin
 import Metal
 import Testing
 @testable import MetalCompiler
@@ -199,19 +198,6 @@ struct SparseMoEPrefillRoutingTests {
         value: String?,
         _ body: () throws -> T
     ) rethrows -> T {
-        let previous = ProcessInfo.processInfo.environment[key]
-        if let value {
-            setenv(key, value, 1)
-        } else {
-            unsetenv(key)
-        }
-        defer {
-            if let previous {
-                setenv(key, previous, 1)
-            } else {
-                unsetenv(key)
-            }
-        }
-        return try body()
+        try TestEnvironmentVariables.withValue(key, value: value, body)
     }
 }

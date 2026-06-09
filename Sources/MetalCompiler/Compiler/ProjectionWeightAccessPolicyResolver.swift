@@ -77,10 +77,10 @@ struct ProjectionWeightAccessPolicyResolver: Sendable {
                   sparseMoE.expertCount == 32,
                   sparseMoE.expertsPerToken == 4,
                   schemeIdentifier == .bf16RowMajor,
-                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"] != "1",
-                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"] != "1",
-                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"] != "1",
-                  ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_BLOCKED8X128"] != "1" {
+                  !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"]),
+                  !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"]),
+                  !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"]),
+                  !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_BLOCKED8X128"]) {
             layoutPolicy = .blockedRows8Tiles128
         } else {
             layoutPolicy = nil

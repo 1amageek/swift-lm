@@ -71,7 +71,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
     }
 
     var usesSplitRoute: Bool {
-        !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_DIAGNOSTIC_SPARSE_MOE_MONOLITHIC"])
+        !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_DIAGNOSTIC_SPARSE_MOE_MONOLITHIC"])
     }
 
     public var weightSlots: [MetalWeightSlot] {
@@ -194,7 +194,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && inputDimension == 2_048
             && expertCount == 32
             && expertsPerToken == 4
-            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_STAGING"])
+            && !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_STAGING"])
             ? "\(baseName)_router_parallel_staged_packed4"
             : "\(baseName)_router_parallel"
         guard let routerParallelPipeline = pipelineCache[routerParallelName] else {
@@ -202,7 +202,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         }
         let routerParallelSimdWidth = max(routerParallelPipeline.threadExecutionWidth, 1)
         let routerParallelMaxSimdgroups = max(1, routerParallelPipeline.maxTotalThreadsPerThreadgroup / routerParallelSimdWidth)
-        let disablesParallelRouter = Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"])
+        let disablesParallelRouter = EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_ROUTER_PARALLEL"])
         let usesParallelRouter = !disablesParallelRouter
             && expertCount <= routerParallelMaxSimdgroups
         let routerParallelThreads = expertCount * routerParallelSimdWidth
@@ -723,11 +723,6 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         )
     }
 
-    private static func isEnabled(_ value: String?) -> Bool {
-        guard let value else { return false }
-        return value == "1" || value.lowercased() == "true"
-    }
-
     private func projectionKernelSelection(
         baseName: String,
         weightFormat: WeightFormat,
@@ -737,20 +732,20 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
         let usesPacked4 = weightFormat.isBFloat16
             && inputDimension.isMultiple(of: 4)
             && intermediateDimension.isMultiple(of: 4)
-            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
+            && !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_PACKED4"])
         let usesPacked8 = usesPacked4
             && inputDimension.isMultiple(of: 8)
             && intermediateDimension.isMultiple(of: 8)
             && usesExperimentalKernels
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
+            && EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_PACKED8"])
         let usesGateUpSplit2 = usesExperimentalKernels
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
+            && EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_SPLIT2"])
         let usesGateUpRow2 = usesPacked4
             && usesExperimentalKernels
             && !usesGateUpSplit2
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
+            && EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_GATE_UP_ROW2"])
         let usesDownSplit2 = usesExperimentalKernels
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
+            && EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DOWN_SPLIT2"])
         let usesDownBlocked8Packed4 = usesPacked4
             && usesExperimentalKernels
             && !usesPacked8
@@ -762,8 +757,8 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && expertsPerToken == 4
             && expertCount == 32
         let usesDownBlocked8StagedActivation = usesDownBlocked8Packed4
-            && Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_DOWN_STAGED_ACTIVATION"])
-            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_STAGED_ACTIVATION"])
+            && EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_ENABLE_DOWN_STAGED_ACTIVATION"])
+            && !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_DOWN_STAGED_ACTIVATION"])
         let usesGateUpStagedPacked4 = usesPacked4
             && usesExperimentalKernels
             && !usesPacked8
@@ -773,7 +768,7 @@ public struct SparseMoEFragment: PrimitiveMetalKernelFragment {
             && intermediateDimension == 1_792
             && expertsPerToken == 4
             && expertCount == 32
-            && !Self.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_GATE_UP_STAGING"])
+            && !EnvironmentFlag.isEnabled(ProcessInfo.processInfo.environment["SWIFTLM_SPARSE_MOE_DISABLE_GATE_UP_STAGING"])
         let gateUpName = usesGateUpSplit2
             ? "\(baseName)_gate_up_split2"
             : (
