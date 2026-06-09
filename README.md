@@ -39,7 +39,7 @@ Optional files used when present:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.9.0")
+    .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.10.0")
 ],
 targets: [
     .target(

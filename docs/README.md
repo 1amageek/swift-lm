@@ -10,6 +10,7 @@ This directory keeps non-API documentation that does not need to live at the rep
 - `releases/0.3.0.md` — release notes for the renamed public generation surface
 - `releases/0.4.0.md` — release notes for embedding request values and public API guide alignment
 - `releases/0.9.0.md` — release notes for the LFM2.5 A1B 90 tok/s decode route
+- `releases/0.10.0.md` — release notes for sparse MoE routing hardening and repeatable release gates
 - `development/lfm25-a1b-m5-progress.md` — decision record for the LFM2.5 A1B decode optimization workstream
 - `design/lfm25-a1b-moe-layout-scratch.md` — design for the next LFM2.5 A1B MoE layout and scratch-traffic optimization track
 - `../Sources/SwiftLM/SwiftLM.docc/` — DocC catalog for API and guide documentation
