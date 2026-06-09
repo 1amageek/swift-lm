@@ -626,6 +626,7 @@ public static func generateUnifiedQuantizedVocabGEMVPartialArgmax(
         device int* partialIndices      [[buffer(3)]],
         constant uint& inputDimension  [[buffer(4)]],
         constant uint& outputDimension [[buffer(5)]],
+        device \(bt)* output           [[buffer(6)]],
         uint2 gid                      [[threadgroup_position_in_grid]],
         uint tid                       [[thread_index_in_threadgroup]],
         uint tiisg                     [[thread_index_in_simdgroup]],
@@ -674,6 +675,9 @@ public static func generateUnifiedQuantizedVocabGEMVPartialArgmax(
 
         sum = simd_sum(sum);
         if (tiisg == 0) {
+            if (active) {
+                output[row] = \(bt)(sum);
+            }
             rowValues[sgitg] = active ? sum : -HUGE_VALF;
             rowIndices[sgitg] = active ? int(row) : 0;
         }

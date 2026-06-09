@@ -326,6 +326,7 @@ extension MetalSourceGenerator {
             device const \(wt)* weight [[id(1)]];
             device float* partialValues [[id(2)]];
             device int* partialIndices [[id(3)]];
+            device \(bt)* output [[id(6)]];
         };
 
         kernel void \(name)(
@@ -376,6 +377,9 @@ extension MetalSourceGenerator {
             }
 
             if (tiisg == 0) {
+                if (active) {
+                    args.output[row] = \(bt)(sum);
+                }
                 rowValues[sgitg] = sum;
                 rowIndices[sgitg] = active ? int(row) : 0;
             }
@@ -414,6 +418,7 @@ extension MetalSourceGenerator {
             device const \(wt)* weight [[id(1)]];
             device float* partialValues [[id(2)]];
             device int* partialIndices [[id(3)]];
+            device \(bt)* output [[id(6)]];
         };
 
         kernel void \(name)(
@@ -451,6 +456,9 @@ extension MetalSourceGenerator {
             }
 
             if (tiisg == 0) {
+                if (active) {
+                    args.output[row] = \(bt)(sum);
+                }
                 rowValues[sgitg] = sum;
                 rowIndices[sgitg] = active ? int(row) : 0;
             }

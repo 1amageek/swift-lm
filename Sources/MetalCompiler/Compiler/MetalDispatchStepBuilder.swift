@@ -350,7 +350,7 @@ struct MetalDispatchStepBuilder {
         let partialKernelName = "\(resolved.name)_argmax_partial"
         guard let partialPipeline = pipelineCache[partialKernelName],
               let reducePipeline = pipelineCache["argmax_partial_reduce"] else {
-            throw MetalCompilerError.kernelNotFound(partialKernelName)
+            return nil
         }
 
         let simdWidth = max(partialPipeline.threadExecutionWidth, 1)
@@ -383,6 +383,7 @@ struct MetalDispatchStepBuilder {
                 (1, weightBinding.buffer, weightBinding.offset),
                 (2, bufferSet.scratch, 0),
                 (3, bufferSet.scratch, partialIndexOffset),
+                (6, bufferSet.logits, 0),
             ],
             bytesBindings: [
                 uint32Binding(4, UInt32(linear.inputDimension)),
@@ -398,6 +399,7 @@ struct MetalDispatchStepBuilder {
                 writeBuffers: [
                     (buffer: bufferSet.scratch, offset: 0),
                     (buffer: bufferSet.scratch, offset: partialIndexOffset),
+                    (buffer: bufferSet.logits, offset: 0),
                 ]
             ),
             metadata: MetalDispatchStepMetadata(
@@ -405,7 +407,7 @@ struct MetalDispatchStepBuilder {
                 entryIndex: entry.index,
                 layerIndex: entry.layerIndex,
                 weightTensorName: weightTensorName,
-                bufferAccessPattern: .init(reads: [0, 1], writes: [2, 3])
+                bufferAccessPattern: .init(reads: [0, 1], writes: [2, 3, 6])
             )
         )
 

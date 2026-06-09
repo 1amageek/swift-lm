@@ -1152,6 +1152,7 @@ extension MetalSourceGenerator {
             device int* partialIndices             [[buffer(3)]],
             constant uint& inputDimension          [[buffer(4)]],
             constant uint& outputDimension         [[buffer(5)]],
+            device \(bt)* output                   [[buffer(6)]],
             uint gid                               [[threadgroup_position_in_grid]],
             uint tid                               [[thread_index_in_threadgroup]],
             uint tiisg                             [[thread_index_in_simdgroup]],
@@ -1196,6 +1197,9 @@ extension MetalSourceGenerator {
             }
 
             if (tiisg == 0) {
+                if (active) {
+                    output[row] = \(bt)(sum);
+                }
                 rowValues[sgitg] = sum;
                 rowIndices[sgitg] = active ? int(row) : 0;
             }
@@ -1237,6 +1241,7 @@ extension MetalSourceGenerator {
             device int* partialIndices             [[buffer(3)]],
             constant uint& inputDimension          [[buffer(4)]],
             constant uint& outputDimension         [[buffer(5)]],
+            device \(bt)* output                   [[buffer(6)]],
             uint gid                               [[threadgroup_position_in_grid]],
             uint tid                               [[thread_index_in_threadgroup]],
             uint tiisg                             [[thread_index_in_simdgroup]],
@@ -1275,6 +1280,9 @@ extension MetalSourceGenerator {
             }
 
             if (tiisg == 0) {
+                if (active) {
+                    output[row] = \(bt)(sum);
+                }
                 rowValues[sgitg] = sum;
                 rowIndices[sgitg] = active ? int(row) : 0;
             }

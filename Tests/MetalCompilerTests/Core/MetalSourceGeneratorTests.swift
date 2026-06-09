@@ -3025,6 +3025,93 @@ struct MetalSourceGeneratorTests {
         #expect(library.makeFunction(name: "test_argmax_partial_reduce") != nil)
     }
 
+    @Test("Vocab GEMV partial argmax writes CPU-readable logits")
+    func vocabGEMVPartialArgmaxWritesLogits() throws {
+        guard let device = MTLCreateSystemDefaultDevice() else { return }
+
+        let kernelName = "test_gemv_vocab_f16_argmax_partial"
+        let source = MetalSourceGenerator.commonHeader + "\n\n"
+            + MetalSourceGenerator.generateVocabGEMVPartialArgmax(
+                name: kernelName,
+                bufferPrecision: .float16,
+                weightFormat: .float16
+            )
+
+        let options = MTLCompileOptions()
+        options.languageVersion = .version4_0
+        let library = try device.makeLibrary(source: source, options: options)
+        let function = try #require(library.makeFunction(name: kernelName))
+        let pipeline = try device.makeComputePipelineState(function: function)
+        let queue = try #require(device.makeCommandQueue())
+
+        let inputDimension = 2_048
+        let outputDimension = 8
+        let input = [Float16](repeating: 1, count: inputDimension)
+        var weights: [Float16] = []
+        weights.reserveCapacity(inputDimension * outputDimension)
+        for row in 0..<outputDimension {
+            weights.append(
+                contentsOf: [Float16](
+                    repeating: Float16(Float(row + 1) / Float(inputDimension)),
+                    count: inputDimension
+                )
+            )
+        }
+
+        let inputBuffer = try #require(device.makeBuffer(
+            bytes: input,
+            length: input.count * MemoryLayout<Float16>.stride,
+            options: .storageModeShared
+        ))
+        let weightBuffer = try #require(device.makeBuffer(
+            bytes: weights,
+            length: weights.count * MemoryLayout<Float16>.stride,
+            options: .storageModeShared
+        ))
+        let partialCount = outputDimension
+        let partialValues = try #require(device.makeBuffer(
+            length: partialCount * MemoryLayout<Float>.stride,
+            options: .storageModeShared
+        ))
+        let partialIndices = try #require(device.makeBuffer(
+            length: partialCount * MemoryLayout<Int32>.stride,
+            options: .storageModeShared
+        ))
+        let logits = try #require(device.makeBuffer(
+            length: outputDimension * MemoryLayout<Float16>.stride,
+            options: .storageModeShared
+        ))
+        memset(logits.contents(), 0, logits.length)
+
+        let commandBuffer = try #require(queue.makeCommandBuffer())
+        let encoder = try #require(commandBuffer.makeComputeCommandEncoder())
+        encoder.setComputePipelineState(pipeline)
+        encoder.setBuffer(inputBuffer, offset: 0, index: 0)
+        encoder.setBuffer(weightBuffer, offset: 0, index: 1)
+        encoder.setBuffer(partialValues, offset: 0, index: 2)
+        encoder.setBuffer(partialIndices, offset: 0, index: 3)
+        encoder.setBytes([UInt32(inputDimension)], length: MemoryLayout<UInt32>.stride, index: 4)
+        encoder.setBytes([UInt32(outputDimension)], length: MemoryLayout<UInt32>.stride, index: 5)
+        encoder.setBuffer(logits, offset: 0, index: 6)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: outputDimension, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: 32, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+
+        if let error = commandBuffer.error {
+            throw error
+        }
+
+        let pointer = logits.contents().bindMemory(to: Float16.self, capacity: outputDimension)
+        let actual = (0..<outputDimension).map { Float(pointer[$0]) }
+        let expected = (1...outputDimension).map(Float.init)
+        let maxError = zip(actual, expected).map { abs($0 - $1) }.max() ?? 0
+        #expect(maxError < 0.01, "Partial argmax logits were not written correctly: \(actual)")
+    }
+
     @Test("Blocked BF16 vocab GEMV partial argmax compiles")
     func blockedBF16VocabGEMVPartialArgmaxCompiles() throws {
         guard let device = MTLCreateSystemDefaultDevice() else { return }
