@@ -57,7 +57,13 @@ private func canonicalizeOperation(_ op: Operation, ctx: inout CanonContext) -> 
     let newOperands = op.operands.map { Operand(value: ctx.mapValue($0.value)) }
     let newKind = canonicalizeKind(op.kind, ctx: &ctx)
     let newResults = op.results.map { OperationResult(id: ctx.mapValue($0.id)) }
-    return Operation(key: newKey, kind: newKind, operands: newOperands, results: newResults)
+    return Operation(
+        key: newKey,
+        kind: newKind,
+        operands: newOperands,
+        results: newResults,
+        parameterBindings: op.parameterBindings
+    )
 }
 
 // MARK: - Kind Normalization

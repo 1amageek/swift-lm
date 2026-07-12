@@ -1,31 +1,29 @@
 # swift-lm
 
-High-performance language-model inference on Apple Silicon using direct Metal compute.
+Declarative model graphs and Core AI model tooling for Apple platforms.
 
-`swift-lm` loads Hugging Face model bundles from `config.json`, tokenizer metadata, and `*.safetensors`, normalizes them into a backend-independent IR, compiles the graph into Metal dispatch plans, and exposes a small Swift API for generation, prompt reuse, multimodal prompt preparation, and text embeddings.
+`swift-lm` loads Hugging Face model metadata, builds a backend-independent graph from a declarative Swift model definition, validates the graph, and exports a stable document for Apple's Core AI tooling. Standard Transformer models use Apple's high-level `CoreAILM` exporter and runtime. Model families outside that registry can use the low-level Core AI program exporter and runtime session.
 
-This repository is the active direct-Metal runtime. It is not a GGUF loader, not an MLX execution engine, and it does not expose older session-style APIs such as `InferenceSession`.
+The direct Metal runtime remains available as the 0.10 compatibility path. New model support and public API work should target Core AI first.
 
 ## What It Provides
 
-- Direct Metal prefill and decode execution.
-- Hugging Face snapshot directories as the input contract.
-- `safetensors` as the canonical weight source.
-- STAF (`model.staf`) as a regenerable GPU execution cache.
-- Container/context public APIs for generation and embeddings.
-- Prompt snapshots for shared-prefix reuse.
-- Request-level reasoning visibility controls.
-- Multimodal prompt preparation and execution when the loaded bundle and runtime declare support.
+- Declarative `LMIR` and `LMArchitecture` model graphs.
+- Deterministic Core AI export documents with explicit graph, operation, and weight-binding contracts.
+- Swift CLI for converting local Hugging Face `config.json` files into export documents.
+- Python tooling that validates documents and invokes Apple's official Core AI exporter.
+- Low-level stateful Core AI sessions for custom model families such as LFM2.
+- The 0.10 direct Metal loader, generation API, embeddings, and multimodal runtime for compatibility.
 
 ## Requirements
 
-- Swift 6.2+
-- macOS 26.1+, iOS 26.1+, or visionOS 26.1+ as declared by `Package.swift`
-- Apple Silicon with Metal support for local inference
+- Xcode 27 beta or later
+- Swift 6.4+
+- macOS 27.0+ or iOS 27.0+ as declared by `Package.swift`
+- Apple Silicon for local Core AI execution
 - A Hugging Face model bundle containing:
   - `config.json`
-  - `tokenizer.json`
-  - one or more `.safetensors` files
+  - model weights and tokenizer metadata when running a complete model
 
 Optional files used when present:
 
@@ -39,17 +37,73 @@ Optional files used when present:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.10.0")
+    .package(url: "https://github.com/1amageek/swift-lm.git", from: "0.11.0")
 ],
 targets: [
     .target(
         name: "MyApp",
         dependencies: [
-            .product(name: "SwiftLM", package: "swift-lm")
+            .product(name: "SwiftLMFoundationModels", package: "swift-lm")
         ]
     )
 ]
 ```
+
+## Core AI Workflow
+
+The Core AI path separates model declaration, validation, export, and runtime:
+
+```text
+Hugging Face config.json
+        |
+        v
+ModelDeclarations -> LMIR -> CoreAIExportDocument
+                                      |
+                                      v
+                         coreai-models / coreai-torch
+                                      |
+                                      v
+                                  .aimodel
+                                      |
+                                      v
+                                  Core AI
+```
+
+Generate and validate a document from a local model configuration:
+
+```bash
+xcrun swift run swiftlm-ir \
+    --config /path/to/config.json \
+    --output /tmp/model.json \
+    --name model \
+    --target macos
+
+PYTHONPATH=python/src python3 -m swiftlm_coreai.cli validate /tmp/model.json
+```
+
+Install the Python exporter in an isolated environment, then export a standard
+Transformer model through Apple's pipeline:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -e python
+.venv/bin/swiftlm-coreai export /tmp/model.json \
+    Qwen/Qwen3-0.6B \
+    --output-dir /tmp/coreai-model \
+    --overwrite
+```
+
+Use `CoreAIExport` when an application needs to build or inspect a document in
+Swift. Use `SwiftLMFoundationModels` for Apple-supported language bundles and
+`SwiftLMCoreAI` for direct asset inspection, specialization, and stateful
+inference. LFM2 currently belongs to the low-level Core AI path because the
+Apple high-level language-model registry does not provide its hybrid state
+layout.
+
+## Legacy Direct Metal API (0.10)
+
+The following container, context, embedding, and multimodal APIs are retained
+for 0.10 compatibility. They are not the Core AI runtime surface.
 
 ## Public API Shape
 
@@ -588,6 +642,8 @@ Useful runners:
 
 ## Documentation
 
+- Core AI architecture: [docs/design/core-ai.md](docs/design/core-ai.md)
+- 0.11.0 alpha release notes: [docs/releases/0.11.0-alpha.1.md](docs/releases/0.11.0-alpha.1.md)
 - Public API guide: [docs/using-swift-lm.md](docs/using-swift-lm.md)
 - Production readiness gates: [docs/production-readiness.md](docs/production-readiness.md)
 - Metal 4 design notes: [docs/design/metal4.md](docs/design/metal4.md)

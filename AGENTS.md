@@ -46,13 +46,18 @@ shared rules aligned here as well.
 
 ## Project Goal
 
-`swift-lm` is intended to be the fastest LLM inference package on Apple Silicon
-and serves as the `MLXFoundationModels` backend for
-`AnyFoundationModels`.
+`swift-lm` is a Core AI-first declarative model authoring and export package for
+macOS and iOS 27+. It provides the graph and runtime foundation for Core
+AI-backed language-model applications on Apple platforms.
 
-The core thesis is to parse IR graphs and emit optimized Metal kernels:
-component-local optimization belongs in `MetalCompilable`, while
-cross-component fusion belongs in the compiler.
+The core thesis is to describe model families once in Swift, normalize them to
+backend-independent IR, and emit a validated Core AI export contract. Apple's
+official exporter owns deployment asset generation for supported models. Custom
+stateful families use the low-level Core AI Torch converter and Swift runtime
+wrapper.
+
+The direct Metal compiler and `SwiftLM` runtime remain as the 0.10 compatibility
+path. They are not the default target for new public APIs or model support.
 
 The consumer input contract is a HuggingFace bundle
 (`config.json`, `safetensors`, `tokenizer.json`, and related metadata), not a
@@ -60,17 +65,25 @@ model-specific Swift type.
 
 ## Project Overview
 
-`swift-lm` is a Swift package for high-performance language model inference on Apple Silicon using direct Metal compute.
+`swift-lm` is a Swift package for declarative model graphs, Core AI export, and
+Core AI runtime integration on Apple platforms.
 
 The current repository is not a GGUF/MLX runtime. The active architecture is:
 
 - HuggingFace model bundles as input: `config.json`, `tokenizer.json`, `tokenizer_config.json`, `chat_template.jinja`, `*.safetensors`
 - `safetensors` as the source of truth for weights
-- STAF as a regenerable GPU execution cache
+- STAF as a regenerable GPU execution cache for the 0.10 compatibility path
 - a backend-independent IR and model-declaration DSL
-- direct Metal compilation and execution for prefill and decode
+- a versioned Core AI export-document format
+- Apple's Core AI model exporter for standard Transformer models
+- a low-level Core AI program exporter for custom stateful families
+- direct Metal compilation and execution for the 0.10 compatibility path
 
-Consumer-facing loading starts from `SwiftLM.ModelBundleLoader`, which downloads or opens a HuggingFace model directory, converts weights to STAF when needed, builds a `ModelGraph`, compiles it to a Metal dispatch plan, and returns a `LanguageModelContainer` or `TextEmbeddingContainer`.
+Core AI consumers start with `CoreAIExportDocument` or the `swiftlm-ir` tool,
+validate the document with `swiftlm-coreai`, and produce an `.aimodel` through
+Apple's exporter. `SwiftLMFoundationModels` adapts Apple's high-level language
+bundle API, while `SwiftLMCoreAI` owns low-level asset and stateful execution.
+`SwiftLM.ModelBundleLoader` remains the direct Metal compatibility entry point.
 
 ## Build & Test
 
@@ -104,7 +117,8 @@ Important:
 - For repeated real-model loads inside tests/helpers, explicitly scope temporary objects tightly and prefer `autoreleasepool` on synchronous helper boundaries when possible. Do not keep multiple large `LanguageModelContext` / `TextEmbeddingContext` / tokenizer / bundle instances alive longer than needed.
 - When `xcodebuild` reports `unexpected exit`, `Restarting after unexpected exit`, or flaky suite-level process failure, rerun with [`scripts/xcodebuild/test-timeout.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild/test-timeout.sh) or [`scripts/xcodebuild/test-hang-guard.sh`](/Users/1amageek/Desktop/swift-lm/scripts/xcodebuild/test-hang-guard.sh) before changing inference code.
 - Metal-dependent tests and generated libraries are exercised via the package Xcode scheme.
-- Repository targets currently declare Swift tools `6.2` and platforms `.macOS(.v26)`, `.iOS(.v26)`, `.visionOS(.v26)` in [Package.swift](/Users/1amageek/Desktop/swift-lm/Package.swift).
+- Repository targets currently declare Swift tools `6.4` and platforms `.macOS(.v27)`, `.iOS(.v27)` in [Package.swift](/Users/1amageek/Desktop/swift-lm/Package.swift).
+- Core AI products require Xcode 27 and the matching Core AI beta SDK.
 
 ### Crash-Resistant Real-Model Test Procedure
 
@@ -179,7 +193,8 @@ Checklist:
 
 ## Module Structure
 
-The repository is intentionally split into five layers.
+The repository is intentionally split into Core AI layers and a preserved direct
+Metal compatibility layer.
 
 - `LMIR`
   - Backend-independent data model.
@@ -196,13 +211,33 @@ The repository is intentionally split into five layers.
   - Current declarations include `Transformer`, `Qwen35`, `LFM2`, and `Cohere`.
   - This layer decides which computation graph to build from `ModelConfig`.
 
+- `CoreAIExport`
+  - Validates normalized graphs and emits a versioned, backend-neutral Core AI
+    export document with explicit parameter bindings.
+
+- `SwiftLMCoreAI`
+  - Validates `.aimodel` assets, specializes `AIModel` instances, and executes
+    low-level stateful `InferenceFunction` calls.
+
+- `SwiftLMFoundationModels`
+  - Adapts Apple's `CoreAILanguageModels` package for supported language bundles.
+
+- `SwiftLMIR`
+  - Converts local HuggingFace `config.json` metadata into a Core AI export
+    document using the declarative model declarations.
+
+- `python/`
+  - Validates Swift export documents and invokes Apple's official Core AI
+    exporter or low-level Torch converter.
+
 - `MetalCompiler`
-  - Metal backend for `LMIR`.
+  - Direct Metal backend for `LMIR`, retained for the 0.10 compatibility path.
   - Walks IR, lowers primitive attributes into fragment trees, runs dispatch optimization, compiles kernels, allocates buffers, and produces an opaque `MetalCompiledModel` containing decode/prefill runtime state.
   - Also owns STAF, safetensors conversion/loading, weight naming resolution, and execution-side buffer formats.
 
 - `SwiftLM`
-  - Public API for loading, tokenization, prompt formatting, and generation.
+  - Direct Metal compatibility API for loading, tokenization, prompt formatting,
+    and generation.
   - `ModelBundleLoader` is the main loader.
   - `LanguageModelContainer` is the primary public entry point for language generation.
   - `LanguageModelContext` exposes mutable runtime state, prompt staging, prompt snapshots, and cache control.
@@ -214,9 +249,12 @@ Dependency direction:
 ```text
 LMIR  ←──  LMArchitecture  ←──  ModelDeclarations
   │                                     │
-  └──────  MetalCompiler                │
-                │                       │
-                └───────  SwiftLM  ─────┘
+  ├──────  CoreAIExport  ──── SwiftLMIR
+  │             │
+  │             ├──────────── SwiftLMCoreAI
+  │             └──────────── SwiftLMFoundationModels
+  │
+  └──────  MetalCompiler  ─── SwiftLM (0.10 compatibility)
 ```
 
 Rules:
@@ -227,19 +265,21 @@ Rules:
 
 ## Runtime Data Flow
 
-Current load path:
+Core AI export path:
 
 ```text
-HF repo or local directory
-  ├─ config.json                → HFConfigDecoder → ModelConfig
-  ├─ tokenizer files            → swift-transformers Tokenizer
-  ├─ chat_template.jinja or tokenizer_config.json["chat_template"]
-  ├─ safetensors                → STAFConverter → model.staf
+HF bundle/config.json
+  ├─ ConfigDecoder              → ModelConfig
   ├─ model declaration          → ModelGraph
   ├─ ParameterResolver          → parameter bindings
-  ├─ MetalInferenceCompiler     → decode plan + prefill plan
-  └─ LanguageModelContainer      → generate / prepare / encode / decode
+  ├─ CoreAIModelExporter        → CoreAIExportDocument
+  ├─ swiftlm-coreai             → Apple Core AI exporter
+  └─ .aimodel                   → AIModel / CoreAILanguageModel
 ```
+
+The legacy direct Metal path additionally converts safetensors to STAF, builds
+decode/prefill plans, and exposes `LanguageModelContainer`. Keep that path
+isolated from Core AI export contracts.
 
 GenerationEvent path:
 
@@ -295,7 +335,9 @@ The source of truth is the HuggingFace safetensors bundle.
 
 ### 5. Decode hot path matters more than convenience abstractions
 
-The current performance center is direct Metal inference on Apple Silicon.
+The current product center is Core AI asset generation and execution on Apple
+platforms. Direct Metal decode performance remains important only for the 0.10
+compatibility path.
 
 Prefer changes that improve:
 
@@ -323,8 +365,9 @@ truth for model behavior.
 - Do not assume existing `swift-lm` code or tests are correct until they have
   been compared against the HuggingFace reference.
 - Keep all model computation on the intended path:
-  `ModelComponent -> LMIR -> MetalCompiler -> Metal GPU`. Do not add a pure
-  Swift CPU fallback for production model math.
+  `ModelComponent -> LMIR -> CoreAIExport -> Core AI`. Do not add a pure Swift
+  CPU fallback for production model math. The legacy path is
+  `ModelComponent -> LMIR -> MetalCompiler -> Metal GPU`.
 
 ## Model Family Boundary
 
@@ -430,9 +473,11 @@ Do not reintroduce stale assumptions from older designs:
 
 If such functionality is reintroduced later, document it from the actual implementation rather than from prior repository history.
 
-## Metal Backend Notes
+## Metal Backend Notes (0.10 Compatibility)
 
-The current backend is direct Metal compute.
+The preserved 0.10 backend is direct Metal compute. Core AI is the primary
+backend for new work; changes here must not leak legacy execution details into
+Core AI products or the backend-independent IR.
 
 - Decode uses a compiled dispatch plan with preallocated buffers.
 - Prefill uses a separate sequence-oriented plan.

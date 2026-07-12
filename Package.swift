@@ -1,4 +1,4 @@
-// swift-tools-version: 6.2
+// swift-tools-version: 6.4
 import PackageDescription
 import Foundation
 
@@ -9,13 +9,17 @@ let metalProbeSwiftSettings: [SwiftSetting] = enableMetalProbes
 
 let package = Package(
     name: "swift-lm",
-    platforms: [.macOS("26.1"), .iOS("26.1"), .visionOS("26.1")],
+    platforms: [.macOS("27.0"), .iOS("27.0")],
     products: [
         .library(name: "LMIR", targets: ["LMIR"]),
         .library(name: "LMArchitecture", targets: ["LMArchitecture"]),
         .library(name: "ModelDeclarations", targets: ["ModelDeclarations"]),
+        .library(name: "CoreAIExport", targets: ["CoreAIExport"]),
+        .library(name: "SwiftLMCoreAI", targets: ["SwiftLMCoreAI"]),
+        .library(name: "SwiftLMFoundationModels", targets: ["SwiftLMFoundationModels"]),
         .library(name: "MetalCompiler", targets: ["MetalCompiler"]),
         .library(name: "SwiftLM", targets: ["SwiftLM"]),
+        .executable(name: "swiftlm-ir", targets: ["SwiftLMIR"]),
         .executable(name: "lfm25-a1b-benchmark", targets: ["LFM25A1BBenchmark"]),
     ],
     dependencies: [
@@ -24,6 +28,10 @@ let package = Package(
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         .package(url: "https://github.com/mattt/JSONSchema", from: "1.3.1"),
         .package(url: "https://github.com/1amageek/swift-testing-heartbeat", from: "0.1.0"),
+        .package(
+            url: "https://github.com/apple/coreai-models.git",
+            revision: "938d0b8943b942ce66438b94ab017c5631d1aef4"
+        ),
     ],
     targets: [
         .target(
@@ -37,6 +45,24 @@ let package = Package(
             ]
         ),
         .target(name: "ModelDeclarations", dependencies: ["LMArchitecture"], path: "Sources/Models"),
+        .target(
+            name: "CoreAIExport",
+            dependencies: ["LMArchitecture"]
+        ),
+        .target(
+            name: "SwiftLMCoreAI",
+            dependencies: ["CoreAIExport"]
+        ),
+        .target(
+            name: "SwiftLMFoundationModels",
+            dependencies: [
+                .product(name: "CoreAILM", package: "coreai-models"),
+            ]
+        ),
+        .executableTarget(
+            name: "SwiftLMIR",
+            dependencies: ["CoreAIExport", "ModelDeclarations"]
+        ),
         .target(
             name: "MetalCompiler",
             dependencies: ["LMIR"],
@@ -76,6 +102,12 @@ let package = Package(
         .testTarget(name: "ModelsTests", dependencies: [
             "ModelDeclarations", "LMArchitecture",
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),
+        ]),
+        .testTarget(name: "CoreAIExportTests", dependencies: [
+            "CoreAIExport", "ModelDeclarations", "LMArchitecture",
+        ]),
+        .testTarget(name: "SwiftLMCoreAITests", dependencies: [
+            "SwiftLMCoreAI",
         ]),
         .testTarget(name: "SwiftLMTests", dependencies: [
             "SwiftLM",

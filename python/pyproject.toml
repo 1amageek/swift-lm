@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling>=1.25,<2.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "swiftlm-coreai"
+version = "0.11.0a1"
+description = "Core AI export tooling for swift-lm declarative model graphs"
+requires-python = ">=3.11"
+dependencies = [
+    "coreai-core==1.0.0b2",
+    "coreai-torch==0.4.1",
+    "coreai-opt==0.2.1",
+    "coreai-models @ git+https://github.com/apple/coreai-models.git@0.2.0#subdirectory=python",
+    "torch==2.9.0",
+    "transformers>=4.57,<5.0",
+]
+
+[project.scripts]
+swiftlm-coreai = "swiftlm_coreai.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/swiftlm_coreai"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
