@@ -335,7 +335,7 @@ private enum GenerationPipelineBenchmarkSupport {
             modelType: bundleResources.modelType,
             config: bundleResources.config
         )
-        let convention = graphResolver.namingConvention(for: bundleResources.modelType)
+        let convention = try graphResolver.namingConvention(for: bundleResources.modelType)
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
         let decodePolicy = resolveDecodePolicy(
             maximumSequenceLength: maximumSequenceLength,

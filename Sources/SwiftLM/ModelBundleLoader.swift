@@ -114,7 +114,7 @@ public struct ModelBundleLoader: Sendable {
             modelType: resources.modelType,
             config: resources.config
         )
-        let convention = graphResolver.namingConvention(for: resources.modelType)
+        let convention = try graphResolver.namingConvention(for: resources.modelType)
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: convention)
         let irTime = CFAbsoluteTimeGetCurrent() - irStart
         InternalLog.info("[Prewarm/Loader] IR resolve: \(String(format: "%.3f", irTime))s")
@@ -260,7 +260,7 @@ public struct ModelBundleLoader: Sendable {
             modelType: resources.modelType,
             config: resources.config
         )
-        let convention = graphResolver.namingConvention(for: resources.modelType)
+        let convention = try graphResolver.namingConvention(for: resources.modelType)
         let resolvedGraph = ParameterResolver().resolve(graph: graph, convention: convention)
 
         let compiler = Self.makeInferenceCompiler()

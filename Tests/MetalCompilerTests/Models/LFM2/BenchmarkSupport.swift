@@ -443,7 +443,7 @@ enum BenchmarkSupport {
         let config = try decoder.decode(from: configData)
         let resolver = ModelGraphResolver()
         let graph = try resolver.resolveModelGraph(modelType: modelType, config: config)
-        let convention = resolver.namingConvention(for: modelType)
+        let convention = try resolver.namingConvention(for: modelType)
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
         let spec = LFM25ModelSpec(
             modelType: modelType,
@@ -633,7 +633,7 @@ enum BenchmarkSupport {
 
         let resolver = ModelGraphResolver()
         let graph = try resolver.resolveModelGraph(modelType: modelType, config: config)
-        let convention = resolver.namingConvention(for: modelType)
+        let convention = try resolver.namingConvention(for: modelType)
         let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
         let compiler = MetalInferenceCompiler()

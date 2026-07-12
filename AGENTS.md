@@ -199,6 +199,8 @@ Metal compatibility layer.
 - `LMIR`
   - Backend-independent data model.
   - Defines `ModelGraph`, `Region`, `Operation`, `OperationKind`, `OperationAttributes`, `ParameterBinding`, `ModelConfig`.
+  - Normalizes Hugging Face `config.json` metadata through the shared
+    `HuggingFaceConfigDecoder`.
   - Contains no Metal code and no DSL knowledge.
 
 - `LMArchitecture`
@@ -209,6 +211,7 @@ Metal compatibility layer.
 - `ModelDeclarations`
   - Product/model-family declarations built on `LMArchitecture`.
   - Current declarations include `Transformer`, `Qwen35`, `LFM2`, and `Cohere`.
+  - `ModelFamilyRegistry` is the shared graph and weight-naming routing point.
   - This layer decides which computation graph to build from `ModelConfig`.
 
 - `CoreAIExport`

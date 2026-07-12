@@ -86,6 +86,11 @@ before execution and use the default specialization policy.
 
 ## Model-Family Routing
 
+Hugging Face configuration normalization is shared by `LMIR`, and
+`ModelFamilyRegistry` in `ModelDeclarations` owns graph and weight-naming
+resolution. `swiftlm-ir` and the legacy Swift loader consume these same
+contracts; neither entry point maintains a separate model-family switch.
+
 | Family | Export route | Runtime route |
 |---|---|---|
 | Standard Transformer | `swiftlm-ir` + `swiftlm-coreai export` | `SwiftLMFoundationModels` / `CoreAILanguageModel` |

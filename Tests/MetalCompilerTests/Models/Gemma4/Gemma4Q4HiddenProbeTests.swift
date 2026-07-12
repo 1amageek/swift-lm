@@ -374,7 +374,7 @@ struct Gemma4Q4HiddenProbeTests {
 
             let resolver = ModelGraphResolver()
             let graph = try resolver.resolveModelGraph(modelType: modelType, config: config)
-            let convention = resolver.namingConvention(for: modelType)
+            let convention = try resolver.namingConvention(for: modelType)
             let resolved = ParameterResolver().resolve(graph: graph, convention: convention)
 
             let compiler = MetalInferenceCompiler()
