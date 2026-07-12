@@ -89,7 +89,7 @@ before execution and use the default specialization policy.
 | Family | Export route | Runtime route |
 |---|---|---|
 | Standard Transformer | `swiftlm-ir` + `swiftlm-coreai export` | `SwiftLMFoundationModels` / `CoreAILanguageModel` |
-| LFM2 / LFM2 MoE | `swiftlm-coreai export` uses the Hugging Face Torch adapter and emits a dynamic stateless asset; `export_torch_module` remains the custom stateful extension point | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| LFM2 / LFM2 MoE | `swiftlm-coreai export` uses the Hugging Face Torch adapter; `--stateful` emits mutable KV and convolution caches | `SwiftLMCoreAI` / `CoreAIStateSession` |
 | Unsupported family | explicit validation error | no fallback |
 
 The low-level session supports heterogeneous persistent states such as key
@@ -100,6 +100,11 @@ each run. This avoids Core AI's fatal unresolved-dimension path and prevents
 the wrapper from inventing a context length. At most four NDArray state tensors
 and one NDArray output are currently supported by the Swift wrapper; image
 states and larger output sets fail with typed errors.
+
+The LFM2 stateful export is an explicit serial-generation contract:
+`input_ids` has shape `1x1`, while `position_ids` carries the complete prefix
+range for the current token. Callers preserve one `CoreAIStateSession` across
+calls and resolve its dynamic state shapes before the first call.
 
 ## Export Commands
 
@@ -121,6 +126,11 @@ PYTHONPATH=python/src python3 -m swiftlm_coreai.cli validate /tmp/model.json
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli export \
   /tmp/lfm2.json LiquidAI/LFM2.5-1.2B-Instruct \
   --output-dir /tmp/coreai-lfm2 --overwrite
+
+# Add mutable KV and short-convolution state for serial generation.
+PYTHONPATH=python/src python3 -m swiftlm_coreai.cli export \
+  /tmp/lfm2.json LiquidAI/LFM2.5-1.2B-Instruct \
+  --output-dir /tmp/coreai-lfm2-stateful --stateful --overwrite
 
 # Inspect a generated asset with Apple's toolchain.
 xcrun coreai-build inspect --json /tmp/coreai-model/model.aimodel

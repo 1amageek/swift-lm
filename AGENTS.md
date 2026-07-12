@@ -421,7 +421,8 @@ These are the major declaration paths visible in the repository today.
 
 - `LFM2`
   - Hybrid short-convolution + attention stack.
-  - Supports dense and MoE variants and uses per-layer schedules from config.
+  - Supports dense and MoE variants, per-layer schedules, and Core AI mutable
+    KV/convolution state export from config.
 
 - `Cohere`
   - Transformer variant with LayerNorm and QK normalization.

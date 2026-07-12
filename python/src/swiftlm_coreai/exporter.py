@@ -34,6 +34,7 @@ def export_model(
     output_dir: Path,
     *,
     overwrite: bool = False,
+    stateful: bool = False,
 ) -> Path:
     """Export a validated document using the family-specific Core AI pipeline.
 
@@ -55,6 +56,12 @@ def export_model(
             output_name=document.metadata["name"],
             max_context_length=document.metadata["maxContextLength"],
             overwrite=overwrite,
+            stateful=stateful,
+        )
+    if stateful:
+        raise ExportError(
+            "unsupported_stateful_model",
+            f"stateful export is only supported for {sorted(LOW_LEVEL_ONLY_MODEL_TYPES)}",
         )
     if document.model_type not in APPLE_HIGH_LEVEL_MODEL_TYPES:
         raise ExportError(

@@ -103,14 +103,26 @@ Torch adapter and emits a dynamic stateless asset:
     --overwrite
 ```
 
+Use `--stateful` when the application owns a serial Core AI context. The
+stateful asset exposes `keyCache`, `valueCache`, and `convCache`; its input is
+one token per call and `position_ids` contains the complete prefix position
+range:
+
+```bash
+.venv/bin/swiftlm-coreai export /tmp/lfm2.json \
+    LiquidAI/LFM2.5-1.2B-Instruct \
+    --output-dir /tmp/coreai-lfm2-stateful \
+    --stateful \
+    --overwrite
+```
+
 Use `CoreAIExport` when an application needs to build or inspect a document in
 Swift. Use `SwiftLMFoundationModels` for Apple-supported language bundles and
 `SwiftLMCoreAI` for direct asset inspection, specialization, and stateful
 inference. LFM2 uses the low-level exporter because Apple's high-level
 language-model registry does not provide its hybrid state layout. The current
-LFM2 exporter emits a dynamic stateless asset that recomputes each supplied
-sequence; stateful convolution/KV cache export remains an explicit advanced
-contract.
+LFM2 exporter emits a dynamic stateless asset by default and provides an
+explicit stateful variant for serial token-by-token execution.
 
 For a low-level asset with dynamic shapes, resolve every dynamic state at
 session creation and every dynamic output at execution:
