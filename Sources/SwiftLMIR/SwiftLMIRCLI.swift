@@ -149,7 +149,12 @@ struct SwiftLMIRCLI {
                 ?? jsonDouble("layer_norm_eps", json)
                 ?? jsonDouble("norm_eps", json)
                 ?? 1e-6
-            let ropeTheta = jsonDouble("rope_theta", json) ?? 10_000
+            let ropeParameters = json["rope_parameters"] as? [String: Any]
+            let ropeScaling = json["rope_scaling"] as? [String: Any]
+            let ropeTheta = jsonDouble("rope_theta", json)
+                ?? ropeParameters.flatMap { jsonDouble("rope_theta", $0) }
+                ?? ropeScaling.flatMap { jsonDouble("rope_theta", $0) }
+                ?? 10_000
             let modelConfig = ModelConfig(
                 hiddenSize: hiddenSize,
                 layerCount: layerCount,

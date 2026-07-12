@@ -93,12 +93,42 @@ python3 -m venv .venv
     --overwrite
 ```
 
+For LFM2 and LFM2 MoE, the same command selects the low-level Hugging Face
+Torch adapter and emits a dynamic stateless asset:
+
+```bash
+.venv/bin/swiftlm-coreai export /tmp/lfm2.json \
+    LiquidAI/LFM2.5-1.2B-Instruct \
+    --output-dir /tmp/coreai-lfm2 \
+    --overwrite
+```
+
 Use `CoreAIExport` when an application needs to build or inspect a document in
 Swift. Use `SwiftLMFoundationModels` for Apple-supported language bundles and
 `SwiftLMCoreAI` for direct asset inspection, specialization, and stateful
-inference. LFM2 currently belongs to the low-level Core AI path because the
-Apple high-level language-model registry does not provide its hybrid state
-layout.
+inference. LFM2 uses the low-level exporter because Apple's high-level
+language-model registry does not provide its hybrid state layout. The current
+LFM2 exporter emits a dynamic stateless asset that recomputes each supplied
+sequence; stateful convolution/KV cache export remains an explicit advanced
+contract.
+
+For a low-level asset with dynamic shapes, resolve every dynamic state at
+session creation and every dynamic output at execution:
+
+```swift
+let session = try CoreAIStateSession(
+    model: model,
+    functionName: "main",
+    stateShapes: [
+        "keyCache": [2, 1, 1, 40960, 32],
+        "valueCache": [2, 1, 1, 40960, 32]
+    ]
+)
+let outputs = try await session.run(
+    inputs: ["input_ids": inputIDs, "position_ids": positionIDs],
+    outputShapes: ["logits": [1, 1, bundle.vocabSize]]
+)
+```
 
 ## Legacy Direct Metal API (0.10)
 

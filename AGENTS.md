@@ -217,7 +217,9 @@ Metal compatibility layer.
 
 - `SwiftLMCoreAI`
   - Validates `.aimodel` assets, specializes `AIModel` instances, and executes
-    low-level stateful `InferenceFunction` calls.
+    low-level `InferenceFunction` calls. Dynamic state descriptors require
+    explicit resolved shapes at session creation; dynamic outputs require
+    explicit shapes for each call.
 
 - `SwiftLMFoundationModels`
   - Adapts Apple's `CoreAILanguageModels` package for supported language bundles.

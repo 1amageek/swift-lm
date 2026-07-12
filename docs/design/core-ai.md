@@ -89,15 +89,17 @@ before execution and use the default specialization policy.
 | Family | Export route | Runtime route |
 |---|---|---|
 | Standard Transformer | `swiftlm-ir` + `swiftlm-coreai export` | `SwiftLMFoundationModels` / `CoreAILanguageModel` |
-| LFM2 / LFM2 MoE | `CoreAIExport` for graph contract, `export_torch_module` for executable stateful program | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| LFM2 / LFM2 MoE | `swiftlm-coreai export` uses the Hugging Face Torch adapter and emits a dynamic stateless asset; `export_torch_module` remains the custom stateful extension point | `SwiftLMCoreAI` / `CoreAIStateSession` |
 | Unsupported family | explicit validation error | no fallback |
 
-The LFM2 route supports heterogeneous persistent states such as key cache,
-value cache, convolution state, and recurrent state. The session allocates
-states from Core AI descriptors rather than guessing their shapes or storage.
-At most four NDArray state tensors are currently supported by the Swift wrapper;
-image states and larger state sets fail with typed errors until the API can be
-represented without weakening lifetime guarantees.
+The low-level session supports heterogeneous persistent states such as key
+cache, value cache, convolution state, and recurrent state. Callers must pass
+the complete resolved shape for every dynamic state through `stateShapes`, and
+the complete resolved shape for every dynamic output through `outputShapes` on
+each run. This avoids Core AI's fatal unresolved-dimension path and prevents
+the wrapper from inventing a context length. At most four NDArray state tensors
+and one NDArray output are currently supported by the Swift wrapper; image
+states and larger output sets fail with typed errors.
 
 ## Export Commands
 
@@ -114,6 +116,11 @@ xcrun swift run swiftlm-ir \
 
 # Validate the document before invoking Apple's exporter.
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli validate /tmp/model.json
+
+# LFM2 and LFM2 MoE use the low-level Torch adapter.
+PYTHONPATH=python/src python3 -m swiftlm_coreai.cli export \
+  /tmp/lfm2.json LiquidAI/LFM2.5-1.2B-Instruct \
+  --output-dir /tmp/coreai-lfm2 --overwrite
 
 # Inspect a generated asset with Apple's toolchain.
 xcrun coreai-build inspect --json /tmp/coreai-model/model.aimodel

@@ -109,6 +109,9 @@ let package = Package(
         .testTarget(name: "SwiftLMCoreAITests", dependencies: [
             "SwiftLMCoreAI",
         ]),
+        .testTarget(name: "SwiftLMFoundationModelsTests", dependencies: [
+            "SwiftLMFoundationModels",
+        ]),
         .testTarget(name: "SwiftLMTests", dependencies: [
             "SwiftLM",
             .product(name: "TestHeartbeat", package: "swift-testing-heartbeat"),

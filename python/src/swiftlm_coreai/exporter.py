@@ -1,4 +1,4 @@
-"""Bridge from validated swift-lm documents to Apple's Core AI exporter."""
+"""Bridge validated swift-lm documents to Core AI exporters."""
 
 from __future__ import annotations
 
@@ -6,8 +6,21 @@ from pathlib import Path
 
 from .document import ExportDocument
 from .errors import ExportError
+from .lfm2 import export_lfm2_model
 
 LOW_LEVEL_ONLY_MODEL_TYPES = {"lfm2", "lfm2_moe"}
+APPLE_HIGH_LEVEL_MODEL_TYPES = {
+    "gemma3",
+    "gemma3_text",
+    "gpt_oss",
+    "mistral",
+    "mixtral",
+    "qwen2",
+    "qwen2_5",
+    "qwen3",
+    "qwen3_moe",
+    "qwen3_vl",
+}
 
 
 def validate_document(path: Path) -> ExportDocument:
@@ -22,16 +35,31 @@ def export_model(
     *,
     overwrite: bool = False,
 ) -> Path:
-    """Export a validated document using Apple's official Core AI model pipeline.
+    """Export a validated document using the family-specific Core AI pipeline.
 
     The Swift document is a required preflight contract. The exporter refuses
     to infer a different model family or platform from the Hugging Face bundle.
+    Apple-registry Transformer families use Apple's official pipeline; LFM2
+    families use the low-level Hugging Face Torch adapter.
     """
     document = validate_document(document_path)
     if document.model_type in LOW_LEVEL_ONLY_MODEL_TYPES:
+        if document.target != "macos_dynamic":
+            raise ExportError(
+                "unsupported_target",
+                f"{document.model_type} low-level export currently requires macos_dynamic",
+            )
+        return export_lfm2_model(
+            model_id,
+            output_dir,
+            output_name=document.metadata["name"],
+            max_context_length=document.metadata["maxContextLength"],
+            overwrite=overwrite,
+        )
+    if document.model_type not in APPLE_HIGH_LEVEL_MODEL_TYPES:
         raise ExportError(
-            "low_level_export_required",
-            f"{document.model_type} requires export_torch_module because its hybrid state layout is not in Apple's high-level registry",
+            "unsupported_model_type",
+            f"{document.model_type} is not supported by Apple's high-level Core AI model registry",
         )
     try:
         from transformers import AutoConfig

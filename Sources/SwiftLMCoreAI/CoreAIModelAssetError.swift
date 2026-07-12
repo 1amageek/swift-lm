@@ -7,6 +7,11 @@ public enum CoreAIModelAssetError: Error, LocalizedError, Sendable, Equatable {
     case missingSummary(URL)
     case functionNotFound(String)
     case stateNotFound(function: String, state: String)
+    case missingDynamicStateShape(String)
+    case missingDynamicOutputShape(String)
+    case invalidStateShape(function: String, state: String, expected: [Int], provided: [Int])
+    case invalidOutputShape(function: String, output: String, expected: [Int], provided: [Int])
+    case unsupportedOutputCount(Int)
     case outputUnavailable(String)
     case unsupportedStateCount(Int)
     case unsupportedSpecializationOption(String)
@@ -21,6 +26,16 @@ public enum CoreAIModelAssetError: Error, LocalizedError, Sendable, Equatable {
             return "Core AI function not found: \(name)"
         case .stateNotFound(let function, let state):
             return "Core AI state '\(state)' not found in function '\(function)'"
+        case .missingDynamicStateShape(let state):
+            return "Core AI dynamic state shape is required: \(state)"
+        case .missingDynamicOutputShape(let output):
+            return "Core AI dynamic output shape is required: \(output)"
+        case .invalidStateShape(let function, let state, let expected, let provided):
+            return "Invalid Core AI state shape for '\(function).\(state)': expected \(expected), got \(provided)"
+        case .invalidOutputShape(let function, let output, let expected, let provided):
+            return "Invalid Core AI output shape for '\(function).\(output)': expected \(expected), got \(provided)"
+        case .unsupportedOutputCount(let count):
+            return "Core AI state session supports at most one NDArray output, got \(count)"
         case .outputUnavailable(let name):
             return "Core AI output is unavailable: \(name)"
         case .unsupportedStateCount(let count):
