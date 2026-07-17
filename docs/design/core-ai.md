@@ -28,17 +28,14 @@ LMArchitecture -> LMIR
                   |
                   v
 CoreAIExport
-  versioned JSON export document
+  versioned function, state, graph, and binding contract
                   |
-                  +------------------------------+
-                  |                              |
-                  v                              v
-Apple Core AI exporter                 Core AI Torch converter
-standard Transformer                    custom/stateful families
-                  |                              |
-                  +--------------+---------------+
-                                 v
-                              .aimodel
+                  v
+Generic Swift LMIR lowerer in Python
+  safetensors bindings -> coreai-torch / coreai-models
+                  |
+                  v
+               .aimodel + embedded Swift contract
                                  |
                                  v
                    AIModel / InferenceFunction
@@ -60,7 +57,7 @@ that validated contract into Apple's Core AI asset format.
 | `LMArchitecture` | Declarative model components and graph validation |
 | `ModelDeclarations` | Transformer and LFM2 family declarations |
 | `CoreAIExport` | Versioned document and graph-to-document exporter |
-| `SwiftLMCoreAI` | Asset validation, specialization, state allocation, and inference |
+| `SwiftLMCoreAI` | Contract-validated stateless/stateful specialization and inference |
 | `SwiftLMFoundationModels` | Apple `CoreAILanguageModels` bundle adapter |
 | `SwiftLMIR` | `config.json` to export-document command-line tool |
 | `MetalCompiler` / `SwiftLM` | 0.10 direct Metal compatibility path |
@@ -93,18 +90,24 @@ contracts; neither entry point maintains a separate model-family switch.
 
 | Family | Export route | Runtime route |
 |---|---|---|
-| Standard Transformer | `swiftlm-ir` + `swiftlm-coreai export` | `SwiftLMFoundationModels` / `CoreAILanguageModel` |
-| LFM2 / LFM2 MoE | `swiftlm-coreai export` uses the Hugging Face Torch adapter; `--stateful` emits mutable KV and convolution caches | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| Standard Transformer | Swift LMIR generic lowering | `SwiftLMCoreAI` generated bundle or an Apple-native high-level bundle |
+| Dense LFM2 | Swift LMIR generic lowering; Swift document execution mode derives KV and convolution states | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| MoE / state-space / unsupported primitive contract | explicit lowering capability error with operation path | no fallback |
 | Unsupported family | explicit validation error | no fallback |
 
-The low-level session supports heterogeneous persistent states such as key
-cache, value cache, convolution state, and recurrent state. Callers must pass
-the complete resolved shape for every dynamic state through `stateShapes`, and
-the complete resolved shape for every dynamic output through `outputShapes` on
-each run. This avoids Core AI's fatal unresolved-dimension path and prevents
-the wrapper from inventing a context length. At most four NDArray state tensors
-and one NDArray output are currently supported by the Swift wrapper; image
-states and larger output sets fail with typed errors.
+The low-level session supports an arbitrary number of heterogeneous NDArray
+states. It owns persistent shared `MTLBuffer` storage, builds mutable Core AI
+views recursively, and serializes run/reset operations across actor
+reentrancy. `CoreAIModelBundle` resolves dynamic state dimensions from the
+embedded contract and requested context length. Dynamic output contracts still
+require an explicit expected shape per call. Image states and multiple output
+tensors fail with typed errors.
+
+`CoreAIExecutableSession` is the shared Swift execution interface.
+`CoreAIModelBundle.makeStatelessSession()` runs dynamic stateless functions,
+while `makeStateSession()` creates the persistent mutable-state path. Bundle
+execution mode is checked before specialization, so the two paths cannot be
+selected accidentally.
 
 The LFM2 stateful export is an explicit serial-generation contract:
 `input_ids` has shape `1x1`, while `position_ids` carries the complete prefix
@@ -127,15 +130,22 @@ xcrun swift run swiftlm-ir \
 # Validate the document before invoking Apple's exporter.
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli validate /tmp/model.json
 
-# LFM2 and LFM2 MoE use the low-level Torch adapter.
+# Export a stateless Swift contract.
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli export \
   /tmp/lfm2.json LiquidAI/LFM2.5-1.2B-Instruct \
   --output-dir /tmp/coreai-lfm2 --overwrite
 
-# Add mutable KV and short-convolution state for serial generation.
+# Derive mutable KV and ShortConv state in Swift, then lower the same contract.
+xcrun swift run swiftlm-ir \
+  --config /path/to/config.json \
+  --output /tmp/lfm2-stateful.json \
+  --name lfm2-stateful \
+  --target macos \
+  --stateful
+
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli export \
-  /tmp/lfm2.json LiquidAI/LFM2.5-1.2B-Instruct \
-  --output-dir /tmp/coreai-lfm2-stateful --stateful --overwrite
+  /tmp/lfm2-stateful.json LiquidAI/LFM2.5-1.2B-Instruct \
+  --output-dir /tmp/coreai-lfm2-stateful --overwrite
 
 # Inspect a generated asset with Apple's toolchain.
 xcrun coreai-build inspect --json /tmp/coreai-model/model.aimodel

@@ -19,7 +19,8 @@ struct SwiftLMIRCLI {
                 modelType: configuration.modelType,
                 target: arguments.target,
                 maxContextLength: arguments.maxContextLength ?? configuration.maxContextLength,
-                vocabSize: configuration.modelConfig.vocabSize
+                vocabSize: configuration.modelConfig.vocabSize,
+                execution: arguments.execution
             )
             let exporter = CoreAIModelExporter()
             let graph = try ModelFamilyRegistry.resolveModelGraph(
@@ -48,6 +49,7 @@ struct SwiftLMIRCLI {
         let name: String
         let target: CoreAIExportDocument.Target
         let maxContextLength: Int?
+        let execution: CoreAIProgramContract.Execution
 
         init(commandLine: [String]) throws {
             var values = commandLine
@@ -70,6 +72,12 @@ struct SwiftLMIRCLI {
                 maxContextLength = length
             } else {
                 maxContextLength = nil
+            }
+            if let index = values.firstIndex(of: "--stateful") {
+                values.remove(at: index)
+                execution = .stateful
+            } else {
+                execution = .stateless
             }
             guard values.isEmpty else {
                 throw CLIError.invalidArgument("unknown arguments: \(values.joined(separator: " "))")

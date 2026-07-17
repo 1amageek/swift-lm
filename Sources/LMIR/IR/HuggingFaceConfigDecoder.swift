@@ -103,7 +103,7 @@ public struct HuggingFaceConfigDecoder: Sendable {
             ropeScaling: nil,
             tiedEmbeddings: jsonBool("tie_word_embeddings", in: json)
                 ?? jsonBool("tie_embedding", in: json)
-                ?? false,
+                ?? tiedEmbeddingDefault(for: modelTypeLowercased),
             expertCount: jsonInt("num_local_experts", in: json)
                 ?? jsonInt("num_experts", in: json),
             expertsPerToken: jsonInt("num_experts_per_tok", in: json),
@@ -213,6 +213,16 @@ public struct HuggingFaceConfigDecoder: Sendable {
         }
         let attentionSet = Set(attentionIndices)
         return (0..<layerCount).map { attentionSet.contains($0) ? "full_attention" : "conv" }
+    }
+
+    private func tiedEmbeddingDefault(for modelType: String) -> Bool {
+        switch modelType {
+        case "gemma", "gemma2", "gemma3", "gemma3_text", "gemma4", "gemma4_text",
+             "lfm2", "lfm2_moe":
+            return true
+        default:
+            return false
+        }
     }
 
     private func fullAttentionRoPEScaling(

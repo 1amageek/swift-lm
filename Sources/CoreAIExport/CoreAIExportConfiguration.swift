@@ -7,13 +7,15 @@ public struct CoreAIExportConfiguration: Codable, Equatable, Sendable {
     public let target: CoreAIExportDocument.Target
     public let maxContextLength: Int
     public let vocabSize: Int
+    public let execution: CoreAIProgramContract.Execution
 
     public init(
         name: String,
         modelType: String,
         target: CoreAIExportDocument.Target,
         maxContextLength: Int,
-        vocabSize: Int
+        vocabSize: Int,
+        execution: CoreAIProgramContract.Execution = .stateless
     ) throws {
         guard !name.isEmpty else {
             throw CoreAIExportError.invalidConfiguration("name must not be empty")
@@ -32,6 +34,7 @@ public struct CoreAIExportConfiguration: Codable, Equatable, Sendable {
         self.target = target
         self.maxContextLength = maxContextLength
         self.vocabSize = vocabSize
+        self.execution = execution
     }
 
     public var metadata: CoreAIExportDocument.Metadata {

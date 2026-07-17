@@ -2,7 +2,7 @@
 
 Declarative model graphs and Core AI model tooling for Apple platforms.
 
-`swift-lm` loads Hugging Face model metadata, builds a backend-independent graph from a declarative Swift model definition, validates the graph, and exports a stable document for Apple's Core AI tooling. Standard Transformer models use Apple's high-level `CoreAILM` exporter and runtime. Model families outside that registry can use the low-level Core AI program exporter and runtime session.
+`swift-lm` loads Hugging Face model metadata, builds a backend-independent graph from a declarative Swift model definition, validates the graph, and exports a stable executable contract for Apple's Core AI tooling. The Swift graph and its parameter bindings are the single model definition; Python lowers that contract generically and does not rebuild model-family graphs.
 
 The direct Metal runtime remains available as the 0.10 compatibility path. New model support and public API work should target Core AI first.
 
@@ -11,8 +11,8 @@ The direct Metal runtime remains available as the 0.10 compatibility path. New m
 - Declarative `LMIR` and `LMArchitecture` model graphs.
 - Deterministic Core AI export documents with explicit graph, operation, and weight-binding contracts.
 - Swift CLI for converting local Hugging Face `config.json` files into export documents.
-- Python tooling that validates documents and invokes Apple's official Core AI exporter.
-- Low-level stateful Core AI sessions for custom model families such as LFM2.
+- Python tooling that validates and lowers Swift LMIR through `coreai-torch`.
+- Validated Core AI bundles and persistent stateful sessions for hybrid families such as LFM2.
 - The 0.10 direct Metal loader, generation API, embeddings, and multimodal runtime for compatibility.
 
 ## Requirements
@@ -81,8 +81,8 @@ xcrun swift run swiftlm-ir \
 PYTHONPATH=python/src python3 -m swiftlm_coreai.cli validate /tmp/model.json
 ```
 
-Install the Python exporter in an isolated environment, then export a standard
-Transformer model through Apple's pipeline:
+Install the Python bridge in an isolated environment, then lower the Swift
+contract and its bound safetensors through Apple's Core AI tooling:
 
 ```bash
 python3 -m venv .venv
@@ -93,8 +93,8 @@ python3 -m venv .venv
     --overwrite
 ```
 
-For LFM2 and LFM2 MoE, the same command selects the low-level Hugging Face
-Torch adapter and emits a dynamic stateless asset:
+The same command handles every supported declaration without model-family
+dispatch in Python:
 
 ```bash
 .venv/bin/swiftlm-coreai export /tmp/lfm2.json \
@@ -103,44 +103,62 @@ Torch adapter and emits a dynamic stateless asset:
     --overwrite
 ```
 
-Use `--stateful` when the application owns a serial Core AI context. The
-stateful asset exposes `keyCache`, `valueCache`, and `convCache`; its input is
-one token per call and `position_ids` contains the complete prefix position
-range:
+Choose stateful execution when producing the Swift document. State tensors and
+operation bindings are derived from LMIR before Python runs. For LFM2 this
+exposes `keyCache`, `valueCache`, and `convCache`; `input_ids` carries one token
+per call and `position_ids` carries the complete prefix position range:
 
 ```bash
-.venv/bin/swiftlm-coreai export /tmp/lfm2.json \
+xcrun swift run swiftlm-ir \
+    --config /path/to/lfm2/config.json \
+    --output /tmp/lfm2-stateful.json \
+    --name lfm2-stateful \
+    --target macos \
+    --stateful
+
+.venv/bin/swiftlm-coreai export /tmp/lfm2-stateful.json \
     LiquidAI/LFM2.5-1.2B-Instruct \
     --output-dir /tmp/coreai-lfm2-stateful \
-    --stateful \
     --overwrite
 ```
 
 Use `CoreAIExport` when an application needs to build or inspect a document in
-Swift. Use `SwiftLMFoundationModels` for Apple-supported language bundles and
-`SwiftLMCoreAI` for direct asset inspection, specialization, and stateful
-inference. LFM2 uses the low-level exporter because Apple's high-level
-language-model registry does not provide its hybrid state layout. The current
-LFM2 exporter emits a dynamic stateless asset by default and provides an
-explicit stateful variant for serial token-by-token execution.
+Swift. Use `SwiftLMCoreAI.CoreAIModelBundle` for generated bundles; it verifies
+the embedded Swift contract against the asset's function names, tensor types,
+shapes, and state layout before specialization. `SwiftLMFoundationModels`
+adapts Apple-native language bundles and is a separate high-level runtime
+surface.
+
+Stateless and stateful generated bundles share the `CoreAIExecutableSession`
+contract:
+
+```swift
+let bundle = try CoreAIModelBundle(contentsOf: bundleURL)
+let session = try await bundle.makeStatelessSession()
+let outputs = try await session.run(
+    inputs: ["input_ids": inputIDs, "position_ids": positionIDs],
+    outputShapes: ["logits": [1, tokenCount, bundle.document.metadata.vocabSize]]
+)
+```
 
 For a low-level asset with dynamic shapes, resolve every dynamic state at
 session creation and every dynamic output at execution:
 
 ```swift
-let session = try CoreAIStateSession(
-    model: model,
-    functionName: "main",
-    stateShapes: [
-        "keyCache": [2, 1, 1, 40960, 32],
-        "valueCache": [2, 1, 1, 40960, 32]
-    ]
-)
+let bundle = try CoreAIModelBundle(contentsOf: bundleURL)
+let session = try await bundle.makeStateSession(maxContextLength: 40960)
 let outputs = try await session.run(
-    inputs: ["input_ids": inputIDs, "position_ids": positionIDs],
-    outputShapes: ["logits": [1, 1, bundle.vocabSize]]
+    inputs: ["input_ids": inputIDs, "position_ids": positionIDs]
 )
 ```
+
+The generic lowerer currently implements token embedding, RMSNorm, LayerNorm,
+LayerScale, Linear, dense MLP, baseline RoPE attention, ShortConv, output heads,
+residual-add, parallel-add, repeat, and layer-index conditionals. Contracts that
+require MoE, state-space recurrence, vision primitives, sliding-window
+attention, scaled/M-RoPE, gated attention, or axis-dependent parallel merges
+fail before graph construction with an operation path. They never fall back to
+a second model definition.
 
 ## Legacy Direct Metal API (0.10)
 
@@ -375,7 +393,7 @@ The loader resolves these families from `config.json["model_type"]`:
 
 ## Architecture
 
-The repository is split into five layers:
+The primary path and the retained compatibility path meet only at LMIR:
 
 ```text
 LMIR
@@ -387,12 +405,21 @@ LMArchitecture
 ModelDeclarations
   Family-specific model declarations.
 
-MetalCompiler
-  IR lowering, fragment planning, dispatch optimization, kernel generation,
-  STAF loading, and direct Metal execution planning.
+CoreAIExport
+  Versioned executable contract with functions, states, operations, and
+  parameter bindings.
 
-SwiftLM
-  Public loading, prompt preparation, tokenization, generation, and embedding API.
+SwiftLMIR
+  Hugging Face config to Swift-authored contract CLI.
+
+SwiftLMCoreAI
+  Generated bundle validation, specialization, persistent state, and execution.
+
+SwiftLMFoundationModels
+  Adapter for Apple-native Core AI language bundles.
+
+MetalCompiler / SwiftLM
+  Direct Metal 0.10 compatibility runtime.
 ```
 
 Dependency direction:
@@ -400,9 +427,12 @@ Dependency direction:
 ```text
 LMIR  <-  LMArchitecture  <-  ModelDeclarations
   |                               |
-  +--------  MetalCompiler  ------+
-                  |
-                  +--------  SwiftLM
+  +---- CoreAIExport <------------+
+  |          |                    |
+  |          +---- SwiftLMIR      +---- generic Python Core AI lowerer
+  |          +---- SwiftLMCoreAI
+  |
+  +---- MetalCompiler ---- SwiftLM (0.10 compatibility)
 ```
 
 Design constraints:
@@ -410,8 +440,10 @@ Design constraints:
 - `LMIR` stays semantic and backend-independent.
 - Model declarations describe architecture families, not backend shortcuts.
 - `safetensors` is canonical; STAF is a regenerable execution cache.
-- Component-local optimization belongs in `MetalCompilable`.
-- Cross-component fusion belongs in the compiler.
+- Core AI lowering consumes only the versioned Swift contract and bound
+  safetensors; it does not dispatch on model families.
+- Component-local Metal optimization belongs in `MetalCompilable` on the 0.10
+  compatibility path.
 - Runtime-critical failures should be reported explicitly, not hidden behind silent fallbacks.
 
 ## Extending Models and Compiler

@@ -4,120 +4,123 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from swiftlm_coreai.errors import ExportError
 from swiftlm_coreai.exporter import export_model
 
 
 class ExporterTests(unittest.TestCase):
-    def test_lfm2_uses_low_level_export(self) -> None:
-        payload = {
-            "formatVersion": 1,
-            "metadata": {
-                "name": "lfm2",
-                "modelType": "lfm2",
-                "target": "macos_dynamic",
-                "maxContextLength": 128,
-                "vocabSize": 32,
-            },
-            "rootRegion": {
-                "parameters": [],
-                "operations": [],
-                "results": [],
-            },
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            document = Path(directory) / "graph.json"
-            output = Path(directory) / "output"
-            document.write_text(json.dumps(payload), encoding="utf-8")
+    def test_export_uses_swift_ir_for_every_model_family(self) -> None:
+        for model_type in ("lfm2", "llama", "qwen3"):
+            with self.subTest(model_type=model_type), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                document = root / "graph.json"
+                output = root / "output"
+                document.write_text(
+                    json.dumps(_document(model_type=model_type, execution="stateless")),
+                    encoding="utf-8",
+                )
+                expected = output / "model"
 
-            expected = output / "lfm2"
-            with patch("swiftlm_coreai.exporter.export_lfm2_model", return_value=expected) as exporter:
+                with patch(
+                    "swiftlm_coreai.exporter.export_ir_language_model",
+                    return_value=expected,
+                ) as exporter:
+                    result = export_model(document, "unused", output)
+
+                self.assertEqual(result, expected)
+                exporter.assert_called_once_with(
+                    unittest.mock.ANY,
+                    "unused",
+                    output,
+                    overwrite=False,
+                )
+
+    def test_stateful_execution_is_read_from_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            document = root / "graph.json"
+            output = root / "output"
+            document.write_text(
+                json.dumps(_document(model_type="lfm2", execution="stateful")),
+                encoding="utf-8",
+            )
+            expected = output / "model"
+
+            with patch(
+                "swiftlm_coreai.exporter.export_ir_language_model",
+                return_value=expected,
+            ) as exporter:
                 result = export_model(document, "unused", output)
 
             self.assertEqual(result, expected)
-            exporter.assert_called_once_with(
-                "unused",
-                output,
-                output_name="lfm2",
-                max_context_length=128,
-                overwrite=False,
-                stateful=False,
-            )
+            exported_document = exporter.call_args.args[0]
+            self.assertEqual(exported_document.execution, "stateful")
 
-    def test_lfm2_stateful_route_is_forwarded(self) -> None:
-        payload = {
-            "formatVersion": 1,
-            "metadata": {
-                "name": "lfm2",
-                "modelType": "lfm2",
-                "target": "macos_dynamic",
-                "maxContextLength": 128,
-                "vocabSize": 32,
-            },
-            "rootRegion": {"parameters": [], "operations": [], "results": []},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            document = Path(directory) / "graph.json"
-            output = Path(directory) / "output"
-            document.write_text(json.dumps(payload), encoding="utf-8")
 
-            expected = output / "lfm2"
-            with patch("swiftlm_coreai.exporter.export_lfm2_model", return_value=expected) as exporter:
-                result = export_model(document, "unused", output, stateful=True)
-
-            self.assertEqual(result, expected)
-            exporter.assert_called_once_with(
-                "unused",
-                output,
-                output_name="lfm2",
-                max_context_length=128,
-                overwrite=False,
-                stateful=True,
-            )
-
-    def test_unregistered_model_is_rejected_before_model_download(self) -> None:
-        payload = {
-            "formatVersion": 1,
-            "metadata": {
-                "name": "llama",
-                "modelType": "llama",
-                "target": "macos_dynamic",
-                "maxContextLength": 128,
-                "vocabSize": 32,
-            },
-            "rootRegion": {"parameters": [], "operations": [], "results": []},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            document = Path(directory) / "graph.json"
-            output = Path(directory) / "output"
-            document.write_text(json.dumps(payload), encoding="utf-8")
-
-            with self.assertRaises(ExportError) as context:
-                export_model(document, "unused", output)
-
-            self.assertEqual(context.exception.code, "unsupported_model_type")
-
-    def test_lfm2_rejects_static_ios_target(self) -> None:
-        payload = {
-            "formatVersion": 1,
-            "metadata": {
-                "name": "lfm2",
-                "modelType": "lfm2",
-                "target": "ios_static",
-                "maxContextLength": 128,
-                "vocabSize": 32,
-            },
-            "rootRegion": {"parameters": [], "operations": [], "results": []},
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            document = Path(directory) / "graph.json"
-            output = Path(directory) / "output"
-            document.write_text(json.dumps(payload), encoding="utf-8")
-
-            with self.assertRaises(ExportError) as context:
-                export_model(document, "unused", output)
-
-            self.assertEqual(context.exception.code, "unsupported_target")
+def _document(*, model_type: str, execution: str) -> dict:
+    states = []
+    if execution == "stateful":
+        states = [
+            {
+                "name": "convCache",
+                "dataType": "float16",
+                "dimensions": [
+                    {"kind": "fixed", "size": 1},
+                    {"kind": "fixed", "size": 1},
+                    {"kind": "fixed", "size": 2},
+                    {"kind": "fixed", "size": 3},
+                ],
+            }
+        ]
+    return {
+        "formatVersion": 2,
+        "metadata": {
+            "name": "model",
+            "modelType": model_type,
+            "target": "macos_dynamic",
+            "maxContextLength": 8,
+            "vocabSize": 4,
+        },
+        "program": {
+            "source": "swift_lmir",
+            "execution": execution,
+            "functions": [
+                {
+                    "name": "main",
+                    "inputs": [
+                        {
+                            "name": "input_ids",
+                            "dataType": "int32",
+                            "dimensions": [
+                                {"kind": "fixed", "size": 1},
+                                {"kind": "fixed", "size": 1},
+                            ],
+                        },
+                        {
+                            "name": "position_ids",
+                            "dataType": "int32",
+                            "dimensions": [
+                                {"kind": "fixed", "size": 1},
+                                {"kind": "fixed", "size": 1},
+                            ],
+                        },
+                    ],
+                    "outputs": [
+                        {
+                            "name": "logits",
+                            "dataType": "float16",
+                            "dimensions": [
+                                {"kind": "fixed", "size": 1},
+                                {"kind": "fixed", "size": 1},
+                                {"kind": "fixed", "size": 4},
+                            ],
+                        }
+                    ],
+                    "states": states,
+                }
+            ],
+        },
+        "rootRegion": {"parameters": [], "operations": [], "results": []},
+    }
 
 
 if __name__ == "__main__":

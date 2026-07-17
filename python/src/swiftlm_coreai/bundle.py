@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,7 @@ def write_language_bundle_metadata(
     vocab_size: int,
     max_context_length: int,
     asset_name: str | None = None,
+    contract_name: str = "swiftlm-program.json",
     compression: str | None = None,
     function_map: dict[str, list[str]] | None = None,
 ) -> Path:
@@ -31,20 +33,33 @@ def write_language_bundle_metadata(
         raise ExportError("invalid_bundle_metadata", "model_id must not be empty")
 
     resolved_asset_name = asset_name or f"{name}.aimodel"
+    contract_path = bundle_path / contract_name
+    try:
+        contract_sha256 = hashlib.sha256(contract_path.read_bytes()).hexdigest()
+    except OSError as error:
+        raise ExportError(
+            "invalid_bundle_metadata",
+            f"Could not hash contract {contract_path}: {error}",
+        ) from error
     metadata: dict[str, Any] = {
         "metadata_version": METADATA_VERSION,
         "kind": "llm",
         "name": name,
-        "assets": {"main": resolved_asset_name},
+        "assets": {
+            "main": resolved_asset_name,
+            "contract": contract_name,
+            "contract_sha256": contract_sha256,
+        },
         "language": {
-            "tokenizer": model_id,
+            "tokenizer": "tokenizer",
             "vocab_size": vocab_size,
             "max_context_length": max_context_length,
             "embedded_tokenizer": True,
             "function_map": function_map or {"main": ["main"]},
         },
         "source": {
-            "model_definition": "torch",
+            "model_definition": "swift_lmir",
+            "format_version": 2,
             "hf_model_id": model_id,
         },
         "compression": compression,
@@ -111,15 +126,49 @@ def validate_language_bundle(
             "invalid_bundle",
             f"metadata.assets.main must reference an existing .aimodel directory: {asset_path}",
         )
+    contract_name = assets.get("contract")
+    if not isinstance(contract_name, str):
+        raise ExportError("invalid_bundle", "metadata.assets.contract must be a string")
+    contract_path = _resolve_bundle_asset(bundle_path, contract_name)
+    if not contract_path.is_file():
+        raise ExportError("invalid_bundle", f"Missing Swift LMIR contract: {contract_path}")
+    expected_contract_hash = assets.get("contract_sha256")
+    if not isinstance(expected_contract_hash, str) or len(expected_contract_hash) != 64:
+        raise ExportError("invalid_bundle", "metadata.assets.contract_sha256 is invalid")
+    try:
+        contract_bytes = contract_path.read_bytes()
+    except OSError as error:
+        raise ExportError("invalid_bundle", f"Could not hash {contract_path}") from error
+    actual_contract_hash = hashlib.sha256(contract_bytes).hexdigest()
+    if actual_contract_hash != expected_contract_hash:
+        raise ExportError("invalid_bundle", "Swift LMIR contract hash does not match metadata")
+    try:
+        contract = json.loads(contract_bytes)
+    except json.JSONDecodeError as error:
+        raise ExportError("invalid_bundle", f"Invalid Swift LMIR contract: {contract_path}") from error
+    if not isinstance(contract, dict) or contract.get("formatVersion") != 2:
+        raise ExportError("invalid_bundle", "Swift LMIR contract must use format version 2")
+    program = contract.get("program")
+    if not isinstance(program, dict) or program.get("source") != "swift_lmir":
+        raise ExportError("invalid_bundle", "Bundle contract must originate from swift_lmir")
+
+    source = metadata.get("source")
+    if not isinstance(source, dict) or source.get("model_definition") != "swift_lmir":
+        raise ExportError("invalid_bundle", "metadata.source.model_definition must be swift_lmir")
+    if source.get("format_version") != 2:
+        raise ExportError("invalid_bundle", "metadata.source.format_version must be 2")
+    if source.get("hf_model_id") != expected_model_id:
+        raise ExportError(
+            "invalid_bundle",
+            f"metadata.source.hf_model_id must be {expected_model_id!r}",
+        )
 
     language = metadata.get("language")
     if not isinstance(language, dict):
         raise ExportError("invalid_bundle", "metadata.language must be an object")
-    if language.get("tokenizer") != expected_model_id:
-        raise ExportError(
-            "invalid_bundle",
-            f"language.tokenizer must be {expected_model_id!r}",
-        )
+    tokenizer_name = language.get("tokenizer")
+    if not isinstance(tokenizer_name, str) or not tokenizer_name:
+        raise ExportError("invalid_bundle", "language.tokenizer must be a relative path")
     if language.get("vocab_size") != expected_vocab_size:
         raise ExportError(
             "invalid_bundle",
@@ -135,11 +184,12 @@ def validate_language_bundle(
     if not isinstance(embedded_tokenizer, bool):
         raise ExportError("invalid_bundle", "language.embedded_tokenizer must be a boolean")
     if embedded_tokenizer:
-        tokenizer_path = bundle_path / "tokenizer" / "tokenizer.json"
-        if not tokenizer_path.is_file():
+        tokenizer_path = _resolve_bundle_asset(bundle_path, tokenizer_name)
+        tokenizer_json = tokenizer_path / "tokenizer.json"
+        if not tokenizer_path.is_dir() or not tokenizer_json.is_file():
             raise ExportError(
                 "invalid_bundle",
-                f"Embedded tokenizer is missing: {tokenizer_path}",
+                f"Embedded tokenizer is missing: {tokenizer_json}",
             )
 
     function_map = language.get("function_map")
@@ -152,7 +202,7 @@ def _resolve_bundle_asset(bundle_path: Path, relative_path: str) -> Path:
     asset_path = (bundle_path / relative_path).resolve()
     bundle_root = bundle_path.resolve()
     if not asset_path.is_relative_to(bundle_root):
-        raise ExportError("invalid_bundle", "metadata.assets.main must stay inside the bundle")
+        raise ExportError("invalid_bundle", "bundle-relative paths must stay inside the bundle")
     return asset_path
 
 

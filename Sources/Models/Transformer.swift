@@ -18,7 +18,7 @@ public struct Transformer: ModelComponent {
     public var body: some ModelComponent {
         TokenEmbedding(vocabSize: config.vocabSize, embeddingSize: config.hiddenSize)
 
-        Repeat(count: config.layerCount, label: "layers") {
+        LayerStack(0..<config.layerCount) { _ in
             TransformerDecoderLayer(config: config)
         }
 

@@ -27,6 +27,10 @@ Packages/
 
 # Python
 __pycache__/
+.venv/
+
+# Test coverage
+*.profraw
 
 # CocoaPods
 Pods/

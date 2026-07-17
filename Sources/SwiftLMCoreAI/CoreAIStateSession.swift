@@ -1,5 +1,6 @@
 import CoreAI
 import Foundation
+import Metal
 
 /// Serial stateful execution for Core AI tensor functions.
 ///
@@ -9,19 +10,24 @@ import Foundation
 /// must be supplied at initialization, and dynamic output shapes must be
 /// supplied for each run.
 @available(macOS 27.0, iOS 27.0, *)
-public actor CoreAIStateSession {
+public actor CoreAIStateSession: CoreAIExecutableSession {
     private final class StateValue {
         let name: String
-        var value: NDArray
+        let buffer: any MTLBuffer
+        let descriptor: NDArrayDescriptor
 
-        init(name: String, value: NDArray) {
+        init(name: String, buffer: any MTLBuffer, descriptor: NDArrayDescriptor) {
             self.name = name
-            self.value = value
+            self.buffer = buffer
+            self.descriptor = descriptor
         }
     }
 
     private let function: InferenceFunction
+    private let stream: ComputeStream
     private var states: [StateValue]
+    private var isExecuting = false
+    private var executionWaiters: [CheckedContinuation<Void, Never>] = []
 
     public init(
         model: AIModel,
@@ -36,6 +42,7 @@ public actor CoreAIStateSession {
             throw CoreAIModelAssetError.stateNotFound(function: functionName, state: name)
         }
         self.function = function
+        self.stream = ComputeStream()
         self.stateShapes = stateShapes
         self.states = try Self.makeStates(for: function, stateShapes: stateShapes)
     }
@@ -44,15 +51,38 @@ public actor CoreAIStateSession {
         function.descriptor
     }
 
-    public func reset() throws {
-        states = try Self.makeStates(for: function, stateShapes: stateShapes)
+    public func reset() async throws {
+        await acquireExecution()
+        do {
+            states = try Self.makeStates(for: function, stateShapes: stateShapes)
+            releaseExecution()
+        } catch {
+            releaseExecution()
+            throw error
+        }
     }
 
     public func run(
         inputs: [String: NDArray],
         outputShapes: [String: [Int]] = [:]
     ) async throws -> [String: NDArray] {
-        guard function.descriptor.outputNames.count <= 1 else {
+        await acquireExecution()
+        do {
+            let output = try await runExclusively(inputs: inputs, outputShapes: outputShapes)
+            releaseExecution()
+            return output
+        } catch {
+            releaseExecution()
+            throw error
+        }
+    }
+
+    private func runExclusively(
+        inputs: [String: NDArray],
+        outputShapes: [String: [Int]]
+    ) async throws -> [String: NDArray] {
+        try validate(inputs: inputs)
+        guard function.descriptor.outputNames.count == 1 else {
             throw CoreAIModelAssetError.unsupportedOutputCount(function.descriptor.outputNames.count)
         }
         let outputNames = Set(function.descriptor.outputNames)
@@ -60,153 +90,107 @@ public actor CoreAIStateSession {
             throw CoreAIModelAssetError.outputUnavailable(name)
         }
 
-        guard let outputName = function.descriptor.outputNames.first else {
-            return try await runWithoutOutput(inputs: inputs)
+        let outputName = function.descriptor.outputNames[0]
+        let expectedDescriptor = try outputDescriptor(
+            named: outputName,
+            shape: outputShapes[outputName]
+        )
+        let asyncInputs = Dictionary(uniqueKeysWithValues: inputs.map { name, value in
+            (name, InferenceFunction.AsyncValue(value))
+        })
+        let stateViews = InferenceFunction.AsyncMutableViews()
+        let encodedOutputs = try encode(
+            stateIndex: 0,
+            inputs: asyncInputs,
+            stateViews: consume stateViews,
+            stream: stream
+        )
+        guard let asyncOutput = encodedOutputs[outputName],
+              let resolvedOutput = try await asyncOutput.ndArray else {
+            throw CoreAIModelAssetError.outputUnavailable(outputName)
         }
+        guard resolvedOutput.shape == expectedDescriptor.shape else {
+            throw CoreAIModelAssetError.invalidOutputShape(
+                function: function.descriptor.name,
+                output: outputName,
+                expected: expectedDescriptor.shape,
+                provided: resolvedOutput.shape
+            )
+        }
+        return [outputName: resolvedOutput]
+    }
 
-        switch states.count {
-        case 0:
-            var output = try makeOutput(named: outputName, shape: outputShapes[outputName])
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&output, for: outputName)
-            _ = try await function.run(inputs: inputs, outputViews: outputViews)
-            return [outputName: output]
-        case 1:
-            var state0 = states[0].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            var output = try makeOutput(named: outputName, shape: outputShapes[outputName])
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&output, for: outputName)
-            _ = try await function.run(
-                inputs: inputs,
-                states: views,
-                outputViews: outputViews
-            )
-            states[0].value = state0
-            return [outputName: output]
-        case 2:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            var output = try makeOutput(named: outputName, shape: outputShapes[outputName])
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&output, for: outputName)
-            _ = try await function.run(
-                inputs: inputs,
-                states: views,
-                outputViews: outputViews
-            )
-            states[0].value = state0
-            states[1].value = state1
-            return [outputName: output]
-        case 3:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var state2 = states[2].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            views.insert(&state2, for: states[2].name)
-            var output = try makeOutput(named: outputName, shape: outputShapes[outputName])
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&output, for: outputName)
-            _ = try await function.run(
-                inputs: inputs,
-                states: views,
-                outputViews: outputViews
-            )
-            states[0].value = state0
-            states[1].value = state1
-            states[2].value = state2
-            return [outputName: output]
-        case 4:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var state2 = states[2].value
-            var state3 = states[3].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            views.insert(&state2, for: states[2].name)
-            views.insert(&state3, for: states[3].name)
-            var output = try makeOutput(named: outputName, shape: outputShapes[outputName])
-            var outputViews = InferenceFunction.MutableViews()
-            outputViews.insert(&output, for: outputName)
-            _ = try await function.run(
-                inputs: inputs,
-                states: views,
-                outputViews: outputViews
-            )
-            states[0].value = state0
-            states[1].value = state1
-            states[2].value = state2
-            states[3].value = state3
-            return [outputName: output]
-        default:
-            throw CoreAIModelAssetError.unsupportedStateCount(states.count)
+    private func validate(inputs: [String: NDArray]) throws {
+        let functionName = function.descriptor.name
+        let expectedNames = Set(function.descriptor.inputNames)
+        for name in inputs.keys where !expectedNames.contains(name) {
+            throw CoreAIModelAssetError.unexpectedInput(function: functionName, input: name)
+        }
+        for name in function.descriptor.inputNames {
+            guard let input = inputs[name] else {
+                throw CoreAIModelAssetError.inputNotFound(function: functionName, input: name)
+            }
+            guard let descriptor = function.descriptor.inputDescriptor(of: name),
+                  case .ndArray(let arrayDescriptor) = descriptor else {
+                throw CoreAIModelAssetError.unsupportedInput(function: functionName, input: name)
+            }
+            guard input.scalarType == arrayDescriptor.scalarType else {
+                throw CoreAIModelAssetError.invalidInputDataType(
+                    function: functionName,
+                    input: name,
+                    expected: String(describing: arrayDescriptor.scalarType),
+                    provided: String(describing: input.scalarType)
+                )
+            }
+            guard input.shape.count == arrayDescriptor.rank,
+                  zip(arrayDescriptor.shape, input.shape).allSatisfy({ expected, actual in
+                      expected == -1 || expected == actual
+                  }) else {
+                throw CoreAIModelAssetError.invalidInputShape(
+                    function: functionName,
+                    input: name,
+                    expected: arrayDescriptor.shape,
+                    provided: input.shape
+                )
+            }
         }
     }
 
-    private func runWithoutOutput(inputs: [String: NDArray]) async throws -> [String: NDArray] {
-        switch states.count {
-        case 0:
-            _ = try await function.run(inputs: inputs)
-            return [:]
-        case 1:
-            var state0 = states[0].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            _ = try await function.run(inputs: inputs, states: views)
-            states[0].value = state0
-            return [:]
-        case 2:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            _ = try await function.run(inputs: inputs, states: views)
-            states[0].value = state0
-            states[1].value = state1
-            return [:]
-        case 3:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var state2 = states[2].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            views.insert(&state2, for: states[2].name)
-            _ = try await function.run(inputs: inputs, states: views)
-            states[0].value = state0
-            states[1].value = state1
-            states[2].value = state2
-            return [:]
-        case 4:
-            var state0 = states[0].value
-            var state1 = states[1].value
-            var state2 = states[2].value
-            var state3 = states[3].value
-            var views = InferenceFunction.MutableViews()
-            views.insert(&state0, for: states[0].name)
-            views.insert(&state1, for: states[1].name)
-            views.insert(&state2, for: states[2].name)
-            views.insert(&state3, for: states[3].name)
-            _ = try await function.run(inputs: inputs, states: views)
-            states[0].value = state0
-            states[1].value = state1
-            states[2].value = state2
-            states[3].value = state3
-            return [:]
-        default:
-            throw CoreAIModelAssetError.unsupportedStateCount(states.count)
+    private func encode(
+        stateIndex: Int,
+        inputs: [String: InferenceFunction.AsyncValue],
+        stateViews: consuming InferenceFunction.AsyncMutableViews,
+        stream: borrowing ComputeStream
+    ) throws -> [String: InferenceFunction.AsyncValue] {
+        guard stateIndex < states.count else {
+            let outputViews = InferenceFunction.AsyncMutableViews()
+            return try function.encode(
+                inputs: inputs,
+                states: stateViews,
+                outputViews: consume outputViews,
+                to: stream
+            )
         }
+
+        let state = states[stateIndex]
+        var stateValue = unsafe InferenceFunction.AsyncMutableValue(
+            unsafeBuffer: state.buffer,
+            scalarType: state.descriptor.scalarType,
+            shape: state.descriptor.shape,
+            strides: state.descriptor.preferredStrides,
+            interleaveLayout: state.descriptor.interleaveLayout
+        )
+        var nextViews = stateViews
+        nextViews.insert(&stateValue, for: state.name)
+        return try encode(
+            stateIndex: stateIndex + 1,
+            inputs: inputs,
+            stateViews: consume nextViews,
+            stream: stream
+        )
     }
 
-    private func makeOutput(named name: String, shape: [Int]?) throws -> NDArray {
+    private func outputDescriptor(named name: String, shape: [Int]?) throws -> NDArrayDescriptor {
         guard let descriptor = function.descriptor.outputDescriptor(of: name) else {
             throw CoreAIModelAssetError.outputUnavailable(name)
         }
@@ -221,7 +205,25 @@ public actor CoreAIStateSession {
             output: name,
             requestedShape: shape
         )
-        return NDArray(descriptor: resolvedDescriptor)
+        return resolvedDescriptor
+    }
+
+    private func acquireExecution() async {
+        guard isExecuting else {
+            isExecuting = true
+            return
+        }
+        await withCheckedContinuation { continuation in
+            executionWaiters.append(continuation)
+        }
+    }
+
+    private func releaseExecution() {
+        guard !executionWaiters.isEmpty else {
+            isExecuting = false
+            return
+        }
+        executionWaiters.removeFirst().resume()
     }
 
     private let stateShapes: [String: [Int]]
@@ -245,7 +247,19 @@ public actor CoreAIStateSession {
                 state: name,
                 requestedShape: stateShapes[name]
             )
-            return StateValue(name: name, value: NDArray(descriptor: resolvedDescriptor))
+            guard let device = MTLCreateSystemDefaultDevice(),
+                  let buffer = device.makeBuffer(
+                    length: resolvedDescriptor.minimumByteCount,
+                    options: .storageModeShared
+                  ) else {
+                throw CoreAIModelAssetError.stateAllocationFailed(name)
+            }
+            memset(buffer.contents(), 0, buffer.length)
+            return StateValue(
+                name: name,
+                buffer: buffer,
+                descriptor: resolvedDescriptor
+            )
         }
     }
 

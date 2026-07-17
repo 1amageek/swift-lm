@@ -19,9 +19,17 @@ public struct CoreAIModelExporter: Sendable {
         }
 
         let canonicalGraph = canonicalize(graph)
+        let program = try CoreAIProgramContractBuilder().make(
+            graph: canonicalGraph,
+            configuration: configuration
+        )
         return CoreAIExportDocument(
             metadata: configuration.metadata,
-            rootRegion: try encodeRegion(canonicalGraph.rootRegion)
+            program: program.contract,
+            rootRegion: try encodeRegion(
+                canonicalGraph.rootRegion,
+                stateBindings: program.stateBindings
+            )
         )
     }
 
@@ -56,15 +64,23 @@ public struct CoreAIModelExporter: Sendable {
         }
     }
 
-    private func encodeRegion(_ region: Region) throws -> CoreAIExportDocument.Region {
+    private func encodeRegion(
+        _ region: Region,
+        stateBindings: [OperationKey: [CoreAIExportDocument.StateBinding]]
+    ) throws -> CoreAIExportDocument.Region {
         CoreAIExportDocument.Region(
             parameters: region.parameters.map { .init(rawValue: $0.id.rawValue) },
-            operations: try region.operations.map(encodeOperation),
+            operations: try region.operations.map {
+                try encodeOperation($0, stateBindings: stateBindings)
+            },
             results: region.results.map { .init(rawValue: $0.value.rawValue) }
         )
     }
 
-    private func encodeOperation(_ operation: LMIR.Operation) throws -> CoreAIExportDocument.Operation {
+    private func encodeOperation(
+        _ operation: LMIR.Operation,
+        stateBindings: [OperationKey: [CoreAIExportDocument.StateBinding]]
+    ) throws -> CoreAIExportDocument.Operation {
         CoreAIExportDocument.Operation(
             key: operation.key.rawValue,
             operands: operation.operands.map { .init(rawValue: $0.value.rawValue) },
@@ -75,33 +91,43 @@ public struct CoreAIModelExporter: Sendable {
                     tensorName: $0.tensorName
                 )
             },
-            kind: try encodeKind(operation.kind)
+            stateBindings: stateBindings[operation.key] ?? [],
+            kind: try encodeKind(operation.kind, stateBindings: stateBindings)
         )
     }
 
     private func encodeKind(
-        _ kind: OperationKind
+        _ kind: OperationKind,
+        stateBindings: [OperationKey: [CoreAIExportDocument.StateBinding]]
     ) throws -> CoreAIExportDocument.OperationKind {
         switch kind {
         case .primitive(let attributes):
             return .primitive(try encodePrimitive(attributes))
         case .residual(let strategy, let body):
-            return .residual(strategy: strategy, body: try encodeRegion(body))
+            return .residual(
+                strategy: strategy,
+                body: try encodeRegion(body, stateBindings: stateBindings)
+            )
         case .parallel(let merge, let branches):
             return .parallel(
                 merge: merge,
-                branches: try branches.map(encodeRegion)
+                branches: try branches.map {
+                    try encodeRegion($0, stateBindings: stateBindings)
+                }
             )
         case .repeating(let count, let body):
             guard count >= 0 else {
                 throw CoreAIExportError.invalidGraph("repeat count must not be negative")
             }
-            return .repeating(count: count, body: try encodeRegion(body))
+            return .repeating(
+                count: count,
+                body: try encodeRegion(body, stateBindings: stateBindings)
+            )
         case .conditional(let condition, let then, let `else`):
             return .conditional(
                 condition: condition,
-                then: try encodeRegion(then),
-                else: try encodeRegion(`else`)
+                then: try encodeRegion(then, stateBindings: stateBindings),
+                else: try encodeRegion(`else`, stateBindings: stateBindings)
             )
         }
     }

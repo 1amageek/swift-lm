@@ -5,6 +5,27 @@ import Testing
 
 @Suite("Model Family Contract Tests", .tags(.unit))
 struct ModelFamilyContractTests {
+    @Test("LFM2 applies its architectural tied-embedding default")
+    func lfm2TiedEmbeddingDefault() throws {
+        let data = Data(
+            """
+            {
+              "model_type": "lfm2",
+              "hidden_size": 64,
+              "num_hidden_layers": 2,
+              "vocab_size": 65536,
+              "num_attention_heads": 2,
+              "num_key_value_heads": 1,
+              "layer_types": ["conv", "full_attention"],
+              "conv_L_cache": 3
+            }
+            """.utf8
+        )
+
+        let configuration = try HuggingFaceConfigDecoder().decode(from: data)
+
+        #expect(configuration.modelConfig.tiedEmbeddings == true)
+    }
     @Test("Shared decoder normalizes nested text configuration")
     func decodesNestedTextConfiguration() throws {
         let data = Data(

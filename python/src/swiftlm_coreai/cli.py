@@ -21,11 +21,6 @@ def build_parser() -> argparse.ArgumentParser:
     export_parser.add_argument("model_id")
     export_parser.add_argument("--output-dir", type=Path, required=True)
     export_parser.add_argument("--overwrite", action="store_true")
-    export_parser.add_argument(
-        "--stateful",
-        action="store_true",
-        help="Export LFM2/LFM2 MoE with mutable KV and convolution states",
-    )
     return parser
 
 
@@ -45,7 +40,6 @@ def main() -> int:
             args.model_id,
             args.output_dir,
             overwrite=args.overwrite,
-            stateful=args.stateful,
         )
         print(result)
         return 0

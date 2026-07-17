@@ -4,19 +4,22 @@ import LMIR
 /// A versioned, backend-neutral document consumed by the Core AI exporter.
 public struct CoreAIExportDocument: Codable, Equatable, Sendable {
 
-    public static let currentFormatVersion = 1
+    public static let currentFormatVersion = 2
 
     public let formatVersion: Int
     public let metadata: Metadata
+    public let program: CoreAIProgramContract
     public let rootRegion: Region
 
     public init(
         formatVersion: Int = CoreAIExportDocument.currentFormatVersion,
         metadata: Metadata,
+        program: CoreAIProgramContract,
         rootRegion: Region
     ) {
         self.formatVersion = formatVersion
         self.metadata = metadata
+        self.program = program
         self.rootRegion = rootRegion
     }
 
@@ -68,6 +71,7 @@ public struct CoreAIExportDocument: Codable, Equatable, Sendable {
         public let operands: [ValueID]
         public let results: [ValueID]
         public let parameterBindings: [ParameterBinding]
+        public let stateBindings: [StateBinding]
         public let kind: OperationKind
 
         public init(
@@ -75,12 +79,14 @@ public struct CoreAIExportDocument: Codable, Equatable, Sendable {
             operands: [ValueID],
             results: [ValueID],
             parameterBindings: [ParameterBinding],
+            stateBindings: [StateBinding] = [],
             kind: OperationKind
         ) {
             self.key = key
             self.operands = operands
             self.results = results
             self.parameterBindings = parameterBindings
+            self.stateBindings = stateBindings
             self.kind = kind
         }
     }
@@ -109,6 +115,18 @@ public struct CoreAIExportDocument: Codable, Equatable, Sendable {
         public init(role: String, tensorName: String) {
             self.role = role
             self.tensorName = tensorName
+        }
+    }
+
+    public struct StateBinding: Codable, Equatable, Sendable {
+        public let role: String
+        public let state: String
+        public let axisIndex: Int
+
+        public init(role: String, state: String, axisIndex: Int) {
+            self.role = role
+            self.state = state
+            self.axisIndex = axisIndex
         }
     }
 
@@ -268,10 +286,12 @@ public struct CoreAIExportDocument: Codable, Equatable, Sendable {
             switch object {
             case is NSNull:
                 self = .null
-            case let value as Bool:
-                self = .bool(value)
             case let value as NSNumber:
-                self = .number(value.doubleValue)
+                if CFGetTypeID(value) == CFBooleanGetTypeID() {
+                    self = .bool(value.boolValue)
+                } else {
+                    self = .number(value.doubleValue)
+                }
             case let value as String:
                 self = .string(value)
             case let value as [Any]:

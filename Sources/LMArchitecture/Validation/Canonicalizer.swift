@@ -123,7 +123,12 @@ private func canonicalizePrimitiveAttributes(_ attrs: any OperationAttributes) -
             bias: a.bias
         )
     case let a as RMSNormAttributes:
-        return RMSNormAttributes(dimension: a.dimension, epsilon: a.epsilon, weightBias: a.weightBias)
+        return RMSNormAttributes(
+            dimension: a.dimension,
+            epsilon: a.epsilon,
+            weightBias: a.weightBias,
+            withScale: a.withScale
+        )
     case let a as LayerNormAttributes:
         return LayerNormAttributes(dimension: a.dimension, epsilon: a.epsilon, affine: a.affine)
     case let a as LayerScaleAttributes:
