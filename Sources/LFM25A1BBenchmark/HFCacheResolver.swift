@@ -2,9 +2,19 @@ import Foundation
 
 enum HFCacheResolver {
     static func resolveSnapshot(repoDirectoryName: String) throws -> URL {
+#if os(macOS) && !targetEnvironment(macCatalyst)
         let home = FileManager.default.homeDirectoryForCurrentUser
-        let snapshots = home
+        let cacheRoot = home
             .appendingPathComponent(".cache/huggingface/hub", isDirectory: true)
+#else
+        guard let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first else {
+            throw BenchmarkError.modelNotFound("No writable user cache directory available")
+        }
+        let cacheRoot = caches
+            .appendingPathComponent("huggingface", isDirectory: true)
+            .appendingPathComponent("hub", isDirectory: true)
+#endif
+        let snapshots = cacheRoot
             .appendingPathComponent(repoDirectoryName, isDirectory: true)
             .appendingPathComponent("snapshots", isDirectory: true)
         let contents = try FileManager.default.contentsOfDirectory(

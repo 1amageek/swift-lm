@@ -429,7 +429,11 @@ private struct MetalCompiledModelRuntimeCloner {
         case .memoryless:
             options.insert(.storageModeMemoryless)
         case .managed:
+#if os(macOS) && !targetEnvironment(macCatalyst) && arch(x86_64)
             options.insert(.storageModeManaged)
+#else
+            options.insert(.storageModeShared)
+#endif
         @unknown default:
             options.insert(.storageModeShared)
         }

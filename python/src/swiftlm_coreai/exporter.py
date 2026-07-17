@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from .bundle import validate_language_bundle
 from .document import ExportDocument
 from .errors import ExportError
 from .lfm2 import export_lfm2_model
@@ -105,4 +106,12 @@ def export_model(
         result = apple_export(export_config)
     except Exception as error:
         raise ExportError("coreai_export_failed", str(error)) from error
-    return Path(result)
+    bundle_path = Path(result)
+    validate_language_bundle(
+        bundle_path,
+        expected_name=document.metadata["name"],
+        expected_model_id=model_id,
+        expected_vocab_size=document.metadata["vocabSize"],
+        expected_max_context_length=document.metadata["maxContextLength"],
+    )
+    return bundle_path

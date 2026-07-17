@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .bundle import validate_language_bundle, write_language_bundle_metadata
 from .errors import ExportError
 from .program import export_torch_module
 
@@ -99,6 +100,13 @@ def export_lfm2_model(
             raise
         except Exception as error:
             raise ExportError("lfm2_stateful_export_failed", str(error)) from error
+        _finalize_bundle(
+            bundle_path,
+            model_id=model_id,
+            name=name,
+            vocab_size=config.vocab_size,
+            max_context_length=context_length,
+        )
         return bundle_path
 
     class StatelessLFM2(torch.nn.Module):
@@ -143,7 +151,39 @@ def export_lfm2_model(
         raise
     except Exception as error:
         raise ExportError("lfm2_export_failed", str(error)) from error
+    _finalize_bundle(
+        bundle_path,
+        model_id=model_id,
+        name=name,
+        vocab_size=config.vocab_size,
+        max_context_length=context_length,
+    )
     return bundle_path
+
+
+def _finalize_bundle(
+    bundle_path: Path,
+    *,
+    model_id: str,
+    name: str,
+    vocab_size: int,
+    max_context_length: int,
+) -> None:
+    """Add and verify the Apple language bundle contract after asset export."""
+    write_language_bundle_metadata(
+        bundle_path,
+        name=name,
+        model_id=model_id,
+        vocab_size=vocab_size,
+        max_context_length=max_context_length,
+    )
+    validate_language_bundle(
+        bundle_path,
+        expected_name=name,
+        expected_model_id=model_id,
+        expected_vocab_size=vocab_size,
+        expected_max_context_length=max_context_length,
+    )
 
 
 def export_lfm2_stateful_model(
