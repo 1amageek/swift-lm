@@ -64,11 +64,16 @@ public struct LlamaFamilyNaming: WeightNamingConvention {
             ]
         }
 
-        if let _ = attributes as? MoEAttributes {
+        if let attrs = attributes as? MoEAttributes {
             let moePrefix = "\(prefix).block_sparse_moe"
-            return [
-                ParameterBinding(role: "router", tensorName: "\(moePrefix).gate.weight"),
-            ]
+            return [ParameterBinding(role: "router", tensorName: "\(moePrefix).gate.weight")]
+                + WeightNamingHelpers.moeExperts(
+                    expertCount: attrs.expertCount,
+                    expertsPrefix: "\(moePrefix).experts",
+                    gateProjection: "w1.weight",
+                    upProjection: "w3.weight",
+                    downProjection: "w2.weight"
+                )
         }
 
         if let _ = attributes as? StateSpaceAttributes {
@@ -117,5 +122,31 @@ enum WeightNamingHelpers {
             return []
         }
         return [ParameterBinding(role: "v_proj", tensorName: "\(attentionPrefix).\(tensorSuffix)")]
+    }
+
+    static func moeExperts(
+        expertCount: Int,
+        expertsPrefix: String,
+        gateProjection: String,
+        upProjection: String,
+        downProjection: String
+    ) -> [ParameterBinding] {
+        (0..<expertCount).flatMap { expertIndex in
+            let prefix = "\(expertsPrefix).\(expertIndex)"
+            return [
+                ParameterBinding(
+                    role: "expert_\(expertIndex)_gate_proj",
+                    tensorName: "\(prefix).\(gateProjection)"
+                ),
+                ParameterBinding(
+                    role: "expert_\(expertIndex)_up_proj",
+                    tensorName: "\(prefix).\(upProjection)"
+                ),
+                ParameterBinding(
+                    role: "expert_\(expertIndex)_down_proj",
+                    tensorName: "\(prefix).\(downProjection)"
+                ),
+            ]
+        }
     }
 }

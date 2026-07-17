@@ -106,6 +106,7 @@ struct Qwen35DeltaNetDecoderLayer: ModelComponent {
                 keyHeadDim: config.ssmKeyHeadDim ?? 128,
                 valueHeadDim: config.ssmValueHeadDim ?? 128,
                 convKernelSize: config.convKernelSize ?? 1,
+                normEpsilon: config.normEps,
                 variant: .gated
             )
         }

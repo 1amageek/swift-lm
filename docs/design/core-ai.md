@@ -92,7 +92,9 @@ contracts; neither entry point maintains a separate model-family switch.
 |---|---|---|
 | Standard Transformer | Swift LMIR generic lowering | `SwiftLMCoreAI` generated bundle or an Apple-native high-level bundle |
 | Dense LFM2 | Swift LMIR generic lowering; Swift document execution mode derives KV and convolution states | `SwiftLMCoreAI` / `CoreAIStateSession` |
-| MoE / state-space / unsupported primitive contract | explicit lowering capability error with operation path | no fallback |
+| SwiGLU MoE | Swift LMIR routing semantics and canonical per-expert safetensors lowered through Apple `SwitchGLU` | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| Qwen3.5 text hybrid | Swift LMIR GatedDeltaNet and per-head packed attention gate lowering; stateful documents derive KV, convolution, and float32 recurrent states | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| Unsupported state-space or primitive contract | explicit lowering capability error with operation path | no fallback |
 | Unsupported family | explicit validation error | no fallback |
 
 The low-level session supports an arbitrary number of heterogeneous NDArray

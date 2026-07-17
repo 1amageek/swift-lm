@@ -18,6 +18,7 @@ public struct DeltaNet: ModelComponent {
     public let keyHeadDim: Int
     public let valueHeadDim: Int
     public let convKernelSize: Int
+    public let normEpsilon: Float
     public let variant: Variant
 
     public init(
@@ -27,6 +28,7 @@ public struct DeltaNet: ModelComponent {
         keyHeadDim: Int,
         valueHeadDim: Int,
         convKernelSize: Int = 1,
+        normEpsilon: Float = 1e-6,
         variant: Variant = .standard
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
@@ -34,12 +36,15 @@ public struct DeltaNet: ModelComponent {
         precondition((groupCount ?? numHeads) > 0, "groupCount must be positive")
         precondition(keyHeadDim > 0, "keyHeadDim must be positive")
         precondition(valueHeadDim > 0, "valueHeadDim must be positive")
+        precondition(convKernelSize > 0, "convKernelSize must be positive")
+        precondition(normEpsilon > 0, "normEpsilon must be positive")
         self.hiddenSize = hiddenSize
         self.numHeads = numHeads
         self.groupCount = groupCount ?? numHeads
         self.keyHeadDim = keyHeadDim
         self.valueHeadDim = valueHeadDim
         self.convKernelSize = convKernelSize
+        self.normEpsilon = normEpsilon
         self.variant = variant
     }
 }
@@ -54,6 +59,7 @@ extension DeltaNet {
             keyHeadDim: keyHeadDim,
             valueHeadDim: valueHeadDim,
             convKernelSize: convKernelSize,
+            normEpsilon: normEpsilon,
             variant: variant.rawValue
         )
     }

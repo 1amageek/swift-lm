@@ -24,7 +24,7 @@ class SafetensorWeightStore:
                 f"No safetensors files found in {model_directory}",
             )
 
-    def tensor(self, name: str) -> Any:
+    def tensor(self, name: str, *, dtype: Any | None = None) -> Any:
         try:
             from safetensors import safe_open
         except ImportError as error:
@@ -42,7 +42,8 @@ class SafetensorWeightStore:
         for path in candidates:
             with safe_open(path, framework="pt", device="cpu") as handle:
                 if name in handle.keys():
-                    return handle.get_tensor(name).to(dtype=self.dtype).contiguous()
+                    target_dtype = self.dtype if dtype is None else dtype
+                    return handle.get_tensor(name).to(dtype=target_dtype).contiguous()
         raise ExportError("weight_not_found", name)
 
     def _load_weight_map(self) -> dict[str, str]:

@@ -52,6 +52,9 @@ public struct StateSpaceAttributes: OperationAttributes, Codable, Equatable {
     /// Convolution kernel size used by the projected state prefilter.
     public let convKernelSize: Int
 
+    /// Epsilon used by the gated RMS normalization after recurrence.
+    public let normEpsilon: Float
+
     /// SSM variant identifier (e.g., "mamba", "deltanet").
     public let variant: String
 
@@ -86,6 +89,7 @@ public struct StateSpaceAttributes: OperationAttributes, Codable, Equatable {
     public init(
         hiddenSize: Int, numHeads: Int, groupCount: Int? = nil, keyHeadDim: Int, valueHeadDim: Int,
         convKernelSize: Int = 1,
+        normEpsilon: Float = 1e-6,
         variant: String, computeDType: ComputeDType = .float32
     ) {
         self.hiddenSize = hiddenSize
@@ -94,6 +98,7 @@ public struct StateSpaceAttributes: OperationAttributes, Codable, Equatable {
         self.keyHeadDim = keyHeadDim
         self.valueHeadDim = valueHeadDim
         self.convKernelSize = convKernelSize
+        self.normEpsilon = normEpsilon
         self.variant = variant
         self.computeDType = computeDType
     }

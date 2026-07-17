@@ -153,12 +153,20 @@ let outputs = try await session.run(
 ```
 
 The generic lowerer currently implements token embedding, RMSNorm, LayerNorm,
-LayerScale, Linear, dense MLP, baseline RoPE attention, ShortConv, output heads,
-residual-add, parallel-add, repeat, and layer-index conditionals. Contracts that
-require MoE, state-space recurrence, vision primitives, sliding-window
-attention, scaled/M-RoPE, gated attention, or axis-dependent parallel merges
-fail before graph construction with an operation path. They never fall back to
-a second model definition.
+LayerScale, Linear, dense MLP, baseline RoPE attention, ShortConv, SwiGLU MoE,
+Qwen3.5 GatedDeltaNet state-space recurrence, per-head packed sigmoid attention
+gates, output heads, residual-add, parallel-add, repeat, and layer-index
+conditionals.
+MoE supports softmax Top-K routing and LFM2 sigmoid Top-K routing with optional
+selection bias, normalization, and routed scaling through Apple's `SwitchGLU`.
+Qwen3.5 text hybrids lower GatedDeltaNet through Apple's `GatedDeltaUpdate`
+composite with explicit convolution and float32 recurrent state. Source
+tokenizer assets are copied directly from the Hugging Face bundle without a
+model-specific Transformers tokenizer class. Contracts that require vision
+primitives, other state-space variants, sliding-window attention, scaled or
+multiaxis M-RoPE inputs, other attention gates, unsupported expert MLPs, or
+axis-dependent parallel merges fail before graph construction with an operation
+path. They never fall back to a second model definition.
 
 ## Legacy Direct Metal API (0.10)
 

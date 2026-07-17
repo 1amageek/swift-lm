@@ -63,11 +63,16 @@ public struct Qwen35FamilyNaming: WeightNamingConvention {
             ]
         }
 
-        if let _ = attributes as? MoEAttributes {
-            let moePrefix = "\(prefix).block_sparse_moe"
-            return [
-                ParameterBinding(role: "router", tensorName: "\(moePrefix).gate.weight"),
-            ]
+        if let attrs = attributes as? MoEAttributes {
+            let moePrefix = "\(prefix).mlp"
+            return [ParameterBinding(role: "router", tensorName: "\(moePrefix).gate.weight")]
+                + WeightNamingHelpers.moeExperts(
+                    expertCount: attrs.expertCount,
+                    expertsPrefix: "\(moePrefix).experts",
+                    gateProjection: "gate_proj.weight",
+                    upProjection: "up_proj.weight",
+                    downProjection: "down_proj.weight"
+                )
         }
 
         if let _ = attributes as? StateSpaceAttributes {

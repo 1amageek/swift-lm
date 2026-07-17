@@ -70,11 +70,14 @@ public struct LFM2FamilyNaming: WeightNamingConvention {
 
         if let attrs = attributes as? MoEAttributes {
             let ffPrefix = "\(prefix).feed_forward"
-            var bindings = [
-                ParameterBinding(role: "router", tensorName: "\(ffPrefix).gate.weight"),
-                ParameterBinding(role: "expert_gate_up_proj", tensorName: "\(ffPrefix).experts.gate_up_proj"),
-                ParameterBinding(role: "expert_down_proj", tensorName: "\(ffPrefix).experts.down_proj"),
-            ]
+            var bindings = [ParameterBinding(role: "router", tensorName: "\(ffPrefix).gate.weight")]
+            bindings.append(contentsOf: WeightNamingHelpers.moeExperts(
+                expertCount: attrs.expertCount,
+                expertsPrefix: "\(ffPrefix).experts",
+                gateProjection: "w1.weight",
+                upProjection: "w3.weight",
+                downProjection: "w2.weight"
+            ))
             if attrs.useExpertBias {
                 bindings.append(ParameterBinding(role: "expert_bias", tensorName: "\(ffPrefix).expert_bias"))
             }

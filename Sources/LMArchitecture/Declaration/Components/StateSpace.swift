@@ -16,6 +16,7 @@ public struct StateSpace: ModelComponent {
     public let keyHeadDim: Int
     public let valueHeadDim: Int
     public let convKernelSize: Int
+    public let normEpsilon: Float
     public let variant: String
 
     public init(
@@ -23,6 +24,7 @@ public struct StateSpace: ModelComponent {
         groupCount: Int? = nil,
         keyHeadDim: Int, valueHeadDim: Int,
         convKernelSize: Int = 1,
+        normEpsilon: Float = 1e-6,
         variant: String
     ) {
         precondition(hiddenSize > 0, "hiddenSize must be positive")
@@ -30,12 +32,15 @@ public struct StateSpace: ModelComponent {
         precondition((groupCount ?? numHeads) > 0, "groupCount must be positive")
         precondition(keyHeadDim > 0, "keyHeadDim must be positive")
         precondition(valueHeadDim > 0, "valueHeadDim must be positive")
+        precondition(convKernelSize > 0, "convKernelSize must be positive")
+        precondition(normEpsilon > 0, "normEpsilon must be positive")
         self.hiddenSize = hiddenSize
         self.numHeads = numHeads
         self.groupCount = groupCount ?? numHeads
         self.keyHeadDim = keyHeadDim
         self.valueHeadDim = valueHeadDim
         self.convKernelSize = convKernelSize
+        self.normEpsilon = normEpsilon
         self.variant = variant
     }
 }
@@ -50,6 +55,7 @@ extension StateSpace {
             keyHeadDim: keyHeadDim,
             valueHeadDim: valueHeadDim,
             convKernelSize: convKernelSize,
+            normEpsilon: normEpsilon,
             variant: variant
         )
     }

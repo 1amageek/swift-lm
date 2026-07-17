@@ -322,10 +322,13 @@ def _make_primitive(
 ) -> Any:
     opcode = primitive["opcode"]
     attributes = primitive["attributes"]
-    tensors = {
-        binding["role"]: weights.tensor(binding["tensorName"])
-        for binding in bindings
-    }
+    tensors = {}
+    for binding in bindings:
+        role = binding["role"]
+        dtype = None
+        if opcode == "state_space" and role in {"A_log", "dt_bias", "scale"}:
+            dtype = torch.float32
+        tensors[role] = weights.tensor(binding["tensorName"], dtype=dtype)
     states_by_role = {binding["role"]: binding for binding in state_bindings}
 
     class Primitive(torch.nn.Module):
@@ -335,6 +338,12 @@ def _make_primitive(
             self.attributes = attributes
             self.states_by_role = states_by_role
             for role, tensor in tensors.items():
+                if (
+                    opcode == "moe"
+                    and role.startswith("expert_")
+                    and role != "expert_bias"
+                ):
+                    continue
                 self.register_parameter(
                     _parameter_name(role),
                     torch.nn.Parameter(tensor, requires_grad=False),
@@ -346,6 +355,33 @@ def _make_primitive(
                 if scale is None:
                     scale = attributes["headDimension"] ** -0.5
                 self.sdpa = SDPA(scale=scale, is_causal=attributes["causal"])
+            if opcode == "moe":
+                from coreai_models.primitives.macos.switch import SwitchGLU
+
+                expert_mlp = attributes["expertMLP"]
+                self.switch_glu = SwitchGLU(
+                    expert_mlp["inputSize"],
+                    expert_mlp["intermediateSize"],
+                    attributes["expertCount"],
+                    bias=False,
+                )
+                for projection in ("gate_proj", "up_proj", "down_proj"):
+                    stacked = torch.stack(
+                        [
+                            tensors[f"expert_{index}_{projection}"]
+                            for index in range(attributes["expertCount"])
+                        ],
+                        dim=0,
+                    ).unsqueeze(0)
+                    switch_projection = getattr(self.switch_glu, projection)
+                    switch_projection.weight = torch.nn.Parameter(
+                        stacked,
+                        requires_grad=False,
+                    )
+            if opcode == "state_space":
+                from coreai_torch.composite_ops import GatedDeltaUpdate
+
+                self.gated_delta_update = GatedDeltaUpdate(use_qk_l2_norm=True)
 
         def forward(
             self,
@@ -375,6 +411,10 @@ def _make_primitive(
                 )
             if self.opcode == "mlp":
                 return self._mlp(value)
+            if self.opcode == "moe":
+                return self._moe(value)
+            if self.opcode == "state_space":
+                return self._state_space(value, states)
             if self.opcode == "short_conv":
                 return self._short_conv(value, states)
             if self.opcode == "attention":
@@ -432,6 +472,208 @@ def _make_primitive(
                 hidden,
                 self.down_proj,
                 getattr(self, "down_proj_bias", None),
+            )
+
+        def _moe(self, value: Any) -> Any:
+            router_logits = torch.nn.functional.linear(value, self.router).float()
+            gate_kind = _enum_case(self.attributes["gateKind"])
+            top_k = self.attributes["expertsPerToken"]
+            normalize = self.attributes["normalizeRoutingWeights"]
+
+            if gate_kind == "topK":
+                if normalize:
+                    top_logits, active_indices = torch.topk(
+                        router_logits,
+                        top_k,
+                        dim=-1,
+                        largest=True,
+                    )
+                    active_scores = torch.softmax(top_logits, dim=-1)
+                else:
+                    routing_scores = torch.softmax(router_logits, dim=-1)
+                    active_scores, active_indices = torch.topk(
+                        routing_scores,
+                        top_k,
+                        dim=-1,
+                        largest=True,
+                    )
+            elif gate_kind == "sigmoidTopK":
+                routing_scores = torch.sigmoid(router_logits)
+                selection_scores = routing_scores
+                if self.attributes["useExpertBias"]:
+                    selection_scores = selection_scores + self.expert_bias.float()
+                _, active_indices = torch.topk(
+                    selection_scores,
+                    top_k,
+                    dim=-1,
+                    largest=True,
+                )
+                active_scores = torch.gather(routing_scores, -1, active_indices)
+                if normalize:
+                    active_scores = active_scores / active_scores.sum(
+                        dim=-1,
+                        keepdim=True,
+                    )
+            else:
+                raise RuntimeError(f"Unsupported MoE gate kind {gate_kind}")
+
+            active_scores = active_scores * self.attributes["routedScalingFactor"]
+            active_outputs = self.switch_glu(value, active_indices.to(torch.uint16))
+            weighted = active_outputs * active_scores.to(value.dtype).unsqueeze(-1)
+            return weighted.sum(dim=-2).to(value.dtype)
+
+        def _state_space(self, value: Any, states: dict[str, Any]) -> Any:
+            batch_size, sequence_length, _ = value.shape
+            head_count = self.attributes["numHeads"]
+            group_count = self.attributes["groupCount"]
+            key_head_dimension = self.attributes["keyHeadDim"]
+            value_head_dimension = self.attributes["valueHeadDim"]
+            key_dimension = group_count * key_head_dimension
+            value_dimension = head_count * value_head_dimension
+            convolution_dimension = 2 * key_dimension + value_dimension
+            kernel_size = self.attributes["convKernelSize"]
+
+            mixed_qkv = torch.nn.functional.linear(value, self.in_proj_qkv)
+            mixed_qkv = mixed_qkv.transpose(-1, -2)
+            if "conv_cache" in self.states_by_role:
+                conv_cache, conv_index = self._state("conv_cache", states)
+                previous = conv_cache.narrow(0, conv_index, 1).squeeze(0)
+                padded_qkv = torch.cat((previous, mixed_qkv), dim=-1)
+            else:
+                padded_qkv = torch.nn.functional.pad(
+                    mixed_qkv,
+                    (kernel_size - 1, 0),
+                )
+            mixed_qkv = torch.nn.functional.conv1d(
+                padded_qkv,
+                self.conv_weight,
+                groups=convolution_dimension,
+            )[..., -sequence_length:]
+            mixed_qkv = torch.nn.functional.silu(mixed_qkv).transpose(-1, -2)
+
+            if "conv_cache" in self.states_by_role:
+                updated_conv = padded_qkv[..., -kernel_size:]
+                self._update_state(
+                    conv_cache,
+                    conv_index,
+                    updated_conv,
+                    value.device,
+                )
+
+            query, key, projected_value = torch.split(
+                mixed_qkv,
+                (key_dimension, key_dimension, value_dimension),
+                dim=-1,
+            )
+            query = query.reshape(
+                batch_size,
+                sequence_length,
+                group_count,
+                key_head_dimension,
+            )
+            key = key.reshape(
+                batch_size,
+                sequence_length,
+                group_count,
+                key_head_dimension,
+            )
+            projected_value = projected_value.reshape(
+                batch_size,
+                sequence_length,
+                head_count,
+                value_head_dimension,
+            )
+            repetitions = head_count // group_count
+            query = query.repeat_interleave(repetitions, dim=2)
+            key = key.repeat_interleave(repetitions, dim=2)
+
+            beta = torch.sigmoid(torch.nn.functional.linear(value, self.in_proj_b))
+            decay_input = torch.nn.functional.linear(value, self.in_proj_a)
+            decay = -self.A_log.float().exp() * torch.nn.functional.softplus(
+                decay_input.float() + self.dt_bias.float()
+            )
+            gate = torch.nn.functional.linear(value, self.in_proj_z).reshape(
+                batch_size,
+                sequence_length,
+                head_count,
+                value_head_dimension,
+            )
+
+            if "recurrent_state" in self.states_by_role:
+                recurrent_cache, recurrent_index = self._state(
+                    "recurrent_state",
+                    states,
+                )
+                initial_state = recurrent_cache.narrow(
+                    0,
+                    recurrent_index,
+                    1,
+                ).squeeze(0)
+            else:
+                initial_state = torch.zeros(
+                    batch_size,
+                    head_count,
+                    key_head_dimension,
+                    value_head_dimension,
+                    dtype=torch.float32,
+                    device=value.device,
+                )
+
+            recurrence_output, updated_recurrent = self.gated_delta_update(
+                query.transpose(1, 2).float(),
+                key.transpose(1, 2).float(),
+                projected_value.transpose(1, 2).float(),
+                decay.transpose(1, 2).float(),
+                beta.transpose(1, 2).float(),
+                initial_state,
+            )
+            if "recurrent_state" in self.states_by_role:
+                self._update_state(
+                    recurrent_cache,
+                    recurrent_index,
+                    updated_recurrent,
+                    value.device,
+                )
+
+            recurrence_output = recurrence_output.to(value.dtype)
+            normalized = recurrence_output.float()
+            variance = normalized.pow(2).mean(-1, keepdim=True)
+            normalized = normalized * torch.rsqrt(
+                variance + self.attributes["normEpsilon"]
+            )
+            normalized = normalized * self.scale.float()
+            normalized = normalized * torch.nn.functional.silu(gate.float())
+            normalized = normalized.to(value.dtype).reshape(
+                batch_size,
+                sequence_length,
+                value_dimension,
+            )
+            return torch.nn.functional.linear(normalized, self.out_proj)
+
+        def _update_state(
+            self,
+            cache: Any,
+            axis_index: int,
+            update: Any,
+            device: Any,
+        ) -> None:
+            from coreai_models.primitives._ops import mutable_slice_update
+
+            begin = torch.tensor(
+                (axis_index,) + (0,) * (cache.dim() - 1),
+                dtype=torch.int32,
+                device=device,
+            )
+            end = torch.tensor(
+                (axis_index + 1,) + tuple(cache.shape[1:]),
+                dtype=torch.int32,
+                device=device,
+            )
+            mutable_slice_update(
+                x=cache,
+                update=update.unsqueeze(0),
+                begin=begin,
+                end=end,
             )
 
         def _short_conv(self, value: Any, states: dict[str, Any]) -> Any:
@@ -498,6 +740,22 @@ def _make_primitive(
                 self.q_proj,
                 getattr(self, "q_proj_bias", None),
             )
+            output_gate = self.attributes.get("outputGate")
+            gate = None
+            if output_gate is not None:
+                output_gate_kind = _enum_case(output_gate)
+                if output_gate_kind == "sigmoidPackedInQProj":
+                    query = query.view(
+                        *input_shape,
+                        head_count,
+                        head_dimension * 2,
+                    )
+                    query, gate = query.chunk(2, dim=-1)
+                    gate = gate.reshape(*input_shape, -1)
+                else:
+                    raise RuntimeError(
+                        f"Unsupported attention output gate {output_gate_kind}"
+                    )
             key = torch.nn.functional.linear(
                 value,
                 self.k_proj,
@@ -508,7 +766,8 @@ def _make_primitive(
                 self.v_proj,
                 getattr(self, "v_proj_bias", None),
             )
-            query = query.view(*input_shape, head_count, head_dimension)
+            if gate is None:
+                query = query.view(*input_shape, head_count, head_dimension)
             key = key.view(*input_shape, kv_head_count, head_dimension)
             projected_value = projected_value.view(
                 *input_shape, kv_head_count, head_dimension
@@ -543,6 +802,8 @@ def _make_primitive(
             projected_value = _repeat_kv(projected_value, repetitions)
             output = self.sdpa(query, key, projected_value)
             output = output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
+            if gate is not None:
+                output = output * torch.sigmoid(gate)
             return torch.nn.functional.linear(
                 output,
                 self.o_proj,
@@ -644,9 +905,11 @@ def _validate_lowering_contract(region: dict[str, Any], path: str) -> None:
         "layer_scale",
         "linear",
         "mlp",
+        "moe",
         "output_head",
         "rms_norm",
         "short_conv",
+        "state_space",
         "token_embedding",
     }
     for index, operation in enumerate(region["operations"]):
@@ -735,6 +998,13 @@ def _validate_primitive_contract(
             )
     elif opcode == "short_conv":
         allowed_state_roles = {"conv_cache"}
+    elif opcode == "state_space":
+        allowed_state_roles = {"conv_cache", "recurrent_state"}
+        if state_roles and state_roles != allowed_state_roles:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: state-space state requires conv_cache and recurrent_state",
+            )
     unknown_state_roles = state_roles - allowed_state_roles
     if unknown_state_roles:
         raise ExportError(
@@ -755,9 +1025,60 @@ def _validate_primitive_contract(
                 "unsupported_lowering",
                 f"{path}: MLP gating {gating!r}",
             )
+    if opcode == "moe":
+        expert_count = attributes["expertCount"]
+        experts_per_token = attributes["expertsPerToken"]
+        if expert_count <= 0 or not 0 < experts_per_token <= expert_count:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: invalid MoE expert counts",
+            )
+        gate_kind = _enum_case(attributes["gateKind"])
+        if gate_kind not in {"topK", "sigmoidTopK"}:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: MoE gate kind {gate_kind!r}",
+            )
+        expert_mlp = attributes["expertMLP"]
+        unsupported = []
+        if expert_mlp["inputSize"] != expert_mlp["outputSize"]:
+            unsupported.append("different input/output sizes")
+        if _enum_case(expert_mlp["activation"]) not in {"silu", "swish"}:
+            activation = _enum_case(expert_mlp["activation"])
+            unsupported.append(f"activation {activation!r}")
+        if _enum_case(expert_mlp["gating"]) != "swiglu":
+            unsupported.append(f"gating {_enum_case(expert_mlp['gating'])!r}")
+        if expert_mlp["bias"]:
+            unsupported.append("projection bias")
+        if unsupported:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: MoE expert MLP {', '.join(unsupported)}",
+            )
+    if opcode == "state_space":
+        variant = attributes["variant"]
+        if variant != "gated_deltanet":
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: state-space variant {variant!r}",
+            )
+        if attributes["computeDType"] != "float32":
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: state-space compute dtype {attributes['computeDType']!r}",
+            )
+        if attributes["numHeads"] % attributes["groupCount"] != 0:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: state-space head count must be divisible by group count",
+            )
+        if attributes["normEpsilon"] <= 0:
+            raise ExportError(
+                "unsupported_lowering",
+                f"{path}: state-space norm epsilon must be positive",
+            )
     if opcode == "attention":
         unsupported = {
-            "outputGate": attributes.get("outputGate"),
             "sharedKeyValueSourceLayerIndex": attributes.get(
                 "sharedKeyValueSourceLayerIndex"
             ),
@@ -766,10 +1087,11 @@ def _validate_primitive_contract(
         }
         enabled = [name for name, value in unsupported.items() if value is not None]
         rope = attributes.get("rope")
-        if rope is not None and (
-            rope.get("scaling") is not None or rope.get("mropeAxes") is not None
-        ):
-            enabled.append("scaled/multi-axis RoPE")
+        if rope is not None and rope.get("scaling") is not None:
+            enabled.append("scaled RoPE")
+        output_gate = attributes.get("outputGate")
+        if output_gate is not None and _enum_case(output_gate) != "sigmoidPackedInQProj":
+            enabled.append(f"output gate {_enum_case(output_gate)}")
         qk_norm = attributes.get("qkNorm")
         if qk_norm is not None and _enum_case(qk_norm) not in {
             "none",
@@ -816,10 +1138,36 @@ def _parameter_roles(
             if "gate_proj" in roles:
                 roles.add("gate_proj_bias")
         return roles, roles
+    if opcode == "moe":
+        roles = {"router"}
+        for expert_index in range(attributes["expertCount"]):
+            roles.update(
+                {
+                    f"expert_{expert_index}_gate_proj",
+                    f"expert_{expert_index}_up_proj",
+                    f"expert_{expert_index}_down_proj",
+                }
+            )
+        if attributes["useExpertBias"]:
+            roles.add("expert_bias")
+        return roles, roles
     if opcode == "short_conv":
         required = {"in_proj", "conv_weight", "out_proj"}
         optional = {"in_proj_bias", "conv_bias", "out_proj_bias"}
         return required, required | optional
+    if opcode == "state_space":
+        roles = {
+            "in_proj_qkv",
+            "in_proj_z",
+            "in_proj_b",
+            "in_proj_a",
+            "out_proj",
+            "scale",
+            "conv_weight",
+            "dt_bias",
+            "A_log",
+        }
+        return roles, roles
     if opcode == "attention":
         roles = {"q_proj", "k_proj", "o_proj"}
         value_source = _enum_case(

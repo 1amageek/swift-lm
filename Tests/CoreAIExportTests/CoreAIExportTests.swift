@@ -247,13 +247,71 @@ struct CoreAIExportTests {
         let function = try #require(document.program.functions.first)
         #expect(function.states.map(\.name) == ["keyCache", "valueCache", "convCache"])
         #expect(function.states[0].dimensions[0] == .fixed(1))
-        #expect(function.states[0].dimensions[3] == .dynamic("cache_length", minimum: 1, maximum: 64))
+        #expect(function.states[0].dimensions[3] == .dynamic("prefix_length", minimum: 1, maximum: 64))
         #expect(document.rootRegion.operations[0].stateBindings == [
             .init(role: "key_cache", state: "keyCache", axisIndex: 0),
             .init(role: "value_cache", state: "valueCache", axisIndex: 0),
         ])
         #expect(document.rootRegion.operations[1].stateBindings == [
             .init(role: "conv_cache", state: "convCache", axisIndex: 0)
+        ])
+    }
+
+    @Test("Stateful export derives DeltaNet convolution and recurrent state")
+    func statefulDeltaNetContract() throws {
+        let stateSpace = Operation(
+            key: OperationKey(rawValue: 20),
+            kind: .primitive(
+                StateSpaceAttributes(
+                    hiddenSize: 8,
+                    numHeads: 4,
+                    groupCount: 2,
+                    keyHeadDim: 3,
+                    valueHeadDim: 5,
+                    convKernelSize: 4,
+                    normEpsilon: 1e-5,
+                    variant: "gated_deltanet"
+                )
+            ),
+            operands: [],
+            results: [OperationResult(id: ValueID(rawValue: 20))]
+        )
+        let document = try CoreAIModelExporter().makeDocument(
+            graph: ModelGraph(
+                rootRegion: Region(
+                    operations: [stateSpace],
+                    results: [ValueUse(value: ValueID(rawValue: 20))]
+                )
+            ),
+            configuration: CoreAIExportConfiguration(
+                name: "stateful-deltanet",
+                modelType: "qwen3_5",
+                target: .macOSDynamic,
+                maxContextLength: 64,
+                vocabSize: 32,
+                execution: .stateful
+            )
+        )
+
+        let function = try #require(document.program.functions.first)
+        #expect(function.states.map(\.name) == [
+            "stateSpaceConvCache", "stateSpaceRecurrentState",
+        ])
+        #expect(function.states[0].dataType == .float16)
+        #expect(function.states[0].dimensions == [
+            .fixed(1), .fixed(1), .fixed(32), .fixed(4),
+        ])
+        #expect(function.states[1].dataType == .float32)
+        #expect(function.states[1].dimensions == [
+            .fixed(1), .fixed(1), .fixed(4), .fixed(3), .fixed(5),
+        ])
+        #expect(document.rootRegion.operations[0].stateBindings == [
+            .init(role: "conv_cache", state: "stateSpaceConvCache", axisIndex: 0),
+            .init(
+                role: "recurrent_state",
+                state: "stateSpaceRecurrentState",
+                axisIndex: 0
+            ),
         ])
     }
 

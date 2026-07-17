@@ -28,7 +28,6 @@ def export_ir_language_model(
     try:
         import torch
         from huggingface_hub import snapshot_download
-        from transformers import AutoTokenizer
     except ImportError as error:
         raise ExportError(
             "missing_coreai_dependencies",
@@ -71,11 +70,7 @@ def export_ir_language_model(
             output_names=[tensor["name"] for tensor in document.function["outputs"]],
             dynamic_shapes=dynamic_shapes,
         )
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_directory)
-        tokenizer.save_pretrained(bundle_path / "tokenizer")
-    except Exception as error:
-        raise ExportError("tokenizer_export_failed", str(error)) from error
+    _copy_tokenizer_assets(model_directory, bundle_path / "tokenizer")
 
     contract_path = bundle_path / "swiftlm-program.json"
     try:
@@ -224,6 +219,37 @@ def _load_config(model_directory: Path) -> dict[str, Any]:
     return config
 
 
+def _copy_tokenizer_assets(model_directory: Path, output_directory: Path) -> None:
+    asset_names = (
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+        "added_tokens.json",
+        "chat_template.jinja",
+        "vocab.json",
+        "merges.txt",
+        "tokenizer.model",
+        "sentencepiece.bpe.model",
+        "spiece.model",
+    )
+    tokenizer_json = model_directory / "tokenizer.json"
+    if not tokenizer_json.is_file():
+        raise ExportError(
+            "tokenizer_export_failed",
+            f"HF bundle is missing tokenizer.json: {tokenizer_json}",
+        )
+    try:
+        if output_directory.exists():
+            shutil.rmtree(output_directory)
+        output_directory.mkdir(parents=True)
+        for name in asset_names:
+            source = model_directory / name
+            if source.is_file():
+                shutil.copy2(source, output_directory / name)
+    except OSError as error:
+        raise ExportError("tokenizer_export_failed", str(error)) from error
+
+
 def _validate_source_contract(
     document: ExportDocument,
     config: dict[str, Any],
@@ -234,7 +260,13 @@ def _validate_source_contract(
             "model_type_mismatch",
             f"document declares {document.model_type!r}, HF config declares {actual_model_type!r}",
         )
-    actual_vocab_size = config.get("vocab_size")
+    language_config = config.get("text_config", config)
+    if not isinstance(language_config, dict):
+        raise ExportError(
+            "invalid_source_config",
+            "HF text_config must be an object",
+        )
+    actual_vocab_size = language_config.get("vocab_size")
     if actual_vocab_size != document.metadata["vocabSize"]:
         raise ExportError(
             "vocab_size_mismatch",

@@ -112,6 +112,13 @@ private func validateStateSpaceInvariants(
     try requirePositive("stateSpace.groupCount", attrs.groupCount, key: key)
     try requirePositive("stateSpace.keyHeadDim", attrs.keyHeadDim, key: key)
     try requirePositive("stateSpace.valueHeadDim", attrs.valueHeadDim, key: key)
+    try requirePositive("stateSpace.convKernelSize", attrs.convKernelSize, key: key)
+    if attrs.normEpsilon <= 0 {
+        throw DimensionValidationError.attributeInvariant(
+            message: "stateSpace.normEpsilon(\(attrs.normEpsilon)) must be positive",
+            operationKey: key
+        )
+    }
 
     // DeltaNet: output projection is numHeads * valueHeadDim → hiddenSize (matmul).
     // Asymmetric variants (e.g. Qwen3.5-4B: numHeads=32, valueHeadDim=128, hiddenSize=2560)

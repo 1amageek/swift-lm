@@ -66,6 +66,11 @@ struct CoreAIProgramContractBuilder {
         collector.collect(graph.rootRegion)
         var states: [CoreAIProgramContract.Tensor] = []
         var stateBindings: [OperationKey: [CoreAIExportDocument.StateBinding]] = [:]
+        let prefixLength = CoreAIProgramContract.Dimension.dynamic(
+            "prefix_length",
+            minimum: 1,
+            maximum: configuration.maxContextLength
+        )
 
         let attentionGroups = Dictionary(grouping: collector.attention) {
             AttentionShape(kvHeads: $0.attributes.kvHeadCount, headDimension: $0.attributes.headDimension)
@@ -74,16 +79,11 @@ struct CoreAIProgramContractBuilder {
             let suffix = attentionGroups.count == 1 ? "" : String(groupIndex)
             let keyName = "keyCache\(suffix)"
             let valueName = "valueCache\(suffix)"
-            let cacheLength = CoreAIProgramContract.Dimension.dynamic(
-                "cache_length",
-                minimum: 1,
-                maximum: configuration.maxContextLength
-            )
             let dimensions: [CoreAIProgramContract.Dimension] = [
                 .fixed(group.value.count),
                 .fixed(1),
                 .fixed(group.key.kvHeads),
-                cacheLength,
+                prefixLength,
                 .fixed(group.key.headDimension),
             ]
             states.append(.init(name: keyName, dataType: .float16, dimensions: dimensions))
@@ -126,17 +126,54 @@ struct CoreAIProgramContractBuilder {
             }
         }
 
+        let stateSpaceGroups = Dictionary(grouping: collector.stateSpace) {
+            StateSpaceShape(attributes: $0.attributes)
+        }
+        for (groupIndex, group) in stateSpaceGroups.sorted(by: { $0.key < $1.key }).enumerated() {
+            let suffix = stateSpaceGroups.count == 1 ? "" : String(groupIndex)
+            let convName = "stateSpaceConvCache\(suffix)"
+            let recurrentName = "stateSpaceRecurrentState\(suffix)"
+            states.append(
+                .init(
+                    name: convName,
+                    dataType: .float16,
+                    dimensions: [
+                        .fixed(group.value.count),
+                        .fixed(1),
+                        .fixed(group.key.convolutionDimension),
+                        .fixed(group.key.kernelSize),
+                    ]
+                )
+            )
+            states.append(
+                .init(
+                    name: recurrentName,
+                    dataType: .float32,
+                    dimensions: [
+                        .fixed(group.value.count),
+                        .fixed(1),
+                        .fixed(group.key.headCount),
+                        .fixed(group.key.keyHeadDimension),
+                        .fixed(group.key.valueHeadDimension),
+                    ]
+                )
+            )
+            for (axisIndex, operation) in group.value.enumerated() {
+                stateBindings[operation.key, default: []].append(
+                    .init(role: "conv_cache", state: convName, axisIndex: axisIndex)
+                )
+                stateBindings[operation.key, default: []].append(
+                    .init(role: "recurrent_state", state: recurrentName, axisIndex: axisIndex)
+                )
+            }
+        }
+
         guard !states.isEmpty else {
             throw CoreAIExportError.invalidConfiguration(
                 "stateful execution requires at least one mutable LMIR operation"
             )
         }
 
-        let prefix = CoreAIProgramContract.Dimension.dynamic(
-            "prefix_length",
-            minimum: 1,
-            maximum: configuration.maxContextLength
-        )
         let contract = CoreAIProgramContract(
             execution: .stateful,
             functions: [
@@ -151,7 +188,7 @@ struct CoreAIProgramContractBuilder {
                         .init(
                             name: "position_ids",
                             dataType: .int32,
-                            dimensions: [.fixed(1), prefix]
+                            dimensions: [.fixed(1), prefixLength]
                         ),
                     ],
                     outputs: [
@@ -180,8 +217,14 @@ private struct PrimitiveCollector {
         let attributes: ShortConvAttributes
     }
 
+    struct StateSpaceOperation {
+        let key: OperationKey
+        let attributes: StateSpaceAttributes
+    }
+
     var attention: [AttentionOperation] = []
     var shortConvolution: [ShortConvolutionOperation] = []
+    var stateSpace: [StateSpaceOperation] = []
 
     mutating func collect(_ region: Region) {
         for operation in region.operations {
@@ -191,6 +234,8 @@ private struct PrimitiveCollector {
                     attention.append(.init(key: operation.key, attributes: attributes))
                 } else if let attributes = attributes as? ShortConvAttributes {
                     shortConvolution.append(.init(key: operation.key, attributes: attributes))
+                } else if let attributes = attributes as? StateSpaceAttributes {
+                    stateSpace.append(.init(key: operation.key, attributes: attributes))
                 }
             case .residual(_, let body), .repeating(_, let body):
                 collect(body)
@@ -221,5 +266,38 @@ private struct ConvolutionShape: Hashable, Comparable {
 
     static func < (lhs: ConvolutionShape, rhs: ConvolutionShape) -> Bool {
         (lhs.hiddenSize, lhs.kernelSize) < (rhs.hiddenSize, rhs.kernelSize)
+    }
+}
+
+private struct StateSpaceShape: Hashable, Comparable {
+    let convolutionDimension: Int
+    let kernelSize: Int
+    let headCount: Int
+    let keyHeadDimension: Int
+    let valueHeadDimension: Int
+
+    init(attributes: StateSpaceAttributes) {
+        convolutionDimension = 2 * attributes.groupCount * attributes.keyHeadDim
+            + attributes.numHeads * attributes.valueHeadDim
+        kernelSize = attributes.convKernelSize
+        headCount = attributes.numHeads
+        keyHeadDimension = attributes.keyHeadDim
+        valueHeadDimension = attributes.valueHeadDim
+    }
+
+    static func < (lhs: StateSpaceShape, rhs: StateSpaceShape) -> Bool {
+        (
+            lhs.convolutionDimension,
+            lhs.kernelSize,
+            lhs.headCount,
+            lhs.keyHeadDimension,
+            lhs.valueHeadDimension
+        ) < (
+            rhs.convolutionDimension,
+            rhs.kernelSize,
+            rhs.headCount,
+            rhs.keyHeadDimension,
+            rhs.valueHeadDimension
+        )
     }
 }

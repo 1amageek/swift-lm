@@ -257,17 +257,18 @@ struct LoadTests {
         #expect(graph.rootRegion.operations.isEmpty == false)
     }
 
-    @Test("Resolve LFM2.5 8B-A1B packed MoE parameter bindings")
-    func resolveLFM25_8B_A1B_PackedMoEParameters() throws {
+    @Test("Resolve LFM2.5 8B-A1B canonical MoE parameter bindings")
+    func resolveLFM25_8B_A1B_CanonicalMoEParameters() throws {
         let graph = try ModelGraph(LFM2(config: Self.lfm25_8B_A1B_Config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
 
         let tensorNames = collectTensorNames(in: resolved.rootRegion)
         #expect(tensorNames.contains("model.layers.2.feed_forward.gate.weight"))
         #expect(tensorNames.contains("model.layers.2.feed_forward.expert_bias"))
-        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.gate_up_proj"))
-        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.down_proj"))
-        #expect(!tensorNames.contains("model.layers.2.feed_forward.experts.0.w1.weight"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.0.w1.weight"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.0.w2.weight"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.0.w3.weight"))
+        #expect(tensorNames.contains("model.layers.2.feed_forward.experts.31.w1.weight"))
     }
 
     @Test("LFM2.5 8B-A1B profile contract is explicit")
@@ -302,13 +303,22 @@ struct LoadTests {
         let graph = try ModelGraph(LFM2(config: config))
         let resolved = ParameterResolver().resolve(graph: graph, convention: .lfm2Family)
         let tensorNames = collectTensorNames(in: resolved.rootRegion)
-        let gateUpBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.experts.gate_up_proj") }
-        let downBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.experts.down_proj") }
+        let expertGateBindings = tensorNames.filter {
+            $0.contains(".feed_forward.experts.") && $0.hasSuffix(".w1.weight")
+        }
+        let expertUpBindings = tensorNames.filter {
+            $0.contains(".feed_forward.experts.") && $0.hasSuffix(".w3.weight")
+        }
+        let expertDownBindings = tensorNames.filter {
+            $0.contains(".feed_forward.experts.") && $0.hasSuffix(".w2.weight")
+        }
         let routerBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.gate.weight") }
         let biasBindings = tensorNames.filter { $0.hasSuffix(".feed_forward.expert_bias") }
 
-        #expect(gateUpBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
-        #expect(downBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
+        let expectedExpertBindings = Self.lfm25_8B_A1B_MoELayerCount * 32
+        #expect(expertGateBindings.count == expectedExpertBindings)
+        #expect(expertUpBindings.count == expectedExpertBindings)
+        #expect(expertDownBindings.count == expectedExpertBindings)
         #expect(routerBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
         #expect(biasBindings.count == Self.lfm25_8B_A1B_MoELayerCount)
     }
