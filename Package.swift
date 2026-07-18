@@ -57,6 +57,7 @@ let package = Package(
             name: "SwiftLMFoundationModels",
             dependencies: [
                 .product(name: "CoreAILM", package: "coreai-models"),
+                .product(name: "Tokenizers", package: "swift-transformers"),
             ]
         ),
         .executableTarget(

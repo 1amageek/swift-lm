@@ -31,6 +31,26 @@ These suites must pass before a release:
 - `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:MetalCompilerTests/PrefillTransferTests`
 - `xcodebuild test -scheme swift-lm-Package -destination 'platform=macOS,arch=arm64' -only-testing:MetalCompilerTests/RotorQuantCorrectnessTests`
 
+## Platform Compatibility Gate
+
+Every release must compile the package for iOS and Mac Catalyst. Run both
+destinations with independent hard timeouts:
+
+```bash
+scripts/xcodebuild/build-supported-platforms.sh --timeout 120
+```
+
+This gate covers the complete package graph, including the direct Metal 0.10
+compatibility products. Platform-specific APIs such as managed Metal storage
+and macOS home-directory lookup must remain isolated behind availability and
+target-environment checks.
+
+Apple-native VLM changes must also run `SwiftLMFoundationModelsTests`. Set
+`SWIFTLM_COREAI_TEST_VLM_BUNDLE`, `SWIFTLM_COREAI_TEST_VLM_IMAGE`, and,
+for a pre-tokenized fixture, `SWIFTLM_COREAI_TEST_VLM_TOKEN_IDS` to exercise
+vision encoding, embedding scatter, stateful decoding, and token generation.
+Metadata-only tests are not sufficient for this runtime boundary.
+
 Required expectations:
 
 - LFM local smoke mentions `Tokyo` (`ReleaseSmokeOutputTests`)

@@ -58,7 +58,7 @@ that validated contract into Apple's Core AI asset format.
 | `ModelDeclarations` | Transformer and LFM2 family declarations |
 | `CoreAIExport` | Versioned document and graph-to-document exporter |
 | `SwiftLMCoreAI` | Contract-validated stateless/stateful specialization and inference |
-| `SwiftLMFoundationModels` | Apple `CoreAILanguageModels` bundle adapter |
+| `SwiftLMFoundationModels` | Apple `CoreAILanguageModels` LLM/VLM bundle adapter |
 | `SwiftLMIR` | `config.json` to export-document command-line tool |
 | `MetalCompiler` / `SwiftLM` | 0.10 direct Metal compatibility path |
 
@@ -75,6 +75,14 @@ The runtime wrapper uses the following public Core AI API boundaries:
 4. `ComputeStream` allows callers to provide an explicit scheduling stream.
 5. `CoreAILanguageModels.LanguageBundle` and `CoreAILanguageModel` provide the
    high-level Apple runtime for supported language-model bundles.
+6. `CoreAISequentialVLMEngine` executes Apple's official three-asset VLM
+   contract: vision encoder, token embedding, and embedding-input decoder.
+
+The VLM adapter preserves that asset boundary and provides a state-owning Swift
+actor. Text input is rendered by the embedded tokenizer chat template and must
+produce one image placeholder before expansion. Pre-tokenized input must carry
+the exact declared placeholder count. Both contracts fail explicitly when the
+bundle metadata, template, or token layout disagrees with the exported model.
 
 `CoreAIModelAsset` rejects unsupported specialization settings explicitly.
 The current beta has a reproducible failure when
@@ -94,6 +102,7 @@ contracts; neither entry point maintains a separate model-family switch.
 | Dense LFM2 | Swift LMIR generic lowering; Swift document execution mode derives KV and convolution states | `SwiftLMCoreAI` / `CoreAIStateSession` |
 | SwiGLU MoE | Swift LMIR routing semantics and canonical per-expert safetensors lowered through Apple `SwitchGLU` | `SwiftLMCoreAI` / `CoreAIStateSession` |
 | Qwen3.5 text hybrid | Swift LMIR GatedDeltaNet and per-head packed attention gate lowering; stateful documents derive KV, convolution, and float32 recurrent states | `SwiftLMCoreAI` / `CoreAIStateSession` |
+| Apple-supported VLM | Official `coreai-models` exporter emits `vision`, `embedding`, and `main` assets | `SwiftLMFoundationModels` / `SwiftLMVisionLanguageModel` |
 | Unsupported state-space or primitive contract | explicit lowering capability error with operation path | no fallback |
 | Unsupported family | explicit validation error | no fallback |
 

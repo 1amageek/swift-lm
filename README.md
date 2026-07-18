@@ -126,8 +126,39 @@ Use `CoreAIExport` when an application needs to build or inspect a document in
 Swift. Use `SwiftLMCoreAI.CoreAIModelBundle` for generated bundles; it verifies
 the embedded Swift contract against the asset's function names, tensor types,
 shapes, and state layout before specialization. `SwiftLMFoundationModels`
-adapts Apple-native language bundles and is a separate high-level runtime
-surface.
+adapts Apple-native language and vision-language bundles and is a separate
+high-level runtime surface.
+
+Apple VLM bundles retain the official three-asset boundary:
+
+```text
+image -> vision.aimodel ----+
+                            v
+prompt -> embed.aimodel -> decoder.aimodel -> generated text
+```
+
+Load a VLM bundle and generate from an image without exposing Core AI tensor
+plumbing to application code:
+
+```swift
+let bundle = try SwiftLMFoundationModelBundle(contentsOf: bundleURL)
+let model = try await bundle.makeVisionLanguageModel()
+let output = try await model.generate(
+    from: SwiftLMVisionLanguageInput(
+        imageURL: imageURL,
+        prompt: .text(prompt)
+    )
+)
+```
+
+Text prompts must render exactly one image placeholder through the bundle's
+chat template; the adapter expands it to the declared visual token count.
+Callers with a model-specific renderer can pass fully rendered token IDs using
+`.tokens`. Missing or ambiguous placeholders fail with a typed error rather
+than using a generic prompt fallback. The model owns mutable KV state, so call
+`reset()` before starting an unrelated request. Model-specific turn-ending
+tokens can be supplied explicitly through
+`SwiftLMVisionLanguageGenerationOptions.additionalStopTokenIDs`.
 
 Stateless and stateful generated bundles share the `CoreAIExecutableSession`
 contract:
@@ -716,6 +747,7 @@ perl -e 'alarm shift; exec @ARGV' 120 \
 
 Useful runners:
 
+- iOS and Mac Catalyst package builds: `scripts/xcodebuild/build-supported-platforms.sh`
 - Qwen3.5+ multimodal suites: `scripts/benchmarks/run-qwen35-vision-tests.sh`
 - Generation benchmark pipeline: `scripts/benchmarks/run-generation-pipeline.sh`
 - Prefill route promotion artifact gate: `scripts/benchmarks/run-prefill-artifact-validation.sh`
